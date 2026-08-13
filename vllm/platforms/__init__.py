@@ -125,6 +125,18 @@ def rocm_platform_plugin() -> str | None:
     except Exception as e:
         logger.debug("ROCm platform is not available because: %s", str(e))
 
+    # On some ROCm builds (notably gfx906-native TheRock / ROCm 7.14) amdsmi
+    # returns 0 processor handles after torch has been imported, even though the
+    # GPU works. Fall back to torch.version.hip to detect ROCm robustly.
+    if not is_rocm:
+        try:
+            import torch
+            if torch.version.hip:
+                is_rocm = True
+                logger.debug("Confirmed ROCm platform via torch.version.hip.")
+        except Exception as e:
+            logger.debug("ROCm platform fallback detection failed: %s", str(e))
+
     return "vllm.platforms.rocm.RocmPlatform" if is_rocm else None
 
 
