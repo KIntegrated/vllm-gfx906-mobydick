@@ -248,3 +248,27 @@ Validation on real gfx906 (ROCm 7.2.1 toolchain, HSA 9.0.6):
 No [PART2] source-fix needed for the exercised paths. Remaining: MiniMax M3
 fp8/fp32 KV + AITER sparse PA, DeepSeek V4 long-context, MRv2 default path on
 gfx906.
+
+---
+
+## Testing the MRv2 (Model Runner V2) default path on gfx906
+
+MRv2 is selected per-model at engine init. Relevant knobs:
+
+- Default: non-MoE models => MRv2 (via `or not model_config.is_moe` in
+  `config/vllm.py::use_v2_model_runner`). MoE models => MRv2 ONLY if the arch is
+  in `DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES`
+  (DeepseekV2/GraniteMoe/Inkling/LongcatFlashNgram/Qwen2Moe), else MRv1.
+- Force one way: `VLLM_USE_V2_MODEL_RUNNER=1` (V2) / `=0` (V1).
+- Confirm at runtime: worker logs `[gpu_worker.py] Using V2 Model Runner`.
+
+Validation on gfx906 (0.26, ROCm 7.2.1 toolchain):
+1. Selection probe: Qwen3-0.6B (non-MoE) -> MRv2; Qwen3.5-9B-AWQ (MoE) -> MRv1.
+2. Qwen3-0.6B (MRv2 default): log "Using V2 Model Runner", correct output.
+3. FORCED MRv2 on AWQ MoE (`VLLM_USE_V2_MODEL_RUNNER=1`): log "Using V2 Model
+   Runner", correct output "Tokyo."  => validates MRv2 quantized-MoE path on
+   gfx906 (the 0.25 #46535 / 0.26 MRv2 maturation).
+
+To test any other gfx906 path under MRv2: rerun with VLLM_USE_V2_MODEL_RUNNER=1
+and grep for the "Using V2 Model Runner" log line + output correctness. Non-MoE
+gfx906 models are already on MRv2 by default.
