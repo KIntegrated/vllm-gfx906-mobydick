@@ -1716,6 +1716,193 @@ void cp_gather_indexer_k_quant_cache(
   }
 }
 
+template <typename scalar_t>
+__global__ void indexer_k_cache_fp16_kernel(
+    const scalar_t* __restrict__ k, uint16_t* __restrict__ kv_cache,
+    const int64_t* __restrict__ slot_mapping, const int head_dim,
+    const int cache_block_size, const int cache_stride) {
+  constexpr int VEC_SIZE = 4;
+  const int64_t token_idx = blockIdx.x;
+  const int64_t head_dim_idx =
+      (blockIdx.y * blockDim.y * blockDim.x + threadIdx.y * blockDim.x +
+       threadIdx.x) * VEC_SIZE;
+  if (head_dim_idx >= head_dim) return;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) return;
+  const int64_t block_idx = slot_idx / cache_block_size;
+  const int64_t block_offset = slot_idx % cache_block_size;
+  const int64_t dst_offset =
+      block_idx * cache_block_size * cache_stride + block_offset * head_dim +
+      head_dim_idx;
+
+  const scalar_t* k_ptr = &k[token_idx * head_dim + head_dim_idx];
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; ++i) {
+    __half h =
+        (std::is_same<scalar_t, __half>::value)
+            ? *reinterpret_cast<const __half*>(&k_ptr[i])
+            : __float2half(static_cast<float>(k_ptr[i]));
+    kv_cache[dst_offset + i] = *reinterpret_cast<uint16_t*>(&h);
+  }
+}
+
+template <typename scalar_t, int BLOCK_Y_SIZE>
+__global__ void cp_gather_indexer_k_cache_fp16_kernel(
+    const uint16_t* __restrict__ kv_cache, scalar_t* __restrict__ dst_k,
+    const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ cu_seq_lens, const int batch_size,
+    const int64_t dst_stride, const int head_dim,
+    const int64_t cache_block_stride, const int64_t cache_block_size,
+    const int64_t block_table_stride, const int num_tokens) {
+  constexpr int VEC_SIZE = 4;
+  const int token_idx = blockIdx.x * BLOCK_Y_SIZE + threadIdx.y;
+  if (token_idx >= num_tokens) return;
+  const int head_dim_idx = (threadIdx.x * VEC_SIZE) +
+                           (blockIdx.y * blockDim.x * VEC_SIZE);
+  if (head_dim_idx >= head_dim) return;
+
+  int req_id = 0;
+  for (; req_id < batch_size; ++req_id) {
+    if (cu_seq_lens[req_id + 1] > token_idx) break;
+  }
+  const int seq_local = token_idx - cu_seq_lens[req_id];
+  const int logical_block = seq_local / cache_block_size;
+  const int block_offset = seq_local % cache_block_size;
+  const int64_t physical_block =
+      block_table[req_id * block_table_stride + logical_block];
+
+  const uint16_t* src =
+      kv_cache + physical_block * cache_block_stride +
+      block_offset * head_dim + head_dim_idx;
+  scalar_t* dst = dst_k + token_idx * dst_stride + head_dim_idx;
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; ++i) {
+    __half h = *reinterpret_cast<const __half*>(&src[i]);
+    dst[i] = static_cast<scalar_t>(__half2float(h));
+  }
+}
+void indexer_k_cache_fp16(
+    torch::stable::Tensor& k, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& slot_mapping) {
+  const int num_tokens = k.size(0);
+  const int head_dim = k.size(1);
+  const int cache_block_size = kv_cache.size(1);
+  const int cache_stride = kv_cache.size(2);
+
+  STD_TORCH_CHECK(k.device() == kv_cache.device(),
+                  "k and kv_cache must be on the same device");
+  STD_TORCH_CHECK(k.device() == slot_mapping.device(),
+                  "k and slot_mapping must be on the same device");
+  STD_TORCH_CHECK(kv_cache.element_size() == 2,
+                  "kv_cache must use a 16-bit element type");
+  STD_TORCH_CHECK(
+      slot_mapping.scalar_type() == torch::headeronly::ScalarType::Long,
+      "slot_mapping must be int64");
+  STD_TORCH_CHECK(head_dim % 4 == 0, "head_dim must be divisible by 4");
+
+  constexpr int VEC_SIZE = 4;
+  constexpr int BLOCK_Y = 4;
+  dim3 block(32, BLOCK_Y);
+  dim3 grid(num_tokens,
+            cuda_utils::ceil_div(head_dim, VEC_SIZE * 32 * BLOCK_Y));
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      k.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+
+  if (k.scalar_type() == torch::headeronly::ScalarType::Float) {
+    indexer_k_cache_fp16_kernel<float><<<grid, block, 0, stream>>>(
+        k.const_data_ptr<float>(),
+        reinterpret_cast<uint16_t*>(kv_cache.mutable_data_ptr()),
+        slot_mapping.const_data_ptr<int64_t>(), head_dim, cache_block_size,
+        cache_stride);
+  } else if (k.scalar_type() == torch::headeronly::ScalarType::Half) {
+    indexer_k_cache_fp16_kernel<half><<<grid, block, 0, stream>>>(
+        reinterpret_cast<const half*>(k.const_data_ptr()),
+        reinterpret_cast<uint16_t*>(kv_cache.mutable_data_ptr()),
+        slot_mapping.const_data_ptr<int64_t>(), head_dim, cache_block_size,
+        cache_stride);
+  } else {
+    STD_TORCH_CHECK(false, "k must be float32 or float16");
+  }
+}
+
+void cp_gather_indexer_k_cache_fp16(
+    const torch::stable::Tensor& kv_cache, torch::stable::Tensor& dst_k,
+    const torch::stable::Tensor& block_table,
+    const torch::stable::Tensor& cu_seq_lens) {
+  const int batch_size = block_table.size(0);
+  const int num_tokens = dst_k.size(0);
+  const int head_dim = dst_k.size(1);
+  const int64_t block_stride = kv_cache.stride(0);
+  const int64_t cache_block_size = kv_cache.size(1);
+  const int64_t block_table_stride = block_table.stride(0);
+
+  STD_TORCH_CHECK(kv_cache.device() == dst_k.device(),
+                  "kv_cache and dst_k must be on the same device");
+  STD_TORCH_CHECK(kv_cache.device() == block_table.device(),
+                  "kv_cache and block_table must be on the same device");
+  STD_TORCH_CHECK(kv_cache.device() == cu_seq_lens.device(),
+                  "kv_cache and cu_seq_lens must be on the same device");
+  STD_TORCH_CHECK(kv_cache.element_size() == 2,
+                  "kv_cache must use a 16-bit element type");
+  STD_TORCH_CHECK(
+      block_table.scalar_type() == torch::headeronly::ScalarType::Int,
+      "block_table must be int32");
+  STD_TORCH_CHECK(
+      cu_seq_lens.scalar_type() == torch::headeronly::ScalarType::Int,
+      "cu_seq_lens must be int32");
+  STD_TORCH_CHECK(head_dim % 4 == 0, "head_dim must be divisible by 4");
+
+  constexpr int VEC_SIZE = 4;
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      kv_cache.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+
+#define LAUNCH_GATHER(BLOCK_Y, TYPE)                                        \
+  cp_gather_indexer_k_cache_fp16_kernel<TYPE, BLOCK_Y>                \
+      <<<dim3(cuda_utils::ceil_div(num_tokens, BLOCK_Y),                    \
+               cuda_utils::ceil_div(head_dim, VEC_SIZE * 32)),             \
+         dim3(32, BLOCK_Y), 0, stream>>>(                                   \
+          reinterpret_cast<const uint16_t*>(kv_cache.const_data_ptr()),     \
+          reinterpret_cast<TYPE*>(dst_k.mutable_data_ptr()),                \
+          block_table.const_data_ptr<int32_t>(),                            \
+          cu_seq_lens.const_data_ptr<int32_t>(), batch_size, dst_k.stride(0), \
+          head_dim, block_stride, cache_block_size, block_table_stride,     \
+          num_tokens)
+
+  if (dst_k.scalar_type() == torch::headeronly::ScalarType::Float) {
+    if (num_tokens < 32) {
+      LAUNCH_GATHER(1, float);
+    } else if (num_tokens < 64) {
+      LAUNCH_GATHER(2, float);
+    } else if (num_tokens < 128) {
+      LAUNCH_GATHER(4, float);
+    } else if (num_tokens < 256) {
+      LAUNCH_GATHER(8, float);
+    } else {
+      LAUNCH_GATHER(16, float);
+    }
+  } else if (dst_k.scalar_type() == torch::headeronly::ScalarType::Half) {
+    if (num_tokens < 32) {
+      LAUNCH_GATHER(1, half);
+    } else if (num_tokens < 64) {
+      LAUNCH_GATHER(2, half);
+    } else if (num_tokens < 128) {
+      LAUNCH_GATHER(4, half);
+    } else if (num_tokens < 256) {
+      LAUNCH_GATHER(8, half);
+    } else {
+      LAUNCH_GATHER(16, half);
+    }
+  } else {
+    STD_TORCH_CHECK(false, "dst_k must be float32 or float16");
+  }
+
+#undef LAUNCH_GATHER
+}
+
+
 // Concatenate ql_nope and q_pe into a contiguous q_out tensor for MLA/DSA.
 // Replaces torch.cat((ql_nope, q_pe), dim=-1).
 void concat_mla_q(
@@ -1762,3 +1949,4 @@ void concat_mla_q(
         q_pe.stride(1));
   });
 }
+
