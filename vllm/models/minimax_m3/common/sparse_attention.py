@@ -27,9 +27,21 @@ from vllm.logger import init_logger
 from vllm.models.minimax_m3.common.ops.sparse_attn import SPARSE_BLOCK_SIZE
 from vllm.platforms import current_platform
 
-# AMD/ROCm uses the gfx942/gfx950-optimized block-sparse kernels in amd.ops;
-# every other platform uses the generic common.ops implementation.
 if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx942, on_gfx950
+else:
+
+    def on_gfx942() -> bool:
+        return False
+
+    def on_gfx950() -> bool:
+        return False
+
+# AMD/ROCm uses the gfx942/gfx950-optimized block-sparse kernels in amd.ops,
+# but gfx906 (MI50) is not CDNA and must use the generic common.ops
+# implementation (which carries the gfx906 LDS-safe launch kwargs); every other
+# platform uses common.ops too.
+if current_platform.is_rocm() and (on_gfx942() or on_gfx950()):
     from vllm.models.minimax_m3.amd.ops.sparse_attn import (
         minimax_m3_sparse_attn,
         minimax_m3_sparse_attn_decode,

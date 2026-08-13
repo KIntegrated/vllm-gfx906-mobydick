@@ -20,8 +20,27 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
+
+
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
+
+
+def _index_score_launch_kwargs() -> dict:
+    """Launch kwargs for index-score dot kernels on gfx906."""
+    if current_platform.is_rocm() and on_gfx906():
+        return {
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 1,
+        }
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +142,8 @@ def _index_block_score_kernel(
         order=(1, 0),
     )
     q = tl.load(q_ptrs, boundary_check=(0,), padding_option="zero")
+    if q.dtype == tl.float32:
+        q = q.to(tl.float16)
     q_start = prefix_len + pid_q * BLOCK_SIZE_Q
 
     off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
@@ -146,6 +167,8 @@ def _index_block_score_kernel(
             + off_k[None, :] * stride_ik_pos
             + off_d[:, None] * stride_ik_d,
         )
+        if k.dtype == tl.float32:
+            k = k.to(tl.float16)
         qk = tl.dot(q, k)
         # apply causal mask as needed
         if q_start < i + BLOCK_SIZE_K:
@@ -383,6 +406,9 @@ def _decode_index_score_kernel(
             # are loaded in their stored dtype (bf16 or e4m3) and the MMA
             # accumulates in fp32 so the per-block max score is exact for the
             # fp8 indexer too.
+            # On gfx906, cast to fp16 (Triton MMA lacks fp32 there).
+            if k.dtype == tl.float32:
+                k = k.to(tl.float16)
             kq = tl.dot(k, q, out_dtype=tl.float32)  # [N,HQ]
         kq = tl.where(pos_mask & q_mask[None, :], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [HQ]
@@ -706,6 +732,8 @@ def minimax_m3_index_score(
         block_table.stride(0),
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        # gfx906 index-score dot kernels need these launch params.
+        **_index_score_launch_kwargs(),
     )
     return score
 
@@ -854,6 +882,8 @@ def minimax_m3_index_decode(
         num_kv_chunks=num_kv_chunks,
         USE_PDL=use_pdl,
         **score_kwargs,
+        # gfx906 index-score dot kernels need these launch params.
+        **_index_score_launch_kwargs(),
     )
 
     if out is not None:
