@@ -20,6 +20,7 @@ IndexerKVDType = Literal[
     "mxfp4",
     "nvfp4",
 ]
+MiniMaxM3MSADecodeBackend = Literal["triton", "cutlass"]
 
 
 @config
@@ -28,6 +29,9 @@ class AttentionConfig:
 
     backend: AttentionBackendEnum | None = None
     """Attention backend to use. Use "auto" or None for automatic selection."""
+
+    minimax_m3_msa_decode_backend: MiniMaxM3MSADecodeBackend = "triton"
+    """Sparse decode kernel used by the MiniMax M3 MSA backend."""
 
     backend_per_kind: dict[str, AttentionBackendEnum] = field(default_factory=dict)
     """Per-KV-cache-group attention backend overrides, keyed by
@@ -98,13 +102,26 @@ class AttentionConfig:
     flex_attn_q_block_size: int | None = None
     """Logical Q block size for the flex attention block mask.
     Must be a power of 2 and divisible by flex_attn_block_m.
-    If None, uses the default (16 on PyTorch >= 2.9, 128 otherwise)."""
+    If None, uses 16 for paged KV attention on PyTorch >= 2.9, and 128
+    for encoder-only attention or older PyTorch versions."""
 
     flex_attn_kv_block_size: int | None = None
     """Logical KV block size for the flex attention block mask.
     Must be a power of 2 and divisible by flex_attn_block_n.
-    If None, uses the default (kv_cache_block_size on PyTorch >= 2.9,
-    128 otherwise)."""
+    If None, uses the KV cache block size for paged KV attention on
+    PyTorch >= 2.9, and 128 for encoder-only attention or older PyTorch
+    versions."""
+
+    def __post_init__(self) -> None:
+        msa_aliases: dict[AttentionBackendEnum, MiniMaxM3MSADecodeBackend] = {
+            AttentionBackendEnum.CUTLASS_MSA: "cutlass",
+            AttentionBackendEnum.TRITON_MSA: "triton",
+        }
+        if self.backend in msa_aliases:
+            self.minimax_m3_msa_decode_backend = msa_aliases[self.backend]
+            # The alias selects only MiniMax's sparse decode kernel. Dense
+            # layers still use the platform's normal automatic backend.
+            self.backend = None
 
     def compute_hash(self) -> str:
         """
@@ -140,20 +157,6 @@ class AttentionConfig:
         """Enable parsing of the `mla_prefill_backend` enum type from string."""
         if isinstance(value, str):
             return MLAPrefillBackendEnum[value.upper()]
-        return value
-
-    @field_validator("indexer_kv_dtype", mode="before")
-    @classmethod
-    def validate_indexer_kv_dtype_before(cls, value: Any) -> Any:
-        """Normalize sparse indexer cache dtype aliases."""
-        if isinstance(value, str):
-            value = value.lower()
-            if value == "fp16":
-                return "float16"
-            if value == "fp32":
-                return "float32"
-            if value == "bfloat16":
-                return "bf16"
         return value
 
     @field_validator("backend_per_kind", mode="before")
