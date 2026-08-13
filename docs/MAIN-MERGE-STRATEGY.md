@@ -31,3 +31,25 @@ RE-APPLY only the true gfx906 kernel deltas as thin adaptations on top:
 ## Verification
 Rebuild native ext + smoke test on gfx906 docker (Qwen3-0.6B / AWQ / MRv2 / MoE),
 plus MiniMax-style fp32-KV decode to settle the IndexerKVDType question.
+
+## Validation status on the pytorch-2.11 / ROCm-7.2.1 toolchain (2026-08-13)
+
+The main merge (v0.27.2rc1) builds and imports cleanly on the gfx906 docker
+(pytorch 2.11 / ROCm 7.2.1): on_gfx906 True, fp8==e4m3fn, no undefined symbols,
+cross-type gather + fp16 indexer kernels compile. Ling-3.bailing_moe_v3 resolves.
+
+However, runtime inference fails with `hipErrorIllegalState` in a BASIC kernel:
+`rms_norm` (vllm/kernels/vllm_c.py -> torch.ops._C.rms_norm). This op worked
+on vLLM 0.26.0 with the same toolchain, so it is NOT a gfx906 kernel bug and NOT
+a graph-capture issue (it reproduces with enforce_eager, in the warmup forward).
+
+Root cause hypothesis: upstream vllm main (0.27.x) is developed/built against
+torch 2.13 + ROCm 7.14 (mixa3607/pytorch-gfx906:v2.13.0-rocm-7.14). Building
+main's C++ with the older torch-2.11 / ROCm-7.2.1 produces subtly broken kernels
+(rms_norm), even though it compiles. The torch-2.13 base lacks triton,
+flash_attn, cmake/ninja, setuptools_rust, so validating main properly requires a
+full rebuild (triton-gfx906 + flash-attn-gfx906 + vllm) on the 2.13 base via the
+ML-gfx906/vllm-v2 recipe.
+
+State: main merge fully resolved & committed; static (build/import) OK on
+torch-2.11; runtime rms_norm failure pending the 2.13 toolchain rebuild.
