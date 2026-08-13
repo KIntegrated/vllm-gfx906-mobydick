@@ -49,6 +49,10 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         self.group_size = weight_quant.group_size
         # grouped actorder isn't supported by this kernel
         assert weight_quant.actorder != "group"
+        assert weight_quant.symmetric, (
+            "Only symmetric quantization is supported for MoE. "
+            "Try --moe-backend emulation."
+        )
 
     def get_weight_shape(
         self,

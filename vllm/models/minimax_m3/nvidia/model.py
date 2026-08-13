@@ -25,6 +25,7 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.attention import set_default_quant_scales
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
     fused_allreduce_gemma_rms_norm,
@@ -259,7 +260,6 @@ class MiniMaxM3MoE(nn.Module):
             swiglu_alpha=config.swiglu_alpha,
             swiglu_beta=config.swiglu_beta,
             routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scale_to_output=True,
             router_logits_dtype=self.gate.out_dtype,
             shared_experts=self.shared_experts,
             quant_config=quant_config,
@@ -492,7 +492,13 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
-        # Indexer side-cache dtype (--attention-config '{"indexer_kv_dtype": ...}').
+        # MiniMax-M3 sparse attention owns its KV-cache insert/read path instead
+        # of wrapping the generic Attention module. Keep the same runtime scale
+        # attributes so FP8 KV reads can honor vLLM's per-layer descale contract.
+        self.calculate_kv_scales = False
+        set_default_quant_scales(self, register_buffer=True)
+        # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main
+        # cache (--attention-config '{"indexer_kv_dtype": ...}').
         self.indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
 
         # Shared top-k buffer: the indexer writes the selected blocks into it and
@@ -506,6 +512,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.impl: MiniMaxM3SparseImpl = select_main_impl_cls(  # type: ignore[assignment]
             topk_blocks=sparse_cfg["sparse_topk_blocks"],
             kv_cache_dtype=self.kv_cache_dtype,
+            num_kv_heads=self.num_kv_heads,
         )(
             self.num_heads,
             self.head_dim,
@@ -802,27 +809,6 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         else:
             self.topk_indices_buffer = None
 
-        # Reserved top-k indices buffer shared by all sparse-attention indexer
-        # layers (mirrors DeepseekV4); kept at a stable address so the indexer's
-        # top-k output survives cudagraph capture/replay. Shape matches the
-        # per-head index top-k output [num_index_heads, total_q, topk].
-        sparse_cfg = getattr(config, "sparse_attention_config", None)
-        if sparse_cfg is not None:
-            tp_size = get_tensor_model_parallel_world_size()
-            num_index_heads = max(1, sparse_cfg["sparse_num_index_heads"] // tp_size)
-            # Pad tokens to a multiple of 4 so the buffer head stride stays
-            # int4-aligned for build_k2q_csr's vectorised int4 loads.
-            max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-            padded_num_tokens = (max_num_batched_tokens + 3) // 4 * 4
-            self.topk_indices_buffer = torch.empty(
-                num_index_heads,
-                padded_num_tokens,
-                sparse_cfg["sparse_topk_blocks"],
-                dtype=torch.int32,
-            )
-        else:
-            self.topk_indices_buffer = None
-
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: MiniMaxM3DecoderLayer(
@@ -1011,17 +997,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            ".mlp.fc1.": ".fc1.",
-            ".mlp.fc2.": ".fc2.",
-        },
-        orig_to_new_suffix={
-            ".mlp.fc1": ".fc1",
-            ".mlp.fc2": ".fc2",
-        },
-    )
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_text_config
@@ -1088,6 +1063,7 @@ class MiniMaxM3SparseForConditionalGeneration(
     # data``; ``run_dp_sharded_mrope_vision_model`` shards the work across
     # ranks (see ``_process_image_input`` / ``_process_video_input``).
     supports_encoder_tp_data = True
+
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1101,10 +1077,6 @@ class MiniMaxM3SparseForConditionalGeneration(
         orig_to_new_substr={
             ".mlp.fc1.": ".fc1.",
             ".mlp.fc2.": ".fc2.",
-        },
-        orig_to_new_suffix={
-            ".mlp.fc1": ".fc1",
-            ".mlp.fc2": ".fc2",
         },
     )
 

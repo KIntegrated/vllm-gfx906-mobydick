@@ -930,6 +930,55 @@ def minimax_m3_index_decode(
         max_decode_query_len,
         score_out=score_out,
     )
+    return score
+
+
+@torch.no_grad()
+def minimax_m3_index_decode(
+    idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
+    index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
+    block_table: torch.Tensor,  # [num_reqs, max_blocks]
+    seq_lens: torch.Tensor,  # [num_reqs] int32
+    max_seq_len: int,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    num_kv_heads: int,
+    decode_query_len: int,
+    max_decode_query_len: int,
+    out: torch.Tensor | None = None,
+    score_out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode index block-score + top-k, both split-K (cudagraph-safe).
+
+    Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
+    When ``out`` ([num_kv_heads, >=total_q, topk]) is given, writes into
+    ``out[:, :total_q, :]`` (stable address for cudagraph) instead of allocating.
+    When ``score_out`` ([num_kv_heads, total_q, >=max_block]) is given, the block
+    scores are written into it (read back by the top-k) instead of a fresh
+    tensor -- used to share a unified score buffer with the prefill side. Reads
+    via strides, so a transposed view of a block-major buffer is accepted.
+    """
+    total_q, num_idx_heads, _ = idx_q.shape
+    batch = total_q
+    max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    use_pdl = current_platform.is_arch_support_pdl()
+    pdl_kwargs: dict[str, bool | int] = {}
+    if use_pdl:
+        pdl_kwargs.update({"launch_pdl": True})
+    score = minimax_m3_index_decode_score(
+        idx_q,
+        index_kv_cache,
+        block_table,
+        seq_lens,
+        max_seq_len,
+        init_blocks,
+        local_blocks,
+        num_kv_heads,
+        decode_query_len,
+        max_decode_query_len,
+        score_out=score_out,
+    )
 
     if out is not None:
         topk_idx = out[:, :total_q, :]
