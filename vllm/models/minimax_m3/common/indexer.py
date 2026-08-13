@@ -25,12 +25,14 @@ from vllm.config.attention import IndexerKVDType
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.models.minimax_m3.common.ops.index_topk import (
     minimax_m3_index_decode,
     minimax_m3_index_score,
     minimax_m3_index_topk,
 )
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -45,6 +47,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
+
+logger = init_logger(__name__)
 
 
 class MiniMaxM3IndexerBackend(AttentionBackend):
@@ -126,6 +130,8 @@ def _indexer_kv_dtype_to_torch_dtype(
     indexer_kv_dtype = _normalize_indexer_kv_dtype(indexer_kv_dtype)
     if indexer_kv_dtype == "bf16":
         return torch.bfloat16
+    if indexer_kv_dtype in ("fp8", "fp8_e4m3"):
+        return torch.float8_e4m3fn
     if indexer_kv_dtype == "float16":
         return torch.float16
     if indexer_kv_dtype == "float32":
@@ -133,7 +139,7 @@ def _indexer_kv_dtype_to_torch_dtype(
     raise NotImplementedError(
         f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported yet "
         "for the MiniMax M3 indexer cache "
-        "(only 'bf16', 'float16', 'float32')."
+        "(only 'bf16', 'float16', 'float32', 'fp8'/'fp8_e4m3')."
     )
 
 
@@ -203,6 +209,7 @@ class MiniMaxM3IndexerDecodeMetadata:
     block_table: torch.Tensor
     max_seq_len: int
     decode_query_len: int
+    max_decode_query_len: int
 
 
 @dataclass
@@ -257,6 +264,8 @@ class MiniMaxM3IndexerMetadataBuilder(
             assert tp_size % total_index_heads == 0
         self.num_index_heads = max(1, total_index_heads // tp_size)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        assert self.reorder_batch_threshold is not None
+        self.max_decode_query_len = self.reorder_batch_threshold
 
         # Stable context-length buffer for decode cudagraph replays.
         self.context_len_buffer = torch.empty(
@@ -325,6 +334,7 @@ class MiniMaxM3IndexerTritonMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 block_table=block_table[:num_decodes],
                 max_seq_len=common_attn_metadata.max_seq_len,
                 decode_query_len=decode_query_len,
+                max_decode_query_len=self.max_decode_query_len,
             )
 
         return MiniMaxM3IndexerMetadata(
@@ -368,6 +378,7 @@ class MiniMaxM3IndexerImpl(nn.Module):
         score_type: str = "max",
         cache_config: CacheConfig | None = None,
         indexer_kv_dtype: IndexerKVDType = "bf16",
+        topk_indices_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.num_kv_heads = num_kv_heads
@@ -381,6 +392,9 @@ class MiniMaxM3IndexerImpl(nn.Module):
         self.index_head_dim = index_head_dim
         indexer_kv_dtype = _normalize_indexer_kv_dtype(indexer_kv_dtype)
         self.indexer_kv_dtype = indexer_kv_dtype
+        # Shared, stable-address top-k output buffer (set by the model for the
+        # cudagraph-safe MSA impl); None -> impl allocates fresh (eager).
+        self.topk_indices_buffer = topk_indices_buffer
         # Owns the side cache (registers itself in the static forward context).
         self.index_cache = MiniMaxM3IndexerCache(
             head_dim=index_head_dim,
@@ -417,6 +431,10 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
         )
         kv = self.index_cache.kv_cache
 
+        # Both sides write into the single shared persistent topk_indices_buffer
+        # (decode at [:, :nd], prefill at [:, nd:]) and return views into it; the
+        # kernels' out= writes out[:, :total_q]. None -> allocate fresh.
+        buf = self.topk_indices_buffer
         decode_topk: torch.Tensor | None = None
         prefill_topk: torch.Tensor | None = None
         if index_md.num_decodes > 0:
@@ -432,8 +450,9 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 self.init_blocks,
                 self.local_blocks,
                 self.num_kv_heads,
-                self.scale,
                 d.decode_query_len,
+                d.max_decode_query_len,
+                out=buf,
             )
         if index_md.num_prefills > 0:
             p = index_md.prefill
@@ -448,7 +467,6 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 p.max_query_len,
                 p.max_seq_len,
                 self.num_kv_heads,
-                self.scale,
             )
             prefill_topk = minimax_m3_index_topk(
                 score,
@@ -458,18 +476,22 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 self.topk_blocks,
                 self.init_blocks,
                 self.local_blocks,
+                out=buf[:, nd:, :] if buf is not None else None,
             )
         return decode_topk, prefill_topk
 
 
 def select_indexer_impl_cls(
     *,
+    topk_blocks: int,
     indexer_kv_dtype: IndexerKVDType = "bf16",
 ) -> type[MiniMaxM3IndexerImpl]:
-    """Pick the indexer impl off the index-cache dtype.
+    """Pick the indexer impl off the platform, top-k count, and cache dtype.
 
-    The SM100 MSA indexer score path is disabled for now; use the local Triton
-    indexer. If re-enabled, add a NVIDIA-specific ``MiniMaxM3IndexerImpl`` here.
+    On Blackwell (SM100) with ``topk_blocks`` in ``(4, 8, 16, 32)`` (matching the
+    main MSA attend), the fmha_sm100 score path + Triton top-k is used for both
+    bf16 and fp8 index caches. Everything else falls back to the Triton indexer
+    (bf16 only).
     """
     indexer_kv_dtype = _normalize_indexer_kv_dtype(indexer_kv_dtype)
     if indexer_kv_dtype in ("mxfp4", "nvfp4"):
@@ -477,11 +499,39 @@ def select_indexer_impl_cls(
             f"indexer_kv_dtype={indexer_kv_dtype!r} needs the (not-yet-added) "
             "CuteDSL indexer impl."
         )
+    is_sm100 = (
+        current_platform.is_cuda() and current_platform.is_device_capability_family(100)
+    )
+    use_msa = (
+        is_sm100
+        and topk_blocks in (4, 8, 16, 32)
+        and indexer_kv_dtype in ("bf16", "fp8", "fp8_e4m3")
+    )
+    if use_msa:
+        # Lazy import so AMD / non-SM100 never import fmha_sm100.
+        from vllm.models.minimax_m3.nvidia.indexer_msa import (
+            MiniMaxM3IndexerMSAImpl,
+        )
+
+        logger.info_once(
+            "MiniMax M3 indexer: selected MSA (fmha_sm100 score + Triton top-k) "
+            "[topk_blocks=%d, indexer_kv_dtype=%s]",
+            topk_blocks,
+            indexer_kv_dtype,
+        )
+        return MiniMaxM3IndexerMSAImpl
     if indexer_kv_dtype not in ("bf16", "float16", "float32"):
         raise NotImplementedError(
             f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the "
             "Triton indexer impl."
         )
+    logger.info_once(
+        "MiniMax M3 indexer: selected Triton (no fmha_sm100) "
+        "[topk_blocks=%d, indexer_kv_dtype=%s, sm100=%s]",
+        topk_blocks,
+        indexer_kv_dtype,
+        is_sm100,
+    )
     return MiniMaxM3IndexerTritonImpl
 
 
@@ -507,10 +557,12 @@ class MiniMaxM3Indexer(nn.Module):
         score_type: str = "max",
         cache_config: CacheConfig | None = None,
         indexer_kv_dtype: IndexerKVDType = "bf16",
+        topk_indices_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         indexer_kv_dtype = _normalize_indexer_kv_dtype(indexer_kv_dtype)
         impl_cls = select_indexer_impl_cls(
+            topk_blocks=topk_blocks,
             indexer_kv_dtype=indexer_kv_dtype,
         )
         self.impl = impl_cls(
@@ -526,6 +578,7 @@ class MiniMaxM3Indexer(nn.Module):
             score_type=score_type,
             cache_config=cache_config,
             indexer_kv_dtype=indexer_kv_dtype,
+            topk_indices_buffer=topk_indices_buffer,
         )
 
     @property
