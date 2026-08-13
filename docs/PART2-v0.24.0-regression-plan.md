@@ -1,3 +1,4 @@
+# NOTE: see also PART2-v0.25.0-regression-plan.md if it exists
 # PART2: v0.24.0 gfx906 regression triage & fix plan
 
 Status: COMPILED + SMOKE-TESTED on gfx906 (MI60/MI50, ROCm 7.2.1, HSA_OVERRIDE_GFX_VERSION=9.0.6).
@@ -181,3 +182,35 @@ crash or garbage output (the known gfx906 failure modes).
 - Long-context (1k-15k+ tok) decode — the known gfx906 garbage-output regime.
 - A `[PART2]` source-fix commit is NOT yet needed: the merge already validates.
   Revisit if the fp8-KV/MLA-sparse tests above regress.
+
+---
+
+## v0.25.0 merge + validation log (gfx906, 2026-08-13)
+
+Bumped the fork to upstream v0.25.0 (702f4814) on branch gfx906/v0.25.0rc0.x,
+based on the 0.24.0 branch. 0.25 highlights handled:
+
+- PagedAttention removed (#47361): paged_attention_v1/v2 deleted; ops.h dropped
+  their declarations but kept gfx906 gptq_shuffle_awq_qweight.
+- MiniMax-M3: 0.25 split common/ops vs amd/ops index_topk; AMD vendor-routes
+  via indexer.py. Ported gfx906 fp16 casts + _index_score_launch_kwargs into the
+  amd/ops/index_topk.py copy (used by gfx906).
+- sparse_attn: 0.25 routes ALL rocm to amd/ops (CDNA gfx942/950). Corrected to
+  route gfx906 (MI50, not CDNA) to common/ops (keeps gfx906 LDS-safe kwargs).
+- fused_moe/deepseek_v2/auto_gptq: kept gfx906 fp16/MI50-tile/marlin-disable
+  paths; added 0.25 SWAP_AB/n_head_scale/allow_tile_padding.
+
+Validation on real gfx906 (ROCm 7.2.1 container toolchain, HSA 9.0.6):
+- Full C++ rebuild OK: vllm 0.25.1.dev92+g0d122f77c.rocm721.
+- platform: RocmPlatform, on_gfx906 True, on_gfx942/gfx950/mi3xx False,
+  fp8 == float8_e4m3fn (OCP).
+- Standard (Qwen3-0.6B float16): "The capital of France is" -> "Paris."
+  (spawn multiproc note: 0.25 enforces spawn; run tests via `python3 -c exec(...)`
+   or set VLLM_WORKER_MULTIPROC_METHOD=fork so __main__ is importable).
+- AWQ (cyankiwi/Qwen3.5-9B-AWQ-INT8-INT4, R4 gptq_gemm): "Tokyo." correct.
+- First AWQ run was blocked by a stale orphaned VLLM::EngineCore hogging gfx906
+  VRAM (left by a prior timed-out `docker run`); killed it and reran clean.
+
+No [PART2] source-fix needed yet for the exercised paths. Remaining: MiniMax M3
+fp8/fp32 KV, MLA-sparse, DeepSeek V4 long-context, and the new 0.25 MRv2 default
+path on gfx906.
