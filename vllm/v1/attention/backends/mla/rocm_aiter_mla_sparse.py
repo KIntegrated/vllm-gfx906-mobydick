@@ -14,8 +14,10 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
+
     get_mla_dims,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -548,7 +550,19 @@ class ROCMAiterMLASparseMetadataBuilder(
             self._num_attention_heads,
             clamped_seq_lens.tobytes(),
         )
-        if not self.use_fp16_sparse and metadata_key != self._prev_metadata_key:
+        # gfx906 fp16-sparse path skips the persistent MLA metadata kernel; on
+        # other paths (bf16/fp8) also guard against chunked-prefill
+        # continuations, which the persistent kernel handles numerically wrong
+        # and breaks long-context decode (vllm#47042).
+        step_query_lens = seg_lengths
+        total_seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs].numpy()
+        is_chunked_continuation = (step_query_lens > 1) & (
+            total_seq_lens > step_query_lens
+        )
+        use_persistent = (not envs.VLLM_ROCM_MLA_SPARSE_FP16) and (
+            not is_chunked_continuation.any()
+        )
+        if use_persistent and metadata_key != self._prev_metadata_key:
             from aiter import get_mla_metadata_v1
 
             get_mla_metadata_v1(
@@ -588,7 +602,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             paged_kv_last_page_len=paged_kv_last_page_len,
             paged_kv_indices=paged_kv_indices,
             paged_kv_indptr=paged_kv_indptr,
-            work_meta_data=self._mla_work_meta_data,
+            work_meta_data=self._mla_work_meta_data if use_persistent else None,
             work_indptr=self._mla_work_indptr,
             work_info_set=self._mla_work_info_set,
             reduce_indptr=self._mla_reduce_indptr,
@@ -905,9 +919,16 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
         # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
         # MQA 576/512 approach for both prefill and decode
 
-        # Concatenate q if it's a tuple (ql_nope, q_pe)
+        fp8_attention = self.kv_cache_dtype.startswith("fp8")
         if isinstance(q, tuple):
-            q = torch.cat(q, dim=-1)
+            ql_nope, q_pe = q
+            if fp8_attention:
+                q = layer._decode_concat_quant_fp8_op(  # type: ignore[attr-defined]
+                    ql_nope, q_pe, layer._q_scale
+                )
+            else:
+                q = self.q_concat_buffer[: ql_nope.shape[0]]
+                ops.concat_mla_q(ql_nope, q_pe, q)
 
         num_actual_toks = q.shape[0]
 
@@ -919,10 +940,19 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
             attn_metadata.req_id_per_token,
             attn_metadata.block_table,
             topk_indices,
+            attn_metadata.paged_kv_indptr,
+            attn_metadata.paged_kv_indices,
             BLOCK_SIZE=attn_metadata.block_size,
             NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
         )
 
+        # write the latent and rope to kv cache
+        if fp8_attention:
+            kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(current_platform.fp8_dtype())
+            if q.dtype != current_platform.fp8_dtype():
+                original_q_shape = q.shape
+                q, _ = ops.scaled_fp8_quant(q.view(q.shape[0], -1), layer._q_scale)
+                q = q.view(original_q_shape)
         mla_padded_q = AiterMLAHelper.get_mla_padded_q(self.num_heads, q)
         attn_out = self._forward_kv(
             mla_padded_q, kv_c_and_k_pe_cache, topk_indices_global, attn_metadata
