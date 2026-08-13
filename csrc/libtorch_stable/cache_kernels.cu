@@ -1136,8 +1136,21 @@ __global__ void gather_and_maybe_dequant_cache_page(
       scalar_t* output = dst + output_token * dst_entry_stride;
 
       if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-        reinterpret_cast<stype*>(output)[idx] =
-            static_cast<stype>(reinterpret_cast<const ltype*>(src)[idx]);
+        if constexpr (std::is_same<scalar_t, cache_t>::value) {
+          reinterpret_cast<stype*>(output)[idx] =
+              static_cast<stype>(reinterpret_cast<const ltype*>(src)[idx]);
+        } else {
+          // Cross-type dequant (e.g. half cache -> float/bf16 dst), which the
+          // AMD float16 KV-cache dispatch instantiates.
+          const ltype loaded = reinterpret_cast<const ltype*>(src)[idx];
+          stype store_val;
+#pragma unroll
+          for (int32_t j = 0; j < vec_size; ++j) {
+            __half h = *reinterpret_cast<const __half*>(&loaded.val[j]);
+            store_val.val[j] = static_cast<scalar_t>(__half2float(h));
+          }
+          reinterpret_cast<stype*>(output)[idx] = store_val;
+        }
       } else {
         const ltype loaded = reinterpret_cast<const ltype*>(src)[idx];
         stype converted;
