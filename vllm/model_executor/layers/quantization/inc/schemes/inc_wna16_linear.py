@@ -18,7 +18,6 @@ from vllm.model_executor.parameter import (
     PackedvLLMParameter,
     RowvLLMParameter,
 )
-
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
