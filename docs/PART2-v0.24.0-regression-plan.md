@@ -1,6 +1,7 @@
 # PART2: v0.24.0 gfx906 regression triage & fix plan
 
-Status: DRAFT — to be executed on real gfx906 hardware.
+Status: COMPILED + SMOKE-TESTED on gfx906 (MI60/MI50, ROCm 7.2.1, HSA_OVERRIDE_GFX_VERSION=9.0.6).
+Remaining: broader kernel-path fuzz and long-context / fp8-KV / MLA-sparse validation.
 
 This follows the established fork workflow: each version bump merges upstream and
 then requires `[PARTx]` regression fixes because upstream refactors silently
@@ -124,7 +125,9 @@ on hardware:
 - Full 0.25.0 migration (PagedAttention removal) — defer until 0.24.0 validated.
 - Non-gfx906 platforms (leave upstream behavior untouched; the gfx906 guards are additive).
 
-## Files most likely to need a `[PART2]` commit
+## Files to watch if a `[PART2]` source-fix is needed
+
+(Validated clean below — kept as the target set should fp8-KV / MLA-sparse tests regress.)
 
 - `vllm/v1/attention/ops/rocm_aiter_mla_sparse.py`
 - `vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py`
@@ -132,3 +135,49 @@ on hardware:
 - `csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu`
 - `vllm/_aiter_ops.py`
 - `vllm/models/minimax_m3/amd/model.py` (indexer_kv_dtype handling)
+---
+
+## Validation log (real gfx906, 2026-08-13)
+
+Environment: host gfx906 card #0 (MI60/MI50), ROCm 7.14 host driver; container
+`aiinfos/vllm-gfx906-mobydick:v0.23.1rc0.x-rocm7.2.1-pytorch2.11.0` as toolchain
+base (ROCm 7.2.1, torch 2.11, triton-gfx906 v3.6.0, flash-attn-gfx906),
+`HSA_OVERRIDE_GFX_VERSION=9.0.6`, `PYTORCH_ROCM_ARCH=gfx906`, `HIP_VISIBLE_DEVICES=0`.
+The merged `gfx906/v0.24.0rc0.x` branch was bind-mounted and rebuilt in-place with:
+`pip install --no-build-isolation --no-deps -e .` + `VLLM_REQUIRE_RUST_FRONTEND=0`
+(reusing the prebuilt `_rust_tool_parser.abi3.so`).
+
+### Compile
+- All native extensions rebuilt from the merged source against ROCm 7.2.1/gfx906
+  cleanly: `_C`, `_C_stable_libtorch`, `_moe_C_stable_libtorch`, `_rocm_C`,
+  `spinloop`, `cumem_allocator`. **R0/R1/R2 `.cu`/`.cpp` merge changes compile.**
+- Editable install succeeded: `vllm 0.24.1.dev71+g5267f8350.rocm721`.
+
+### Runtime (import + platform)
+- `from vllm import LLM` OK; `RocmPlatform`, `on_gfx906() == True` confirmed.
+- All C++ op tables load (`_C_stable_libtorch`, `_moe_C_stable_libtorch`, `_rocm_C`).
+- **`fp8_dtype() == torch.float8_e4m3fn` (OCP)** on gfx906. Confirms R0/R2 note:
+  gfx906 uses OCP E4M3FN, NOT fnuz (fnuz is gfx94-only via `is_fp8_fnuz()`).
+
+### End-to-end generation (all via `python3 -c` to satisfy engine-core spawn)
+- **Qwen/Qwen3-0.6B** (float16): "The capital of France is" ->
+  "Paris, and the President of France is Gaston de Voltaire." (correct)
+- **cyankiwi/Qwen3.5-9B-AWQ-INT8-INT4** (AWQ, exercises R4 gptq_gemm path):
+  "The capital of Japan is" -> "Tokyo." (correct)
+
+Both paths completed CUDA-graph capture, warmup, and inference on gfx906 without
+crash or garbage output (the known gfx906 failure modes).
+
+### Verified PART2 fixes already correct in the merge
+- R3 `_aiter_ops.per_tensor_quant` dynamic/static split: loaded and ran (AWQ/dequant
+  path exercised).
+- R4 AWQ gfx906 gptq_gemm routing: correct output on a real AWQ model.
+
+### Still needs coverage (next validation pass)
+- MiniMax M3 / DeepSeek V4 **fp8-KV** and **fp32-KV** decodes (MiniMax M3 model not
+  in the local HF cache; would need to pull it) — validates R1/R2 stride + fused
+  minimax kernel end to end.
+- MLA-sparse top-k selection consistency (R0) on a sparse model.
+- Long-context (1k-15k+ tok) decode — the known gfx906 garbage-output regime.
+- A `[PART2]` source-fix commit is NOT yet needed: the merge already validates.
+  Revisit if the fp8-KV/MLA-sparse tests above regress.
