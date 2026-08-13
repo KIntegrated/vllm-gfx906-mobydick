@@ -1,0 +1,134 @@
+# PART2: v0.24.0 gfx906 regression triage & fix plan
+
+Status: DRAFT — to be executed on real gfx906 hardware.
+
+This follows the established fork workflow: each version bump merges upstream and
+then requires `[PARTx]` regression fixes because upstream refactors silently
+clobber gfx906 kernels (see the v0.23.1 `PART1/2/3` commits restoring the fp8
+path, `rocm_unquantized_gemm_impl`, and `rocm_aiter_mla_sparse`).
+
+## Execution & accountability
+
+- Per AGENTS.md: human must review every changed line and run the listed tests.
+- Each fix lands as its own `[PART2]` commit with an attribution trailer.
+- Do NOT jump to 0.25.0 until 0.24.0 is validated on gfx906.
+
+---
+
+## High-risk regression areas (grounded in actual merge diffs)
+
+### R0. MLA sparse Triton kernels — `vllm/v1/attention/ops/rocm_aiter_mla_sparse.py`
+
+Upstream 0.24 changed 69 lines here (fork-only file, auto-merged). Concrete changes:
+
+- **int64 block-id** for the packed KV layout:
+  `block_id = (slot_id // block_size)` -> `.to(tl.int64)` (32-bit overflow guard).
+- **scale broadcast fix**: `score = einsum(...) * scale` -> `* scale.reshape(-1)`
+  (per-KV-token scale broadcast alignment).
+- **FNUZ/OCP fp8 split**: `IS_FNUZ_MAIN` vs `IS_FNUZ_EXTRA`; gfx942 uses FNUZ
+  (`tl.float8e4b8`), gfx950 uses OCP. The C++ encoder writes FNUZ on gfx942; the
+  Triton encoder writes OCP.
+- **gfx942 aiter#3257 workaround**: `fp8_mqa_logits_gfx942` routed from
+  `triton_fp8_mqa_logits` while gfx942, `rocm_aiter_ops.is_enabled()`.
+
+**Why it matters for gfx906**: even though these branches are mostly gfx942/gfx950
+guarded, the shared int64 block-id and scale-broadcast rewrites affect the
+`indexer_k_*` / logits paths gfx906 uses. The fp8 write/read path must be rechecked
+for gfx906. Note: `is_fp8_fnuz()` is True only for `gfx94` (MI300); gfx906 is NOT
+gfx94, so gfx906 uses **OCP `torch.float8_e4m3fn`** (regular E4M3FN), not fnuz. The
+FNUZ path in this merged code is gfx942-only. Verify gfx906's write/read encoding
+consistency.
+
+**Tests**: `tests/kernels/attention/test_attention_selector.py` (resolved in PART1),
+plus a real gfx906 decode of a MiniMax M3 / DeepSeek V4 model. Watch for
+"garbage output at 1k-15k+ tok" and infinite loops (the known gfx906 failure modes).
+
+### R1. `indexer_k_quant_and_cache` stride semantics — `csrc/libtorch_stable/cache_kernels.cu`
+
+Upstream changed the kernel from per-token `cache_stride = kv_cache.size(2)` to
+per-block `cache_block_stride = kv_cache.stride(0)`:
+
+- `dst_offset = block_idx * cache_block_size * cache_stride` -> `block_idx * cache_block_stride`
+- bindings (`_custom_ops.py`, `torch_bindings.cpp`, `sparse_attn_indexer.py`) all
+  updated consistently.
+
+This is the **fp8 index-K cache write** used by gfx906 MLA. The offset math is
+`block_idx * cache_block_stride + block_offset * head_dim + head_dim_idx`.
+Verify numerically that for a `[num_blocks, block_size, ...]` cache,
+`cache_block_stride == cache_block_size * per_token_stride` still holds so the fp8
+scale index (`dst_scale_idx`) lands correctly.
+
+**Tests**: stress a MiniMax M3 fp8 KV decode on gfx906; compare selections/scores
+between `cache_stride != block_size*per_token` layouts.
+
+### R2. MiniMax M3 fused KV insert — `csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu`
+
+Merged with 221+/80- lines: added direct float->FP8 E4M3 conversion
+(`rocm_cvt_float_to_fp8_e4m3` with `HIP_FP8_TYPE_OCP` vs `__hip_fp8_e4m3_fnuz`),
+and a split-`scalar_t`/`cache_t` store path (`kAuto` = unquantized, fp8 cache uses
+scaled-convert + identity scale). This is the fused kernel behind the PART1
+`AMD/model.py` `indexer_kv_dtype` + `_fp8_kv` handling.
+
+**Why it matters**: gfx906 fp32 kv / fp8 path. The `HIP_FP8_TYPE_OCP` vs fnuz
+branch is the key correctness fork: gfx906 must match what the Python side
+(`_indexer_kv_dtype_to_torch_dtype`) and the read kernels expect.
+
+**Tests**: MiniMax M3 fp32 kv and fp8 kv decodes; verify fp32-dtype indexer writes
+(introduced in the fork for gfx906, "no more infinite loops" fix) still hold.
+
+### R3. Per-tensor quant API change — `vllm/_aiter_ops.py`
+
+Upstream changed `rocm_aiter_per_tensor_quant` from returning
+`(out, scale)` with `quant_dtype` arg to an out-param `(out, x, scale, is_dynamic)`
+call with dynamic/static split (`dynamic_per_tensor_quant` vs `static_per_tensor_quant`).
+The fork's `per_tensor_quant` wrapper was updated to the new signature.
+
+**Why it matters**: gfx906 quantization/fp8. Verify the identity of the returned
+scale tensor and that `static` vs `dynamic` (scale is None) dispatches correctly.
+
+**Tests**: run an AWQ/GPTQ/moe quantized decode on gfx906; unit-check
+`rocm_aiter_ops.per_tensor_quant` output dtype/shape/scale for both dynamic and
+static scale.
+
+### R4. Quantization dispatch consolidation (AWQ/INC) — PART1 already handled
+
+PART1 adopted upstream `AutoAWQConfig`/`inc/` refactor and re-applied gfx906
+routing. This is the one area with real code added (not just merge), so double-check
+on hardware:
+
+- AWQ gfx906 -> `AutoAWQLinearMethod` gptq_gemm path (fp16/fp32 dtypes, min-cap 60).
+- INC gfx906 -> marlin disabled, gptq_gemm fallback.
+- `moe_wna16.py` + fused_moe oracle `int_wna16`: gfx906 uses the config JSONs
+  (`E=...,device_name=AMD_GFX906,...`) — verify these still resolve after the
+  fused_moe refactor.
+
+**Tests**: one AWQ model, one AutoGPTQ model, one INC model, and a DeepSeek MoE
+(int4_w4a16 gfx906) on gfx906.
+
+---
+
+## Verification workflow
+
+1. Static: `pre-commit run --all-files` on the touched files
+   (per AGENTS.md — use `.venv`, not system python).
+2. Build the ROCm wheel (out of scope here; needs gfx906 build machine).
+3. Smoke test per model family on gfx906, watching for:
+   - garbage output at long context (1k-15k+ tok)
+   - infinite loops / hang (the MiniMax M3 symptom the fork fixed)
+   - detection/selection mismatches (R0/R1/R2 fp8)
+4. Perf sanity — the fork's purpose is speed; a build-time regression check on the
+   aiter / unquantized gemm paths.
+
+## Out of scope
+
+- Full 0.25.0 migration (PagedAttention removal) — defer until 0.24.0 validated.
+- Non-gfx906 platforms (leave upstream behavior untouched; the gfx906 guards are additive).
+
+## Files most likely to need a `[PART2]` commit
+
+- `vllm/v1/attention/ops/rocm_aiter_mla_sparse.py`
+- `vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py`
+- `csrc/libtorch_stable/cache_kernels.cu`
+- `csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu`
+- `vllm/_aiter_ops.py`
+- `vllm/models/minimax_m3/amd/model.py` (indexer_kv_dtype handling)
