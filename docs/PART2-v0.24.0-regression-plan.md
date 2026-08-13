@@ -214,3 +214,37 @@ Validation on real gfx906 (ROCm 7.2.1 container toolchain, HSA 9.0.6):
 No [PART2] source-fix needed yet for the exercised paths. Remaining: MiniMax M3
 fp8/fp32 KV, MLA-sparse, DeepSeek V4 long-context, and the new 0.25 MRv2 default
 path on gfx906.
+
+---
+
+## v0.26.0 merge + validation log (gfx906, 2026-08-13)
+
+Bumped the fork to upstream v0.26.0 (568afb3) on branch gfx906/v0.26.0rc0.x,
+based on the 0.25.0 branch.
+
+0.26 highlights handled:
+- MiniMax-M3 AITER sparse paged attention + spec decode (amd/model.py
+  use_aiter_sparse_pa + skip_index_topk + new named-arg
+  fused_minimax_m3_qknorm_rope_kv_insert kernel API).
+- MXFP8 GEMM for MiniMax-M3; csrc/rocm/skinny_gemms_int4.cu (new ROCm INT4
+  integer GEMM) + ngram_embedding kernel; both compile on gfx906.
+- KV-cache layout refactor: per KV-group backend (config/attention.py
+  backend_per_kind) + k/v content-dim packing; KV_SCALE_MODE per-token scales
+  in sparse_attn.py.
+- Keep gfx906 indexer fp16/fp32 dtype + indexer_kv_dtype validator.
+- fp32 lm_head head_dtype ROCm torch.mm fast path.
+
+15 conflicts resolved (ops.h, config/attention, kv_cache_manager, int_wna16,
+fused_moe/config, kernels/linear, compressed_tensors_moe_wna16, qwen3_dflash,
+deepseek_v32/mtp, minimax_m3 amd/nvidia/sparse_attn, rocm_aiter_mla_sparse).
+
+Validation on real gfx906 (ROCm 7.2.1 toolchain, HSA 9.0.6):
+- Full C++ rebuild OK incl. new skinny_gemms_int4 + ngram:
+  vllm 0.26.1.dev111+g8388aa8ea.rocm721.
+- on_gfx906 True, fp8 == float8_e4m3fn.
+- Qwen3-0.6B (float16): "The capital of France is" -> "Paris."
+- cyankiwi/Qwen3.5-9B-AWQ-INT8-INT4 (R4 gptq_gemm): "Tokyo."
+
+No [PART2] source-fix needed for the exercised paths. Remaining: MiniMax M3
+fp8/fp32 KV + AITER sparse PA, DeepSeek V4 long-context, MRv2 default path on
+gfx906.
