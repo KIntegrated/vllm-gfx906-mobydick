@@ -1,5 +1,62 @@
 ## Mini Install Guide for GFX906
 
+## Custom FlashAttention backend (gfx906 FA, `CUSTOM`)
+
+This fork vendors a custom Q8 FlashAttention attention backend for gfx906
+(`AttentionBackendEnum.CUSTOM`, built from
+`https://github.com/cassettesgoboom/gfx906-fa-vllm`) and makes it the **default**
+for dense decoder attention on gfx906. No `--attention-backend` flag is needed;
+`CUSTOM` is automatically selected and the extension ships inside this wheel.
+
+### What it accelerates
+
+The custom kernels target **prefill** (part of `pp`), not decode. It is most
+beneficial on **long contexts** on **full-attention models**; on *any*-attention
+hybrids (e.g. Qwen3.5, which has only a few full attention layers) the gain is
+small because the model spends little time in the attention they accelerate.
+
+### Benchmarks
+
+**gfx906 fork — dense AWQ `QuantTrio/Qwen3.5-9B-AWQ` (few full attention
+layers), pp = prefill throughput (tok/s), single MI60, eager, pp/tgen two-phase:**
+
+| pp | `CUSTOM` prefill | stock `ROCM_ATTN` prefill | Δ |
+| ---: | ---: | ---: | ---: |
+|  256 | 590 | 575 | +2.6% |
+|  512 | 757 | 764 | −0.9% |
+| 1024 | 1483 | 1427 | +3.9% |
+| 2048 | 1399 | 1288 | **+8.6%** |
+
+Decode throughput is essentially unchanged (`CUSTOM` ≈ stock within ~1–2%).
+
+**Upstream gfx906-fa-vllm — full-attention `MiniMax-M2.7-AWQ-4bit` (8× MI50,
+TP=8, BS=1, from the upstream repo's README):**
+
+| ctx | `CUSTOM` TG (tok/s) | Δ vs stock `TRITON_ATTN` |
+| ---: | ---: | ---: |
+|  1K | 27.7 | — |
+|  32K | 7.7  | +6% |
+| 100K | 3.9 | **+32%** |
+| 130K | 3.0 | **+29%** |
+
+On a full-attention model at long context the custom kernels give roughly
+**+20–40%** prefill/overall throughput and stay functional where the stock
+Triton kernels stall.
+
+### Escaping back to the default attention backend
+
+To bypass `CUSTOM` and use vLLM's stock ROCm backend instead:
+
+```bash
+vllm serve ... --attention-backend ROCM_ATTN
+# or in Python:
+# LLM(..., attention_backend="ROCM_ATTN")
+```
+
+Set the env `VLLM_ATTENTION_BACKEND=ROCM_ATTN` as well for earlier-stack paths.
+If you built without gfx906 (no FA extension compiled), or the backend is not
+registered, vLLM automatically falls back to the stock ROCm/TRITON backends.
+
 ### 🐳 Using Pre-built Docker Image (Recommended)
 
 If you have Docker and the AMD ROCm drivers/kernel modules installed on your host system, you can totally bypass the complex manual source-build installation by using our pre-built Docker image.
