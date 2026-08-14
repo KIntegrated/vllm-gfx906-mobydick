@@ -381,7 +381,10 @@ def rocm_unquantized_gemm_impl(
         # The skinny kernels assume contiguous K elements. A shape-preserving
         # reshape can retain a transposed activation's non-contiguous strides.
         x_view = x.reshape(-1, x.size(-1)).contiguous()
-        if m > 8 and 0 < n <= 5:
+        # wvSplitK targets CDNA/RDNA matrix cores and is not supported on
+        # gfx906 (GCN5/Vega20); exclude it here so small batches fall through
+        # to the Triton skinny-GEMM path below, matching the pre-main behavior.
+        if m > 8 and 0 < n <= 5 and not on_gfx906():
             cu_count = num_compute_units()
             out = ops.wvSplitK(weight, x_view, cu_count, bias)
             return out.reshape(*x.shape[:-1], weight.shape[0])

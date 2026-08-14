@@ -401,6 +401,16 @@ def use_rocm_custom_paged_attention(
 ) -> bool:
     # custom paged attn always supported on V0. On V1, requires sliding window
     # disabled due to observed numerical discrepancy.
+    #
+    # gfx906 (MI50/Vega20, GCN5) is NOT CDNA even though its arch string
+    # contains "gfx9". The ROCm C++ paged-attention kernel selected by the
+    # CDNA branch drives the HIP runtime into an illegal state
+    # (hipErrorIllegalState) when invoked from the V2 mixed prefill+decode
+    # path on gfx906. Fall back to the Triton paged-attention kernel, which
+    # already carries gfx906-specific launch tuning and correctly no-ops
+    # prefill tokens via filter_by_query_len.
+    if on_gfx906():
+        return False
     if on_cdna():
         return (
             (sliding_window == 0 or sliding_window == (-1, -1))
