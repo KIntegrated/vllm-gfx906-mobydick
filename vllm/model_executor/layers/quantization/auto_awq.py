@@ -969,7 +969,10 @@ class AutoAWQLinearMethod(BaseAWQLinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if current_platform.is_rocm() and on_gfx906():
-            out_shape = x.shape[:-1] + (layer.qweight.shape[-1] * self.quant_config.pack_factor,)
+            # NOTE: on gfx906, process_weights_after_loading reshapes qweight
+            # from [K, N/pack] to [K/pack, N], so qweight.shape[-1] is already
+            # the full unpacked output size. Do not multiply by pack_factor.
+            out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
 
             # The optimized GPTQ GEMM is FP16-only; preserve FP32 at the API.
             orig_dtype = x.dtype
