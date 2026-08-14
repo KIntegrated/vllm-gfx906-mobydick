@@ -186,8 +186,17 @@ def bundle_tcmalloc(build_lib: str) -> None:
 
 
 class CMakeExtension(Extension):
-    def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
-        super().__init__(name, sources=[], py_limited_api=not is_freethreaded(), **kwa)
+    def __init__(
+        self, name: str, cmake_lists_dir: str = ".", py_limited_api=None, **kwa
+    ) -> None:
+        # Most vLLM C extensions use the Python stable ABI (.abi3). The
+        # gfx906 custom FA extension ships a plain pybind11 module that only
+        # builds with the full ABI, so callers may pass py_limited_api=False.
+        if py_limited_api is None:
+            py_limited_api = not is_freethreaded()
+        super().__init__(
+            name, sources=[], py_limited_api=py_limited_api, **kwa
+        )
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 
@@ -954,6 +963,19 @@ def _is_hip() -> bool:
     ) and torch.version.hip is not None
 
 
+def _targets_gfx906() -> bool:
+    """True when the ROCm build targets gfx906 (MI50/MI60/Vega20), for which the
+    vendored custom FlashAttention (CUSTOM backend) extension is built.
+    """
+    if not _is_hip():
+        return False
+    rocm_arch = os.environ.get("PYTORCH_ROCM_ARCH", "").replace(";", " ").split()
+    # If the arch list is empty, CMake selects the archs from the detected
+    # devices; gfx906 is the only arch this fork cares about on this hardware,
+    # so build the extension in that case too.
+    return not rocm_arch or "gfx906" in rocm_arch
+
+
 def _is_tpu() -> bool:
     return VLLM_TARGET_DEVICE == "tpu"
 
@@ -1132,6 +1154,15 @@ if not _is_xpu() and sys.version_info >= (3, 11):
 
 if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
+
+if _targets_gfx906():
+    # Vendored custom FlashAttention (CUSTOM attention backend) for gfx906.
+    # The CMake target (_gfx906_fa_C) is only defined when gfx906 is among the
+    # build arches, so this is gated on the same condition in setup.py.
+    # py_limited_api=False: the gfx906_fa.cpp is a plain pybind11 module that
+    # does not build against the Python stable ABI.
+    ext_modules.append(CMakeExtension(
+        name="vllm._gfx906_fa_C", py_limited_api=False))
 
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))

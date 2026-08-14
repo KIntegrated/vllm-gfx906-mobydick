@@ -494,6 +494,14 @@ def _get_backend_priorities(
             ]
 
     backends = []
+    # On gfx906 (MI50/MI60), the vendored custom Q8 FlashAttention kernels
+    # (AttentionBackendEnum.CUSTOM) are the default for dense decoder
+    # attention. They only support fp16/half KV, no MLA/sparse, no sliding
+    # window, so validate_configuration keeps the fallback path for anything
+    # unsupported. Only include CUSTOM when it is actually registered (its
+    # plugin entry point ran), otherwise it degrades to the stock backends.
+    if on_gfx906() and AttentionBackendEnum.CUSTOM.is_overridden():
+        backends.append(AttentionBackendEnum.CUSTOM)
     # Keep ROCM_ATTN disabled for KV connectors until connector transfer
     # semantics are validated for its asymmetric native K/V cache views.
     if not use_kv_connector:

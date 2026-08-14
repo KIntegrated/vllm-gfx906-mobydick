@@ -1539,6 +1539,54 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 endif()
 
+#
+# gfx906 custom FlashAttention Q8 extension (vendored from
+# https://github.com/cassettesgoboom/gfx906-fa-vllm). Built only when gfx906
+# is among the target arches; it provides the CUSTOM attention backend kernels.
+#
+  if(VLLM_GPU_LANG STREQUAL "HIP" AND VLLM_GPU_ARCHES MATCHES "gfx906")
+    message(STATUS "Building gfx906_fa extension (CUSTOM attention backend)")
+    set(VLLM_GFX906_FA_SRC
+      "csrc/gfx906_fa/gfx906_fa.cpp"
+      "csrc/gfx906_fa/gfx906_fa_launcher.cu"
+      "csrc/gfx906_fa/gfx906_fa_quant.cu"
+      "csrc/gfx906_fa/gfx906_fa_gather.cu")
+
+    set(VLLM_GFX906_FA_FLAGS
+      "-O3"
+      "-std=c++17"
+      "-DGGML_USE_HIP"
+      "-DGGML_HIP_GFX906"
+      "-DFLASH_ATTN_AVAILABLE"
+      "-D__HIP_PLATFORM_AMD__"
+      # PyTorch cpp_extension forces -D__HIP_NO_HALF_OPERATORS__=1 (partial)
+      # and -D__HIP_NO_HALF_CONVERSIONS__=1; our kernels need native HIP half
+      # arithmetic, so re-enable them.
+      "-U__HIP_NO_HALF_OPERATORS__"
+      "-U__HIP_NO_HALF_CONVERSIONS__")
+
+    # gfx906_fa.cpp uses plain pybind11 with torch::Tensor bindings; the
+    # type_caster<at::Tensor> symbols live in PyTorch's libtorch_python.so.
+    # Link it by absolute path (the -ltorch_python form is not resolvable by
+    # the ROCm linker which links the other torch libs by absolute path).
+    find_library(_GFX906_FA_TORCH_PYTHON torch_python
+      PATHS "${TORCH_INSTALL_PREFIX}/lib" NO_DEFAULT_PATH)
+    if(_GFX906_FA_TORCH_PYTHON)
+      message(STATUS "Found PyTorch-bundled libtorch_python for _gfx906_fa_C at ${_GFX906_FA_TORCH_PYTHON}")
+    endif()
+
+    define_extension_target(
+      _gfx906_fa_C
+      DESTINATION vllm
+      LANGUAGE ${VLLM_GPU_LANG}
+      SOURCES ${VLLM_GFX906_FA_SRC}
+      COMPILE_FLAGS ${VLLM_GFX906_FA_FLAGS}
+      ARCHITECTURES gfx906
+      INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/gfx906_fa;${CMAKE_CURRENT_SOURCE_DIR}/csrc/gfx906_fa/kernel"
+      LIBRARIES ${_GFX906_FA_TORCH_PYTHON}
+      WITH_SOABI)
+  endif()
+
 # Must run after the last HIP `define_extension_target` so every extension
 # has registered its sources.
 if (VLLM_GPU_LANG STREQUAL "HIP")
