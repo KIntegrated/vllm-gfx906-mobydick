@@ -284,7 +284,7 @@ class Gfx906FAImpl(AttentionImpl):
         #       = K_fp16_bytes * (34/32) / 2 ≈ 0.53 × K_fp16 bytes.
         # ------------------------------------------------------------------
         self._k_cache_q8: torch.Tensor | None = None
-        self._legacy = _os.environ.get("GFX906_FA_LEGACY", "0") == "1"
+        self._legacy = _os.environ.get("GFX906_FA_LEGACY", "1") == "1"
 
         # ------------------------------------------------------------------
         # Предаллоцированные буферы для forward_paged.
