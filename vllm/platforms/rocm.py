@@ -833,7 +833,16 @@ class RocmPlatform(Platform):
     @lru_cache(maxsize=8)
     def get_device_name(cls, device_id: int = 0) -> str:
         physical_device_id = cls.device_id_to_physical_device_id(device_id)
-        handle = amdsmi_get_processor_handles()[physical_device_id]
+        handles = amdsmi_get_processor_handles()
+        if physical_device_id >= len(handles):
+            # On some ROCm builds (notably gfx906-native TheRock / ROCm 7.14)
+            # amdsmi returns 0 processor handles after torch import, even though
+            # the GPU works. Derive a config-file-friendly name from the resolved
+            # GCN arch (e.g. "gfx906" -> "AMD_GFX906"), matching the naming used
+            # by the tuned-kernel config files.
+            arch = _GCN_ARCH.split(":")[0].split("-")[0].strip()
+            return f"AMD_{arch.upper()}"
+        handle = handles[physical_device_id]
         asic_info = amdsmi_get_gpu_asic_info(handle)
         asic_info_device_id: str = asic_info["device_id"]
         if asic_info_device_id in _ROCM_DEVICE_ID_NAME_MAP:
