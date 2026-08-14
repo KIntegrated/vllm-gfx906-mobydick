@@ -74,6 +74,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("moe_gptq_gemm_rdna3", torch::kCUDA, &moe_gptq_gemm_rdna3);
 #endif
 
+  // W4A16 fused MoE GEMM for gfx906 (Vega 20, no MFMA). Works on any ROCm
+  // target; selected at runtime on gfx906.
+  rocm_ops.def(
+      "moe_gptq_gemm_gfx906(Tensor a, Tensor! c, Tensor b_q_weight, "
+      "Tensor b_scales, Tensor b_qzeros, Tensor topk_weights, "
+      "Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, "
+      "int top_k, int block_size_m, bool mul_topk_weight, "
+      "int output_topk, int zero_offset) -> ()");
+  rocm_ops.impl("moe_gptq_gemm_gfx906", torch::kCUDA,
+                &moe_gptq_gemm_gfx906);
+
   // Custom attention op
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.

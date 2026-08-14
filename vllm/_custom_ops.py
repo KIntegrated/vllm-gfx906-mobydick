@@ -699,6 +699,68 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "moe_gptq_gemm_r
         return
 
 
+def moe_gptq_gemm_gfx906(
+    a: torch.Tensor,
+    c: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_qzeros: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    block_size_m: int,
+    mul_topk_weight: bool,
+    output_topk: int = 0,
+    zero_offset: int = 0,
+) -> None:
+    """Fused MoE W4A16 GEMM for gfx906 (see csrc/rocm/moe_q_gemm_gfx906.cu).
+
+    ``c`` must be pre-zeroed; the kernel atomic-adds partial K-splits into it.
+    """
+    torch.ops._rocm_C.moe_gptq_gemm_gfx906(
+        a,
+        c,
+        b_q_weight,
+        b_scales,
+        b_qzeros,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        block_size_m,
+        mul_topk_weight,
+        output_topk,
+        zero_offset,
+    )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "moe_gptq_gemm_gfx906"
+):
+
+    @register_fake("_rocm_C::moe_gptq_gemm_gfx906")
+    def _moe_gptq_gemm_gfx906_fake(
+        a: torch.Tensor,
+        c: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_scales: torch.Tensor,
+        b_qzeros: torch.Tensor,
+        topk_weights: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_tokens_post_padded: torch.Tensor,
+        top_k: int,
+        block_size_m: int,
+        mul_topk_weight: bool,
+        output_topk: int = 0,
+        zero_offset: int = 0,
+    ) -> None:
+        return
+
+
 if hasattr(torch.ops._C, "allspark_w8a16_gemm"):
 
     @register_fake("_C::allspark_w8a16_gemm")

@@ -57,6 +57,7 @@ class WNA16MoEBackend(Enum):
     TRITON = "TRITON"
     XPU = "XPU"
     EMULATION = "EMULATION"
+    GFX906_HIP = "GFX906_HIP"
 
 
 def backend_to_kernel_cls(
@@ -83,6 +84,12 @@ def backend_to_kernel_cls(
         return [TrtLlmMxint4ExpertsMonolithic]
     elif backend == WNA16MoEBackend.TRITON:
         return [TritonWNA16Experts]
+    elif backend == WNA16MoEBackend.GFX906_HIP:
+        from vllm.model_executor.layers.fused_moe.experts.gfx906_w4a16_moe import (
+            Gfx906WNA16Experts,
+        )
+
+        return [Gfx906WNA16Experts]
     elif backend == WNA16MoEBackend.XPU:
         from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
             XPUExpertsWNA16,
@@ -114,7 +121,16 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
     if current_platform.is_xpu():
         return [WNA16MoEBackend.XPU]
 
-    return [
+    backends: list[WNA16MoEBackend] = []
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx906
+
+        if on_gfx906() and hasattr(torch.ops, "_rocm_C") and hasattr(
+            torch.ops._rocm_C, "moe_gptq_gemm_gfx906"
+        ):
+            backends.append(WNA16MoEBackend.GFX906_HIP)
+
+    return backends + [
         WNA16MoEBackend.FLASHINFER_TRTLLM,
         WNA16MoEBackend.MARLIN,
         WNA16MoEBackend.BATCHED_MARLIN,
@@ -134,6 +150,12 @@ def _backend_incompatibility_reason(
 ) -> str | None:
     if backend == WNA16MoEBackend.FLASHINFER_TRTLLM and (may_have_zp or may_have_bias):
         return "zero points and bias are not supported"
+
+    if backend == WNA16MoEBackend.GFX906_HIP:
+        # Phase 1: AWQ-style stored zero points only; symmetric GPTQ (no zp)
+        # falls back to Triton.
+        if not may_have_zp:
+            return "zero points are required (AWQ-style checkpoints)"
 
     from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
     from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -392,6 +414,10 @@ def make_wna16_moe_kernel(
     )
     if backend == WNA16MoEBackend.HUMMING:
         allowed_experts += tuple(backend_to_kernel_cls(WNA16MoEBackend.HUMMING))
+    if backend == WNA16MoEBackend.GFX906_HIP:
+        allowed_experts += tuple(
+            backend_to_kernel_cls(WNA16MoEBackend.GFX906_HIP)
+        )
     assert experts_cls in allowed_experts
 
     is_monolithic = experts_cls.is_monolithic()
@@ -1404,6 +1430,164 @@ def _process_weights_emulation_awq(
     )
 
 
+def _repack_w4a16_gfx906_expert(
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Repack one W4A16 MoE weight set into the gfx906 kernel layout.
+
+    Two source layouts are supported (detected by shape/dtype):
+
+    MoeWNA16 (N-first uint8; the AWQ-on-ROCm fallback path via
+    MoeWNA16Method.create_weights):
+      w:      [E, N, K/2] uint8  (byte j holds k=2j low, k=2j+1 high)
+      scales: [E, N, G]   fp16
+      qzeros: [E, N/2, G] uint8 (byte i holds n=2i low, n=2i+1 high)
+
+    AutoAWQMoEMethod (K-first int32; Marlin-supported path):
+      w:      [E, K, N/8] int32 (word m holds n=8m..8m+7, low nibble first)
+      scales: [E, G, N]   fp16
+      qzeros: [E, G, N/8] int32 (word m holds n=8m..8m+7, low nibble first)
+
+    Outputs (both):
+      wq:  [E, K/8, N] int32 exllama shuffle
+            (even/odd interleaved: bits[3:0]=k0 [7:4]=k2 [11:8]=k4
+             [15:12]=k6 [19:16]=k1 [23:20]=k3 [27:24]=k5 [31:28]=k7
+             for k = 8*qk .. 8*qk+7)
+      sc:  [E, G, N] fp16
+      zp:  [E, G, N/8] int32 (8 nibbles per word, ascending n order)
+    """
+    if w.dtype == torch.uint8 and w.shape[1] == scales.shape[1]:
+        return _repack_w4a16_wna16_layout(w, scales, qzeros)
+    N = scales.shape[2]
+    if w.shape[2] * 8 == N:
+        return _repack_w4a16_awq_kfirst_layout(w, scales, qzeros, N)
+    raise ValueError(
+        f"unrecognized W4A16 MoE weight layout: w={tuple(w.shape)} "
+        f"dtype={w.dtype}, scales={tuple(scales.shape)}"
+    )
+
+
+def _repack_w4a16_wna16_layout(
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """MoeWNA16 N-first uint8 layout (see _repack_w4a16_gfx906_expert)."""
+    E, N, k_half = w.shape
+    K = 2 * k_half
+    assert N % 8 == 0 and K % 8 == 0
+
+    b = w.to(torch.int32).view(E, N, K // 8, 4)
+    lo = b & 0xF  # k = 2j
+    hi = (b >> 4) & 0xF  # k = 2j + 1
+    wq = (
+        lo[..., 0]
+        | (lo[..., 1] << 4)
+        | (lo[..., 2] << 8)
+        | (lo[..., 3] << 12)
+        | (hi[..., 0] << 16)
+        | (hi[..., 1] << 20)
+        | (hi[..., 2] << 24)
+        | (hi[..., 3] << 28)
+    ).permute(0, 2, 1).contiguous()
+
+    sc = scales.to(torch.float16).permute(0, 2, 1).contiguous()
+
+    if qzeros is None:
+        # Symmetric quant: zero point = 8 (midpoint of uint4)
+        zp = torch.full(
+            (E, scales.shape[2], N // 8), 8, dtype=torch.int32, device=w.device
+        )
+    else:
+        z = qzeros.to(torch.int32)
+        zf = torch.stack([z & 0xF, (z >> 4) & 0xF], dim=2).reshape(E, N, -1)
+    zr = zf.view(E, N // 8, 8, -1)
+    zp = (
+        zr[..., 0, :]
+        | (zr[..., 1, :] << 4)
+        | (zr[..., 2, :] << 8)
+        | (zr[..., 3, :] << 12)
+        | (zr[..., 4, :] << 16)
+        | (zr[..., 5, :] << 20)
+        | (zr[..., 6, :] << 24)
+        | (zr[..., 7, :] << 28)
+    ).permute(0, 2, 1).contiguous()
+
+    return wq, sc, zp
+
+
+def _repack_w4a16_awq_kfirst_layout(
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor | None,
+    N: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """AutoAWQMoEMethod K-first int32 layout (see
+    _repack_w4a16_gfx906_expert). Scales and zero points are already in the
+    kernel's [E, G, N] / [E, G, N/8] layout and pass through unchanged."""
+    E, K, _ = w.shape
+    assert K % 8 == 0
+
+    # Shifts that place nibble j (k = 8*qk + j) into its exllama-shuffled
+    # position: even j -> bits[4j], odd j -> bits[16 + 4*(j-1)].
+    shifts_out = torch.tensor(
+        [0, 16, 4, 20, 8, 24, 12, 28], device=w.device, dtype=torch.int32
+    )
+    nib_shifts = (4 * torch.arange(8, device=w.device, dtype=torch.int32))
+
+    wq = torch.empty(E, K // 8, N, dtype=torch.int32, device=w.device)
+    # Process one expert at a time to keep the temporary [K, N] unpack small.
+    for e in range(E):
+        q = ((w[e].unsqueeze(-1) >> nib_shifts) & 0xF).reshape(K, N)
+        wq[e] = (q.view(K // 8, 8, N) << shifts_out.view(1, 8, 1)).sum(
+            dim=1
+        ).to(torch.int32)
+
+    sc = scales.to(torch.float16).contiguous()
+    if qzeros is None:
+        # Symmetric quant: zero point = 8 (midpoint of uint4)
+        zp = torch.full((E, scales.shape[1], N // 8), 8, dtype=torch.int32,
+                        device=w.device)
+    else:
+        zp = qzeros.to(torch.int32).contiguous()
+
+    return wq, sc, zp
+
+
+def _process_weights_gfx906(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_qzeros: torch.Tensor | None,
+    w2_qzeros: torch.Tensor | None,
+) -> tuple:
+    w13_qweight, w13_scales, w13_zp = _repack_w4a16_gfx906_expert(
+        w13, w13_scale, w13_qzeros
+    )
+    w2_qweight, w2_scales, w2_zp = _repack_w4a16_gfx906_expert(
+        w2, w2_scale, w2_qzeros
+    )
+    return (
+        w13_qweight,
+        w2_qweight,
+        w13_scales,
+        w2_scales,
+        None,  # w13_g_idx
+        None,  # w2_g_idx
+        None,  # w13_g_idx_sort_indices
+        None,  # w2_g_idx_sort_indices
+        w13_zp,
+        w2_zp,
+        None,  # w13_input_global_scale
+        None,  # w2_input_global_scale
+        None,  # w13_bias
+        None,  # w2_bias
+    )
+
+
 def convert_to_wna16_moe_kernel_format(
     backend: WNA16MoEBackend,
     layer: torch.nn.Module,
@@ -1620,6 +1804,15 @@ def convert_to_wna16_moe_kernel_format(
                 w2_qzeros,
             )
         return _process_weights_emulation_gptq(
+            w13,
+            w2,
+            w13_scale,
+            w2_scale,
+            w13_qzeros,
+            w2_qzeros,
+        )
+    elif backend == WNA16MoEBackend.GFX906_HIP:
+        return _process_weights_gfx906(
             w13,
             w2,
             w13_scale,
