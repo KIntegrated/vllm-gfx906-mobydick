@@ -1,8 +1,10 @@
 # Phase 3 — non-MoE decode path on gfx906 (MI50)
 
-Status: v6 — **P3-1 landed** (serving 41.51 → 44.09 t/s); **P3-2 is now the
-primary dev bet**; **P3-3a suspended** pending gather micro-bench go/no-go
-(see §4 ordering and `plan-gfx906fa-serving.md`). Scope: close the remaining
+Status: v7 — **P3-1 landed** (serving 41.51 → 44.09 t/s); **P3-2 is the
+primary dev bet** ((a) probe closed, (b) is the only path); **P3-3a
+RESUMED** — Day-1 gather micro-bench passed (21.7 µs/layer @ Sk=2816 vs
+~80 µs gate; DEVLOG "Day-1 pre-step pair"). See §4 ordering and
+`plan-gfx906fa-serving.md` (v2; M0 1/3 done). Scope: close the remaining
 decode gap vs llama.cpp. Prefill is already 2.6× faster than llama.cpp —
 out of scope unless a candidate helps both for free.
 
@@ -56,6 +58,31 @@ Review changes (v2→v3):
 Review changes (v1→v2, preserved): P3-0 Q0 first added; P3-1 range softened
 to 2–3×; P3-4 reframed (inductor already fused; lever is graph breaks); P3-3
 latency-bound nature made explicit; §6 success criteria + quantization caveat.
+
+Review changes (v6→v7):
+
+- **Day-1 outcomes recorded** (DEVLOG "Day-1 pre-step pair", 2026-08-15):
+  gather micro-bench **21.7 µs/layer @ Sk=2816, B=1** (2.0× HBM floor,
+  407 GB/s; Q-fp32 side costs 21.9 µs/layer) → **gate passed, P3-3a
+  RESUMED** per the §4 decision tree. Sub-plan M0 item 1 done; remaining
+  M0: Triton-PIECEWISE baseline + attention slice. Sub-plan M0 spec's
+  "Hkv=8" is wrong for this model (`num_key_value_heads=2`); the bench
+  used the real value — at Hkv=8 the gather would be ~4×.
+- **P3-2(a) probe STOPPED (structurally a no-op on gfx906)**: aiter triton
+  gemm + wvSplitKrc sit inside `if not on_gfx906():`; wvSplitK excluded
+  (no matrix cores on Vega20); `VLLM_ROCM_USE_AITER` defaults False;
+  aiter triton-gemm whitelist matches no model shape. Rejection reason =
+  arch exclusion, not shape/dtype — P3-1's "collapse into P3-2(b)" path
+  confirmed. The only knob on the real surface is LLGemm1
+  `rows_per_block` (dispatch hardcodes 4): sweep gives +1.4% best
+  (rpb=8) weighted per-step — below the ≥20% continue bar; no config
+  change warranted.
+- **P3-2(b) rescoped from the rpb sweep**: big rows (in_proj/LM head/qkv/
+  o_proj) are BW-bound at rpb=4 (0.95–1.29× floor); small rows
+  (gate_up/down/router/GDN-small, 150 calls/step) are launch/latency-bound
+  (3.6–14× floor; LLGemm1 at M=64 launches 16 blocks, 60 CUs under-filled)
+  → the custom kernel must K-split. Realistic capture ≈ 0.7–1.1 ms/step
+  (slightly under the v6 1–1.5 ms estimate).
 
 Review changes (v5→v6):
 
@@ -237,31 +264,37 @@ a profile artifact, void.
 
 Ordering = measured ms/step × feasibility, from the reconciled §2 table.
 P3-0 is complete and the sizes below are final for this phase. Live order
-(v6): **P3-2 is the primary development bet**; P3-3a is suspended pending a
-go/no-go micro-bench.
+(v7): **P3-2(b) is the primary development bet**; **P3-3a resumed** (Day-1
+gate passed) as the time-fenced parallel line.
 
-**Day-1 pre-step (both run together, same session):**
-- **Gather micro-bench**: measure the fused gather + Q-fp32 kernel at serving
-  shapes (Sk~2816, B=1) in isolation. This is the decisive gate for P3-3a:
-  the eager near-parity (CUSTOM 19.33 vs Triton 19.49 t/s) strongly suggests
-  the gather+dtype tax is eating most of the 72 µs kernel win at B=1. If
-  gather > ~80 µs/layer, P3-3a's realistic serving gain collapses to ≤0.3 ms
-  and P3-3a stays suspended.
-- **P3-2(a) aiter splitK probe**: env/backend flags, splitK for N≤2048
-  (time-boxed, same day). Records the aiter rejection reason for any shape
-  that doesn't move — needed to scope P3-2(b).
+**Day-1 pre-step — DONE (2026-08-15, DEVLOG "Day-1 pre-step pair"):**
+- **Gather micro-bench**
+  (`benchmarks/kernels/gfx906/bench_gfx906_fa_gather.py`):
+  `gather_paged_kv_q8` at B=1, Sk~2816 (Hkv=2, D=256, bs=16, pre-allocated
+  out buffers, byte-identical to torch reference): **21.7 µs/layer** (2.0×
+  HBM floor, 407 GB/s; 18.6 @ Sk=2048, 25.3 @ Sk=3328) + Q-fp32 side costs
+  21.9 µs/layer (q.float 3.9 / q_pad zero 2.7 / q copy 7.0 / out unpack
+  8.3) → combined tax 43.6 µs vs 122 µs FA kernel win → **net ~0.78
+  ms/step** over 10 layers. **Gate passed (≤ ~80 µs) → P3-3a resumes.**
+- **P3-2(a) aiter splitK probe** (audit +
+  `bench_llmm1_rows_per_block.py`): **stopped — structurally a no-op on
+  gfx906.** aiter triton gemm/wvSplitKrc gated `not on_gfx906()`; wvSplitK
+  needs matrix cores (absent on Vega20); `VLLM_ROCM_USE_AITER` default
+  False; aiter triton-gemm whitelist matches no model shape. The only knob
+  on the real surface — LLGemm1 `rows_per_block` (dispatch hardcodes 4) —
+  sweeps to +1.4% best weighted per-step (rpb=8); rpb=2 is net-negative
+  (6× regression on shared gate_up, M=1024). Below the ≥20% continue bar.
 
-**After Day-1:**
-- **If gather ≤ ~80 µs**: P3-3a resumes (M1 work: side-buffer lifecycle +
-  COW mirror + gather-buffer hysteresis). Also fix M1's measurement confound:
-  run a Triton PIECEWISE baseline bench before reporting M1 numbers, so
-  kernel win and graph-boundary overhead are separated. P3-3a runs as a
-  **time-fenced parallel line alongside P3-2**, not a replacement — it
-  suspends again if M1 nets < +0.3 ms after the confound is accounted for.
-- **If gather > ~80 µs**: P3-3a suspended until P3-2b is landed or near-done;
-  revisit only if the remaining gap vs llama.cpp warrants it.
-- **P3-2(b) custom W16A16** is the primary dev path regardless of the gather
-  result — larger ceiling (~1–1.5 ms), no serving-layer integration risk.
+**After Day-1 (resolved branch: gather ≤ ~80 µs):**
+- **P3-3a resumes** per `plan-gfx906fa-serving.md`: M0 remainder (Triton-
+  PIECEWISE baseline + attention slice) then M1 (side-buffer lifecycle +
+  COW Q8 mirror + partial-block COW probe; gather-buffer hysteresis is a
+  separate A/B, not part of M1). Runs as a **time-fenced parallel line
+  alongside P3-2**, not a replacement — it suspends again if M1 nets
+  < +0.3 ms/step vs the Triton-PIECEWISE baseline (mode-matched).
+- **P3-2(b) custom W16A16** is the primary dev path — ceiling ~0.7–1.1 ms,
+  no serving-layer integration risk; the kernel must K-split to attack the
+  latency-bound small rows (see (b) below).
 
 ### P3-1 — `shared_expert_gate` [1×2048] scalar gemv — DONE (2026-08-15)
 
@@ -274,18 +307,21 @@ m < 4)`. Micro-bench: Triton 42.8 µs vs LLMM1pad4 7.3 µs (torch linear
 prompts identical, one diverges ~token 11 (fp16 reorder on the sigmoid
 gate; both fluent — accepted). Residual §2 row now ~0.29 ms.
 
-### P3-2 — LLGemm1 dense surface (5.83 ms/step, 230 calls) — PRIMARY DEV BET (v6)
+### P3-2 — LLGemm1 dense surface (5.83 ms/step, 230 calls) — PRIMARY DEV BET (v7)
 
 Floor across the projection table ≈ 4.6 ms @798 GB/s; the two big rows
 (in_proj ~1.3×, LM head ~1.1×) are already near floor — realistic capture is
 **~1–1.5 ms/step**, concentrated in the mid-size rows (out_proj/qkv/shared).
 Options in priority order:
 
-**(a) Quick aiter probe** (Day-1, time-boxed, runs alongside gather micro-bench):
-env/backend flags, splitK for N≤2048. If these knobs exist and move the
-needle by ≥20% on one shape, continue. If aiter declines for a
-shape/dtype constraint (Q3 records the reason), stop immediately and
-proceed to (b). Do not invest further in (a) past one run per flag variant.
+**(a) Quick aiter probe — STOPPED (Day-1, 2026-08-15)**: aiter is
+structurally excluded on gfx906 (all aiter gemm paths gated
+`not on_gfx906()`; wvSplitK needs matrix cores; `VLLM_ROCM_USE_AITER`
+default False; whitelist has no matching shape) — rejection reason: arch
+exclusion. The one real knob, LLGemm1 `rows_per_block` (dispatch hardcodes
+4), sweeps to +1.4% best weighted per-step (rpb=8; rpb=2 net-negative) —
+below the ≥20% continue bar; no config change warranted. See DEVLOG
+"Day-1 pre-step pair".
 
 **(b) Custom M=1 W16A16 dense kernel — primary development path**:
 `moe_q_gemm_gfx906.cu` already demonstrates b128 LDS weight streaming +
@@ -294,13 +330,19 @@ strictly simpler. The MoE phase proved upstream kernels are the wrong
 tree on gfx906 for this class of problem; the custom kernel is the primary
 bet, not the fallback. Reference: llama.cpp's mmq single-pass decode kernel
 from P3-0 Q2 trace.
+Day-1 rpb-sweep scoping: big rows (in_proj/LM head/qkv/o_proj) are
+BW-bound at rpb=4 (0.95–1.29× floor; qkv at 1.29× is the main one);
+small rows (gate_up/down/router/GDN-small, 150 calls/step) are
+launch/latency-bound (3.6–14× floor; LLGemm1 at M=64 launches 16 blocks
+and under-fills 60 CUs) → the kernel must **K-split** to attack them.
+Realistic capture ≈ **0.7–1.1 ms/step** (rescoped from v6's 1–1.5).
 
 (P3-1's 1.63 ms Triton row is tracked separately above; this item covers
 only the LLGemm1 surface.)
 **Gate**: floors confirmed (798 GB/s, TCC hit ~14.5%); micro-bench per shape
 before touching the model path.
 
-### P3-3 — paged attention decode (1.94 ms/step) — SUSPENDED pending gather micro-bench (v6)
+### P3-3 — paged attention decode (1.94 ms/step) — P3-3a RESUMED (Day-1 gate passed, v7)
 
 The original plan (partition the Triton kernel over KV) was overtaken by
 events: the tree already vendors a Q8 FlashAttention backend (llama.cpp
