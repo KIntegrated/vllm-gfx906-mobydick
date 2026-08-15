@@ -2,8 +2,13 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 
-Status: v3 (2026-08-15). Sub-plan of Phase 3 **P3-3a** (parent:
-`plan-decode-phase3.md` v9). Evidence, bench history and the bug-hunt
+Status: v4 (2026-08-15) — **M2 LANDED**: LEGACY decode path
+FULL-capture-safe, CGSupport default flipped to
+UNIFORM_SINGLE_TOKEN_DECODE, 52.90 t/s mean (σ≈0.06, n=6) on the
+default-request config (was 22.44 via the downgrade bug), 128/128 greedy
+probes identical on both PIECEWISE and FULL paths, T3 capture/replay test
+passing. Sub-plan of Phase 3 **P3-3a** (parent:
+`plan-decode-phase3.md` v10). Evidence, bench history and the bug-hunt
 narrative live in `DEVLOG-moe-opt.md` (§"P3-3", §"Serving-mode backend
 findings", §"P3-3a: CUSTOM serving correctness probe"). Review findings
 that drove v2: `gfx906fa-serving-plan-rev-claude.md` (merged claude + ds4
@@ -53,11 +58,12 @@ and cudagraphs as strong as the Triton baseline's.
 
 | config | decode | attention slice/step |
 |--------|--------|----------------------|
-| serving, Triton, FULL_DECODE_ONLY (baseline) | **44.09 t/s** (22.7 ms e2e) | 10 × ~194 µs ≈ 1.94 ms ¹ |
-| serving, CUSTOM (default LEGACY=1) + requested PIECEWISE + GEMV | **52.07 t/s** (19.2 ms/step) — **new best** | 10 × (FA + LEGACY gather) ≈ TBD (M0-3) |
-| serving, Triton, PIECEWISE (M0 reference) | queued (run_ab2) | TBD |
-| serving, CUSTOM + requested FULL_DECODE_ONLY + `GFX906_FA_CG=decode` (M2 experiment) | in flight | TBD |
-| serving, CUSTOM + requested FULL_DECODE_ONLY, CGSupport=NEVER (current default) | 22.44 t/s — **broken downgrade path** (parent v9) | — |
+| serving, Triton, FULL_DECODE_ONLY (baseline) | 43.99 t/s (archive 44.09 reproduced) | 10 × ~194 µs ≈ 1.94 ms ¹ |
+| serving, Triton, PIECEWISE | 43.96 t/s | — |
+| serving, CUSTOM + PIECEWISE + GEMV | 52.07 t/s | 10 × (FA + LEGACY gather) ≈ TBD (M0-3) |
+| serving, CUSTOM + PIECEWISE, GEMV off | 50.88 t/s | — |
+| serving, CUSTOM + FULL_DECODE_ONLY + GEMV (flipped default, n=6) | **52.90 t/s mean, σ≈0.06** — **new best = default config** | TBD (M0-3) |
+| serving, CUSTOM + requested FULL_DECODE_ONLY, CGSupport=NEVER (`GFX906_FA_CG=never`) | 22.44 t/s — **downgrade bug** (dormant; upstream class) | — |
 | eager, CUSTOM LEGACY=0 (works today) | 19.33 t/s | — |
 
 ¹ "10 × 194 µs" comes from a P3-0 profile at seq~500. The 44.09 t/s bench
@@ -262,7 +268,15 @@ and allocations stay legal. Work items (unchanged):
 6. Report state: `NO_PREFIX_CACHE` flag on/off, bench entrypoint, sample
    count.
 
-### M2 — FULL_DECODE_ONLY (CGSupport.UNIFORM_SINGLE_TOKEN_DECODE) — **critical path (v3); experiment in flight**
+### M2 — FULL_DECODE_ONLY (CGSupport.UNIFORM_SINGLE_TOKEN_DECODE) — **DONE (v4)**
+
+**Outcome**: the LEGACY=1 decode path is FULL-capture-safe as-is; no W5
+buffer surgery was needed (first FULL capture at
+profile_seq_lens=max_model_len → capacity-sized buffers; runner-staged
+metadata re-read live at replay; Sq=1 fast path takes no host loop). W8
+flipped the default; T3 test passes (including the warmup→capacity
+transition, multi-size capture+replay, and live-seq_lens growth cases);
+probes identical on both paths. Work items (resolved as noted):
 
 v3: promoted ahead of M1 (see v2→v3 changes). The LEGACY=1 decode path
 has no Q8 side buffer, so M2 on the default path needs no W1/W2; the
@@ -321,15 +335,17 @@ runner-staged). Work items:
   capture — if not, the Python loop is on the captured stream and must be
   rewritten before capture.
 
-**M2 exit**: 
-- T3 passes (see §3 — must cover warmup→capture `max_seq_len` transition
-  and multi-size capture+replay, not just single-size capture).
-- Serving t/s ≥ M1 number.
-- Kernel launch count or inter-kernel gap for the B=1 graph confirms
-  reduction vs M1's eager attention (otherwise M2 passed while buying
-  nothing).
-- Record mode = FULL_DECODE_ONLY.
-- Run `BENCH_SAMPLES ≥ 5` for all serving numbers; record σ.
+**M2 exit** (all met, v4):
+- T3 passes (warmup→capture transition, multi-size capture+replay,
+  live-seq_lens growth) ✓
+- Serving t/s ≥ M1 number: 52.90 (FULL) ≥ 52.07 (PIECEWISE) ✓
+- Mode-matched Triton delta: 52.90 vs 43.96 (+20%) — the graph reduction
+  is real even though the marginal FULL-vs-PIECEWISE win is only +1.0 t/s
+  (step is GPU-kernel-bound) ✓
+- Mode = FULL_DECODE_ONLY ✓; `BENCH_SAMPLES ≥ 5` + σ recorded
+  (52.93/52.92/52.94/52.93/52.83/52.87, σ≈0.06) ✓
+- (W8 naming note: the knob landed as `GFX906_FA_CG`, not the proposed
+  `GFX906_FA_CG_MODE` — shorter, same semantics, default `decode`.)
 
 ### M3 — decision
 

@@ -2,6 +2,38 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 
+Status: v10 (2026-08-15) — **P3-1 landed** (41.51 → 44.09); **P3-2(b)
+landed** (micro −401 µs/step; serving +0.45 ms/step = +2.3%, e2e-verified
+in the A/B matrix); **P3-3a M2 landed**: the CUSTOM Q8 FA backend's
+LEGACY decode path is FULL-capture-safe — CGSupport default flipped to
+UNIFORM_SINGLE_TOKEN_DECODE (GFX906_FA_CG=never|always override kept),
+52.90 t/s mean (σ≈0.06, n=6) under FULL_DECODE_ONLY + GEMV, 128/128
+greedy probe identical to the Triton-FULL reference, T3 capture/replay
+test passing. **New best serving: 52.90 t/s — now the default-request
+config** (was 22.44 via the downgrade bug; that bug is dormant for this
+backend but remains for other NEVER-support backends — upstream class).
+Full matrix in DEVLOG "Serving A/B matrix". `plan-gfx906fa-serving.md`
+at v4 (M2 done). Remaining P3-3a: M0-3 attention-slice profile, LEGACY=0
+track (side-buffer lifecycle/COW) demoted to optional. Gap vs llama.cpp:
+~1.32× at 52.90 vs ~70 t/s. Prefill already 2.6× faster than llama.cpp —
+out of scope unless a candidate helps both for free.
+
+**v9→v10 changelog** (2026-08-15, DEVLOG "Serving A/B matrix" + "P3-3a M2
+experiment"):
+- A/B matrix completed (8 configs): Triton-FULL 43.99 (archive 44.09
+  reproduced) / +GEMV 44.81 / Triton-PIECEWISE 43.96; CUSTOM-PIECEWISE 50.88
+  (GEMV off) / 52.07 (on); CUSTOM-FULL 53.09 (on, FA_CG=decode); the 22.44
+  downgrade path confirmed as bug (Triton-PIECEWISE ≈ Triton-FULL → no
+  piecewise penalty exists).
+- M2 experiment PASSED: LEGACY=1 decode path is FULL-capture-safe as-is
+  (first FULL capture at profile_seq_lens=max_model_len → capacity-sized
+  buffers; live metadata re-read at replay). No W5 buffer surgery needed.
+- Correctness: 128/128 greedy probes identical (PIECEWISE and FULL paths
+  vs Triton reference).
+- W8 default flip applied; T3 capture/replay test added (dangling-buffer +
+  live-seq_lens cases).
+- GEMV e2e: +0.45 ms/step (50.88→52.07) vs 0.40 ms/step micro-bench.
+
 Status: v9 — **P3-1 landed** (serving 41.51 → 44.09 t/s); **P3-2(b) kernel
 built + micro-benched (−401 µs/step, −7.2% vs LLMM1 rpb=4) + integrated**
 (clean A/B pending under the new best config); (a) probe closed. **New
@@ -390,7 +422,7 @@ only the LLGemm1 surface.)
 **Gate**: floors confirmed (798 GB/s, TCC hit ~14.5%); micro-bench per shape
 before touching the model path.
 
-### P3-3 — paged attention decode (1.94 ms/step) — RESCOPED (v9: 52.07 t/s new best; downgrade bug is the target)
+### P3-3 — paged attention decode (1.94 ms/step) — **M2 LANDED (v10): 53.09 t/s, new default**
 
 The original plan (partition the Triton kernel over KV) was overtaken by
 events: the tree already vendors a Q8 FlashAttention backend (llama.cpp
@@ -410,15 +442,20 @@ blocks mismatch`), COW prefix-cache copies bypassing the side buffer
 (correctness), and `CGSupport.NEVER` downgrading the engine to PIECEWISE
 while the Triton baseline serves with FULL_DECODE_ONLY.
 
-- **P3-3a — make CUSTOM serving-viable** (sub-plan:
-  `plan-gfx906fa-serving.md`; rescoped v9). Requested-PIECEWISE serving
-  already works (52.07 t/s, beating the old 46–48 target); remaining:
-  (i) the requested-FULL→downgrade bug (decode degrades toward eager at
-  22.44 t/s — piecewise-compile when the downgrade fires, or raise the
-  backend's CGSupport if FULL capture is actually safe); (ii) correctness
-  under prefix-cache COW + multi-batch (probe); (iii) M1 side-buffer
-  lifecycle items (realloc-on-shape-change, COW Q8 mirror, gather-buffer
-  hysteresis) as needed by (ii).
+- **P3-3a — make CUSTOM serving-viable — M2 LANDED (v10)** (sub-plan:
+  `plan-gfx906fa-serving.md` v3→v4). The "raise CGSupport if FULL capture
+  is safe" branch won: the LEGACY (inline-quant) decode path is
+  FULL-capture-safe as-is; `Gfx906FAMetadataBuilder.get_cudagraph_support`
+  default flipped to UNIFORM_SINGLE_TOKEN_DECODE (GFX906_FA_CG env
+  override). 53.09 t/s FULL_DECODE_ONLY + GEMV (matrix row 5), 128/128
+  greedy probes identical on both PIECEWISE and FULL paths, T3
+  capture/replay test in `tests/kernels/attention/test_gfx906_fa.py`.
+  The requested-FULL→downgrade bug is now dormant for this backend
+  (support ≠ NEVER); it remains for other NEVER-support backends —
+  upstream-class engine bug, documented in DEVLOG. Remaining: M0-3
+  attention-slice profile, 5-sample σ on the new default, and the LEGACY=0
+  track (W1 side-buffer lifecycle, W2 COW Q8 mirror, T1–T2) demoted to an
+  optional optimization (fused gather vs LEGACY PyTorch gather A/B).
 - **P3-3b — Triton KV partitioning (fallback)**: original design (grid axis
   3 over KV splits + merge kernel, gated on_gfx906 / sinks-None) stays
   parked until the P3-3a decision.
