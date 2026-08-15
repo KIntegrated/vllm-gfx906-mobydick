@@ -128,7 +128,7 @@ Per decode step: ~80 WNA16 GEMM calls × 3.5ms ≈ 280ms → matches 2.5–3.5 t
 Weight traffic per w13 call ≈ 8 active experts × (1MB int4 + 40KB scales/zp)
 ≈ 8.3 MB → at 3.5ms that's ~2.4 GB/s ≈ **3% of achievable HBM bandwidth**.
 
-### gfx906 ISA notes (from repo-root `gfx906-notes.md`)
+### gfx906 ISA notes (from [`docs/gfx906/`](../gfx906/))
 
 - **No `v_mfma*` on gfx906** (Vega 20, no matrix cores) → Triton `tl.dot`
   lowers to scalar fp16 FMA with poor codegen; exllama's manual

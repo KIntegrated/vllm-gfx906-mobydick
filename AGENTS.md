@@ -152,6 +152,9 @@ Security reviewers should start with [`SECURITY.md`](SECURITY.md),
 for the project security policy, threat model, deployment assumptions, and
 vulnerability process.
 
+- **gfx906 kernel work**: [`docs/gfx906/`](docs/gfx906/) — measured ISA facts,
+  latency-hiding patterns, and the LDS layout standard for MI50. Read before
+  writing or modifying gfx906 kernels or interpreting kernel benchmarks.
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.
