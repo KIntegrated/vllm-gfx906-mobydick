@@ -1067,3 +1067,26 @@ Consequences:
   multi-batch (probe running), the FULL-downgrade bug, M1 side-buffer
   lifecycle items.
 - `_bench_gfx906.py` gained `BENCH_ATTN_BACKEND` (maps to attention_config).
+
+### P3-3a: CUSTOM serving correctness probe — PASSED (2026-08-15)
+
+`/bench/probe_custom_fa.py` (scratch): 2048-token filler prompt, 128 greedy
+tokens, same seed/params:
+- A = ROCM_ATTN (Triton) + FULL_DECODE_ONLY — reference
+- B = CUSTOM (Q8 FA) + requested PIECEWISE — the 52.07 t/s path
+
+**RESULT: IDENTICAL** (first_diff_index=None, 128/128). The degenerate
+prompt produces a tight repetition loop — a strong fingerprint; the
+V-cache stride-bug class (garbage V → early divergence) would break it
+immediately. KV growth across 128 decode steps (Sk 2048→2176) is covered.
+Residual correctness gaps for the record: prefix-cache COW and multi-batch
+decode are not exercised by this probe (P3-3a items (ii) continue).
+
+Also added `GFX906_FA_CG` env knob to `Gfx906FAMetadataBuilder`
+(default never; decode → UNIFORM_SINGLE_TOKEN_DECODE; always → ALWAYS) to
+test whether the LEGACY decode path is actually FULL-capture-safe.
+Hypothesis basis: the first FULL capture runs with
+profile_seq_lens=max_model_len (gpu_model_runner), so Sk-sized buffers
+inside forward_paged are allocated at capacity at capture time; the
+metadata (seq_lens/block_table) is runner-staged into fixed buffers and
+re-read live at replay.
