@@ -1,9 +1,11 @@
 # Phase 3 — non-MoE decode path on gfx906 (MI50)
 
-Status: v4 — **P3-0 complete** (2026-08-15); §2/§3 replaced with measured
-answers, §4 re-prioritized. Scope: close the remaining decode gap vs
-llama.cpp. Prefill is already 2.6× faster than llama.cpp — out of scope
-unless a candidate helps both for free.
+Status: v5 — **P3-1 landed** (serving 41.51 → 44.09 t/s); **P3-3 reframed**
+around the vendored CUSTOM (Q8 FA) backend — kernel 2.7× faster but
+serving-blocked (see new sub-plan `plan-gfx906fa-serving.md`). Scope:
+close the remaining decode gap vs llama.cpp. Prefill is already 2.6×
+faster than llama.cpp — out of scope unless a candidate helps both for
+free.
 
 P3-0 outcomes (details in DEVLOG "P3-0" section):
 
@@ -56,6 +58,28 @@ Review changes (v1→v2, preserved): P3-0 Q0 first added; P3-1 range softened
 to 2–3×; P3-4 reframed (inductor already fused; lever is graph breaks); P3-3
 latency-bound nature made explicit; §6 success criteria + quantization caveat.
 
+Review changes (v4→v5):
+
+- **P3-1 recorded DONE**: `_llmm1_tiny_m()` pad-to-4 fix in the dispatch
+  layer; serving 41.51 → **44.09 t/s** (+6.2%, ≈1.4 ms/step), eager 18.88 →
+  19.49. §2 row updated (residual ~0.29 ms).
+- **P3-3 reframed**: the original "partition the Triton kernel" plan was
+  overtaken by the discovery that the tree vendors a Q8 FlashAttention
+  backend that was dead code (unregistered) + carried a real stride bug —
+  both fixed (`7e9e855bab`). Kernel measured **72 µs/layer vs Triton
+  194 µs**; eager parity only (launch-bound); serving blocked by side-buffer
+  lifecycle (crash), COW prefix copies (correctness), CGSupport.NEVER
+  (mode downgrade). Split into **P3-3a** (make CUSTOM serving-viable — new
+  sub-plan `plan-gfx906fa-serving.md`) and **P3-3b** (Triton partitioning,
+  fallback).
+- **P3-2 promoted** to top unblocked candidate while P3-3a is in flight.
+- **§1/§6 rebased on measured serving numbers**: 44.09 t/s = 22.7 ms e2e
+  step; the 20.3 ms P3-0 figure is the profiled step, not e2e (~2.4 ms of
+  host/scheduler/sampling sits outside it).
+- **§7 additions**: cudagraph-mode confound (backend choice changes graph
+  coverage, not just the kernel); prefix-COW correctness risk for any
+  K-quant side buffer.
+
 ---
 
 ## 1. Where we are
@@ -66,12 +90,12 @@ top-8 MoE), MI50 32 GB (gfx906, 60 CU), single request:
 | engine | prefill pp=2048 | decode |
 |--------|-----------------|--------|
 | llama.cpp (Q4_K_XL) | 807 t/s | **70.3 t/s** (14.2 ms/step) |
-| vLLM + cudagraphs (AWQ int4) | ~2140 t/s | ~49 t/s (20.3 ms/step) |
+| vLLM + cudagraphs, Triton attn, post-P3-1 | ~2140 t/s | **44.09 t/s** (22.7 ms e2e step; ~19.0 ms profiled step) |
 
-Gap: **~6 ms/step (≈30% of the step)**, entirely in GPU kernel time
-(cudagraphs remove the launch overhead; eager is not the target anymore).
-Primary metric: **serving mode** (`BENCH_EAGER=0`, `FULL_DECODE_ONLY`),
-decode tok/s and ms/step.
+Gap: **1.59× (~8.5 ms e2e/step)**. ~2.4 ms of the e2e step is outside the
+profiled kernel window (host/scheduler/sampling) — kernel-side targets can
+only attack the remaining ~6 ms. Primary metric: **serving mode**
+(`BENCH_EAGER=0`), decode tok/s and ms/step. Note: eager best is 19.49 t/s.
 
 ---
 
@@ -83,8 +107,8 @@ construction; DEVLOG P3-0 for method):
 | component | ms/step | calls/step | status |
 |-----------|---------|------------|--------|
 | LLGemm1 dense projections (aiter, incl. shared expert 80 + LM head) | **5.83** | 230 | **P3-2 target** |
-| `triton_matmul` = `shared_expert_gate` [1×2048] ×40 layers | **1.63** | 40 | **P3-1 target (precisely scoped)** |
-| paged attention (custom FA), 10 layers × ~194 µs | **1.94** | 10 | **P3-3 target** |
+| `triton_matmul` = `shared_expert_gate` [1×2048] ×40 layers | 1.63 → **0.29** | 40 | **P3-1 DONE** (padded LLMM1, 40 × 7.3 µs) |
+| paged attention, 10 layers × ~194 µs (Triton) | **1.94** | 10 | **P3-3a target** — in-tree CUSTOM kernel is 72 µs/layer; serving integration pending (`plan-gfx906fa-serving.md`); fallback P3-3b |
 | gfx906 MoE routed kernel (Phase 1/2) | 1.75 | ~78 | done |
 | routing pipeline (topk+align+count_sort) | 1.06 | 79 | P2-4 deferred |
 | GDN decode (recurrent + conv1d) | ~0.5 | 60 | leave alone (faster than llama.cpp) |
@@ -199,28 +223,24 @@ a profile artifact, void.
 ## 4. Ordered candidates (each: test → bench → commit, per common protocol)
 
 Ordering = measured ms/step × feasibility, from the reconciled §2 table.
-Every step is gated on P3-0. Sizes below are from the DEVLOG profile; they
-will be revised after P3-0 Q0–Q6 complete.
+P3-0 is complete and the sizes below are final for this phase. Live order
+(v5): **P3-3a** (sub-plan `plan-gfx906fa-serving.md`, M1 first) and
+**P3-2** in parallel — P3-2 is the top candidate that needs no new
+integration work; P3-3a has the larger single win but is gated on the
+serving-integration milestones.
 
-### P3-1 — `shared_expert_gate` [1×2048] scalar gemv (~1.63 ms/step) — TOP CANDIDATE
+### P3-1 — `shared_expert_gate` [1×2048] scalar gemv — DONE (2026-08-15)
 
-Precisely scoped by P3-0: 40 × rank-1 dot products (sigmoid gate on the
-shared-expert output, one per layer), each 41 µs in Triton because m=1 fails
-LLMM1's `m % 4 == 0` check in `rocm_unquantized_gemm_impl`. Floor ~5 µs.
-Expected saving **~1.4 ms/step** (also removes 40 kernel launches/step,
-hitting the inter-kernel gap).
+**Landed** (`3e7c4f2252`, devlog `8b2c5ccc05`): `_llmm1_tiny_m()` in
+`vllm/model_executor/layers/utils.py` zero-pads the weight to 4 rows →
+`ops.LLMM1(w, x, 4)` → slice; both dispatch sites accept `(m % 4 == 0 or
+m < 4)`. Micro-bench: Triton 42.8 µs vs LLMM1pad4 7.3 µs (torch linear
+281 µs rejected; rocBLAS skinny gemv is terrible here). **Serving 41.51 →
+44.09 t/s (+6.2%, ≈1.4 ms/step); eager 18.88 → 19.49.** Greedy A/B: 2/3
+prompts identical, one diverges ~token 11 (fp16 reorder on the sigmoid
+gate; both fluent — accepted). Residual §2 row now ~0.29 ms.
 
-Fix options, order of invasiveness:
-(a) dispatch m<4 (n≤16) to `torch.nn.functional.linear` (rocBLAS gemv) —
-    zero new code; measure first, rocBLAS skinny gemv may still be ~10–20 µs;
-(b) zero-pad the gate weight to [4,2048] at load time + `ops.LLMM1(w, x, 4)`
-    + slice — ~5 lines in `qwen3_next.py`, no new kernel;
-(c) tiny custom GEMV kernel if (a)/(b) disappoint.
-Correctness: greedy-output diff vs current build (gate is numerics-visible
-but a rank-1 dot; fp reorder tolerance applies). **Gate**: micro-bench the
-chosen option standalone before model integration.
-
-### P3-2 — LLGemm1 dense surface (5.83 ms/step, 230 calls)
+### P3-2 — LLGemm1 dense surface (5.83 ms/step, 230 calls) — TOP REMAINING CANDIDATE
 
 Floor across the projection table ≈ 4.6 ms @798 GB/s; the two big rows
 (in_proj ~1.3×, LM head ~1.1×) are already near floor — realistic capture is
@@ -246,19 +266,37 @@ only the LLGemm1 surface.)
 **Gate**: floors confirmed (798 GB/s, TCC hit ~14.5%); micro-bench per shape
 before touching the model path.
 
-### P3-3 — paged attention decode (1.94 ms/step, 10 layers × ~194 µs) — #2 CANDIDATE
+### P3-3 — paged attention decode (1.94 ms/step) — IN PROGRESS, reframed (v5)
 
-At seq~500 the KV read per layer is ~0.5 MB with **82% L2 hit** — 194 µs is
-latency/occupancy-bound, not BW-bound. P3-0 Q2 confirms the gap is real:
-llama.cpp's flash_attn_tile (256×256 KV-chunked) does ~15 µs/layer at avg
-seq~128 → ~30–60 µs even scaled to our seq~500, i.e. **3–10× faster**.
-Likely cause on our side: poor work-split at M=1 with GQA kv_heads=2 (few
-work items for 60 CUs). Study the custom FA kernel's grid config and
-llama.cpp's tile split before writing anything; expected saving **~1.5–1.7
-ms/step** if a comparable split is reachable.
+The original plan (partition the Triton kernel over KV) was overtaken by
+events: the tree already vendors a Q8 FlashAttention backend (llama.cpp
+`flash_attn_tile_q8` port, head_size 256 OK) that was **dead code at
+runtime** (plugin entry point missing from stale egg-info) and carried a
+**real stride bug** (V-cache is a non-contiguous `unbind(1)` view; kernels
+derived strides from shapes → read K bytes as V). Both fixed in
+`7e9e855bab`; regression tests in
+`tests/kernels/attention/test_gfx906_fa.py` build the cache exactly like
+the backend so this bug class can't hide again.
 
-**Gate**: gap confirmed ≥3× (it is); FA prefill advantage must not regress —
-bench both phases.
+Measured state: **FA kernel 72 µs/layer vs Triton 194 µs (2.7×)**; eager
+parity only (19.33 vs 19.49 — B=1 eager is launch-bound; the gather+q-fp32
+tax eats the kernel win). Serving is blocked by three identified issues:
+Q8 side-buffer lifecycle vs profile→real cache realloc (crash: `value_cache
+blocks mismatch`), COW prefix-cache copies bypassing the side buffer
+(correctness), and `CGSupport.NEVER` downgrading the engine to PIECEWISE
+while the Triton baseline serves with FULL_DECODE_ONLY.
+
+- **P3-3a — make CUSTOM serving-viable** (sub-plan:
+  `plan-gfx906fa-serving.md`). M1 = PIECEWISE correctness (side-buffer
+  realloc-on-shape-change + COW Q8 mirror + gather-buffer hysteresis) →
+  measure; M2 = capture-safe decode path (capacity buffers, static shapes,
+  `CGSupport.ALWAYS`) → measure. Expected ~0.9–1.4 ms/step → **46–48 t/s**.
+  Time-boxed; explicit stop conditions.
+- **P3-3b — Triton KV partitioning (fallback)**: original design (grid axis
+  3 over KV splits + merge kernel, gated on_gfx906 / sinks-None) stays
+  parked until the P3-3a decision.
+
+**Gate**: FA prefill advantage must not regress — bench both phases.
 
 ### P3-4 — elementwise/norm pile (~2.3 ms/step) — DEPRIORITIZED
 
@@ -316,23 +354,25 @@ warmup/capture region. No action; recorded so nobody re-chases it.
 
 ## 6. Expected outcome (success criteria)
 
-Per-candidate targets against the reconciled 20.3 ms/step denominator:
+Per-candidate targets against the measured 22.7 ms e2e step (44.09 t/s
+baseline; ~19.0 ms of it is profiled kernel time):
 
-| candidate | saving (best case) | saving (realistic) | cumulative realistic |
-|-----------|-------------------|--------------------|---------------------|
-| P3-1 (shared_expert_gate) | ~1.4 ms | ~1.2 ms | ~1.2 ms |
-| P3-3 (attention work-split) | ~1.7 ms | ~1.0 ms | ~2.2 ms |
-| P3-2 (LLGemm1 mid-size rows) | ~1.5 ms | ~1.0 ms | ~3.2 ms |
-| P3-4 (elementwise) | — | 0 (deprioritized) | ~3.2 ms |
+| candidate | saving (realistic) | cumulative |
+|-----------|--------------------|------------|
+| P3-1 (LANDED, measured) | **+1.4 ms** | 22.7 ms / **44.09 t/s** ✅ |
+| P3-3a CUSTOM serving (M1→M2) | 0.7–1.2 ms | ~21.5–22.0 / ~46–47 |
+| P3-2 LLGemm1 mid-size rows | ~1.0 ms | ~20.5–21.0 / ~48–49 |
+| P3-3b Triton partitioning | 0.7–1.0 ms | alternative to P3-3a |
+| P3-4 elementwise | 0 (deprioritized) | — |
 
-**Realistic range: ~2.5–4 ms off 20.3 ms/step** → **~57–68 t/s decode**.
+**Realistic remaining: ~1.7–2.2 ms → ~48–49 t/s.**
 Parity with llama.cpp's 70.3 t/s is NOT the goal and is not reachable on
 this budget: its dense weights are Q8_0 (half our fp16 bytes) and it uses
 Q8_1 activation quantization — a structural arithmetic advantage, not a
 kernel-quality one (MoE is at parity; GDN we already win). Phase success =
-**close ≥50% of the 6 ms gap (≥3 ms) with measured per-kernel evidence and
-no prefill regression**; failure to reach parity is an acceptable,
-documented outcome.
+**close ≥50% of the remaining kernel-side gap with measured per-kernel
+evidence and no prefill regression**; failure to reach parity is an
+acceptable, documented outcome.
 
 ---
 
@@ -358,3 +398,11 @@ documented outcome.
 - **aiter tunability on gfx906**: P3-2(a) assumes aiter splitK/dispatch knobs
   are exposed and effective for the relevant shapes. They may not be. Time-box
   the probe at 1 day; do not invest in (a) past one run per flag variant.
+- **Cudagraph-mode confound**: an attention backend's CGSupport decides
+  PIECEWISE vs FULL_DECODE_ONLY; swapping backends changes graph coverage,
+  not just the kernel. Always record the resolved `cudagraph_mode` next to
+  serving numbers (v4's "~49 t/s" row silently assumed FULL mode).
+- **Prefix-COW correctness**: any K-quant side buffer must mirror COW block
+  copies (`copy_kv_cache_blocks_inplace`) — a bug class that only fires on
+  prefix hits sharing a partially-filled block, invisible to fresh-run
+  benches (see `plan-gfx906fa-serving.md` RC2).
