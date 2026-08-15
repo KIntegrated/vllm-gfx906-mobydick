@@ -4,7 +4,8 @@ Benchmarks run on real gfx906 hardware collected across the versions this fork
 tracks (`0.23.0`, our `0.26.0` port, and current `main`), plus the prefill/
 decode split that isolates the custom FlashAttention (`CUSTOM`) backend.
 
-Hardware: single AMD MI60 (32 GB, gfx906) unless noted. ROCm 7.14 image
+Hardware: single AMD MI50 32 GB (gfx906, 60 CU) unless noted — the card was
+identified as MI60 by VRAM but P2-0 rocprofv3 confirmed 60 CUs (MI50). ROCm 7.14 image
 (`mixa3607/vllm-gfx906`: `0.27.99rc0-rocm-7.14-kintegrated`), torch 2.13.
 Models cached under `/data/cache/huggingface`; all runs offline
 (`HF_HUB_OFFLINE=1`), `HIP_VISIBLE_DEVICES=0`,
@@ -50,6 +51,18 @@ CPU-launch-bound (~1500 dispatches/step); graphs remove that. Capture needs
 `max_num_seqs <= Mamba cache blocks` on this hybrid GDN model (see dev log
 P2-2).
 
+**Reference: llama.cpp on the same card** (`llama-bench`, full offload;
+different generation + quant, same 34.66B A3B family — reference point only,
+not a like-for-like comparison):
+
+| engine | prefill pp=2048 | decode |
+|--------|-----------------|--------|
+| llama.cpp (Qwen3.6 UD-Q4_K_XL) | 807 t/s | **70.3 t/s** |
+| vLLM (Qwen3.5 AWQ int4, cudagraphs) | ~2140 t/s | ~49 t/s |
+
+vLLM wins prefill 2.6×; llama.cpp still leads decode 1.43× — the residual
+gap is in non-MoE kernels (see dev log: graph-mode profile).
+
 Summary: on the **dense** model the forward port is strictly non-regressing
 (0.26 ≈ 0.23, main +18% faster). On the **MoE** model, main regressed badly
 vs our 0.26 port (−71%); the custom gfx906 W4A16 MoE kernel (§4) fixes both
@@ -90,7 +103,7 @@ Dev log: [`DEVLOG-moe-opt.md`](DEVLOG-moe-opt.md).
 
 ## 2. Prefill/decode split — custom `CUSTOM` FA vs stock backend (main)
 
-Method: `_pp_bench.py`, dense `QuantTrio/Qwen3.5-9B-AWQ`, single MI60, eager,
+Method: `_pp_bench.py`, dense `QuantTrio/Qwen3.5-9B-AWQ`, single MI50 32 GB, eager,
 prefix caching on, pp/tgen two-phase timing. `prefill_tps` = fresh-pp TTFT;
 `decode_tps` = prefix-cached tg only. tg = 64, gpu_util = 0.7.
 
