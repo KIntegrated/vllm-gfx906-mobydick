@@ -38,12 +38,18 @@ namespace moe_gptq_gfx906 {
 #define BLOCK_KN_SIZE 256
 #define THREADS_X 256
 
+// 8 consecutive halves must be 16B-aligned: one ds_read_b128 instead of
+// four ds_read_b32 (halves LDS instruction pressure in the K-loop).
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
+  union {
+    uint4 u;
+    half2 h[4];
+  } v;
+  v.u = *(const uint4*)a_ptr;
   float result = {};
-  const half2* a2_ptr = (const half2*)a_ptr;
   #pragma unroll
   for (int i = 0; i < 4; i++)
-    result = __ockl_fdot2(dq[i], *a2_ptr++, result, true);
+    result = __ockl_fdot2(dq[i], v.h[i], result, true);
   return result;
 }
 
