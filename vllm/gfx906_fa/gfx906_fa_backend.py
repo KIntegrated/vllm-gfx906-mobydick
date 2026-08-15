@@ -76,7 +76,19 @@ class Gfx906FAMetadata:
 class Gfx906FAMetadataBuilder(
     AttentionMetadataBuilder[Gfx906FAMetadata]
 ):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    # P3-3a M2: default stays NEVER (MVP). GFX906_FA_CG=decode|always raises
+    # it experimentally to test FULL-decode capture safety of the LEGACY
+    # (inline-quant) path; see plan-gfx906fa-serving.md.
+    @classmethod
+    def get_cudagraph_support(
+        cls, vllm_config: VllmConfig, kv_cache_spec: AttentionSpec
+    ) -> AttentionCGSupport:
+        mode = _os.environ.get("GFX906_FA_CG", "never").lower()
+        if mode == "always":
+            return AttentionCGSupport.ALWAYS
+        if mode == "decode":
+            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+        return AttentionCGSupport.NEVER
 
     def __init__(
         self,
