@@ -1,11 +1,10 @@
 # Phase 3 — non-MoE decode path on gfx906 (MI50)
 
-Status: v5 — **P3-1 landed** (serving 41.51 → 44.09 t/s); **P3-3 reframed**
-around the vendored CUSTOM (Q8 FA) backend — kernel 2.7× faster but
-serving-blocked (see new sub-plan `plan-gfx906fa-serving.md`). Scope:
-close the remaining decode gap vs llama.cpp. Prefill is already 2.6×
-faster than llama.cpp — out of scope unless a candidate helps both for
-free.
+Status: v6 — **P3-1 landed** (serving 41.51 → 44.09 t/s); **P3-2 is now the
+primary dev bet**; **P3-3a suspended** pending gather micro-bench go/no-go
+(see §4 ordering and `plan-gfx906fa-serving.md`). Scope: close the remaining
+decode gap vs llama.cpp. Prefill is already 2.6× faster than llama.cpp —
+out of scope unless a candidate helps both for free.
 
 P3-0 outcomes (details in DEVLOG "P3-0" section):
 
@@ -57,6 +56,20 @@ Review changes (v2→v3):
 Review changes (v1→v2, preserved): P3-0 Q0 first added; P3-1 range softened
 to 2–3×; P3-4 reframed (inductor already fused; lever is graph breaks); P3-3
 latency-bound nature made explicit; §6 success criteria + quantization caveat.
+
+Review changes (v5→v6):
+
+- **Ordering resequenced**: P3-2 promoted to primary dev bet; P3-3a suspended.
+  Rationale: eager near-parity (19.33 vs 19.49 t/s) indicates gather+dtype
+  tax likely eats most of the 72 µs kernel win at B=1; P3-2's ceiling
+  (~1–1.5 ms) is comparable with far lower integration risk. A Day-1
+  gather micro-bench (at Sk~2816 B=1) is the explicit go/no-go gate to
+  resume P3-3a; it runs alongside the P3-2(a) aiter probe. See §4 ordering
+  block for full decision tree.
+- **P3-3a measurement fix added**: if resumed, requires a Triton PIECEWISE
+  baseline bench before reporting M1 numbers, to deconfound kernel win from
+  graph-boundary overhead (CUSTOM runs PIECEWISE, baseline runs
+  FULL_DECODE_ONLY).
 
 Review changes (v4→v5):
 
@@ -224,10 +237,31 @@ a profile artifact, void.
 
 Ordering = measured ms/step × feasibility, from the reconciled §2 table.
 P3-0 is complete and the sizes below are final for this phase. Live order
-(v5): **P3-3a** (sub-plan `plan-gfx906fa-serving.md`, M1 first) and
-**P3-2** in parallel — P3-2 is the top candidate that needs no new
-integration work; P3-3a has the larger single win but is gated on the
-serving-integration milestones.
+(v6): **P3-2 is the primary development bet**; P3-3a is suspended pending a
+go/no-go micro-bench.
+
+**Day-1 pre-step (both run together, same session):**
+- **Gather micro-bench**: measure the fused gather + Q-fp32 kernel at serving
+  shapes (Sk~2816, B=1) in isolation. This is the decisive gate for P3-3a:
+  the eager near-parity (CUSTOM 19.33 vs Triton 19.49 t/s) strongly suggests
+  the gather+dtype tax is eating most of the 72 µs kernel win at B=1. If
+  gather > ~80 µs/layer, P3-3a's realistic serving gain collapses to ≤0.3 ms
+  and P3-3a stays suspended.
+- **P3-2(a) aiter splitK probe**: env/backend flags, splitK for N≤2048
+  (time-boxed, same day). Records the aiter rejection reason for any shape
+  that doesn't move — needed to scope P3-2(b).
+
+**After Day-1:**
+- **If gather ≤ ~80 µs**: P3-3a resumes (M1 work: side-buffer lifecycle +
+  COW mirror + gather-buffer hysteresis). Also fix M1's measurement confound:
+  run a Triton PIECEWISE baseline bench before reporting M1 numbers, so
+  kernel win and graph-boundary overhead are separated. P3-3a runs as a
+  **time-fenced parallel line alongside P3-2**, not a replacement — it
+  suspends again if M1 nets < +0.3 ms after the confound is accounted for.
+- **If gather > ~80 µs**: P3-3a suspended until P3-2b is landed or near-done;
+  revisit only if the remaining gap vs llama.cpp warrants it.
+- **P3-2(b) custom W16A16** is the primary dev path regardless of the gather
+  result — larger ceiling (~1–1.5 ms), no serving-layer integration risk.
 
 ### P3-1 — `shared_expert_gate` [1×2048] scalar gemv — DONE (2026-08-15)
 
@@ -240,14 +274,14 @@ m < 4)`. Micro-bench: Triton 42.8 µs vs LLMM1pad4 7.3 µs (torch linear
 prompts identical, one diverges ~token 11 (fp16 reorder on the sigmoid
 gate; both fluent — accepted). Residual §2 row now ~0.29 ms.
 
-### P3-2 — LLGemm1 dense surface (5.83 ms/step, 230 calls) — TOP REMAINING CANDIDATE
+### P3-2 — LLGemm1 dense surface (5.83 ms/step, 230 calls) — PRIMARY DEV BET (v6)
 
 Floor across the projection table ≈ 4.6 ms @798 GB/s; the two big rows
 (in_proj ~1.3×, LM head ~1.1×) are already near floor — realistic capture is
 **~1–1.5 ms/step**, concentrated in the mid-size rows (out_proj/qkv/shared).
 Options in priority order:
 
-**(a) Quick aiter probe** (time-boxed at 1 day, driven by P3-0 Q3 output):
+**(a) Quick aiter probe** (Day-1, time-boxed, runs alongside gather micro-bench):
 env/backend flags, splitK for N≤2048. If these knobs exist and move the
 needle by ≥20% on one shape, continue. If aiter declines for a
 shape/dtype constraint (Q3 records the reason), stop immediately and
@@ -266,7 +300,7 @@ only the LLGemm1 surface.)
 **Gate**: floors confirmed (798 GB/s, TCC hit ~14.5%); micro-bench per shape
 before touching the model path.
 
-### P3-3 — paged attention decode (1.94 ms/step) — IN PROGRESS, reframed (v5)
+### P3-3 — paged attention decode (1.94 ms/step) — SUSPENDED pending gather micro-bench (v6)
 
 The original plan (partition the Triton kernel over KV) was overtaken by
 events: the tree already vendors a Q8 FlashAttention backend (llama.cpp
