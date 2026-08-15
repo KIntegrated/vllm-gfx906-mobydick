@@ -258,16 +258,76 @@ K=768/N=1536 (partial grid), both gemm passes incl. fused topk-weight+reduce.
   AutoAWQ K-first int32 path exists too and is handled by the same repack
   dispatcher. Both verified in the standalone test.
 
-### Phase 2 candidates (after full-model numbers land)
+## PHASE 2 (plan: `plan-moe-phase2.md`, adversarially reviewed)
 
-- Prefill: block_m sweep / larger A tiles; fp16 atomic-add contention at
-  M=512 (8 experts × 64 rows writing same output row); consider fp32 scratch
-  + separate reduce for large M, or SPLIT_K rework.
-- Decode latency: 35.5µs ≈ launch+K-loop; try 128-thread blocks (2 waves)
-  or skipping the A-LDS round trip for BLOCK_SIZE_M=1 (read A from global
-  directly, as RDNA3 bf16 M=1 does).
-- Secondary per-step costs once MoE is fixed: aten::mm (~2.3ms/step),
-  aiter LLMM1/LLGemm1 (~7ms/step).
+### P2-0 — diagnostics baseline (done)
+
+**Hardware correction** (rocprofv3 agent info, this MI60): Simd_Count=240 →
+**60 CUs** (the plan's SKU table said 64), Max_Waves_Per_Simd=10 (40 waves/CU),
+LDS 64 KB/CU. Device id 90006 = gfx906.
+
+**Micro-bench per bucket** (`/tmp/bench/_p2_diag.py`, % of 29.5 TFLOPS fp16 peak):
+
+| M | bm | w13 µs | w13 %peak | w2 µs | w2 %peak |
+|---|----|--------|-----------|-------|----------|
+| 1   | 1  | 41.0   | 2.8%      | 29.5  | 1.9%     |
+| 8   | 4  | 132.6  | 6.9%      | 79.0  | 5.8%     |
+| 32  | 4  | 358.6  | 10.1%     | 233.5 | 7.8%     |
+| 128 | 16 | 1880   | 7.7%      | 963   | 7.6%     |
+| 512 | 16 | 3027   | **19.2%** | 1613  | 18.1%    |
+| 2048| 16 | 9593   | **24.3%** | 5032  | 23.1%    |
+
+(TFLOPS% rises with M and plateaus ~24%; note the dip at M=128 vs M=32 is
+bm=4→16 transition noise/atomic overhead.)
+
+**VGPR table** (llvm-readobj on the gfx906 code object extracted from
+`_rocm_C.abi3.so`; host LLVM tools work fine — no docker needed):
+
+| BM | vgpr | sgpr | spills | occ (blocks/CU, VGPR-limited) |
+|----|------|------|--------|-------------------------------|
+| 1  | 74   | 48   | 0      | 13                            |
+| 2  | 93   | 48   | 0      | 11                            |
+| 4  | 95   | 48   | 0      | 10                            |
+| 8  | 129  | 48   | 0      | 7                             |
+| 16 | 166  | 48   | 0      | 6                             |
+
+**The plan's "occupancy=1 pinned by ~80 VGPRs" hypothesis is REFUTED**: no
+spills at any BM, occupancy 6–13 blocks/CU (24–52 waves). Latency hiding is
+present; outcome (C) "under-occupied" does not apply.
+
+**Three-way bottleneck pass** (rocprofv3 --pmc on all buckets; gfx906 counter
+names differ from CDNA: SQ_INSTS_LDS / SQ_WAIT_INST_LDS / SQ_THREAD_CYCLES_VALU
+/ TCC_EA_RDREQ_32B — the CDNA-style names silently return 0):
+- `SQ_LDS_BANK_CONFLICT = 0` in every bucket (the +8-half row pad works).
+- `SQ_WAIT_INST_LDS / SQ_INSTS_LDS ≤ 0.6%` — LDS waits are a negligible
+  fraction of LDS instructions.
+- VALU pipe is dominant by instruction mix (~256 v_dot2 per thread per k-step
+  at BM=16 vs ~48 dequant ALU); absolute utilization % is ambiguous across
+  rocprofv3's multi-pass collection, so classified as **outcome (B) leaning**
+  (dot-pipe-bound at large M).
+- Per the plan's decision rule: (A)/(C) → b128 first; (B) → n_per_thread=2.
+  Since bank conflicts and LDS waits are negligible but b32 A-staging still
+  emits 4× the LDS instructions of b128, **do P2-1(a) b128 A-staging first**
+  (surgical), re-measure, then decide on n_per_thread=2.
+
+**P2-0 decision gate** (prunes P2-1):
+- (a) b128 LDS A-staging: **in scope, first**.
+- (b) BM=8 heuristic trial: in scope (129 VGPRs, no spills, occ 7 — viable).
+- (c) n_per_thread=2: conditional on (a)+(b) result.
+- (d) K-slice 512: deferred (new template + VGPR recheck; only if atomics
+  prove a problem).
+- (e) persistent-CTA: **out of scope for now** — occupancy is fine; revisit
+  only if (a)–(c) stall below ~30% of peak.
+
+**Launch-count baseline** (rocprofv3 --hip-trace, steady-state 50 ms windows ≈
+one decode step at 19.7 tok/s): **~1,500 hipLaunchKernel dispatches per
+decode step**. This is the denominator for P2-0b (−80), P2-4 (−40) and
+P2-5 (−40).
+
+**Tooling note**: fatbin bundle parsing by hand is a rabbit hole; the fast
+path is `llvm-objcopy --dump-section .hip_fatbin=` + scan for \x7fELF headers
++ `llvm-readobj --notes` on the extracted gfx906 object — all with host LLVM
+(`/opt/rocm-*/lib/llvm/bin`), no docker needed.
 
 ### Design notes (exllama dense kernel study)
 
