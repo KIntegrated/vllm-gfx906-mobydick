@@ -570,3 +570,28 @@ this project's MoE scope.
 - Verdict: the specified baseline file cannot produce a fair GPU number on
   this box. A fitting quant (Q4_K_S/M, ~20 GB) would need a ~20 GB download;
   or drop the llama.cpp reference point entirely.
+
+### llama.cpp baseline (Q4, full offload) — done
+
+Downloaded `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` (20.8 GiB; Qwen3.6 uses the
+same `qwen35moe` GGUF arch as 3.5, so no llama.cpp rebuild was needed).
+The earlier Q5_K_XL attempt (36 GiB) could not fit the 32 GB card at all.
+
+`llama-bench -ngl 99 -p 2048 -n 256 -r 2`, MI60, build 704485942:
+
+| engine | prefill pp=2048 | decode |
+|--------|-----------------|--------|
+| llama.cpp (Q4_K_XL) | 806.5 t/s | **70.3 t/s** (14.2 ms/step) |
+| vLLM eager (AWQ int4) | ~2140 t/s | 19.7 t/s (50.8 ms/step) |
+| vLLM + cudagraph (AWQ int4) | ~2140 t/s | **~49 t/s** (20.3 ms/step) |
+
+Caveats: different model generation (3.6 vs 3.5, same 34.66B A3B family and
+GGUF arch) and quant (UD-Q4_K vs AWQ int4 — similar class). Good enough as a
+reference point.
+
+**Read-out:** vLLM wins prefill 2.6x; llama.cpp still wins decode 1.43x even
+with cudagraphs (6 ms/step gap ≈ 30% of the step). Per the graph-mode
+profile, our MoE kernel is only ~8% of the step — the gap lives in the
+dense/GDN/attention paths (aiter LLGemm1 32%, aten::mm 10%, paged attn 9%,
+triton_matmul 7%). That is exactly what a Phase 3 (non-MoE kernel tuning)
+would target; llama.cpp's mmid/mmq + fused decode path is the thing to study.
