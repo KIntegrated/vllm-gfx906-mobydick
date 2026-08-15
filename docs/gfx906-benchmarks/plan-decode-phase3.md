@@ -1,9 +1,26 @@
 # Phase 3 — non-MoE decode path on gfx906 (MI50)
 
-Status: DRAFT v3 — post adversarial review (DS4 + Claude Sonnet 4.6,
-2026-08-15). Scope: close the remaining decode gap vs llama.cpp. Prefill is
-already 2.6× faster than llama.cpp — out of scope unless a candidate helps
-both for free.
+Status: v4 — **P3-0 complete** (2026-08-15); §2/§3 replaced with measured
+answers, §4 re-prioritized. Scope: close the remaining decode gap vs
+llama.cpp. Prefill is already 2.6× faster than llama.cpp — out of scope
+unless a candidate helps both for free.
+
+P3-0 outcomes (details in DEVLOG "P3-0" section):
+
+- Hardware label confirmed **MI50 32 GB** (lspci 1002:66a1; device string
+  "MI60 / MI50"). 60 CUs.
+- HBM read BW = **798 GB/s**; TCC hit at M=1 dense gemms ~14.5% → floors
+  are real, L2 does not rescue small m=1 gemms.
+- Layer composition: **30 GDN + 10 FA** (two independent confirmations).
+- The old "aten::mm 4×532 µs = 2.2 ms/step" row is **VOID** — warmup/capture
+  artifact of the P2-3 window; zero M=1 aten::mm in steady-state decode.
+- The entire `triton_matmul` row (1.63 ms/step) is ONE tiny Linear per
+  layer: `shared_expert_gate` [1×2048] (m=1 fails LLMM1's m%4==0 → Triton).
+- llama.cpp decode = 14.32 ms/step kernel time; its dense weights are Q8_0
+  (half our fp16 bytes); MoE ≈ parity with us; **attention is 3–10× faster**;
+  GDN is slower than ours.
+- Reconciled vLLM budget: ~17.6 ms kernel + ~2.7 ms inter-kernel gap =
+  20.3 ms wall.
 
 Review changes (v2→v3):
 
@@ -58,61 +75,70 @@ decode tok/s and ms/step.
 
 ---
 
-## 2. Per-step decode budget (measured, graph mode, M=1)
+## 2. Per-step decode budget (RECONCILED, graph mode, M=1)
 
-From the DEVLOG P2-3/P2-4/P2-5 graph-mode profile (torch profiler,
-`FULL_DECODE_ONLY`, Self CUDA ≈22.6 ms/step matching the 20.3 ms bench).
-All rows are from that single profile window; percentages are of 20.3 ms.
+Kernel-level sums over 31 steady-state graph steps (prefill excluded by
+construction; DEVLOG P3-0 for method):
 
-| component | ms/step | % | status |
-|-----------|---------|---|--------|
-| dense projections, aiter LLGemm1 (`LLMM1` op) | **7.2** | 35% | **P3 target** |
-| `aten::mm` (4 calls × 532 µs) | **2.2** | 11% | **P3-0 Q6 — scope TBD** |
-| `vllm::rocm_unquantized_gemm` / `triton_matmul` | ~1.6 | 8% | **P3 target (P3-1)** |
-| paged attention (custom FA), 10 layers × ~198 µs | ~1.9 | 9% | **P3 target (P3-3)** |
-| gfx906 MoE routed kernel (Phase 1/2) | ~1.75 | 9% | done |
-| GDN recurrence + conv + chunk ops | ~1.15 | 6% | watch |
-| aiter LLMM1 (small-batch dense path) | **1.2** | 6% | **P3 target — inside LLGemm1 surface** |
-| routing pipeline (topk+align+sort) | ~1.0 | 5% | P2-4 deferred |
-| shared expert (Triton `fused_moe_kernel`) | **0.55** | 3% | **P3-0 Q4 — scope TBD** |
-| elementwise/norm/copy/zeros pile | ~2.0 | 10% | **P3 target (P3-4)** |
-| **table total** | **≈20.6** | ≈101% | matches measured 20.3 ms |
+| component | ms/step | calls/step | status |
+|-----------|---------|------------|--------|
+| LLGemm1 dense projections (aiter, incl. shared expert 80 + LM head) | **5.83** | 230 | **P3-2 target** |
+| `triton_matmul` = `shared_expert_gate` [1×2048] ×40 layers | **1.63** | 40 | **P3-1 target (precisely scoped)** |
+| paged attention (custom FA), 10 layers × ~194 µs | **1.94** | 10 | **P3-3 target** |
+| gfx906 MoE routed kernel (Phase 1/2) | 1.75 | ~78 | done |
+| routing pipeline (topk+align+count_sort) | 1.06 | 79 | P2-4 deferred |
+| GDN decode (recurrent + conv1d) | ~0.5 | 60 | leave alone (faster than llama.cpp) |
+| elementwise/norm/copy pile | ~2.3 | ~300 | deprioritized (P3-4) |
+| fused_moe_kernel (Triton, residual, 2/step) | 0.39 | ~2 | out of scope |
+| other small kernels (GDN/attn per-row ops) | ~2.2 | — | watch |
+| **kernel total** | **~17.6** | | |
+| inter-kernel gap (wall 20.3 − kernel 17.6) | **~2.7** | | attacked via kernel-count cuts |
 
 Notes:
-- **LLGemm1 (7.2) and LLMM1 (1.2) are separate aiter paths.** Previous v2
-  merged them into a single "~6.8" row, understating the surface by 1.6 ms.
-- **`aten::mm` (2.2 ms) was absent from v2.** Its identity (which layer,
-  which shape) is the first thing P3-0 Q6 must answer. Until then it carries
-  a "(scope TBD)" note — it is too large to leave unnamed.
-- **Shared expert (0.55 ms)** may be MoE-side (Triton `fused_moe_kernel`,
-  overlaps deferred P2-5) or dense-side (inside LLGemm1 surface). Q4 decides.
-- **Floor math** (`N·K·2 / ~1 TB/s`) treats every read as global HBM. At M=1
-  decode, small matrices re-read 40×/step may see substantial L2 residency —
-  DEVLOG measured ~61% L2 hit at M=512 w13. P3-0 Q1 now includes a
-  TCC_HIT/TCC_MISS counter pass per dense kernel class; floors will be revised
-  if L2 residency is material.
+- The v3 table's "aten::mm 4×532 µs = 2.2 ms/step" row is **VOID**: it was a
+  warmup/capture artifact of the P2-3 profile window; steady-state decode has
+  zero M=1 aten::mm calls (shape-aware profile + kernel-level reconciliation).
+- Shared expert = two plain fp16 Linears per layer via LLMM1 (inside the
+  LLGemm1 row); the 0.39 ms Triton `fused_moe_kernel` residual is a separate
+  small path, out of scope.
+- **Floor math** (`N·K·2 / 798 GB/s`) treats every read as global HBM.
+  Confirmed by P3-0: TCC_HIT/(HIT+MISS) ≈ 14.5% for M=1 dense gemms, so L2
+  residency is not material and the floors below hold.
 
-Dense-projection breakdown (M=1, weight-read-bound; bytes = N·K·2 fp16;
-floor = bytes / achievable HBM BW measured in P3-0 Q1):
+Dense-projection breakdown inside LLGemm1 (M=1, fp16 weights;
+floor = N·K·2 B / 798 GB/s):
 
-| projection (N,K) | layers | µs/call | floor @1TB/s | ratio |
-|------------------|--------|---------|--------------|-------|
-| GDN in_proj (12288, 2048) | ~30 | ~80 | ~50 | 1.6× |
-| LM head (248320, 2048) | 1 | ~1420 | ~1000 | 1.4× |
-| GDN out_proj (2048, 4096) | ~30 | ~41 | ~17 | **2.4×** |
-| FA qkv (9216, 2048) | ~10 | ~64 | ~38 | 1.7× |
-| shared gate_up (1024, 2048) | ~40 | ~10 | ~4 | **2.5×** |
-| shared down (2048, 512) | ~40 | ~9 | ~2 | 4.5× |
-| router (256, 2048) | ~40 | ~6 | ~1 | — |
-| GDN small proj (64, 2048) | ~30 | ~4 | <1 | — |
-| Triton fallback (2048, 2048) | ~37? | ~44 | ~8 | **5.5×** |
+| projection (N,K) | layers | µs/call | floor @798GB/s | ratio |
+|------------------|--------|---------|----------------|-------|
+| GDN in_proj (12288, 2048) | 30 | ~80 | ~63 | 1.3× |
+| LM head (248320, 2048) | 1 | ~1420 | ~1280 | 1.1× |
+| GDN out_proj + FA o_proj (2048, 4096 / 2048) | 30+10 | ~33 | ~21–47 | ~1.5–2× |
+| FA qkv (9216, 2048) | 10 | ~64 | ~47 | 1.4× |
+| shared gate_up (1024, 2048) | 40 | ~10 | ~5 | ~2× |
+| shared down (2048, 512) | 40 | ~9 | ~3 | ~3× |
+| router (256, 2048) | 40 | ~6 | ~1 | — |
+| GDN small proj (64, 2048) | 30 | ~4 | <1 | — |
 
-All ratios are provisional until P3-0 Q0 reconciles the layer counts and Q1
-provides the real achievable BW (and L2 hit rate per class).
+(µs/call from the eager attribution trace; ±20%. The two big rows — in_proj
+and LM head — are already near floor; the mid-size rows carry most of the
+remaining LLGemm1 slack.)
 
 ---
 
-## 3. Open questions P3-0 must answer (diagnostics, no code changes)
+## 3. P3-0 open questions — ALL ANSWERED (see DEVLOG P3-0)
+
+Resolved: Q0 budget reconciled + layer split 30/10; Q1 BW=798 GB/s, TCC hit
+~14.5% on dense gemms; Q2 llama.cpp table captured (Q8_0 dense weights,
+Q8_1 activation quant, attention 3–10× faster, MoE parity); Q3 Triton
+fallback = shared_expert_gate [1×2048] (no bias anywhere — the v3 bias
+hypothesis was wrong; m=1 fails LLMM1's m%4==0); Q4 shared expert = two
+plain fp16 Linears via LLMM1 (dense surface); Q5 pile identified (~2.3 ms,
+mostly inductor-fused + aten Fill/copyBuffer); Q6 the 2.2 ms aten::mm row is
+a profile artifact, void.
+
+(Original question list below, kept for audit.)
+
+### Original P3-0 questions (superseded)
 
 **0. Full-step budget reconciliation** (extended from v2's "layer composition"):
    Reproduce the §2 budget table from one profile window. Confirm it sums to
@@ -176,29 +202,30 @@ Ordering = measured ms/step × feasibility, from the reconciled §2 table.
 Every step is gated on P3-0. Sizes below are from the DEVLOG profile; they
 will be revised after P3-0 Q0–Q6 complete.
 
-### P3-1 — Triton `rocm_unquantized_gemm` fallback (~1.6 ms/step)
+### P3-1 — `shared_expert_gate` [1×2048] scalar gemv (~1.63 ms/step) — TOP CANDIDATE
 
-Low-effort probe: find why these [2048→2048] M=1 GEMMs bypass aiter (P3-0 Q3)
-and whether routing them to LLGemm1 is possible. **This is a probe, not a
-promised win**: the ~37 calls already bypassing aiter is itself evidence of a
-shape/dtype constraint rather than a selection bug. If P3-0 Q3 records an
-intentional rejection reason, fold P3-1 directly into P3-2 — there is no
-separate easy win here.
+Precisely scoped by P3-0: 40 × rank-1 dot products (sigmoid gate on the
+shared-expert output, one per layer), each 41 µs in Triton because m=1 fails
+LLMM1's `m % 4 == 0` check in `rocm_unquantized_gemm_impl`. Floor ~5 µs.
+Expected saving **~1.4 ms/step** (also removes 40 kernel launches/step,
+hitting the inter-kernel gap).
 
-Expectation if the bypass IS a bug: 1.6 → ~0.5–0.9 ms/step (2–3×; the 5.5×
-floor assumes perfect HBM utilization that no M=1 kernel reaches). Note that
-destination (LLGemm1) is itself ~2–2.5× off floor — the ceiling for P3-1's
-gain is "as good as the other mediocre aiter kernels," not "approach the floor."
+Fix options, order of invasiveness:
+(a) dispatch m<4 (n≤16) to `torch.nn.functional.linear` (rocBLAS gemv) —
+    zero new code; measure first, rocBLAS skinny gemv may still be ~10–20 µs;
+(b) zero-pad the gate weight to [4,2048] at load time + `ops.LLMM1(w, x, 4)`
+    + slice — ~5 lines in `qwen3_next.py`, no new kernel;
+(c) tiny custom GEMV kernel if (a)/(b) disappoint.
+Correctness: greedy-output diff vs current build (gate is numerics-visible
+but a rank-1 dot; fp reorder tolerance applies). **Gate**: micro-bench the
+chosen option standalone before model integration.
 
-**Gate**: P3-0 Q3 identifies the layers and records the rejection reason.
-Change is config/backend-selection only; if that is insufficient, proceed to
-P3-2.
+### P3-2 — LLGemm1 dense surface (5.83 ms/step, 230 calls)
 
-### P3-2 — M=1 dense GEMM efficiency (7.2 + 1.2 ms/step LLGemm1+LLMM1 surface, plus 1.6 ms Triton fallback)
-
-The combined dense + LLMM1 + Triton-fallback surface is **≈10.0 ms** (7.2 +
-1.2 + 1.6). BW floor across the projection table is ~4.5 ms; realistic capture
-at M=1 is ~2–3 ms. Options in priority order:
+Floor across the projection table ≈ 4.6 ms @798 GB/s; the two big rows
+(in_proj ~1.3×, LM head ~1.1×) are already near floor — realistic capture is
+**~1–1.5 ms/step**, concentrated in the mid-size rows (out_proj/qkv/shared).
+Options in priority order:
 
 **(a) Quick aiter probe** (time-boxed at 1 day, driven by P3-0 Q3 output):
 env/backend flags, splitK for N≤2048. If these knobs exist and move the
@@ -214,54 +241,47 @@ tree on gfx906 for this class of problem; the custom kernel is the primary
 bet, not the fallback. Reference: llama.cpp's mmq single-pass decode kernel
 from P3-0 Q2 trace.
 
-Target (combined P3-1 + P3-2, no double-counting): dense surface
-~10 ms → ~6.5–7.5 ms, i.e. **~2.5–3.5 ms saving**.
-**Gate**: P3-0 BW number + L2 hit rate make the floors real; micro-bench per
-shape before touching the model path.
+(P3-1's 1.63 ms Triton row is tracked separately above; this item covers
+only the LLGemm1 surface.)
+**Gate**: floors confirmed (798 GB/s, TCC hit ~14.5%); micro-bench per shape
+before touching the model path.
 
-### P3-3 — paged attention decode (~1.9 ms/step, 10 layers × 198 µs)
+### P3-3 — paged attention decode (1.94 ms/step, 10 layers × ~194 µs) — #2 CANDIDATE
 
-At seq~500 the KV read per layer is ~0.5 MB — BW floor is sub-microsecond,
-so 198 µs is **latency/occupancy-bound**, not BW-bound. Likely cause: poor
-parallelism at M=1 (GQA kv_heads=2). Compare against llama.cpp's attention
-kernel from the P3-0 Q2 trace; if it is materially faster at batch=1, study
-its work-split before writing anything.
+At seq~500 the KV read per layer is ~0.5 MB with **82% L2 hit** — 194 µs is
+latency/occupancy-bound, not BW-bound. P3-0 Q2 confirms the gap is real:
+llama.cpp's flash_attn_tile (256×256 KV-chunked) does ~15 µs/layer at avg
+seq~128 → ~30–60 µs even scaled to our seq~500, i.e. **3–10× faster**.
+Likely cause on our side: poor work-split at M=1 with GQA kv_heads=2 (few
+work items for 60 CUs). Study the custom FA kernel's grid config and
+llama.cpp's tile split before writing anything; expected saving **~1.5–1.7
+ms/step** if a comparable split is reachable.
 
-**Gate**: P3-0 shows a gap ≥2× vs llama.cpp's attention; otherwise defer.
-FA prefill advantage must not regress — bench both phases.
+**Gate**: gap confirmed ≥3× (it is); FA prefill advantage must not regress —
+bench both phases.
 
-### P3-4 — elementwise/norm pile (~1–2 ms/step)
+### P3-4 — elementwise/norm pile (~2.3 ms/step) — DEPRIORITIZED
 
-Inductor has already fused much of this (profile names are
-`triton_*_fused_*`). The remaining kernels are mostly OUTSIDE compiled regions
-(custom-op boundaries). The real lever is reducing graph breaks / moving work
-into compiled regions, not `pass_config` flags. P3-0 Q5 must identify which
-pile items live where; then enable applicable fusions and measure.
+P3-0 Q5: the pile is Fill/zeros 0.37 + copyBuffer 0.32 + rmsnorm variants
+~0.6 + act/sigmoid ~0.4 + misc triton ~0.6. llama.cpp spends ~3.5 ms/step on
+its equivalent (plus 1.31 ms Q8_1 quant tax we don't pay) — **we are already
+at or better than the reference**, so there is no demonstrated win here.
+Keep as a watch item; only revisit if P3-1/P3-3 land and the gap vs
+llama.cpp still exceeds 2 ms. (If revisited: inductor has already fused most
+of it — the lever would be graph breaks, not pass_config.)
 
-Numerics-sensitive: correctness test + sanity generation required; any output
-diff beyond fp rounding → revert. Expected value uncertain: **0–1 ms/step**.
+### P3-5 — LM head (~1.2 ms/step, inside LLGemm1) — SKIP
 
-### P3-5 — LM head (~1.4 ms/step in dense-projection table)
+Q6 resolved: the LM head runs through LLMM1 (not aten::mm) at ~1420 µs vs
+~1280 µs floor @798 GB/s — **1.1× off floor, no meaningful slack**. Skip.
+(llama.cpp's head is Q8_0 = half the bytes; that part of its lead is
+quantization, not kernel quality.)
 
-1 GB weight read per step = ~1 ms BW floor; ~0.4 ms of apparent slack.
-**Default: SKIP** with the following caveat: P3-0 Q6 may reveal that the real
-LM-head path runs through `aten::mm` (4 × 532 µs = 2.1 ms), which would change
-the row identity, the slack calculation, and potentially the skip decision.
-Revisit P3-5 after Q6 resolves the `aten::mm` identity. If the true head is
-the `aten::mm` path, P3-5 becomes a 2.1 ms item with more slack and the skip
-reasoning must be re-evaluated.
+### `aten::mm` (2.2 ms, 11%) — RESOLVED: profile artifact, void
 
-Options if Q6 changes the picture: study llama.cpp's head/decoder projection
-kernel from the P3-0 Q2 trace as the reference. Skip fp8/fp4 lm_head (changes
-model numerics) unless numeric impact is measured and acceptable.
-
-### `aten::mm` (2.2 ms, 11%) — pending P3-0 Q6
-
-Too large to leave as a silent omission but identity unknown. After Q6:
-- If these are the LM-head path → subsumes P3-5; re-evaluate skip.
-- If these are FA o_proj or GDN-variant → add as a candidate inside the
-  P3-1/P3-2 dense surface.
-- If these are outside this phase's scope → say so explicitly and record why.
+Q6: zero M=1 aten::mm calls in steady-state decode (shape-aware graph
+profile + kernel-level reconciliation). The P2-3 row came from that window's
+warmup/capture region. No action; recorded so nobody re-chases it.
 
 ### Explicitly out of scope
 
@@ -300,23 +320,19 @@ Per-candidate targets against the reconciled 20.3 ms/step denominator:
 
 | candidate | saving (best case) | saving (realistic) | cumulative realistic |
 |-----------|-------------------|--------------------|---------------------|
-| P3-1 (probe only, if bug) | ~1.1 ms | ~0.5 ms | ~0.5 ms |
-| P3-2 (dense kernel, incl. P3-1) | ~3.5 ms | ~2.0 ms | ~2.5 ms |
-| P3-3 (attention) | ~1.0 ms | ~0.5 ms | ~3.0 ms |
-| P3-4 (elementwise) | ~1.0 ms | ~0.5 ms | ~3.5 ms |
-| aten::mm (post-Q6) | TBD | TBD | — |
+| P3-1 (shared_expert_gate) | ~1.4 ms | ~1.2 ms | ~1.2 ms |
+| P3-3 (attention work-split) | ~1.7 ms | ~1.0 ms | ~2.2 ms |
+| P3-2 (LLGemm1 mid-size rows) | ~1.5 ms | ~1.0 ms | ~3.2 ms |
+| P3-4 (elementwise) | — | 0 (deprioritized) | ~3.2 ms |
 
-Note: P3-1 is a sub-item of the dense surface. The P3-2 row above covers the
-full dense + Triton-fallback surface; P3-1's gain is not added separately.
-
-**Realistic range: ~2–4 ms off 20.3 ms/step** → **~53–65 t/s decode**.
+**Realistic range: ~2.5–4 ms off 20.3 ms/step** → **~57–68 t/s decode**.
 Parity with llama.cpp's 70.3 t/s is NOT the goal and is not reachable on
-this budget: a structural part of llama.cpp's decode lead is its int8-
-activation × Q4-weight mmq arithmetic (Q8_1 quant per token block), which
-halves both weight and activation traffic vs our fp16. Phase success =
+this budget: its dense weights are Q8_0 (half our fp16 bytes) and it uses
+Q8_1 activation quantization — a structural arithmetic advantage, not a
+kernel-quality one (MoE is at parity; GDN we already win). Phase success =
 **close ≥50% of the 6 ms gap (≥3 ms) with measured per-kernel evidence and
-no prefill regression**; failure to reach parity is an acceptable, documented
-outcome.
+no prefill regression**; failure to reach parity is an acceptable,
+documented outcome.
 
 ---
 

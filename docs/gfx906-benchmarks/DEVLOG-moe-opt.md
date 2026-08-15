@@ -32,6 +32,43 @@ need work; the MoE path is the prime suspect for the regression.
 - [ ] Phase 2 (optional, see candidates below): prefill block_m tuning,
       decode latency (smaller A tile path / 128-thread blocks), LLGemm1 study
 
+## PROBE PITFALLS — read before ANY monkeypatch/counter/measurement probe
+
+> Learned the hard way twice (Phase 3, P3-0 Q3/Q4). vLLM V1 makes naive
+> in-process probes silently wrong or loudly crashing. Checklist:
+
+1. **The model does NOT live in your process by default.** V1 runs EngineCore
+   in a separate **spawn**ed process (`SyncMPClient`). Wrapping
+   `module.forward` / counting op calls in the main process then measures
+   NOTHING — the probe exits 0 and prints all-zero tables. A silent lie.
+   - Fix: run with `-e VLLM_ENABLE_V1_MULTIPROCESSING=0` (→ `InprocClient`,
+     model in-process) BEFORE wrapping anything.
+2. **Every probe script needs `if __name__ == "__main__": main()`** — spawn
+   re-imports the main module in the child; without the guard you get
+   `RuntimeError: ... bootstrapping phase` at `LLM(...)` construction.
+3. **In-process mode changes memory accounting** (no separate process
+   overhead, but same GPU). With this model's `max_model_len=262144`,
+   `gpu_memory_utilization=0.9` OOMs on KV cache in-proc. Probes that only
+   need short generations: set `max_model_len=4096` (or whatever the bench
+   script uses) — never copy a config you haven't checked for seq-len.
+4. **Never trust a probe that prints zeros.** After wrapping, assert at
+   least one counter is non-zero (and matches an expected order of magnitude,
+   e.g. ~40 router gemms/step here) before believing any result. Zero counts
+   = broken instrumentation, not "the op never ran".
+5. **Profiling ≠ probing.** torch-profiler traces (chrome JSON) still work in
+   MP mode and give kernel→op correlation for EAGER runs; use them when you
+   can't go in-process. In cudagraph mode the correlation breaks (kernels are
+   launched from `hipGraphLaunch`, no per-op parent) — attribute via
+   `hipGraphLaunch` boundaries instead of op nesting.
+6. **Counter keys built in a loop need default-arg binding.**
+   `def fwd(...): counts[key]...` where `key` is the loop variable makes
+   EVERY wrapper increment the LAST key (late binding) — one bucket gets all
+   calls, table looks "plausible" but is wrong. Use
+   `def make_fwd(orig, _k=key): def fwd(*a, **kw): counts[_k]...`.
+7. Cross-ref: layout gotchas #4 (spawn guard) below; P3-0 Q3/Q4 entries in
+   this devlog show a probe done right (in-proc + guard + max_model_len fix
+   + closure binding).
+
 ## Notes / findings
 
 ### Model facts (QuantTrio/Qwen3.5-35B-A3B-AWQ)
@@ -595,3 +632,138 @@ profile, our MoE kernel is only ~8% of the step — the gap lives in the
 dense/GDN/attention paths (aiter LLGemm1 32%, aten::mm 10%, paged attn 9%,
 triton_matmul 7%). That is exactly what a Phase 3 (non-MoE kernel tuning)
 would target; llama.cpp's mmid/mmq + fused decode path is the thing to study.
+
+## PHASE 3 (plan: `plan-decode-phase3.md`, v3 after external adversarial review)
+
+Goal: close the ~6 ms/step decode gap vs llama.cpp in non-MoE kernels.
+Primary metric: serving mode (`BENCH_EAGER=0`), decode tok/s + ms/step.
+
+### P3-0 — diagnostics (done, 2026-08-15)
+
+All Q0–Q6 answered. Evidence: shape-aware graph-mode torch profile
+(`trace_cgsh.json.gz`, pp=512/tg=32), eager attribution trace
+(`trace_cgeager.json.gz`), in-proc module probe (`_probe_layers.py`),
+HBM BW microkernel, `rocprofv3 --pmc TCC_HIT,TCC_MISS` graph run, and a
+llama.cpp `rocprofv3 --kernel-trace` decode run (Q4 model, -p 0 -n 256).
+
+**Hardware label**: lspci says **MI50 32 GB** (Vega 20, 1002:66a1); device
+string "AMD Instinct MI60 / MI50". 60 CUs confirmed. Using "MI50" henceforth.
+
+**Q1 — HBM BW + L2**: achievable read BW = **798 GB/s** (8 GiB double4
+stream, grid=2×CUs best). `TCC_HIT/(HIT+MISS)` at M=1 decode: LLGemm1
+**14.5%**, triton_matmul 12.6%, paged attn 82% (KV is L2-resident), MoE
+decode kernel 34%. → dense-gemm floors at 798 GB/s are real; L2 does not
+rescue the small m=1 gemms.
+
+**Q0/Q6 — reconciled per-step decode budget** (kernel-level sums over 31
+graph steps; prefill excluded by construction):
+
+| component | ms/step | calls/step | notes |
+|-----------|---------|------------|-------|
+| LLGemm1 dense projections (aiter) | **5.83** | 230 | incl. shared expert (80) + LM head |
+| triton_matmul = **shared_expert_gate** [1,2048] | **1.63** | 40 | see Q3 below — the whole row is ONE tiny Linear per layer |
+| paged attention (custom FA `attn_fwd`) | **1.94** | 10 | ~194 µs/layer, M=1, seq~500 |
+| gfx906 MoE routed kernel (Phase 1/2) | 1.75 | ~78 | done |
+| routing (topkGating+align+count_sort) | 1.06 | 79 | P2-4 deferred |
+| GDN decode (recurrent + conv1d) | ~0.5 | 60 | faster than llama.cpp's — leave alone |
+| elementwise/norm/copy pile | ~2.3 | ~300 | Fill 0.37, copyBuffer 0.32, rmsnorms ~0.6, act/sigmoid ~0.4, misc triton ~0.6 |
+| fused_moe_kernel (Triton, residual) | 0.39 | ~2 | identity unclear, small — out of scope |
+| other small kernels | ~2.2 | — | per/row ops around GDN+attn |
+| **kernel total** | **~17.6** | | |
+| inter-kernel gap (wall 20.3 − kernel 17.6) | **~2.7** | | in-graph launch/dep stalls; llama.cpp has ~0 (14.32 kernel = 14.2 wall) |
+
+**Negative result (important):** the P2-3 table's "aten::mm 4×532 µs =
+2.2 ms/step (11%)" row **does not exist in steady-state decode**. It was a
+warmup/capture-region artifact of that profile window (the shape-aware
+profile has zero M=1 `aten::mm` rows; all decode mms go through LLMM1 or the
+Triton fallback). The §2 "scope TBD" row is void — 2.2 ms never existed per
+step. Lesson: windows that include prefill/capture must be separated by
+timestamp before dividing by step count.
+
+**Layer composition (Q0):** **30 GDN + 10 full-attn** layers, confirmed two
+independent ways: llama.cpp kernel counts (gated_delta_net 30/step,
+flash_attn_tile 10/step) and the vLLM probe (in_proj 30/step, qkv 10/step).
+
+**Q3 — Triton fallback identity (the big one):** in-proc probe of all 270
+Linear modules (per decode step):
+
+| /step | N×K | class | path | what it is |
+|-------|------|-------|------|------------|
+| 40 | 2048×4096 | RowParallel | LLMM1 | GDN out_proj + FA o_proj (all layers) |
+| 40 | 2048×512 | RowParallel | LLMM1 | shared expert down |
+| 40 | 1024×2048 | MergedColumn | LLMM1 | shared expert gate_up |
+| 40 | 256×2048 | Replicated | LLMM1 | router |
+| **40** | **1×2048** | **Replicated** | **TRITON** | **`shared_expert_gate` — scalar gate on shared-expert output** |
+| 30 | 12288×2048 | MergedColumn | LLMM1 | GDN in_proj (qkvz) |
+| 30 | 64×2048 | MergedColumn | LLMM1 | GDN A/B small proj |
+| 10 | 9216×2048 | QKVParallel | LLMM1 | FA qkv |
+
+Total 270/step = 230 LLGemm1 + 40 Triton — matches kernel counts exactly.
+The **entire** 1.63 ms/step `triton_matmul` row is the `shared_expert_gate`
+(`qwen3_next.py: Qwen3NextSparseMoeBlock.shared_expert_gate =
+ReplicatedLinear(hidden→1, bias=False)`): a rank-1 dot product that costs
+41 µs/call in Triton because `rocm_unquantized_gemm_impl` sends m=1 to the
+Triton branch (LLMM1 requires `m % 4 == 0`). **Hypothesis "biased out_projs
+fall back to Triton" was WRONG — no module has bias.** Fix surface: one
+dispatch branch or a tiny GEMV; floor ~5 µs/call → **~1.4 ms/step
+recoverable**. This is now P3-1, precisely scoped.
+
+**Q4 — shared expert:** two plain fp16 Linears per layer (gate_up + down)
+via LLMM1 — inside the dense surface, NOT MoE-side. The 2/step Triton
+`fused_moe_kernel` residual is a separate small path (0.39 ms), left out of
+scope.
+
+**Q2 — llama.cpp decode reference (per step, ÷257 steps, 14.32 ms total):**
+
+| component | llama.cpp ms/step | vLLM ms/step | read-out |
+|-----------|-------------------|--------------|----------|
+| dense gemms (Q8_0 weights!) | 3.85 (211 calls) | 5.83 LLGemm1 (fp16) + 1.2 LM head | llama.cpp's dense weights are Q8_0 = half our fp16 bytes — most of its lead here is quantization, as predicted |
+| MoE experts (Q4/Q5_K gather-gemv, ~80 fused calls) | 2.57 | 1.75 kernel + 1.06 routing | roughly at parity; no big win available |
+| shared expert (F16 gemvs) | ~1.0 (in f32-gemv row) | ~0.75 (in LLGemm1) | comparable |
+| **attention** | **0.19** (flash_attn_tile 10×15.2 µs @ avg seq~128) | **1.94** (10×194 µs @ seq~500) | **~3–10x gap even after KV-length scaling — biggest kernel-level difference; P3-3 promoted to #2** |
+| GDN recurrence+conv | ~2.0 | ~0.5 | vLLM already faster — do not touch |
+| activation quant (Q8_1, 291 calls) | 1.31 | 0 | llama.cpp pays this tax; we don't |
+| topk routing | 0.51 | 1.06 | comparable |
+| norms/elementwise | ~3.5 | ~2.3 | comparable |
+
+GGUF tensor map (via `~/.bin/gguf-parser --raw`): dense projections + LM
+head = Q8_0; MoE experts = Q4_K/Q5_K (gate/up) + Q5_K/Q6_K (down); shared
+expert + norms = F16. Note: this llama.cpp build reads **GGUF v3** with the
+new type enum (STRING=8, ARRAY=9) — hand-rolled parsers using the old enum
+silently misparse; use gguf-parser or the repo's own tooling.
+
+llama.cpp arithmetic regime: Q8_1-quantized activations × quant weights
+(mmq/mmvq). Its decode lead = weight bytes (Q8_0/Q4 vs our fp16/int4-dense)
++ attention kernel quality, NOT MoE. The int8-activation option stays a
+named future candidate (out of Phase 3 scope per plan §4).
+
+**Revised priorities (supersedes plan v3 §4 ordering):**
+1. **P3-1: shared_expert_gate fix — ~1.4 ms/step.** One [1,2048] gemv ×40.
+   Candidate fixes in order of invasiveness: (a) dispatch m<4 to torch
+   F.linear (rocBLAS) and measure; (b) zero-pad weight to [4,2048] at load
+   + `ops.LLMM1(..., 4)` + slice; (c) tiny custom GEMV. All low-risk;
+   correctness = greedy-output diff.
+2. **P3-3: paged attention decode — ~1.5–1.7 ms/step.** 194 µs/layer at M=1
+   is latency/occupancy-bound (KV read ~0.5 MB, 82% L2 hit). Study the
+   custom FA kernel's work-split for GQA kv_heads=2 vs llama.cpp's
+   flash_attn_tile 256×256 KV-chunked design before writing anything.
+3. **P3-2: remaining LLGemm1 surface — ~1–1.5 ms/step.** 5.83 ms vs ~4.6 ms
+   floor @798 GB/s (L2 hit only 14.5%). Custom M=1 W16A16 kernel remains the
+   primary development path (plan v3 decision); aiter knobs time-boxed.
+4. Inter-kernel gap (~2.7 ms/step): attacked indirectly by cutting kernel
+   count (P3-1 removes 40 launches/step). No direct lever yet.
+5. P3-4 elementwise: deprioritized (we're already at/better than llama.cpp).
+
+### Probe/measurement notes (this phase)
+
+- `rocprofv3 --hip-trace` does NOT include kernel dispatches; use
+  `--kernel-trace`. CSV output needs `-f csv -d <dir>` (writes to
+  `<dir>/<host>-<nn>/`). `--pmc TCC_HIT,TCC_MISS --kernel-trace` together
+  give per-dispatch L2 hit/miss joined with kernel names.
+- llama.cpp host runs: `LD_LIBRARY_PATH=/opt/rocm-7.14/lib` (hsa-runtime ABI)
+  AND it works under rocprofv3 fine.
+- vLLM in-proc probes: see "PROBE PITFALLS" section above (spawn, __main__
+  guard, max_model_len KV OOM, closure late-binding).
+- Eager probe runs fell back to Triton paged attention ("Cannot use ROCm
+  custom paged attention kernel") — config-dependent; do not take timings
+  from probe runs, only call attribution.
