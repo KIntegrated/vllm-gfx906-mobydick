@@ -4,7 +4,7 @@ Branch: `gfx906/moe-opt` (from `gfx906/fa-integration`, i.e. fork main + custom 
 
 ## Problem statement
 
-End-to-end bench (`_bench_gfx906.py`, pp=2048/tg=256, MI60 32 GB, eager):
+End-to-end bench (`_bench_gfx906.py`, pp=2048/tg=256, MI50 32 GB, eager):
 
 | Version | dense 9B-AWQ tok/s | MoE 35B-A3B-AWQ tok/s |
 |---------|--------------------|-----------------------|
@@ -42,9 +42,10 @@ need work; the MoE path is the prime suspect for the regression.
 - AWQ int4, group_size=128, zero_point=true.
 - Active routed params/token ≈ 8 × 3.15M = 25.2M → ~12.7 MB int4+scale per
   layer-token → **~507 MB/token over 40 layers**.
-- Roofline at ~700 GB/s effective HBM: **>1000 tok/s decode**. Measured 12 (0.26)
-  / 3.5 (main) tok/s → ~100x off roofline. This is a kernel problem, not a
-  bandwidth wall.
+- Roofline at ≤1 TB/s theoretical HBM (MI50): **>1000 tok/s decode** — the
+  "~700 GB/s" figure used here originally was wrong (see P2-0 hardware note).
+  Measured 12 (0.26) / 3.5 (main) tok/s → ~100× off roofline. This is a
+  kernel problem, not a bandwidth wall.
 
 ### Dispatch path for AWQ MoE on ROCm (both versions)
 
@@ -173,8 +174,8 @@ per-call µs, AWQ K-first int32 inputs for both:
 
 Decode w13: 3.5 ms → 35.5 µs (99x). Effective decode bandwidth ≈
 8 active experts × ~1MB / 35.5µs ≈ 225 GB/s (latency-bound, not BW-bound;
-MI60 HBM ≈ 500+ GB/s). Prefill M=512 is only ~90 GB/s (block_m=16 re-read
-amplification + fp16 atomics) — Phase 2 target.
+MI50 peak HBM ≤1 TB/s theoretical). Prefill M=512 at ~5.6 TFLOPS — Phase 2
+target. (Note: early estimates used wrong BW/peak figures; see P2-0 section.)
 
 Correctness: `/tmp/bench/_test_gfx906_moe.py` ALL PASS (maxrel ≈ 2% = fp16
 accum noise) for M ∈ {1,2,4,8,32,64}, block_m ∈ {1,4,16}, K=2048/512 and
@@ -262,11 +263,17 @@ K=768/N=1536 (partial grid), both gemm passes incl. fused topk-weight+reduce.
 
 ### P2-0 — diagnostics baseline (done)
 
-**Hardware correction** (rocprofv3 agent info, this MI60): Simd_Count=240 →
-**60 CUs** (the plan's SKU table said 64), Max_Waves_Per_Simd=10 (40 waves/CU),
-LDS 64 KB/CU. Device id 90006 = gfx906.
+**Hardware correction** (rocprofv3 agent info): Simd_Count=240 → **60 CUs**
+→ this is an **MI50**, not MI60 (MI60 = 64 CU). Max_Waves_Per_Simd=10
+(40 waves/CU), LDS 64 KB/CU. Device id 90006 = gfx906. The devlog header's
+"MI60" label was based on VRAM; the CU count proves MI50. The measured
+`v_dot2_f32_f16` peak is ~20 TFLOPS (see P2-1), not the datasheet 26.8 or
+29.5 TFLOPS. The %peak column below uses 29.5 (the figure available at P2-0
+time); re-read against the corrected 20 TFLOPS peak — actual utilisation at
+M=512 is ~30%, not ~19%.
 
-**Micro-bench per bucket** (`/tmp/bench/_p2_diag.py`, % of 29.5 TFLOPS fp16 peak):
+**Micro-bench per bucket** (`/tmp/bench/_p2_diag.py`, %peak vs 29.5 TFLOPS
+datasheet — divide by 0.68 for % of measured 20 TFLOPS practical peak):
 
 | M | bm | w13 µs | w13 %peak | w2 µs | w2 %peak |
 |---|----|--------|-----------|-------|----------|
@@ -391,7 +398,7 @@ still material after those.
 ### P2-1 — prefill MoE tuning (in progress)
 
 **Corrected roofline (measured, not datasheet):**
-- `v_dot2_f32_f16` pipe peak on this MI60: **~20 TFLOPS** (standalone micro-kernel,
+- `v_dot2_f32_f16` pipe peak on this MI50: **~20 TFLOPS** (standalone micro-kernel,
   ILP≥2, sclk=930 MHz). The plan's "29.5 TFLOPS fp16 peak" is unreachable with
   dot2 (it assumes a different instruction mix). At ILP=1 the same pipe only
   does ~8.5 TF → latency/dependency sensitive.
@@ -545,3 +552,21 @@ torch profiler, FULL_DECODE_ONLY graphs, pp=512+tg=64. Self CUDA ≈ 22.6 ms/ste
 End-to-end: **3.49 → 18.88 tok/s eager (5.4×), 41.5 tok/s serving mode
 (11.9×)**. Remaining per-step time is dominated by dense/GDN kernels outside
 this project's MoE scope.
+
+### llama.cpp baseline attempt (blocked by VRAM)
+
+- `nemotron-gfx906` build tree: gfx906 (`AMDGPU_TARGETS=gfx906:xnack-`),
+  had no `llama-bench` — built it from the existing tree (link-only, fast).
+- **Segfault root cause (host toolchain gotcha):** the binary resolved
+  `libamdhip64.so.7` fine (identical backported file in /opt/rocm-6.4.3 and
+  /opt/rocm-7.14) but `libhsa-runtime64.so.1` from **6.4.3 (v1.15)** via the
+  ldconfig cache — ABI mismatch with the 7.13 HIP runtime → SIGSEGV in
+  `hipStreamCreateWithFlags`. Fix: run with
+  `LD_LIBRARY_PATH=/opt/rocm-7.14/lib` (hsa-runtime v1.21).
+- **Model does not fit:** Qwen3.5-35B-A3B-UD-Q5_K_XL.gguf is **36 GiB** >
+  32 GB VRAM. Full offload OOMs (llama.cpp wants one ~35.9 GiB device buffer).
+  Partial offload (`-ngl 24`) works but is CPU-bound: tg8 = 1.14 t/s — not a
+  meaningful comparison vs vLLM's full-GPU 41.5 t/s serving mode.
+- Verdict: the specified baseline file cannot produce a fair GPU number on
+  this box. A fitting quant (Q4_K_S/M, ~20 GB) would need a ~20 GB download;
+  or drop the llama.cpp reference point entirely.
