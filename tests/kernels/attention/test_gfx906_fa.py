@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """gfx906 custom FlashAttention (vllm/gfx906_fa) regression tests.
 
 The gather/direct kernels take byte strides computed in C++. A past bug
@@ -78,6 +79,95 @@ def test_fused_gather_matches_torch_gather_on_unbind_cache():
         assert torch.equal(k_f[b, :, :L], k_ref[b, :, :L])
         assert torch.equal(v_f[b, :, :L], v_ref[b, :, :L])
         assert bool((v_f[b, :, L:] == 0).all().item())
+
+
+def test_cudagraph_capture_replay_legacy_decode_path():
+    """M2 gate: the LEGACY (inline-quant) decode path must be FULL-capture-safe.
+
+    Captures the exact serving composite (`forward_paged` with
+    key_cache_q8=None, i.e. fp16 K cache + inline K quant) and covers the
+    sub-plan T3 landmines for this path: (a) warmup at a small max_seqlen_k
+    followed by capture at capacity (buffer-realloc class); (b) multi-size
+    capture (B=1 then B=2) with a B=1 replay afterwards (dangling-buffer
+    class); (c) the live-metadata invariant — seq_lens is re-read at replay,
+    so growing Sk and filling the new K/V rows must make the replayed output
+    match eager at the new length.
+    """
+    dev = "cuda"
+    torch.manual_seed(3)
+    max_len = 512
+    n_blocks = (max_len + BLOCK - 1) // BLOCK
+    kc, vc, kv = _make_paged_cache(n_blocks + 4, dev)
+    scale = 1.0 / math.sqrt(D)
+
+    # Identity block map; K/V live in the fp16 cache halves (LEGACY path).
+    K = torch.randn(max_len, HKV, D, device=dev, dtype=torch.float16) * 0.5
+    V = torch.randn(max_len, HKV, D, device=dev, dtype=torch.float16) * 0.5
+    _write_v(kv, V[:100])
+    kv[:, 0].view(-1, HKV, D)[:100].copy_(K[:100])
+
+    from vllm.gfx906_fa.gfx906_fa_paged import forward_paged
+
+    # Shared q_pad buffer across both graphs, as the backend's lazy-grown
+    # class buffer would be at capture capacity.
+    q_pad = torch.zeros(2, HQ, 2, D, dtype=torch.float32, device=dev)
+
+    def fwd(q, bt_, sl_, cu_, msk):
+        return forward_paged(
+            q, kv[:, 0], vc, bt_, sl_, cu_,
+            max_seqlen_q=1, max_seqlen_k=msk, scale=scale,
+            key_cache_q8=None, q_pad_buf=q_pad,
+        )
+
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, -1)
+    sl = torch.tensor([100], dtype=torch.int32, device=dev)
+    cu1 = torch.arange(2, dtype=torch.int32, device=dev)
+    q1 = torch.randn(1, HQ, D, device=dev, dtype=torch.float32) * 0.5
+
+    # (a) warmup at small max_seqlen_k, then capture at capacity
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            fwd(q1, bt, sl, cu1, 128)
+    torch.cuda.current_stream().wait_stream(s)
+    g1 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g1):
+        out1 = fwd(q1, bt, sl, cu1, max_len)
+    g1.replay()
+    torch.cuda.synchronize()
+    ref1 = fwd(q1, bt, sl, cu1, max_len)
+    assert ((out1 - ref1).norm() / ref1.norm()).item() < 2e-2
+
+    # (b) capture B=2 after B=1, then replay B=1 (dangling-buffer check)
+    bt2 = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(2, -1)
+    sl2 = torch.tensor([100, 150], dtype=torch.int32, device=dev)
+    cu2 = torch.arange(3, dtype=torch.int32, device=dev)
+    q2 = torch.randn(2, HQ, D, device=dev, dtype=torch.float32) * 0.5
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            fwd(q2, bt2, sl2, cu2, 256)
+    torch.cuda.current_stream().wait_stream(s)
+    g2 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g2):
+        out2 = fwd(q2, bt2, sl2, cu2, max_len)
+    g2.replay()
+    torch.cuda.synchronize()
+    ref2 = fwd(q2, bt2, sl2, cu2, max_len)
+    assert (
+        (out2[1] - ref2[1]).norm() / ref2[1].norm()
+    ).item() < 2e-2  # row 1 at Sk=150 exercises the longer row
+    g1.replay()
+    torch.cuda.synchronize()
+    assert ((out1 - ref1).norm() / ref1.norm()).item() < 2e-2
+
+    # (c) live seq_lens: grow Sk 100 -> 200, fill K/V rows, replay g1
+    kv[:, 0].view(-1, HKV, D)[100:200].copy_(K[100:200])
+    kv[:, 1].view(-1, HKV, D)[100:200].copy_(V[100:200])
+    sl.fill_(200)
+    g1.replay()
+    torch.cuda.synchronize()
+    ref200 = fwd(q1, bt, sl, cu1, max_len)
+    assert ((out1 - ref200).norm() / ref200.norm()).item() < 2e-2
 
 
 def test_forward_decode_prefill_vs_sdpa_on_unbind_cache():

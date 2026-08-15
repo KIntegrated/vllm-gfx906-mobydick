@@ -1090,3 +1090,50 @@ profile_seq_lens=max_model_len (gpu_model_runner), so Sk-sized buffers
 inside forward_paged are allocated at capacity at capture time; the
 metadata (seq_lens/block_table) is runner-staged into fixed buffers and
 re-read live at replay.
+
+### P3-3a M2 experiment: FULL decode capture works on LEGACY=1 (2026-08-15)
+
+`GFX906_FA_CG=decode` (UNIFORM_SINGLE_TOKEN_DECODE) + requested
+FULL_DECODE_ONLY + CUSTOM FA + GEMV on: **53.09 t/s** (18.8 ms/step) —
+capture succeeds ("Capturing CUDA graphs (decode, FULL)"), no downgrade
+warning, no crash. Beats the 52.07 PIECEWISE number (+1.9%; the step is
+GPU-kernel-bound, so the CPU-launch tax on eager-between-pieces attention
+was only ~1 t/s, not the 30–40-launch concern of RC3).
+
+Hypothesis confirmed: the LEGACY=1 decode path is FULL-capture-safe as
+is. The first FULL capture runs at profile_seq_lens=max_model_len →
+Sk-sized buffers inside forward_paged are allocated at capacity at capture
+time; seq_lens/block_table/query_start_loc are runner-staged into
+pointer-stable buffers re-read live at replay; the decode fast path
+(max_seqlen_q==1) takes no host loop / dtype-conversion branch that would
+dangle. No W5 buffer surgery needed for LEGACY=1.
+
+**PENDING: correctness probe for the FULL path** (the passing probe covered
+PIECEWISE only; 53.09 is not a "new best" until its greedy tokens match the
+Triton reference). Then the W8 default flip.
+
+### Serving A/B matrix (pp=2048/tg=256, single req; GEMV = P3-2b)
+
+| # | attention | requested CG | GEMV | FA_CG | t/s | step | notes |
+|---|-----------|--------------|------|-------|-----|------|-------|
+| 1 | CUSTOM (default) | FULL_DECODE_ONLY | off | never | 22.436 | 44.57 ms | downgrade bug (parent v9) |
+| 2 | CUSTOM | FULL_DECODE_ONLY | on | never | 22.584 | 44.28 ms | downgrade bug; GEMV +0.7% |
+| 3 | CUSTOM | PIECEWISE | on | never | **52.074** | 19.20 ms | probe-verified correct |
+| 4 | CUSTOM | PIECEWISE | off | never | 50.877 | 19.66 ms | clean GEMV A/B: **+0.45 ms/step (+2.3%)** ≈ micro-bench 0.40 ms |
+| 5 | CUSTOM | FULL_DECODE_ONLY | on | decode | **53.094** | 18.83 ms | M2 experiment; correctness probe pending |
+| 6 | ROCM_ATTN (Triton) | FULL_DECODE_ONLY | off | — | 43.986 | 22.73 ms | reproduces 44.09 archive (−0.2%) |
+| 7 | ROCM_ATTN | FULL_DECODE_ONLY | on | — | 44.808 | 22.32 ms | GEMV +1.9% |
+| 8 | ROCM_ATTN | PIECEWISE | on | — | 43.955 | 22.75 ms | M0-2 mode-matched FA reference |
+
+Conclusions:
+- 44.09 archive confirmed reproducible (43.99); the 22.44 default-request
+  config is the downgrade bug, not model/engine drift. Triton PIECEWISE
+  (43.96) ≈ Triton FULL (43.99) — piecewise mode itself costs nothing for
+  Triton, so 22.44 cannot be a "piecewise penalty" of any kind.
+- GEMV (P3-2b) end-to-end verified in both modes: +0.45 ms/step serving vs
+  0.40 ms/step micro-bench (prediction held); +1.9% under Triton-FULL too.
+- M2 (FULL capture, LEGACY=1) works: 53.09 t/s; +1.0 t/s over PIECEWISE
+  (step is GPU-kernel-bound, CPU launch tax was smaller than RC3 feared).
+- Attention win over Triton, mode-matched: FULL 53.09 vs 44.81 = +8.3 t/s
+  (+18.5%); PIECEWISE 50.88 (GEMV off) vs 43.99 (GEMV off) = +6.9 t/s
+  (+15.7%).
