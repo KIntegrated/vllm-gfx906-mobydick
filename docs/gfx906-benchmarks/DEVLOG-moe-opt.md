@@ -754,6 +754,41 @@ named future candidate (out of Phase 3 scope per plan §4).
    count (P3-1 removes 40 launches/step). No direct lever yet.
 5. P3-4 elementwise: deprioritized (we're already at/better than llama.cpp).
 
+### P3-1 — `shared_expert_gate` tiny-m gemv fix (done, 2026-08-15)
+
+**Micro-bench** (`/tmp/bench/_p31_memb.py`, n=1, k=2048 fp16):
+
+| option | µs | notes |
+|--------|-----|-------|
+| Triton triton_matmul (before) | 42.8 | matches 41 µs in-model |
+| torch F.linear (rocBLAS gemv) | 281.1 | rocBLAS skinny gemv is terrible — rejected |
+| **LLMM1 + zero-pad to 4 rows** | **7.3** | chosen; 5.9× vs Triton |
+| `(x*w).sum(-1)` | 12.6 | workable but worse than LLMM1 |
+
+**Change**: `_llmm1_tiny_m()` in `vllm/model_executor/layers/utils.py` —
+zero-pads weight rows to a multiple of 4, calls `ops.LLMM1(w, x, 4)`, slices
+the output. Both LLMM1 dispatch sites now accept `(m % 4 == 0 or m < 4)`.
+Generic (helps any tiny-m decode Linear), not model-specific.
+
+**Correctness**: unit tests added to
+`tests/model_executor/layers/test_rocm_unquantized_gemm.py` (mock dispatch
+for m=1/2/3 + real-kernel m=1 path). NOTE: that file has 8 pre-existing
+failures on the base commit in this env (mock/platform-setup dependent,
+not caused by P3-1); passes go 1 → 5. Greedy A/B (`/tmp/bench/_p31_ab.py`,
+3 prompts × 64 toks): prompts 0/1 token-identical; prompt 2 diverges at
+~token 11 with both continuations fluent — fp16 reorder sensitivity of the
+sigmoid gate (measured logit delta ~1e-3), accepted.
+
+**Results** (pp=2048/tg=256, single request):
+
+| mode | before | after | Δ |
+|------|--------|-------|---|
+| eager | 18.88 t/s | **19.49 t/s** | +3.2% |
+| serving (cudagraph) | 41.51 t/s | **44.09 t/s** | +6.2% ≈ 1.6 ms/step |
+
+Serving step time 24.3 → 22.7 ms. Cumulative from the original 3.49:
+eager 5.6×, serving 12.6×. llama.cpp gap (serving): 1.70× → **1.59×**.
+
 ### Probe/measurement notes (this phase)
 
 - `rocprofv3 --hip-trace` does NOT include kernel dispatches; use
