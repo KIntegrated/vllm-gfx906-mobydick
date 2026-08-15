@@ -452,3 +452,20 @@ occupancy or prefetch tweaks in this kernel shape; candidates left:
 - Plan option (e) persistent-CTA B-in-LDS redesign if that also stalls.
 - Otherwise record the scalar-dot ceiling per plan option (f) and move to P2-2
   (cudagraph measurement), where the decode-side win likely is.
+
+**4. BM=8 for prefill (heuristic `em > 512 -> BM=8`, NPT=2): BIG WIN.**
+   <8,2> = 3 blocks/CU (12 waves, 3/SIMD) — better latency hiding than <16,2>:
+   - M=128 w13: 1811 -> **933 us (-48%)**, w2 922 -> 634 (-31%)
+   - M=512 w13: 2917 -> **2247 us (-23%)**, w2 1530 -> 1201 (-21%)
+   - M=2048 w13: 9326 -> **7614 us (-18%)**, w2 4857 -> 3956 (-19%)
+   - BM=8 LOSES below em~1024 (padding waste: M=8 139->181us, M=32 370->561)
+     -> mid bucket stays BM=4. New heuristic: <=32 -> 1, <=512 -> 4, else 8.
+   - Full model (pp=2048/tg=256): 18.79 -> 18.88 tok/s (+0.5%) — prefill is
+     only ~7% of total bench time; decode (unchanged BM=1/4 paths) dominates.
+   - Cumulative vs Phase-1 baseline at M=512 w13: 3027 -> 2247 us (-26%).
+
+**P2-1 status:** the plan's <1.5 ms goal for M=512 is not reachable in this
+kernel shape (issue-bound at ~57% dot share; double-buffering register-
+infeasible at BM=16; further gains need the persistent-CTA redesign, option
+(e) — deferred). Moving to P2-2 (cudagraph ceiling): decode is 93% of bench
+time and CPU-launch-bound, so that is where the remaining end-to-end upside is.

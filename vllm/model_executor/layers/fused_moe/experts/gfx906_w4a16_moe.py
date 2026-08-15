@@ -177,13 +177,16 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
             f"got {hidden_states.dtype}"
         )
 
+        # BM=8 (NPT=2, 3 blocks/CU) beats BM=16 at prefill sizes: measured
+        # M=512 w13 2917->2247us, M=128 1811->933us. BM=8 loses below em~1024
+        # (padding waste), so the mid bucket stays at BM=4.
         em = M * topk
         if em <= 32:
             block_size_m = 1
         elif em <= 512:
             block_size_m = 4
         else:
-            block_size_m = 16
+            block_size_m = 8
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             moe_align_block_size(
