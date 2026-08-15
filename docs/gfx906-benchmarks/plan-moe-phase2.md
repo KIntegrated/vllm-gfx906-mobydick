@@ -1,4 +1,6 @@
 # Plan — MoE phase 2 on gfx906 (branch `gfx906/moe-opt`)
+Copyright Kevin Read <me@kevin-read.com>
+
 
 Phase 1 shipped a custom W4A16 MoE GEMM (`csrc/rocm/moe_q_gemm_gfx906.cu` +
 `Gfx906WNA16Experts`): end-to-end **3.49 → 18.79 tok/s** (prefill ~450 →

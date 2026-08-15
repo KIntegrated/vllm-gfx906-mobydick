@@ -1,4 +1,6 @@
 # Devlog — Qwen 3.5 quantized MoE decode/prefill on gfx906
+Copyright Kevin Read <me@kevin-read.com>
+
 
 Branch: `gfx906/moe-opt` (from `gfx906/fa-integration`, i.e. fork main + custom FA).
 
@@ -961,3 +963,107 @@ effect (512 blocks vs 256 on 60 CUs); rpb=2 net negative.
   M=1 kernel attacks this. Ceiling ≈ 0.5–0.6 ms/step.
 - Total realistic P3-2(b) capture ≈ **0.7–1.1 ms/step**, consistent
   with (slightly under) the plan's 1–1.5 ms estimate.
+
+### P3-2(b) — custom W16A16 dense GEMV for M=1 (2026-08-15)
+
+Kernel: `csrc/rocm/dense_gemv_gfx906.cu`, op `_rocm_C.dense_gemv_gfx906(weight[N,K] fp16,
+x[1,K] fp16, kchunk) -> out[1,N]`. Row-parallel (LLGemm1-style, `__ockl_fdot2`, fp32 acc),
+templates `RPT ∈ {1,2,4}` (rows/thread) × `KCHUNK ∈ {512,2048,4096}` (K per block,
+threads = KCHUNK/8). K-split (KSPLIT>1) accumulates via packed fp16 CAS into a
+pre-zeroed out; KSPLIT==1 stores directly. RPT selectable at runtime via
+`VLLM_GFX906_GEMV_RPT` (bench sweeps); default is the measured rule below.
+
+**v1 correctness bugs (caught in static review, before first GPU run was trusted):**
+64-thread K-split CAS overcount (4 lanes CAS same 8 bytes → guarded by `t==0`);
+256-thread OOB LDS read in the sibling-row epilogue (lane 3 read `red_smem[4..6]`);
+host accepted N%4!=0 with K-split (now: RPT=1 requires kchunk>=K).
+
+**v1 micro-bench — K-split hypothesis was WRONG** (negative result): kc=512 splits are
+2.4–4.2× *slower* than LLMM1 on every K=2048 shape; o_proj (K=4096) via 2-chunk split
+3.5× slower. fp16-CAS + `zero_` + tiny-block latency dominates at M=1 — unlike the MoE
+kernel, where dequant makes blocks compute-heavy and atomics amortize over token rows.
+Small rows (router/GDN-small/shared-down) are **launch/latency-bound, not CU-occupancy
+bound**: 64-block single-pass does not beat LLMM1's 16-block single-pass. The "3.6–14×
+floor" rows cannot be closed with a better GEMM kernel; they belong to kernel-count
+reduction (the §2 inter-kernel-gap row).
+
+**v2 — RPT=2 + kc=4096 single pass: real win.** Best-per-shape vs LLMM1 rpb=4:
+
+| shape (n/step) | LLMM1 µs | best cfg µs | delta |
+|---|---|---|---|
+| qkv 9216×2048 (×10) | 63.2 | kc2048/r2 48.5 | **−23%** |
+| router 256×2048 (×40) | 5.4 | kc2048/r2 4.5 | **−17%** |
+| in_proj 12288×2048 (×30) | 64.1 | kc2048/r2 59.9 | −6% |
+| LM head 248320×2048 (×1) | 1216.5 | kc2048/r2 1137.9 (0.9× floor) | −6% |
+| o_proj 2048×4096 (×40) | 22.0 | LLMM1 (kc4096/r2 +4%) | keep |
+| shared gate_up 1024 (×40) | 7.6 | LLMM1 (r2 +533%!) | keep |
+| shared down / GDN small | 7.1 / 4.5 | LLMM1 / tie | keep |
+
+**Weighted step total: 5203 µs vs 5604 µs (Day-1 rpb=4) = −401 µs/step (−7.2%).**
+Pattern: K=2048 single-pass RPT=2 wins for N==256 or N≥2048; RPT=2 is pathologically
+bad at N=1024 (512 blocks) — the shape rule is N==256 ∨ N≥2048, not a threshold.
+Plan predicted 0.7–1.1 ms/step capture; measured 0.40 ms/step — the small-row
+latency-bound reframing above is why the top of the estimate was unreachable.
+
+**Integration:** single choke point `_llmm1_tiny_m` (both n==1 call sites in
+`rocm_unquantized_gemm_impl`); routes to the op when K==2048 ∧ fp16 ∧
+(N==256 ∨ N≥2048) — everything else stays LLMM1. Kill switch
+`VLLM_GFX906_DENSE_GEMV=0`. C++ default RPT = measured rule.
+
+**Build gotcha:** a missing `\` on an interior macro line silently truncated
+`LAUNCH_BY_RPT` at `do { if (rpt == 4)` and made the rest parse as code at the
+definition site (errors pointed at the #define body). `clang -E | grep` on the file
+alone revealed it in seconds — use that for macro surgery, not full rebuilds.
+
+Serving A/B (FULL_DECODE_ONLY, Triton ROCM_ATTN, source-mounted): running.
+
+### Serving-mode backend findings (P3-2b A/B detour, 2026-08-15)
+
+The first source-mounted serving A/B (BENCH_CG_MODE=FULL_DECODE_ONLY,
+"VLLM_ATTENTION_BACKEND=ROCM_ATTN") produced **22.44 t/s (GEMV off) /
+22.58 (GEMV on)** — half the 44.09 reference. Root cause, two independent
+facts:
+
+1. **`VLLM_ATTENTION_BACKEND` no longer exists in this vLLM** (0.27.2rc1.dev
+   tree): backend choice is the new priority-based selector
+   (`platforms/rocm.py get_valid_backends`); the knob is now
+   `attention_config={"backend": ...}` (AttentionConfig.backend). The env var
+   was silently ignored.
+2. **The fork's gfx906 FA plugin now wins selection by default** ("Overriding
+   with CUSTOM out of potential backends: ['CUSTOM', 'ROCM_ATTN',
+   'TRITON_ATTN']") — the P3-3 "dead code at runtime" state is gone (plugin
+   entry now active).
+
+Then the surprising one: the third run of the sequence requested
+**cudagraph_mode=PIECEWISE** (not FULL_DECODE_ONLY) and hit **52.07 t/s**
+(CUSTOM FA + GEMV on) — beating the 44.09 Triton-FULL reference. Side-by-side
+with identical everything else:
+
+| requested CG mode | backend | GEMV | t/s |
+|---|---|---|---|
+| FULL_DECODE_ONLY → downgraded to PIECEWISE (warning: CGSupport.NEVER) | CUSTOM | off | 22.44 |
+| FULL_DECODE_ONLY → downgraded to PIECEWISE | CUSTOM | on | 22.58 |
+| PIECEWISE (requested, compiled piecewise) | CUSTOM | on | **52.07** |
+
+Mechanism (hypothesis, pending diagnosis): FULL_DECODE_ONLY requests a
+non-piecewise-compiled model graph; the CGSupport.NEVER downgrade then gives
+PIECEWISE *runtime* mode over a non-piecewise-compiled graph → decode
+degrades toward eager. Plain PIECEWISE compiles the model with attention
+split out → proper piecewise graphs + the 72 µs/layer CUSTOM FA kernel wins
+→ 52 t/s. Either way: **requested-PIECEWISE + CUSTOM is the new best
+serving config**, and the downgrade path is a real engine bug (P3-3a scope:
+fix or guard it; with a working FULL decode capture, CUSTOM+FULL may beat
+52). GEMV's 0.40 ms/step GPU win is largely hidden in the downgraded config
+(+0.7% only — CPU-launch-bound); its clean A/B is pending under the
+52 t/s config (GEMV=0 leg not yet run).
+
+Consequences:
+- The "44.09 t/s current best decode" record is **stale**: the current
+  default (source-mounted fork, FULL_DECODE_ONLY request) serves at 22.44;
+  the current best achievable is 52.07 (requested PIECEWISE). llama.cpp gap
+  narrows from ~1.6× to ~1.35×.
+- P3-3a sub-plan rescoped: "make CUSTOM serving-viable" is largely met by
+  the plain-PIECEWISE path; remaining: correctness under prefix-cache COW /
+  multi-batch (probe running), the FULL-downgrade bug, M1 side-buffer
+  lifecycle items.
+- `_bench_gfx906.py` gained `BENCH_ATTN_BACKEND` (maps to attention_config).

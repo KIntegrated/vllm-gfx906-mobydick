@@ -1,4 +1,6 @@
 # Plan — make the gfx906 CUSTOM (Q8 FA) backend the serving decode path
+Copyright Kevin Read <me@kevin-read.com>
+
 
 Status: v2 (2026-08-15). Sub-plan of Phase 3 **P3-3a** (parent:
 `plan-decode-phase3.md` v6 — **P3-3a currently suspended** pending M0

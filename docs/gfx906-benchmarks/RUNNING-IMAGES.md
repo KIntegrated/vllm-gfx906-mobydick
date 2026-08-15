@@ -1,4 +1,6 @@
 # Running & modifying the vLLM gfx906 docker images
+Copyright Kevin Read <me@kevin-read.com>
+
 
 Quick reference so this doesn't have to be rediscovered (hardware + toolchain
 selection + source mount are the three things that consistently trip people up).

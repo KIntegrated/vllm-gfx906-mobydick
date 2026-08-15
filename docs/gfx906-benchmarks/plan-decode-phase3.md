@@ -1,12 +1,19 @@
 # Phase 3 — non-MoE decode path on gfx906 (MI50)
+Copyright Kevin Read <me@kevin-read.com>
 
-Status: v7 — **P3-1 landed** (serving 41.51 → 44.09 t/s); **P3-2 is the
-primary dev bet** ((a) probe closed, (b) is the only path); **P3-3a
-RESUMED** — Day-1 gather micro-bench passed (21.7 µs/layer @ Sk=2816 vs
-~80 µs gate; DEVLOG "Day-1 pre-step pair"). See §4 ordering and
+
+Status: v9 — **P3-1 landed** (serving 41.51 → 44.09 t/s); **P3-2(b) kernel
+built + micro-benched (−401 µs/step, −7.2% vs LLMM1 rpb=4) + integrated**
+(clean A/B pending under the new best config); (a) probe closed. **New
+best serving: 52.07 t/s** (CUSTOM Q8 FA + requested-PIECEWISE + GEMV) —
+beats the 44.09 Triton-FULL record; the requested-FULL path is broken in
+this tree (CGSupport.NEVER downgrade → 22.44 t/s, engine bug). **P3-3a
+rescoped** (DEVLOG "Serving-mode backend findings"): fix the downgrade
+path, verify CUSTOM serving correctness (COW/multi-batch), keep the
+Triton-baseline record for the archive. See §4 ordering and
 `plan-gfx906fa-serving.md` (v2; M0 1/3 done). Scope: close the remaining
-decode gap vs llama.cpp. Prefill is already 2.6× faster than llama.cpp —
-out of scope unless a candidate helps both for free.
+decode gap vs llama.cpp (~1.35× at 52.07 vs ~70). Prefill is already 2.6×
+faster than llama.cpp — out of scope unless a candidate helps both for free.
 
 P3-0 outcomes (details in DEVLOG "P3-0" section):
 
@@ -58,6 +65,44 @@ Review changes (v2→v3):
 Review changes (v1→v2, preserved): P3-0 Q0 first added; P3-1 range softened
 to 2–3×; P3-4 reframed (inductor already fused; lever is graph breaks); P3-3
 latency-bound nature made explicit; §6 success criteria + quantization caveat.
+
+Review changes (v8→v9):
+
+- **New best serving 52.07 t/s** (DEVLOG "Serving-mode backend findings",
+  2026-08-15): the fork's gfx906 FA plugin now wins backend selection by
+  default (and `VLLM_ATTENTION_BACKEND` was dropped upstream — the knob is
+  `attention_config["backend"]`), so the current default request
+  (FULL_DECODE_ONLY) downgrades via CGSupport.NEVER and serves at 22.44
+  t/s; requesting **PIECEWISE** compiles the model piecewise and gets
+  **52.07 t/s** with CUSTOM FA + GEMV. llama.cpp gap: ~1.6× → ~1.35×.
+- **P3-3a rescoped** around the finding: (i) fix/guard the
+  FULL-request→PIECEWISE-downgrade path (decode degrades toward eager —
+  engine bug, candidate: piecewise-compile when the downgrade fires);
+  (ii) verify CUSTOM serving correctness under prefix-cache COW and
+  multi-batch (probe running); (iii) M1 side-buffer lifecycle items stand.
+  The 44.09 Triton-FULL number is archived as the pre-FA record.
+- **P3-2(b) A/B**: the first (misconfigured) sequence showed +0.7% under
+  the broken config (CPU-launch-bound, GPU win hidden); the clean GEMV
+  on/off A/B runs under the 52.07 config.
+
+Review changes (v7→v8):
+
+- **P3-2(b) micro-bench results in** (DEVLOG "P3-2(b)", 2026-08-15):
+  v1's K-split (fp16-CAS) hypothesis for the small rows is **falsified** —
+  splits are 2.4–4.2× slower than LLMM1 at M=1; the "3.6–14× floor" rows
+  are launch/latency-bound, not CU-occupancy-bound, and no GEMM kernel
+  closes them (that is kernel-count-reduction territory). v2 (single-pass
+  + RPT=2 rows/thread) wins K=2048 rows with N==256 or N≥2048: qkv −23%,
+  router −17%, in_proj/LM head −6%; best-per-shape weighted total
+  **5203 vs 5604 µs/step = −401 µs/step (−7.2%)** — under the 0.7–1.1 ms
+  v7 estimate (the latency-bound reframing caps it).
+- **P3-2(b) integrated** at the `_llmm1_tiny_m` choke point with the
+  measured shape rule (K==2048 ∧ fp16 ∧ N==256∨N≥2048; RPT=2 via C++
+  default), `VLLM_GFX906_DENSE_GEMV=0` kill switch; serving A/B
+  (FULL_DECODE_ONLY, mode-matched) running.
+- **Ordering**: A/B resolves before P3-3a M0 runs (single GPU, sequential);
+  M0 (Triton-PIECEWISE baseline + attention slice) is next in the queue
+  either way.
 
 Review changes (v6→v7):
 
@@ -292,9 +337,9 @@ gate passed) as the time-fenced parallel line.
   separate A/B, not part of M1). Runs as a **time-fenced parallel line
   alongside P3-2**, not a replacement — it suspends again if M1 nets
   < +0.3 ms/step vs the Triton-PIECEWISE baseline (mode-matched).
-- **P3-2(b) custom W16A16** is the primary dev path — ceiling ~0.7–1.1 ms,
-  no serving-layer integration risk; the kernel must K-split to attack the
-  latency-bound small rows (see (b) below).
+- **P3-2(b) custom W16A16** — DONE at micro-bench level (−401 µs/step,
+  −7.2%; K-split falsified, single-pass RPT=2 wins; see (b) below),
+  integrated, serving A/B in flight.
 
 ### P3-1 — `shared_expert_gate` [1×2048] scalar gemv — DONE (2026-08-15)
 
@@ -323,26 +368,29 @@ exclusion. The one real knob, LLGemm1 `rows_per_block` (dispatch hardcodes
 below the ≥20% continue bar; no config change warranted. See DEVLOG
 "Day-1 pre-step pair".
 
-**(b) Custom M=1 W16A16 dense kernel — primary development path**:
-`moe_q_gemm_gfx906.cu` already demonstrates b128 LDS weight streaming +
-`__ockl_fdot2` dot loop at M=1. Dense W16A16 (no dequant, no packing) is
-strictly simpler. The MoE phase proved upstream kernels are the wrong
-tree on gfx906 for this class of problem; the custom kernel is the primary
-bet, not the fallback. Reference: llama.cpp's mmq single-pass decode kernel
-from P3-0 Q2 trace.
-Day-1 rpb-sweep scoping: big rows (in_proj/LM head/qkv/o_proj) are
-BW-bound at rpb=4 (0.95–1.29× floor; qkv at 1.29× is the main one);
-small rows (gate_up/down/router/GDN-small, 150 calls/step) are
-launch/latency-bound (3.6–14× floor; LLGemm1 at M=64 launches 16 blocks
-and under-fills 60 CUs) → the kernel must **K-split** to attack them.
-Realistic capture ≈ **0.7–1.1 ms/step** (rescoped from v6's 1–1.5).
+**(b) Custom M=1 W16A16 dense kernel — BUILT + MICRO-BENCHED + INTEGRATED
+(A/B in flight)**:
+`csrc/rocm/dense_gemv_gfx906.cu`, op `dense_gemv_gfx906`. Row-parallel
+(`__ockl_fdot2`, fp32 acc), templates RPT∈{1,2,4} × KCHUNK∈{512,2048,4096};
+K-split via packed fp16-CAS into pre-zeroed out. Micro-bench
+(`benchmarks/kernels/gfx906/bench_dense_gemv_gfx906.py`), best per shape:
+qkv 9216 −23%, router 256 −17%, in_proj 12288 −6%, LM head −6% (0.9× floor);
+o_proj (K=4096), shared gate_up (1024), shared down (K=512), GDN small
+(64) stay LLMM1 (RPT=2 is pathologically bad at N=1024). **Weighted step
+total 5203 vs 5604 µs = −401 µs/step (−7.2%)** — under the 0.7–1.1 ms
+estimate: v1 falsified K-split (2.4–4.2× slower at M=1) and the small rows
+are launch/latency-bound, not occupancy-bound, so the estimate's top half
+was unreachable. Integrated at `_llmm1_tiny_m` (both n==1 sites); rule
+K==2048 ∧ fp16 ∧ (N==256∨N≥2048); kill switch `VLLM_GFX906_DENSE_GEMV=0`;
+C++ default RPT = measured rule. **Gate** (micro-bench per shape before
+touching the model path): passed.
 
 (P3-1's 1.63 ms Triton row is tracked separately above; this item covers
 only the LLGemm1 surface.)
 **Gate**: floors confirmed (798 GB/s, TCC hit ~14.5%); micro-bench per shape
 before touching the model path.
 
-### P3-3 — paged attention decode (1.94 ms/step) — P3-3a RESUMED (Day-1 gate passed, v7)
+### P3-3 — paged attention decode (1.94 ms/step) — RESCOPED (v9: 52.07 t/s new best; downgrade bug is the target)
 
 The original plan (partition the Triton kernel over KV) was overtaken by
 events: the tree already vendors a Q8 FlashAttention backend (llama.cpp
@@ -363,11 +411,14 @@ blocks mismatch`), COW prefix-cache copies bypassing the side buffer
 while the Triton baseline serves with FULL_DECODE_ONLY.
 
 - **P3-3a — make CUSTOM serving-viable** (sub-plan:
-  `plan-gfx906fa-serving.md`). M1 = PIECEWISE correctness (side-buffer
-  realloc-on-shape-change + COW Q8 mirror + gather-buffer hysteresis) →
-  measure; M2 = capture-safe decode path (capacity buffers, static shapes,
-  `CGSupport.ALWAYS`) → measure. Expected ~0.9–1.4 ms/step → **46–48 t/s**.
-  Time-boxed; explicit stop conditions.
+  `plan-gfx906fa-serving.md`; rescoped v9). Requested-PIECEWISE serving
+  already works (52.07 t/s, beating the old 46–48 target); remaining:
+  (i) the requested-FULL→downgrade bug (decode degrades toward eager at
+  22.44 t/s — piecewise-compile when the downgrade fires, or raise the
+  backend's CGSupport if FULL capture is actually safe); (ii) correctness
+  under prefix-cache COW + multi-batch (probe); (iii) M1 side-buffer
+  lifecycle items (realloc-on-shape-change, COW Q8 mirror, gather-buffer
+  hysteresis) as needed by (ii).
 - **P3-3b — Triton KV partitioning (fallback)**: original design (grid axis
   3 over KV splits + merge kernel, gated on_gfx906 / sinks-None) stays
   parked until the P3-3a decision.
