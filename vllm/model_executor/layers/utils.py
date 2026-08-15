@@ -214,6 +214,17 @@ def triton_matmul(a, b):
     )
     return c
 
+
+def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor:
+    """ops.LLMM1 requires weight rows % 4 == 0; zero-pad tiny m (e.g. the
+    Qwen3-Next shared-expert gate [1, K]) and slice the result back."""
+    m = weight.shape[0]
+    if m % 4 == 0:
+        return ops.LLMM1(weight, x_view, 4)
+    out = ops.LLMM1(torch.nn.functional.pad(weight, (0, 0, 0, 4 - m)), x_view, 4)
+    return out[:, :m]
+
+
 def get_token_bin_counts_and_mask(
     tokens: torch.Tensor,
     vocab_size: int,
@@ -388,19 +399,19 @@ def rocm_unquantized_gemm_impl(
             cu_count = num_compute_units()
             out = ops.wvSplitK(weight, x_view, cu_count, bias)
             return out.reshape(*x.shape[:-1], weight.shape[0])
-        elif m % 4 == 0 and n == 1 and k <= 8192 and bias is None:
-            out = ops.LLMM1(weight, x_view, 4)
+        elif (m % 4 == 0 or m < 4) and n == 1 and k <= 8192 and bias is None:
+            out = _llmm1_tiny_m(weight, x_view)
             return out.reshape(*x.shape[:-1], weight.shape[0])
 
     x_view = x.reshape(-1, x.size(-1))
     # Prefer skinny GEMV kernel
     if (
-        m % 4 == 0
+        (m % 4 == 0 or m < 4)
         and n == 1
         and k <= 8192
         and bias is None
     ):
-        out = ops.LLMM1(weight, x_view, 4)
+        out = _llmm1_tiny_m(weight, x_view)
         return out.reshape(*x.shape[:-1], weight.shape[0])
     elif m > 8 and 0 < n <= 4 and (on_gfx9() or on_gfx1x()):
         out = ops.wvSplitK(weight, x_view, cu_count, bias)  # matrix cores not supported by gfx906 so excluded here

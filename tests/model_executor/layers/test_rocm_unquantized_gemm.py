@@ -176,6 +176,51 @@ def test_rocm_unquantized_gemm_gfx1x_n_gt_5_falls_back(monkeypatch):
     assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize("m", [1, 2, 3])
+def test_rocm_unquantized_gemm_tiny_m_llmm1_padded(monkeypatch, m):
+    # m < 4 (e.g. Qwen3-Next shared_expert_gate [1, K]): LLMM1 requires
+    # M % 4 == 0, so the dispatch zero-pads the weight and slices the out.
+    x = torch.randn(1, 2048, dtype=torch.float16)
+    weight = torch.randn(m, 2048, dtype=torch.float16)
+
+    monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
+    monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1250", lambda: False)
+    monkeypatch.setattr(utils, "num_compute_units", lambda: 120)
+
+    llmm1_mock = MagicMock(side_effect=lambda w, x_view, _: x_view @ w.t())
+    monkeypatch.setattr(utils.ops, "LLMM1", llmm1_mock)
+
+    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
+    ref = torch.nn.functional.linear(x, weight, None)
+
+    llmm1_mock.assert_called_once()
+    w_padded = llmm1_mock.call_args.args[0]
+    assert w_padded.shape == (4, 2048)
+    assert torch.equal(w_padded[:m], weight)
+    assert out.shape == (1, m)
+    assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel test")
+def test_rocm_unquantized_gemm_tiny_m_real_kernel(monkeypatch):
+    # Real LLMM1 path for m=1 (shared_expert_gate shape): padded weight must
+    # produce the same result as a plain linear on one token.
+    x = torch.randn(1, 2048, device="cuda", dtype=torch.float16)
+    weight = torch.randn(1, 2048, device="cuda", dtype=torch.float16)
+
+    monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
+
+    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
+    ref = torch.nn.functional.linear(x, weight, None)
+
+    assert out.shape == (1, 1)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
 def test_rocm_unquantized_gemm_gfx950_wvsplitkrc_path(monkeypatch):
     x = torch.randn(1024, 16, dtype=torch.float16).t()
     weight = torch.randn(256, 1024, dtype=torch.float16)
