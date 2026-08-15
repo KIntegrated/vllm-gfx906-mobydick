@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """P3-3a Day-1 gate: fused KV gather + Q-fp32 micro-bench at serving shapes.
 
 Measures gfx906_fa.gather_paged_kv_q8 in isolation at B=1 (single-request

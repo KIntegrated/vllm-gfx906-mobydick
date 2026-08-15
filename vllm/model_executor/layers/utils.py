@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """Utility methods for model layers."""
 
 from collections.abc import Callable
+
+import os
 
 import torch
 
@@ -217,8 +220,24 @@ def triton_matmul(a, b):
 
 def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor:
     """ops.LLMM1 requires weight rows % 4 == 0; zero-pad tiny m (e.g. the
-    Qwen3-Next shared-expert gate [1, K]) and slice the result back."""
+    Qwen3-Next shared-expert gate [1, K]) and slice the result back.
+
+    gfx906: the custom row-parallel W16A16 GEMV (dense_gemv_gfx906) beats
+    LLMM1 rpb=4 on K=2048 rows with N==256 (router, -17%) or N>=2048
+    (in_proj/qkv/LM-head, -6..-23%); see
+    benchmarks/kernels/gfx906/bench_dense_gemv_gfx906.py. Varying shapes
+    (o_proj K=4096, gate_up 1024, shared down K=512, N=64) stay on LLMM1.
+    """
     m = weight.shape[0]
+    if (
+        os.environ.get("VLLM_GFX906_DENSE_GEMV", "1") != "0"
+        and weight.dtype == torch.float16
+        and x_view.dtype == torch.float16
+        and weight.is_contiguous()
+        and weight.shape[1] == 2048
+        and (m == 256 or m >= 2048)
+    ):
+        return ops.dense_gemv_gfx906(weight, x_view, 2048)
     if m % 4 == 0:
         return ops.LLMM1(weight, x_view, 4)
     out = ops.LLMM1(torch.nn.functional.pad(weight, (0, 0, 0, 4 - m)), x_view, 4)

@@ -86,6 +86,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("moe_gptq_gemm_gfx906", torch::kCUDA,
                 &moe_gptq_gemm_gfx906);
 
+  // M=1 W16A16 dense GEMV for gfx906 (Phase 3 P3-2b). Works on any ROCm
+  // target; selected at runtime on gfx906.
+  rocm_ops.def(
+      "dense_gemv_gfx906(Tensor weight, Tensor x, int kchunk) -> Tensor");
+  rocm_ops.impl("dense_gemv_gfx906", torch::kCUDA, &dense_gemv_gfx906);
+
   // Custom attention op
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.

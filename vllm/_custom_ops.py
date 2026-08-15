@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 
 from enum import IntEnum
 from typing import TYPE_CHECKING, Literal
@@ -759,6 +760,37 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
         zero_offset: int = 0,
     ) -> None:
         return
+
+
+def dense_gemv_gfx906(
+    weight: torch.Tensor,
+    x: torch.Tensor,
+    kchunk: int,
+) -> torch.Tensor:
+    """M=1 W16A16 dense GEMV for gfx906 (see csrc/rocm/dense_gemv_gfx906.cu).
+
+    ``weight`` [N, K] row-major fp16, ``x`` [1, K] fp16, ``kchunk`` 512,
+    2048 or 4096 (must divide K). Returns ``out`` [1, N] fp16. When K >
+    kchunk the output is pre-zeroed and K-chunks atomic-add into it. Rows
+    per thread (RPT) defaults to the gfx906-measured rule; override with
+    VLLM_GFX906_GEMV_RPT for micro-bench sweeps.
+    """
+    return torch.ops._rocm_C.dense_gemv_gfx906(weight, x, kchunk)
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "dense_gemv_gfx906"
+):
+
+    @register_fake("_rocm_C::dense_gemv_gfx906")
+    def _dense_gemv_gfx906_fake(
+        weight: torch.Tensor,
+        x: torch.Tensor,
+        kchunk: int,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (1, weight.size(0)), dtype=weight.dtype, device=weight.device
+        )
 
 
 if hasattr(torch.ops._C, "allspark_w8a16_gemm"):

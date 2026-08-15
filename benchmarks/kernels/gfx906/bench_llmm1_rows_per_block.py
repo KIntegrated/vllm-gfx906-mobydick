@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """P3-2(a) probe: LLGemm1 (LLMM1) rows_per_block sweep at decode M=1 shapes.
 
 The aiter probe (plan §4 P3-2a) is structurally a no-op on gfx906 — all
