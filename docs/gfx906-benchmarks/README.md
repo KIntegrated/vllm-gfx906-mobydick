@@ -33,7 +33,7 @@ gpu_memory_utilization = 0.85, max_model_len = 3328, greedy (temperature 0.0),
 | 0.23.0  | —     | —         | Unsupported: `RoutedExperts` object has no attribute `tp_size` |
 | 0.26.0  | 12.16 | —         | Baseline (legacy monolithic Triton W4A16) |
 | main    | 3.49  | **−71%**  | MoE regression on main (modular pipeline + TritonWNA16Experts) |
-| main + gfx906 MoE kernel (`gfx906/moe-opt`) | **18.79** | **+54%** | Custom HIP W4A16 grouped GEMM, see §4 |
+| main + gfx906 MoE kernel (`gfx906/moe-opt`) | **18.88** | **+55%** | Custom HIP W4A16 grouped GEMM, see §4 |
 
 Prefill/decode split (same harness; prefill = tg=1 run, decode derived as
 (tg=256 − tg=1) / 255):
@@ -42,6 +42,13 @@ Prefill/decode split (same harness; prefill = tg=1 run, decode derived as
 |------|-----------------|--------------|
 | main (pre-fix) | ~450 tok/s (4.5 s) | 3.72 |
 | main + gfx906 MoE kernel | **~2140 tok/s (0.95 s)** — 4.7× | **19.7** — 5.3× |
+
+**Serving mode (cudagraphs, `BENCH_EAGER=0`) — not comparable to the eager
+table above:** with `FULL_DECODE_ONLY` capture the same config reaches
+**41.5 tok/s** end-to-end (decode ~49 tok/s, ~20 ms/step). Eager decode is
+CPU-launch-bound (~1500 dispatches/step); graphs remove that. Capture needs
+`max_num_seqs <= Mamba cache blocks` on this hybrid GDN model (see dev log
+P2-2).
 
 Summary: on the **dense** model the forward port is strictly non-regressing
 (0.26 ≈ 0.23, main +18% faster). On the **MoE** model, main regressed badly

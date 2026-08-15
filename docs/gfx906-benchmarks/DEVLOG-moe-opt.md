@@ -469,3 +469,33 @@ kernel shape (issue-bound at ~57% dot share; double-buffering register-
 infeasible at BM=16; further gains need the persistent-CTA redesign, option
 (e) — deferred). Moving to P2-2 (cudagraph ceiling): decode is 93% of bench
 time and CPU-launch-bound, so that is where the remaining end-to-end upside is.
+
+### P2-2 — cudagraph ceiling measurement (done)
+
+**Setup gotchas (hybrid GDN model + gfx906):**
+- Default `FULL_AND_PIECEWISE` capture OOMs the KV cache (graphs up to size
+  512). Use `cudagraph_mode=FULL_DECODE_ONLY` + `max_cudagraph_capture_size=8`.
+- Cudagraph capture requires `max_num_seqs <= Mamba cache blocks` (91 here);
+  set `max_num_seqs=32` for the single-request bench.
+- Capture itself: 4 decode graphs (sizes 1,2,4,8) in 16 s, +0.11 GiB. Works
+  fine on this model/platform — no capture fallback.
+
+**Result (pp=2048/tg=256, single request):**
+
+| mode | total tok/s | elapsed | decode-only est. |
+|------|-------------|---------|------------------|
+| eager (default) | 18.88 | 13.56 s | ~19.7 tok/s (50.8 ms/step) |
+| **cudagraph FULL_DECODE_ONLY** | **41.51** | **6.17 s** | **~49 tok/s (~20.3 ms/step)** |
+
+2.2x end-to-end from configuration alone — confirms the Phase-1 diagnosis
+(eager decode is CPU-launch-bound: ~1500 dispatches/step). Prefill is
+unchanged (chunked prefill stays eager in this mode).
+
+**Go/no-go:** cudagraph works and decode is now GPU-bound at ~20 ms/step.
+P2-3 (decode MoE latency) is worth doing only if MoE is a large share of the
+20 ms — profile next. P2-4's launch-count argument largely evaporates in
+graph mode (launches are captured); only its GPU-time argument remains.
+
+**Bench script note:** `_bench_gfx906.py` gained `BENCH_EAGER=0` for serving
+mode (untracked user file; not committed). Serving-mode numbers must stay
+labeled separately from the §1 eager table.
