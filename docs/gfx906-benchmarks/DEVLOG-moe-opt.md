@@ -499,3 +499,49 @@ graph mode (launches are captured); only its GPU-time argument remains.
 **Bench script note:** `_bench_gfx906.py` gained `BENCH_EAGER=0` for serving
 mode (untracked user file; not committed). Serving-mode numbers must stay
 labeled separately from the §1 eager table.
+
+### P2-3/P2-4/P2-5 — go/no-go from graph-mode decode profile (done)
+
+torch profiler, FULL_DECODE_ONLY graphs, pp=512+tg=64. Self CUDA ≈ 22.6 ms/step
+(matches the 20.3 ms/step derived from the bench). Per-step breakdown:
+
+| component | ms/step | % | notes |
+|-----------|---------|---|-------|
+| aiter LLGemm1 (dense projections) | 7.2 | 32% | 224 calls × 32 µs — non-MoE, upstream aiter territory |
+| aten::mm | 2.2 | 10% | 4 calls × 532 µs — large dense GEMMs |
+| paged attention (FA) | 1.95 | 9% | 10 layers × 198 µs |
+| **gfx906 MoE kernel** | **1.77** | **8%** | ~76 calls × 23 µs (BM=1 decode) |
+| triton_matmul_kernel | 1.6 | 7% | 39 calls × 41 µs |
+| GDN/mamba (chunk+recurrent+conv) | ~1.15 | 5% | hybrid-attention layers |
+| aiter LLMM1 | 1.2 | 5% | |
+| routing: topkGating + align + count_sort | ~1.0 | 4.5% | P2-4 target |
+| shared expert (Triton fused_moe) | 0.55 | 2.5% | P2-5 target |
+| elementwise/copy/zeros pile | ~2 | 9% | |
+
+**Decisions:**
+- **P2-3 (decode MoE latency): SKIP.** MoE is 8% of the step; even halving it
+  is ~+4% e2e. The plan's own gate ("proceed only if decode is clearly below
+  ceiling with GPU-bound residual") points the effort elsewhere: the residual
+  is dominated by non-MoE kernels (LLGemm1/aten::mm/attn/GDN) that are a
+  separate aiter/rocBLAS-on-gfx906 project, not MoE work.
+- **P2-4 (fused topk+align): DEFERRED.** ~1 ms/step (4.5%) is the largest
+  remaining MoE-adjacent item, but in graph mode only GPU time matters and
+  it's the highest-correctness-risk item on the list. Not worth it now;
+  revisit if someone takes up dense-GEMM tuning and wants the last few %.
+- **P2-5 (shared expert Triton elimination): DEFERRED.** ~0.55 ms/step (2.5%).
+
+### Phase 2 summary
+
+| step | outcome |
+|------|---------|
+| P2-0 diagnostics | dot pipe peak ~20 TF measured; true occupancy table; issue-bound at large M; launch baseline ~1500/step |
+| P2-0b zero-fill fusion | **descoped** — design is racy (documented) |
+| P2-1a b128 LDS | neutral, kept |
+| P2-1b NPT=2 | +3.7% prefill (occupancy 4→8 waves/CU at BM=16) |
+| P2-1c BM=8 prefill heuristic | **−23% M=512 w13** (cumulative −26% vs Phase 1); double-buffering failed (spills) |
+| P2-2 cudagraph ceiling | **41.5 tok/s serving mode (2.2× eager)**; capture works on hybrid GDN model with max_num_seqs≤91 |
+| P2-3/4/5 | skip/defer — MoE is 8% of graph-mode step; residual is non-MoE kernels |
+
+End-to-end: **3.49 → 18.88 tok/s eager (5.4×), 41.5 tok/s serving mode
+(11.9×)**. Remaining per-step time is dominated by dense/GDN kernels outside
+this project's MoE scope.
