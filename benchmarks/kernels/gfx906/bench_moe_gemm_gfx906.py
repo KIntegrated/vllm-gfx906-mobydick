@@ -2,8 +2,8 @@
 """P2-0 diagnostics for the gfx906 WNA16 MoE kernel.
 
 Runs the gfx906 kernel over the full M-bucket table and reports, per bucket,
-per-call time and achieved TFLOPS / GB/s vs the (corrected) MI60 roofline
-(29.5 TFPOPS fp16 peak, <=1 TB/s HBM2).
+per-call time and achieved TFLOPS / GB/s vs the MI50 measured dot2 peak
+(~20 TFLOPS practical, <=1 TB/s HBM2).
 
 Env:
   BENCH_MS  csv of M values (default 1,8,32,128,512,2048)
@@ -24,7 +24,7 @@ TOPK = 8
 GS = 128
 N13, K13 = 1024, 2048
 N2, K2 = 2048, 512
-PEAK_F16 = 29.5e12
+PEAK_F16 = 20e12  # MI50 measured v_dot2_f32_f16 peak (~20 TFLOPS practical)
 PEAK_BW = 1e12
 
 w13_bytes = E * N13 * K13 // 2
@@ -64,7 +64,7 @@ def main():
     if profile:
         M = int(os.environ.get("PROF_M", "512"))
         EM = M * TOPK
-        bm = 16 if EM > 512 else (4 if EM > 32 else 1)
+        bm = 8 if EM > 512 else (4 if EM > 32 else 1)  # matches gfx906_w4a16_moe.py
         x = torch.randn(M, K13, device=dev, dtype=torch.float16)
         topk_ids = torch.randint(0, E, (M, TOPK), dtype=torch.int32, device=dev)
         sorted_ids, expert_ids, ntp = moe_align_block_size(topk_ids, bm, E)
@@ -98,7 +98,7 @@ def main():
           f"{'w13 TF':>8} {'w2 TF':>8} | {'w13 bw':>7} | {'w2 bw':>7}")
     for M in Ms:
         EM = M * TOPK
-        bm = 16 if EM > 512 else (4 if EM > 32 else 1)
+        bm = 8 if EM > 512 else (4 if EM > 32 else 1)  # matches gfx906_w4a16_moe.py
         x = torch.randn(M, K13, device=dev, dtype=torch.float16)
         topk_ids = torch.randint(0, E, (M, TOPK), dtype=torch.int32, device=dev)
         topk_w = torch.rand(M, TOPK, device=dev, dtype=torch.float16)

@@ -89,11 +89,15 @@ __forceinline__ __device__ void atomic_add_pk4_f16(half* addr, half2 v01,
   }
 }
 
-// N nibbles starting at column n; requires n % 8 <= 8 - N (holds for
-// N_PER_THREAD <= 4 with the block alignment used by the launcher).
+// N nibbles starting at column n within a single packed uint32 word.
+// Safe only when (n % 8) + N <= 8: all N nibbles live in one word.  This holds
+// whenever n is aligned to N_PER_THREAD and N_PER_THREAD divides 8, which is
+// guaranteed by the launcher (n = offset_n + t*N_PER_THREAD, offset_n aligned
+// to BLOCK_KN_SIZE*N_PER_THREAD, both divisible by 8 for N_PER_THREAD ∈ {2,4}).
 template <int N>
 __forceinline__ __device__ void loadN_zeros(const uint32_t* qzeros_row, int n,
                                             int (&zeros)[N]) {
+  static_assert(N == 2 || N == 4, "loadN_zeros: N must be 2 or 4");
   uint32_t d = qzeros_row[n / 8] >> ((n & 0x07) * 4);
   #pragma unroll
   for (int i = 0; i < N; ++i) zeros[i] = (int)((d >> (4 * i)) & 0xF);
@@ -107,12 +111,7 @@ __forceinline__ __device__ void loadN_zeros(const uint32_t* qzeros_row, int n,
 __forceinline__ __device__ void prep_zero_scale_fp16(uint32_t zero, half scale,
                                                      half2 (&z1z16)[2],
                                                      half2 (&y1y16)[2]) {
-  union {
-    uint16_t u;
-    half h;
-  } z1u;
-  z1u.u = (uint16_t)(0xE400 | zero);  // half(-1024 - zero) bit trick
-  half z1 = z1u.h;
+  half z1 = __float2half_rn(-1024.0f - (float)zero);
   half z16 = __hsub(__int2half_rn(-64), __int2half_rn((int)zero));
 
   half2 scale2 = __half2half2(scale);
@@ -201,8 +200,10 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
   const uint32_t* expert_qzeros =
       b_qzeros + (int64_t)expert_id * expert_zeros_stride;
 
-  // LDS for activations
+  // LDS for activations; pad to 16-byte alignment so dot22_8_f can use uint4.
   constexpr int LDS_PAD = 8;
+  static_assert((BLOCK_KN_SIZE + LDS_PAD) % 8 == 0,
+                "LDS row stride must be 16-byte aligned for ds_read_b128");
   __shared__ half block_a[BLOCK_SIZE_M][BLOCK_KN_SIZE + LDS_PAD];
 
   static_assert(BLOCK_KN_SIZE == THREADS_X,
@@ -379,8 +380,11 @@ void launch_moe_gemm_q4(
 // prefill speedup. VLLM_GFX906_MOE_NPT=4|2 overrides for tuning.
 static int select_n_per_thread(int block_size_m) {
   if (block_size_m < 8) return 4;
-  const char* e = getenv("VLLM_GFX906_MOE_NPT");
-  return (e && e[0] == '4') ? 4 : 2;
+  static int cached = [] {
+    const char* e = getenv("VLLM_GFX906_MOE_NPT");
+    return (e && e[0] == '4') ? 4 : 2;
+  }();
+  return cached;
 }
 
 #define LAUNCH_MOE(BM, NPT)                                                \
@@ -476,6 +480,12 @@ void moe_gptq_gemm_gfx906(torch::Tensor a, torch::Tensor c,
   TORCH_CHECK(c.scalar_type() == torch::kHalf, "c must be half");
   TORCH_CHECK(b_scales.scalar_type() == torch::kHalf,
               "b_scales dtype must be half");
+  // atomic_add_pk2_f16 and atomic_add_pk4_f16 both require 4-byte alignment on
+  // the output pointer: NPT=2 writes 2 halves (4 bytes), NPT=4 writes 4 halves
+  // (8 bytes). size_n % 4 == 0 covers both.
+  TORCH_CHECK(b_q_weight.size(2) % 4 == 0,
+              "moe_gptq_gemm_gfx906: size_n (", b_q_weight.size(2),
+              ") must be a multiple of 4 for CAS alignment");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   auto stream = at::cuda::getCurrentCUDAStream();

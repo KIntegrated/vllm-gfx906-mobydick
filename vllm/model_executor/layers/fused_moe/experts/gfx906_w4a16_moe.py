@@ -194,14 +194,13 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
             )
         )
 
-        if not hasattr(self, "_empty_topk_w"):
-            self._empty_topk_w = torch.empty(0, dtype=torch.float32,
-                                             device=hidden_states.device)
+        empty_topk_w = torch.empty(0, dtype=torch.float32,
+                                   device=hidden_states.device)
         if apply_router_weight_on_input:
             w1_tw = topk_weights.view(-1).float()
-            w2_tw = self._empty_topk_w
+            w2_tw = empty_topk_w
         else:
-            w1_tw = self._empty_topk_w
+            w1_tw = empty_topk_w
             w2_tw = topk_weights.view(-1).float()
 
         # --- gemm1: [M, K] -> [M*topk, N] (atomic into zeroed workspace) ---
