@@ -362,9 +362,13 @@ void reshape_and_cache_q8(
     const int64_t key_token_stride = key.stride(0);  // обычно Hkv*D
     const int64_t key_head_stride  = key.stride(1);  // обычно D
 
-    const int64_t cache_block_stride = (int64_t)block_size * num_kv_heads * bytes_per_row;
-    const int64_t cache_token_stride = (int64_t)num_kv_heads * bytes_per_row;
-    const int64_t cache_head_stride  = bytes_per_row;
+    // Cache strides: use the tensor's REAL strides (contiguous today, but
+    // do not depend on it — same bug class as the V-cache unbind stride).
+    const int64_t cache_block_stride = k_cache_q8.stride(0);
+    const int64_t cache_token_stride = k_cache_q8.stride(1);
+    const int64_t cache_head_stride  = k_cache_q8.stride(2);
+    TORCH_CHECK(k_cache_q8.stride(3) == 1,
+                "reshape_and_cache_q8: last dim must be contiguous");
 
     auto stream = c10::hip::getCurrentHIPStream().stream();
     hipError_t err = launch_reshape_and_cache_q8(
@@ -476,13 +480,20 @@ std::vector<torch::Tensor> gather_paged_kv_q8(
     auto v_out = use_or_alloc(v_out_opt, value_cache.options(),  (int64_t)D);
 
     // Strides.
-    const int64_t cache_block_stride    = (int64_t)block_size * num_kv_heads * bytes_per_row;
-    const int64_t cache_token_stride    = (int64_t)num_kv_heads * bytes_per_row;
-    const int64_t cache_head_stride_q8  = (int64_t)bytes_per_row;
+    // Use the tensors' REAL strides: value_cache is typically
+    // kv_cache.unbind(1) of [num_blocks, 2, block_size, Hkv, D], i.e.
+    // non-contiguous with a 2x block stride. Deriving strides from shapes
+    // (block_size*Hkv*D) reads K-cache bytes as V and poisons attention.
+    const int64_t cache_block_stride    = key_cache_q8.stride(0);
+    const int64_t cache_token_stride    = key_cache_q8.stride(1);
+    const int64_t cache_head_stride_q8  = key_cache_q8.stride(2);
 
-    const int64_t v_cache_block_stride  = (int64_t)block_size * num_kv_heads * D;
-    const int64_t v_cache_token_stride  = (int64_t)num_kv_heads * D;
-    const int64_t v_cache_head_stride   = (int64_t)D;
+    const int64_t v_cache_block_stride  = value_cache.stride(0);
+    const int64_t v_cache_token_stride  = value_cache.stride(1);
+    const int64_t v_cache_head_stride   = value_cache.stride(2);
+
+    TORCH_CHECK(key_cache_q8.stride(3) == 1 && value_cache.stride(3) == 1,
+                "gather_paged_kv_q8: last dim must be contiguous");
 
     auto stream = c10::hip::getCurrentHIPStream().stream();
     hipError_t err = launch_gather_paged_kv_q8(
@@ -578,14 +589,22 @@ torch::Tensor gfx906_fa_forward_paged_direct(
 
     const int max_blocks_per_seq = block_table_c.size(1);
 
-    // Strides (bytes) for paged layout.
-    const int64_t k_token_stride = (int64_t) heads_kv * bytes_per_row;
-    const int64_t k_head_stride  = (int64_t) bytes_per_row;
-    const int64_t k_block_stride = (int64_t) block_size * k_token_stride;
+    // Strides (bytes) for paged layout. Use the tensors' REAL strides:
+    // value_cache is typically kv_cache.unbind(1) of
+    // [num_blocks, 2, block_size, Hkv, D] — non-contiguous with a 2x block
+    // stride. Shape-derived strides would read K-cache bytes as V.
+    const int64_t k_token_stride = key_cache_q8.stride(1);
+    const int64_t k_head_stride  = key_cache_q8.stride(2);
+    const int64_t k_block_stride = key_cache_q8.stride(0);
 
-    const int64_t v_token_stride = (int64_t) heads_kv * head_dim * sizeof(__half);
-    const int64_t v_head_stride  = (int64_t) head_dim * sizeof(__half);
-    const int64_t v_block_stride = (int64_t) block_size * v_token_stride;
+    TORCH_CHECK(key_cache_q8.stride(3) == 1,
+                "forward_paged_direct: k_q8 last dim must be contiguous");
+    TORCH_CHECK(value_cache.stride(3) == 1,
+                "forward_paged_direct: v last dim must be contiguous");
+    const int64_t v_esize = value_cache.element_size();
+    const int64_t v_token_stride = value_cache.stride(1) * v_esize;
+    const int64_t v_head_stride  = value_cache.stride(2) * v_esize;
+    const int64_t v_block_stride = value_cache.stride(0) * v_esize;
 
     // max_seq_kv используется kernel'ом ТОЛЬКО как fallback для ne11 когда
     // KV_max==nullptr. Мы всегда передаём kv_max_d, поэтому ne11 фактически

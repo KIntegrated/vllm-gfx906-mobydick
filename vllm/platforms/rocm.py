@@ -500,6 +500,21 @@ def _get_backend_priorities(
     # window, so validate_configuration keeps the fallback path for anything
     # unsupported. Only include CUSTOM when it is actually registered (its
     # plugin entry point ran), otherwise it degrades to the stock backends.
+    if on_gfx906() and not AttentionBackendEnum.CUSTOM.is_overridden():
+        # The vllm.general_plugins entry point only resolves from installed
+        # metadata; source-tree runs (PYTHONPATH) with a stale egg-info miss
+        # it. Register explicitly so the default priority below sees it.
+        try:
+            from vllm.gfx906_fa.gfx906_fa_backend import (
+                register as _register_gfx906_fa,
+            )
+
+            _register_gfx906_fa()
+        except ImportError:
+            logger.warning(
+                "gfx906_fa extension not found; falling back to stock "
+                "attention backends on gfx906."
+            )
     if on_gfx906() and AttentionBackendEnum.CUSTOM.is_overridden():
         backends.append(AttentionBackendEnum.CUSTOM)
     # Keep ROCM_ATTN disabled for KV connectors until connector transfer

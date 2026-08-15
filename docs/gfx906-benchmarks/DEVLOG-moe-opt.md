@@ -802,3 +802,89 @@ eager 5.6×, serving 12.6×. llama.cpp gap (serving): 1.70× → **1.59×**.
 - Eager probe runs fell back to Triton paged attention ("Cannot use ROCm
   custom paged attention kernel") — config-dependent; do not take timings
   from probe runs, only call attribution.
+
+### P3-3 — paged attention: the CUSTOM (Q8 FA) backend saga (2026-08-15)
+
+**Starting point**: vLLM attention 1.94 ms/step (10 FA layers × 194 µs) vs
+llama.cpp 0.19 ms — P3-3 was planned as "partition the Triton kernel".
+While starting that, discovered the repo **already vendors a custom Q8
+FlashAttention backend** (`vllm/gfx906_fa/` + `csrc/gfx906_fa/`, llama.cpp's
+`flash_attn_tile_q8`, head_size 256 supported) integrated in `67d2a813a2`
+as the gfx906 default — **but it was dead code at runtime**: the
+`vllm.general_plugins` entry point is absent from the tree's stale
+`vllm.egg-info` AND the image's dist-info, so `CUSTOM.is_overridden()` was
+always False and everything fell to Triton. Nobody noticed because the
+fallback is silent.
+
+Fix: `vllm/platforms/rocm.py` `_get_backend_priorities` now registers the
+plugin explicitly on gfx906 when not already registered (idempotent;
+entry-point installs still win). Verified priorities become
+`[CUSTOM, ROCM_ATTN, TRITON_ATTN, TURBOQUANT]`.
+
+**Then the real bug hunt.** With the backend live, `GFX906_FA_LEGACY=0`
+(the fast path: Q8 side-buffer + fused HIP gather) produced garbage from
+the first token ('!!!!!...'), while LEGACY=1 and FUSED=0 worked. Isolation
+ladder (each step verified before moving on):
+
+1. `reshape_and_cache_q8` vs `quantize_q8_0` on same data: **byte-identical**
+   (D=256 fine).
+2. Synthetic gather test vs torch `_gather_kv_q8`: byte-identical,
+   V tail zeroed (Sk_pad, varied seq_lens).
+3. Synthetic end-to-end (gather → `fa.forward` vs fp32 SDPA, decode AND
+   prefill shapes, tails, B=1/B=2): all correct (rel err ~2.5e-3 = Q8 noise).
+   NOTE: my first two "references" were wrong (einsum axis bugs — GQA
+   broadcast + softmax over the wrong axis); the *pairwise* A/B/C identity
+   checks are what kept the investigation honest.
+4. In-model double-gather compare (`GFX906_FA_DOUBLE_CHECK=1`): **K identical,
+   V corrupted with NaN** — synthetic had passed because my test caches were
+   contiguous.
+
+**Root cause**: `value_cache` in the backend is `kv_cache.unbind(1)` of
+`[num_blocks, 2, block_size, Hkv, D]` — non-contiguous, block stride 2×.
+`gather_paged_kv_q8` (and `forward_paged_direct`) **computed strides from
+shapes, ignoring the real tensor strides** → the kernel read K-cache bytes
+as V → NaN/garbage V. Only block 0 happened to look sane. Same bug class in
+`reshape_and_cache_q8` (latent — its side buffer is contiguous today).
+Fixed all three sites to use `tensor.stride(i)` (+ element size for fp16 V,
+the launcher wants bytes) with contiguity TORCH_CHECKs on the last dim.
+
+After the fix, live double-check reports `K=True V=True`, and the probe
+generates the exact correct greedy output in both LEGACY modes.
+
+**Benchmarks** (pp=2048/tg=256, single request):
+
+| config | eager t/s | notes |
+|--------|-----------|-------|
+| Triton paged + P3-1 | **19.49** | best eager |
+| CUSTOM LEGACY=1 (fp16 gather + per-step Q8 quant) | 18.49 | 2.1 ms/step gather/quant tax; FA kernel itself 194→72 µs/layer (2.7×) |
+| CUSTOM LEGACY=0 FUSED (fixed) | 19.33 | fused gather removes quant tax |
+| CUSTOM LEGACY=0 DIRECT forced | 19.21 | block-table indirection tax at B=1 |
+| serving (cudagraph) + CUSTOM | **crashes** | `value_cache blocks mismatch` during piecewise capture — CGSupport.NEVER does not protect the torch.compile path; deeper integration issue, deferred |
+| serving (cudagraph) + Triton (P3-1) | **44.09** | current best decode |
+
+Also fixed along the way: `_bench_gfx906.py` counted tokens by re-encoding
+the output *text* — garbage output re-encodes to fewer tokens (the
+mysterious "32 tokens" was 256 real tokens of garbage, 19.05 t/s). Now
+counts `token_ids`.
+
+**Net P3-3 outcome so far**: attention itself can be 2.7× faster
+(72 µs/layer), but at B=1 eager the win is eaten by the gather/conversion
+tax and eager is CPU-launch-bound anyway; serving mode — where decode time
+actually matters — cannot use CUSTOM until cudagraph capture is fixed
+(capture calls attention with a different/aliasing kv_cache view; the
+side-buffer alloc also assumes the first cache shape). Learnings:
+- **Stride bugs hide from synthetic tests that build contiguous caches** —
+  always mirror the real allocation path (`unbind` views) in tests.
+- Silent registration fallbacks make dead backends invisible; assert the
+  backend you expect in logs.
+- The bench's text-re-encode token counting is wrong on degenerate output.
+- llama.cpp-style Q8 K quant changes logits ~1e-3 — greedy outputs diverge
+  from fp16 runs after ~10-25 tokens (both fluent); same trade llama.cpp
+  makes.
+- A/B pairwise identity checks (two implementations on same inputs) are
+  more reliable than building a mathematical reference from scratch.
+
+Next candidates: (a) cudagraph-safe CUSTOM (fix capture view handling or
+pad the side buffer at capture sizes), (b) prefill uses CUSTOM (it wins
+there per the vendored docs; our serving prefill could improve), (c) back
+to the original P3-3 Triton partitioning for the serving path.

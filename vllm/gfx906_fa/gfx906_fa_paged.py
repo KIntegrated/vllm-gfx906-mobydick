@@ -63,6 +63,12 @@ _FUSED = _os.environ.get("GFX906_FA_FUSED", "1") != "0"
 _DIRECT_PAGED_MODE = _os.environ.get("GFX906_FA_DIRECT_PAGED", "auto").lower()
 _DIRECT_PAGED_MIN_BATCH = int(_os.environ.get("GFX906_FA_DIRECT_PAGED_MIN_BATCH", "2"))
 _DIRECT_PAGED_MAX_SQ = int(_os.environ.get("GFX906_FA_DIRECT_PAGED_MAX_SQ", "16"))
+# Diagnostics for the LEGACY=0 corruption hunt (P3-3).
+_ZERO_KTAIL = _os.environ.get("GFX906_FA_ZERO_KTAIL", "0") == "1"
+_NO_BUF_REUSE = _os.environ.get("GFX906_FA_NO_BUF_REUSE", "0") == "1"
+_DOUBLE_CHECK = _os.environ.get("GFX906_FA_DOUBLE_CHECK", "0") == "1"
+_DUMP_DIR = _os.environ.get("GFX906_FA_DUMP", "")
+_dump_n = 0
 
 def _should_use_direct_paged(num_seqs: int, max_seqlen_q: int) -> bool:
     """Решает, использовать ли direct-paged FA для текущего batch/seq_q."""
@@ -349,14 +355,16 @@ def forward_paged(
         # аллоцирует 24-200+ MiB в HBM → peak VRAM spike → OOM.
         bytes_per_row_expected = (D // 32) * 34
         kbuf = k_gather_buf if (
-            k_gather_buf is not None
+            not _NO_BUF_REUSE
+            and k_gather_buf is not None
             and k_gather_buf.dtype == torch.uint8
             and k_gather_buf.dim() == 4
             and k_gather_buf.shape == (num_seqs, key_cache_q8.shape[2], Sk_pad, bytes_per_row_expected)
             and k_gather_buf.is_contiguous()
         ) else None
         vbuf = v_gather_buf if (
-            v_gather_buf is not None
+            not _NO_BUF_REUSE
+            and v_gather_buf is not None
             and v_gather_buf.dtype == torch.float16
             and v_gather_buf.dim() == 4
             and v_gather_buf.shape == (num_seqs, value_cache.shape[2], Sk_pad, D)
@@ -368,6 +376,20 @@ def forward_paged(
         )
         # K_q8: [B, Hkv, Sk_pad, bytes]; V_bhsd: [B, Hkv, Sk_pad, D] — уже padded.
         gathered_sk = Sk_pad
+        if _DOUBLE_CHECK:
+            k_ref, v_ref = _gather_kv_q8(
+                key_cache_q8, value_cache, block_table, seq_lens, max_seqlen_k)
+            ke = torch.equal(k_ref, K_q8[:, :, :max_seqlen_k])
+            ve = torch.equal(v_ref, V_bhsd[:, :, :max_seqlen_k])
+            vn = bool(torch.isnan(V_bhsd.float()).any().item())
+            print(f"[FA-DC] fused==torch: K={ke} V={ve} V_nan={vn} "
+                  f"B={num_seqs} Sk_pad={Sk_pad} sl={seq_lens.tolist()[:4]}",
+                  flush=True)
+        if _ZERO_KTAIL:
+            sl64 = sl_i32.to(torch.int64)
+            pos = torch.arange(Sk_pad, device=sl_i32.device)
+            m = (pos.unsqueeze(0) >= sl64.unsqueeze(1)).view(num_seqs, 1, Sk_pad, 1)
+            K_q8 = K_q8.masked_fill(m, 0)
     elif key_cache_q8 is not None:
         # Fast-path (старый): K уже квантован в side-buffer, но gather через torch.
         K_q8, V_bhsd = _gather_kv_q8(
@@ -450,6 +472,20 @@ def forward_paged(
             mask=None,
             q_abs_offset=q_abs_offset_tensor,
         )
+        global _dump_n
+        if _DUMP_DIR and _dump_n < 40:
+            import torch as _t
+            _t.save({
+                "n": _dump_n, "q": q_padded.detach().clone(),
+                "k_q8": K_q8.detach().clone(), "v": V_bhsd.detach().clone(),
+                "kv_max": kv_max_tensor.detach().clone(),
+                "q_abs": (q_abs_offset_tensor.detach().clone()
+                          if q_abs_offset_tensor is not None else None),
+                "scale": float(scale), "seq_lens": seq_lens.detach().clone(),
+                "block_table": block_table.detach().clone(),
+                "out": out_padded.detach().clone(),
+            }, f"{_DUMP_DIR}/fwd_{_dump_n:04d}.pt")
+            _dump_n += 1
         if _DBG:
             torch.cuda.synchronize()
             _fwdlog(f"forward_paged OK: out={tuple(out_padded.shape)}")
