@@ -358,3 +358,32 @@ path is `llvm-objcopy --dump-section .hip_fatbin=` + scan for \x7fELF headers
 - llama.cpp reference: mm_ids_helper (per-expert compact rows + expert_bounds)
   + Q8_1 activation quant + generic grouped mmq. Their dedup-scatter quantizes
   each token once when it feeds multiple experts.
+
+### P2-0b — zero-fill launch elimination: **DESCOPED (design is racy)**
+
+The plan proposed folding `w1_out.zero_()`/`output.zero_()` into the GEMM
+kernel via `if (blockIdx.z == 0) clear-tile-before-CAS`. **This is a data
+race**: K-slice blocks run concurrently with no ordering guarantee between
+grid.z values — a z>0 block's atomic-add can land *before* the z=0 block's
+clear-store, silently dropping that partial sum. The plan's "a plain store
+that completes before any sibling's atomic" assumption is false on AMD (and
+any GPU); the adversarial review missed it. Correctness tests would pass
+thousands of times while remaining wrong (tiny race window).
+
+Safe alternatives considered and rejected for now:
+- **Spin-wait flag per tile** (z>0 spins until z=0 sets a gmem flag): relies
+  on undocumented FIFO work-dispatch + fair wave-scheduling to avoid
+  deadlock; hang risk in production MoE is unacceptable.
+- **Monotonic per-element epoch CAS + acq_rel fences** (first-writer plain
+  stores, others add; no restore needed since every element is touched every
+  call): correct, but adds a 4B atomic per output element — likely *slower*
+  than the memset at prefill sizes; only viable decode-gated. Complexity not
+  justified for ~80/1500 launches (~2-3% of step time).
+- **Zero-on-read in the consumer**: works for gemm1 only (activation reads
+  every element), but `silu_and_mul` is a shared CUDA op — modifying it to
+  zero its input is cross-cutting. Saves only 40 launches.
+
+Decision: descope P2-0b; proceed to P2-1 (far higher upside). Launch-count
+reduction stays in scope via P2-4 (fused topk+align, −40) and P2-5 (shared
+expert, −40); the epoch-CAS protocol is a fallback if CPU launch overhead is
+still material after those.
