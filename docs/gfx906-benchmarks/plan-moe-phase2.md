@@ -20,18 +20,24 @@ decode under cudagraphs/high batch).
 
 Hardware (gfx906 SKU table, from ROCm specs + AMD launch material):
 
-| SKU | VRAM | CUs | FP16 peak | HBM2 BW | LDS/CU | VGPR file/CU |
-|-----|------|-----|-----------|---------|--------|--------------|
-| MI60 | 32 GB | 64 | 29.5 TFLOPS | ≤1 TB/s | 64 KiB | 256 KiB |
-| MI50 (32 GB) | 32 GB | 60 | 26.8 TFLOPS | ≤1 TB/s | 64 KiB | 256 KiB |
-| MI50 (16 GB) | 16 GB | 60 | 26.8 TFLOPS | ≤1 TB/s | 64 KiB | 256 KiB |
+| SKU | VRAM | CUs | FP16 datasheet | FP16 measured (dot2) | HBM2 BW | LDS/CU | VGPR file/CU |
+|-----|------|-----|----------------|----------------------|---------|--------|--------------|
+| MI60 | 32 GB | 64 | 29.5 TFLOPS | — | ≤1 TB/s | 64 KiB | 256 KiB |
+| MI50 (32 GB) | 32 GB | 60 | 26.8 TFLOPS | **~20 TFLOPS** | ≤1 TB/s | 64 KiB | 256 KiB |
+| MI50 (16 GB) | 16 GB | 60 | 26.8 TFLOPS | — | ≤1 TB/s | 64 KiB | 256 KiB |
 
 Both SKUs: gfx906 ISA, wavefront=64, 40 resident wavefronts/CU max (4 pools ×
-10), 32-bank LDS (4-byte bank width). Benchmarks in this branch were run on the
-**MI60 32 GB**; parallelism estimates below use 64 CU and 29.5 TFLOPS FP16
-peak. Earlier references to "~40-CU part" and "~700 GB/s HBM" were wrong —
-the roofline HBM figure is ≤1 TB/s (theoretical); effective achieved bandwidth
-at small M is lower and measured per kernel in the micro-bench.
+10), 32-bank LDS (4-byte bank width).
+
+**Benchmarks in this branch ran on the MI50 32 GB** (60 CU). The devlog header
+says "MI60" based on the VRAM amount, but `rocprofv3` agent info reports
+`Simd_Count=240 → 60 CUs`, which matches MI50, not MI60 (64 CU). The measured
+`v_dot2_f32_f16` peak is **~20 TFLOPS** at ILP≥2 (sclk=930 MHz) — the
+datasheet 26.8 TFLOPS is unachievable with dot2 at ILP=1 and the datasheet
+29.5 TFLOPS (MI60 figure) was never applicable. Earlier references to "~40-CU
+part", "~700 GB/s HBM", "~13.8 TFLOPS", and "29.5 TFLOPS" were all wrong;
+effective achieved HBM bandwidth at small M is measured per kernel in the
+micro-bench.
 
 Per-decode-step GPU budget (profile totals ÷ 64 decode steps; MoE row uses
 the decode-only call subset):
@@ -81,12 +87,13 @@ Kernel facts that shape the options (current `moe_q_gemm_gfx906.cu`):
   that skips the LDS round-trip for BF16/M=1. The gfx906 port always uses LDS.
   For M=1, the LDS stage reads each A element exactly once with no reuse — pure
   overhead.
-- Micro-bench vs roofline: decode M=1 w13 = 35.5 µs (bandwidth floor ~8 µs,
-  8 experts × ~1 MB @ ~1 TB/s peak HBM; measured 228 GB/s ≈ 23% of peak →
-  latency-bound, not bandwidth-bound); prefill M=512 w13 = 3063 µs at
-  **~5.6 TFLOPS ≈ 19% of the 29.5 TFLOPS FP16 peak** (bandwidth floor ≈
-  ~380 µs at 1 TB/s → prefill is compute-bound, not bandwidth-bound, but
-  further from roofline than previously estimated).
+- Micro-bench vs roofline: decode M=1 w13 = 35.5 µs (latency-bound, not
+  bandwidth-bound; measured ~228 GB/s ≈ 23% of ≤1 TB/s peak HBM); prefill
+  M=512 w13 = 3063 µs (Phase 1) → 2247 µs (Phase 2 post-tuning) at **~5.9
+  TFLOPS ≈ 30% of the ~20 TFLOPS measured dot2 peak** (the datasheet 26.8
+  TFLOPS MI50 peak is not achievable with `v_dot2_f32_f16` at ILP=1;
+  bandwidth floor at ≤1 TB/s ≈ 380 µs → prefill is issue/compute-bound,
+  not bandwidth-bound).
 
 ## Ordered candidates
 
@@ -156,15 +163,15 @@ baseline (P2-0) shows −80 dispatches.
 ### P2-1 — Prefill MoE tuning · effort M · risk low-medium
 
 Goal: w13 M=512 3063 µs → < ~1.5 ms (≈2×); prefill pp=2048 0.95 s → ~0.6–0.7
-s. **Important caveat**: the corrected roofline is 29.5 TFLOPS FP16 peak
-(MI60); the kernel is currently at ~5.6 TFLOPS = **~19% of peak**, not 40% as
-previously estimated with the wrong peak figure. Reaching <1.5 ms (2×) requires
-~11 TFLOPS = ~37% of peak — substantially more achievable than the old estimate
-implied, and plausibly within reach of b128 LDS + occupancy tuning without a
-full algorithmic redesign. However, P2-0's three-way bottleneck table must still
-confirm whether the gap is LDS-, occupancy-, or dot-pipe-limited before
-committing to a path. Option (e) (persistent-CTA) remains the fallback if
-tuning stalls below the target.
+s. **Important caveat**: the practical roofline is **~20 TFLOPS measured dot2
+peak** (MI50, ILP≥2; see hardware table above). Post-tuning the kernel reaches
+~5.9 TFLOPS = **~30% of that practical peak** at M=512. Reaching <1.5 ms (2×
+from Phase 1 baseline 3027 µs) requires ~11 TFLOPS = ~55% of the measured
+peak — achievable only with the persistent-CTA redesign (option e) or by
+raising ILP substantially. The tuning work in P2-1a–c (b128 LDS, NPT=2, BM=8)
+delivered ~26% improvement and stalled there, consistent with being
+issue-bound (scalar-heavy instruction mix) rather than LDS or bandwidth limited.
+Option (e) (persistent-CTA) remains the only path to 2×; it is deferred.
 
 Options, **re-ordered** by expected value per P2-0 findings:
 
@@ -275,9 +282,9 @@ CPU-launch-bound and improvements here won't move the §1 bench number.
 
 Goal: w13 M=1 35.5 µs → ~18–20 µs, w2 33 µs → ~16 µs (decode MoE 2.1 →
 ~1.1 ms/step). At M=1 with 8 active experts, grid = (8 blocks, 1, 8) — 64
-blocks on a **64-CU MI60** (60 CU on MI50). The kernel is latency-bound:
-measured ~228 GB/s ≈ 23% of peak HBM bandwidth (≤1 TB/s), with significant
-fixed overhead per-call (LDS fill, syncthreads, epilogue CAS).
+blocks on a **60-CU MI50**. The kernel is latency-bound: measured ~228 GB/s
+≈ 23% of peak HBM bandwidth (≤1 TB/s), with significant fixed overhead
+per-call (LDS fill, syncthreads, epilogue CAS).
 
 Options, **re-ordered** by expected value:
 
@@ -301,7 +308,7 @@ Options, **re-ordered** by expected value:
 - **c) Finer K-slicing for EM ≤ 32** (e.g. BLOCK_KN_SIZE=128 → 2× more
   blocks): increases parallelism but adds fp16-CAS contenders per output cell
   (retry cost) and adds more fp16 rounding steps (precision cost). These are
-  two distinct costs, not one; measure both. The MI60 has 64 CU, so 128 blocks
+  two distinct costs, not one; measure both. The MI50 has 60 CU, so 128 blocks
   at M=1 is reasonable. Bench carefully.
 
 - **d) 128-thread variant** (grid.y doubles): new template instantiation, same

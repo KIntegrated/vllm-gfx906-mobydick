@@ -70,17 +70,22 @@ skip A-LDS for BM=1 → (b) DPP broadcast → (c) finer K-slicing → (d)
 128-thread variant.
 
 **Note on CU count and hardware specs** (DS4-CRIT-5 sub-claim, updated with
-wiki data): DS4 flagged "~40 CU" as unsubstantiated. From the ROCm hardware
-table and AMD launch material: MI60 = 64 CU, 29.5 TFLOPS FP16, ≤1 TB/s HBM2;
-MI50 = 60 CU, 26.8 TFLOPS FP16, ≤1 TB/s HBM2. Both are gfx906. Benchmarks
-in this branch ran on the MI60 32 GB. The "~40-CU" and "~700 GB/s HBM" figures
-in the original plan were both wrong. The corrected peak changes the roofline
-materially: the prefill kernel is at ~5.6 TFLOPS = **19% of the 29.5 TFLOPS
-FP16 peak** (not 40% of a wrong ~13.8 TFLOPS figure). This makes the 2× goal
-(→ ~37% of peak) more plausible from tuning alone, and it lowers the threshold
-at which option (e) (persistent-CTA) becomes necessary. **Plan fix**: SKU table
-added to Current State; "~40-CU part", "~700 GB/s", and "~13.8 TFLOPS" removed
-throughout; decode bandwidth utilisation corrected to ~23% of ≤1 TB/s peak.
+wiki data and P2-0 measurement): DS4 flagged "~40 CU" as unsubstantiated. From
+the ROCm hardware table and AMD launch material: MI60 = 64 CU, 29.5 TFLOPS
+FP16; MI50 = 60 CU, 26.8 TFLOPS FP16; both ≤1 TB/s HBM2 and gfx906 ISA.
+
+The devlog header says "MI60 32 GB", but P2-0's `rocprofv3` agent info measured
+`Simd_Count=240 → 60 CUs`, confirming the bench hardware is an **MI50** (not
+MI60). The measured `v_dot2_f32_f16` peak is **~20 TFLOPS** (ILP≥2,
+sclk=930 MHz) — well below either datasheet figure, because the dot2 issue rate
+is limited by scalar instruction mix at ILP=1. Post-tuning the kernel reaches
+~5.9 TFLOPS = **~30% of the 20 TFLOPS practical peak**; reaching 2× (→ ~55%
+of practical peak) requires the persistent-CTA redesign, which was deferred.
+
+**Plan fix**: SKU table added to Current State with a measured-vs-datasheet
+column; hardware corrected to MI50 throughout; "~40-CU part", "~700 GB/s",
+"~13.8 TFLOPS", and "29.5 TFLOPS" removed; decode bandwidth utilisation
+corrected to ~23% of ≤1 TB/s peak.
 
 ### DS4-CRIT-6 / Claude-MOD-3 — CAS cost and determinism are two distinct things
 
