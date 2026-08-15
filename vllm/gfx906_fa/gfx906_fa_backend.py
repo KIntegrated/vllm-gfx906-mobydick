@@ -76,14 +76,18 @@ class Gfx906FAMetadata:
 class Gfx906FAMetadataBuilder(
     AttentionMetadataBuilder[Gfx906FAMetadata]
 ):
-    # P3-3a M2: default stays NEVER (MVP). GFX906_FA_CG=decode|always raises
-    # it experimentally to test FULL-decode capture safety of the LEGACY
-    # (inline-quant) path; see plan-gfx906fa-serving.md.
+    # P3-3a M2: the LEGACY (inline-quant) decode path is FULL-capture-safe
+    # (first FULL capture runs at profile_seq_lens=max_model_len, so
+    # Sk-sized buffers allocate at capacity; metadata is runner-staged and
+    # re-read live at replay). Verified: serving bench 53.09 t/s + 128/128
+    # greedy probe identical to the Triton-FULL reference, plus
+    # test_cudagraph_capture_replay_legacy_decode_path.
+    # GFX906_FA_CG=never|always still overrides for experiments.
     @classmethod
     def get_cudagraph_support(
         cls, vllm_config: VllmConfig, kv_cache_spec: AttentionSpec
     ) -> AttentionCGSupport:
-        mode = _os.environ.get("GFX906_FA_CG", "never").lower()
+        mode = _os.environ.get("GFX906_FA_CG", "decode").lower()
         if mode == "always":
             return AttentionCGSupport.ALWAYS
         if mode == "decode":

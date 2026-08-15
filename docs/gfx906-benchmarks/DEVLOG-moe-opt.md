@@ -1137,3 +1137,31 @@ Conclusions:
 - Attention win over Triton, mode-matched: FULL 53.09 vs 44.81 = +8.3 t/s
   (+18.5%); PIECEWISE 50.88 (GEMV off) vs 43.99 (GEMV off) = +6.9 t/s
   (+15.7%).
+
+### P3-3a M2 closed (2026-08-15)
+
+- **FULL-path correctness probe: PASSED.** probe2 (Triton-FULL ref vs
+  CUSTOM-FULL, 128 greedy tokens @ pp=2048): IDENTICAL (128/128). Case A
+  ids reproduced bit-exact across probe runs (stable reference).
+- **W8 default flip applied**: `Gfx906FAMetadataBuilder.get_cudagraph_support`
+  now returns UNIFORM_SINGLE_TOKEN_DECODE by default (GFX906_FA_CG=never|always
+  override retained for experiments). Requested FULL_DECODE_ONLY no longer
+  downgrades for this backend; the downgrade path is dormant here and
+  remains an upstream-class bug for other NEVER-support backends.
+- **Final 5-sample bench** (new default, FULL_DECODE_ONLY + GEMV on):
+  52.93 / 52.92 / 52.94 / 52.93 / 52.83 / 52.87 t/s → **mean ≈ 52.90, σ ≈ 0.06**.
+  No downgrade warnings; "Capturing CUDA graphs (decode, FULL)" confirmed.
+- **T3 capture/replay test added and passing**
+  (`test_cudagraph_capture_replay_legacy_decode_path`): warmup@small-Sk →
+  capture@capacity; multi-size capture B=1→B=2 with B=1 replay after
+  (dangling-buffer class); live seq_lens growth 100→200 with K/V refill
+  matching eager at the new length. Existing 2 FA tests stay green.
+  (Debug detour: a `.tolist()` inside a debug print during capture raises
+  "Cannot copy between CPU and CUDA tensors" — the error is the print, not
+  the path; and `arange(n).view(2,-1)` silently loses half the block-table
+  columns.)
+
+**P3-3a headline: 22.44 → 52.90 t/s on the default-request config (2.36×).**
+Remaining P3-3a items (optional, see sub-plan v4): M0-3 attention-slice
+profile, LEGACY=0 fused-gather track (W1/W2/T1/T2) if an A/B ever shows it
+beats the LEGACY=1 PyTorch gather.

@@ -100,11 +100,15 @@ def test_cudagraph_capture_replay_legacy_decode_path():
     kc, vc, kv = _make_paged_cache(n_blocks + 4, dev)
     scale = 1.0 / math.sqrt(D)
 
-    # Identity block map; K/V live in the fp16 cache halves (LEGACY path).
+    # LEGACY path: K lives in an fp16 cache (contiguous here; the backend's
+    # unbind(1) K view has the same per-element layout the C++ strides expect),
+    # V in the strided unbind view as in serving (exercised via _write_v).
+    k16 = torch.zeros(n_blocks + 4, BLOCK, HKV, D, dtype=torch.float16,
+                      device=dev)
     K = torch.randn(max_len, HKV, D, device=dev, dtype=torch.float16) * 0.5
     V = torch.randn(max_len, HKV, D, device=dev, dtype=torch.float16) * 0.5
     _write_v(kv, V[:100])
-    kv[:, 0].view(-1, HKV, D)[:100].copy_(K[:100])
+    k16.view(-1, HKV, D)[:100].copy_(K[:100])
 
     from vllm.gfx906_fa.gfx906_fa_paged import forward_paged
 
@@ -114,7 +118,7 @@ def test_cudagraph_capture_replay_legacy_decode_path():
 
     def fwd(q, bt_, sl_, cu_, msk):
         return forward_paged(
-            q, kv[:, 0], vc, bt_, sl_, cu_,
+            q, k16, vc, bt_, sl_, cu_,
             max_seqlen_q=1, max_seqlen_k=msk, scale=scale,
             key_cache_q8=None, q_pad_buf=q_pad,
         )
@@ -139,7 +143,9 @@ def test_cudagraph_capture_replay_legacy_decode_path():
     assert ((out1 - ref1).norm() / ref1.norm()).item() < 2e-2
 
     # (b) capture B=2 after B=1, then replay B=1 (dangling-buffer check)
-    bt2 = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(2, -1)
+    # Both rows share the same 32 blocks (arange(n_blocks).view(2, -1) would
+    # be (2, 16) — wrong column count).
+    bt2 = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, -1).expand(2, -1).contiguous()
     sl2 = torch.tensor([100, 150], dtype=torch.int32, device=dev)
     cu2 = torch.arange(3, dtype=torch.int32, device=dev)
     q2 = torch.randn(2, HQ, D, device=dev, dtype=torch.float32) * 0.5
@@ -161,8 +167,8 @@ def test_cudagraph_capture_replay_legacy_decode_path():
     assert ((out1 - ref1).norm() / ref1.norm()).item() < 2e-2
 
     # (c) live seq_lens: grow Sk 100 -> 200, fill K/V rows, replay g1
-    kv[:, 0].view(-1, HKV, D)[100:200].copy_(K[100:200])
-    kv[:, 1].view(-1, HKV, D)[100:200].copy_(V[100:200])
+    k16.view(-1, HKV, D)[100:200].copy_(K[100:200])
+    _write_v(kv, V[:200])
     sl.fill_(200)
     g1.replay()
     torch.cuda.synchronize()
