@@ -387,3 +387,68 @@ Decision: descope P2-0b; proceed to P2-1 (far higher upside). Launch-count
 reduction stays in scope via P2-4 (fused topk+align, −40) and P2-5 (shared
 expert, −40); the epoch-CAS protocol is a fallback if CPU launch overhead is
 still material after those.
+
+### P2-1 — prefill MoE tuning (in progress)
+
+**Corrected roofline (measured, not datasheet):**
+- `v_dot2_f32_f16` pipe peak on this MI60: **~20 TFLOPS** (standalone micro-kernel,
+  ILP≥2, sclk=930 MHz). The plan's "29.5 TFLOPS fp16 peak" is unreachable with
+  dot2 (it assumes a different instruction mix). At ILP=1 the same pipe only
+  does ~8.5 TF → latency/dependency sensitive.
+- Kernel at M=512 w13: 5.9 TF = **~29% of the practical dot ceiling** (was
+  estimated as ~40% of a wrong peak).
+
+**True occupancy table** (`hipOccupancyMaxActiveBlocksPerMultiprocessor` — the
+P2-0 "occupancy" column was mislabeled; these are measured):
+
+| variant | VGPR | spills | blocks/CU | waves/CU (per SIMD) |
+|---------|------|--------|-----------|---------------------|
+| <1,4>   | 74   | 0      | 3         | 12                  |
+| <2,4>   | 93   | 0      | 2         | 8                   |
+| <4,4>   | 95   | 0      | 2         | 8                   |
+| <8,4>   | 129  | 0      | 1         | **4 (1/SIMD)**      |
+| <16,4>  | 166  | 0      | 1         | **4 (1/SIMD)**      |
+| <8,2>   | ~70  | 0      | 3         | 12                  |
+| <16,2>  | 94   | 0      | 2         | 8 (2/SIMD)          |
+
+BM≥8 with NPT=4 runs at **1 wave/SIMD**: zero inter-wave latency hiding.
+
+**Experiments (M=512 w13 µs, baseline <16,4> = 3027):**
+1. **b128 LDS reads in dot loop** (committed `9521993915`): 3027→3049 (noise),
+   M=1 41.0→35.7. Neutral at prefill — expected, since P2-0 showed zero bank
+   conflicts and <1% LDS waits. Kept (lower LDS instruction pressure).
+2. **N_PER_THREAD=2** (template param + `VLLM_GFX906_MOE_NPT` override; default
+   2 for BM≥8): M=512 3027→**2917 (+3.7%)**, M=128 1880→1811, M=2048
+   9593→9326, w2 similar. Correctness 12/12 both NPT settings. Occupancy
+   doubles at BM=16 (4→8 waves/CU). Modest gain → not purely latency-bound.
+3. **Double-buffered weight prefetch** (two attempts): **FAILED — reverted.**
+   - swap-based: <16,4> 256 VGPRs + 214 spills → M=512 3049→17790 µs (5.8x
+     slower); even spill-free <4,4> (167 VGPR) got slower (occupancy halved).
+   - unrolled-by-2 ping-pong (no swap, no runtime indexing): still 256 VGPRs +
+     109 spills at <16,2>. The compiler keeps both chunk buffers live across
+     the whole consume phase; hand structures can't beat its liveness analysis.
+   - Conclusion: software prefetch is register-infeasible in this kernel shape
+     at BM=16. (Would need NPT=2 + BM≤8 or a redesign.)
+
+**ISA-level findings** (llvm-objdump on extracted code objects; host LLVM
+tools, no docker needed):
+- K-loop body (single-stage <16,2>): ~890 instructions, **512 v_dot2 = 57.5%**;
+  scalar (s_*) instructions ~45% of the whole kernel — but S and V share one
+  issue port per SIMD, so the kernel is **issue-bound**, not dot-pipe-bound:
+  dots alone could only reach ~9.6 TF (48% of dot peak) at 100% issue rate.
+- Each iteration: 4× `global_load_dwordx2` then `s_waitcnt vmcnt(3)` — the
+  weight chunk's HBM latency is exposed every iteration (single-stage).
+- **No PC sampling on gfx906** (`rocprofv3-avail list --spm`: "No spm counters
+  supported" — CDNA2+ only). TCC_HIT/TCC_MISS counters work: M=512 w13 shows
+  ~61% L2 hit rate on the (contaminated, spilling) build.
+- Disassembly detour note: `hipcc -c` of a device-only TU puts the GPU object
+  in a second embedded ELF (scan for \x7fELF); loads disassemble as
+  `global_load_*`/`buffer_load_*`, not `v_load*`.
+
+**Status/go-forward:** best config so far = single-stage + NPT=2 (BM≥8).
+The remaining gap to the plan's <1.5 ms goal (~2x) is NOT reachable by
+occupancy or prefetch tweaks in this kernel shape; candidates left:
+- BM=8 + NPT=2 (+ maybe DBUF, which fits registers at BM=8) — next experiment.
+- Plan option (e) persistent-CTA B-in-LDS redesign if that also stalls.
+- Otherwise record the scalar-dot ceiling per plan option (f) and move to P2-2
+  (cudagraph measurement), where the decode-side win likely is.

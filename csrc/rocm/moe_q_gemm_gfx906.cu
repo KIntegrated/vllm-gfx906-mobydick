@@ -53,6 +53,23 @@ __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
   return result;
 }
 
+// Packed 2-half atomic add via one 32-bit CAS loop (N_PER_THREAD == 2).
+__forceinline__ __device__ void atomic_add_pk2_f16(half* addr, half2 v01) {
+  unsigned* addr_u = reinterpret_cast<unsigned*>(addr);
+  unsigned old = *addr_u;
+  while (true) {
+    union {
+      unsigned u;
+      half2 h;
+    } cur, sum;
+    cur.u = old;
+    sum.h = __hadd2(cur.h, v01);
+    unsigned prev = atomicCAS(addr_u, old, sum.u);
+    if (prev == old) break;
+    old = prev;
+  }
+}
+
 // Packed 4-half atomic add via one 64-bit CAS loop.
 __forceinline__ __device__ void atomic_add_pk4_f16(half* addr, half2 v01,
                                                    half2 v23) {
@@ -72,15 +89,14 @@ __forceinline__ __device__ void atomic_add_pk4_f16(half* addr, half2 v01,
   }
 }
 
-__forceinline__ __device__ void load4_zeros(const uint32_t* qzeros_row, int n,
-                                            int (&zeros)[4]) {
-  int qcol = n / 8;
-  int shift = (n & 0x07) * 4;
-  uint32_t d = qzeros_row[qcol] >> shift;
-  zeros[0] = (int)(d & 0xF);
-  zeros[1] = (int)((d >> 4) & 0xF);
-  zeros[2] = (int)((d >> 8) & 0xF);
-  zeros[3] = (int)((d >> 12) & 0xF);
+// N nibbles starting at column n; requires n % 8 <= 8 - N (holds for
+// N_PER_THREAD <= 4 with the block alignment used by the launcher).
+template <int N>
+__forceinline__ __device__ void loadN_zeros(const uint32_t* qzeros_row, int n,
+                                            int (&zeros)[N]) {
+  uint32_t d = qzeros_row[n / 8] >> ((n & 0x07) * 4);
+  #pragma unroll
+  for (int i = 0; i < N; ++i) zeros[i] = (int)((d >> (4 * i)) & 0xF);
 }
 
 // Precompute scale-baked dequant constants for one zero/scale pair.
@@ -137,7 +153,9 @@ __forceinline__ __device__ void dequant_4bit_8_fp16(uint32_t qa,
 // Fused MoE kernel.
 // ---------------------------------------------------------------------------
 
-template <int BLOCK_SIZE_M>
+// N_PER_THREAD: output columns per thread (4 = original layout; 2 halves
+// accumulator/dequant register pressure for ~2x occupancy at large BM).
+template <int BLOCK_SIZE_M, int N_PER_THREAD>
 __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
     const half* __restrict__ a,  // [size_m, size_k] or [M*topk, K]
     half* __restrict__ c,        // [M*topk, size_n] or [M, size_n], pre-zeroed
@@ -160,12 +178,14 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
     const bool mul_topk_weight,
     const int output_topk,           // >0: write to row token_id/output_topk
     const int zero_offset) {
+  static_assert(N_PER_THREAD == 4 || N_PER_THREAD == 2,
+                "N_PER_THREAD must be 2 or 4");
   const int t = threadIdx.x;
   const int token_block = blockIdx.x;
-  const int offset_n = blockIdx.y * BLOCK_KN_SIZE * 4;
+  const int offset_n = blockIdx.y * BLOCK_KN_SIZE * N_PER_THREAD;
   const int offset_k = blockIdx.z * BLOCK_KN_SIZE;
   const int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
-  const int n = offset_n + t * 4;
+  const int n = offset_n + t * N_PER_THREAD;
 
   // Early exit for padding blocks or invalid experts (expert_map = -1)
   if (token_block * BLOCK_SIZE_M >= num_tokens_post_padded[0]) return;
@@ -217,16 +237,16 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
   int qk = offset_k / 8;
   const uint32_t* b_ptr = expert_weights + qk * size_n + n;
 
-  // Per-column dequant constants (4 columns per thread)
-  half2 z1z16_h[4][2], y1y16_h[4][2];
+  // Per-column dequant constants (N_PER_THREAD columns per thread)
+  half2 z1z16_h[N_PER_THREAD][2], y1y16_h[N_PER_THREAD][2];
 
   auto refresh_group = [&](int g) {
     const uint32_t* qz_row = expert_qzeros + g * (size_n / 8);
     const half* sc_row = expert_scales + g * size_n;
-    int zeros[4];
-    load4_zeros(qz_row, n, zeros);
+    int zeros[N_PER_THREAD];
+    loadN_zeros<N_PER_THREAD>(qz_row, n, zeros);
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < N_PER_THREAD; ++i) {
       half scale = sc_row[n + i];
       prep_zero_scale_fp16((uint32_t)(zeros[i] + zero_offset), scale,
                            z1z16_h[i], y1y16_h[i]);
@@ -235,15 +255,20 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
 
   refresh_group(group);
 
-  float block_c[BLOCK_SIZE_M][4];
+  float block_c[BLOCK_SIZE_M][N_PER_THREAD];
   #pragma unroll
   for (int m = 0; m < BLOCK_SIZE_M; ++m) {
     #pragma unroll
-    for (int j = 0; j < 4; ++j) block_c[m][j] = 0.0f;
+    for (int j = 0; j < N_PER_THREAD; ++j) block_c[m][j] = 0.0f;
   }
 
-  // --- Main K-loop ---
+  // --- Main K-loop (single-stage weight prefetch) ---
+  // NOTE: double-buffered prefetch was tried (both a swap-based and an
+  // unrolled-by-2 ping-pong structure) but the compiler kept both chunk
+  // buffers live across the whole consume phase -> 256 VGPRs + heavy spills
+  // at BM=16 (5x slower). Single-stage stays; see DEVLOG P2-1.
   int k = offset_k;
+  uint32_t b_w[4][N_PER_THREAD];
   while (k < end_k) {
     if (k == nextgroup) {
       group++;
@@ -251,11 +276,19 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
       refresh_group(group);
     }
 
-    // Prefetch 4 weight words (128 bytes)
-    int4 b_w[4];
     #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      b_w[j] = *(const int4*)(b_ptr + j * size_n);
+      if constexpr (N_PER_THREAD == 4) {
+        int4 v = *(const int4*)(b_ptr + j * size_n);
+        b_w[j][0] = v.x;
+        b_w[j][1] = v.y;
+        b_w[j][2] = v.z;
+        b_w[j][3] = v.w;
+      } else {
+        uint2 v = *(const uint2*)(b_ptr + j * size_n);
+        b_w[j][0] = v.x;
+        b_w[j][1] = v.y;
+      }
     }
     b_ptr += 4 * size_n;
 
@@ -263,20 +296,18 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
     for (int j = 0; j < 4; ++j) {
       const int a_off = (k - offset_k) + 8 * j;
 
-      half2 dq[4][4];
-      dequant_4bit_8_fp16((uint32_t)b_w[j].x, dq[0], z1z16_h[0], y1y16_h[0]);
-      dequant_4bit_8_fp16((uint32_t)b_w[j].y, dq[1], z1z16_h[1], y1y16_h[1]);
-      dequant_4bit_8_fp16((uint32_t)b_w[j].z, dq[2], z1z16_h[2], y1y16_h[2]);
-      dequant_4bit_8_fp16((uint32_t)b_w[j].w, dq[3], z1z16_h[3], y1y16_h[3]);
+      half2 dq[N_PER_THREAD][4];
+      #pragma unroll
+      for (int i = 0; i < N_PER_THREAD; ++i)
+        dequant_4bit_8_fp16(b_w[j][i], dq[i], z1z16_h[i], y1y16_h[i]);
 
       #pragma unroll
       for (int m = 0; m < BLOCK_SIZE_M; ++m) {
         const half* a_ptr =
             reinterpret_cast<const half*>(&block_a[m][a_off]);
-        block_c[m][0] += dot22_8_f(dq[0], a_ptr);
-        block_c[m][1] += dot22_8_f(dq[1], a_ptr);
-        block_c[m][2] += dot22_8_f(dq[2], a_ptr);
-        block_c[m][3] += dot22_8_f(dq[3], a_ptr);
+        #pragma unroll
+        for (int i = 0; i < N_PER_THREAD; ++i)
+          block_c[m][i] += dot22_8_f(dq[i], a_ptr);
       }
     }
     k += 32;
@@ -292,7 +323,7 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
     if (mul_topk_weight && topk_weights != nullptr) {
       float tw = topk_weights[token_id];
       #pragma unroll
-      for (int j = 0; j < 4; ++j) block_c[m][j] *= tw;
+      for (int j = 0; j < N_PER_THREAD; ++j) block_c[m][j] *= tw;
     }
 
     // output_topk > 0: reduce by mapping token_id back to original token
@@ -300,11 +331,17 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
     int64_t out_row = (output_topk > 0) ? (int64_t)(token_id / output_topk)
                                         : (int64_t)token_id;
     half* out = c + out_row * size_n + n;
-    half2 r01 = __halves2half2(__float2half_rn(block_c[m][0]),
-                               __float2half_rn(block_c[m][1]));
-    half2 r23 = __halves2half2(__float2half_rn(block_c[m][2]),
-                               __float2half_rn(block_c[m][3]));
-    atomic_add_pk4_f16(out, r01, r23);
+    if constexpr (N_PER_THREAD == 4) {
+      half2 r01 = __halves2half2(__float2half_rn(block_c[m][0]),
+                                 __float2half_rn(block_c[m][1]));
+      half2 r23 = __halves2half2(__float2half_rn(block_c[m][2]),
+                                 __float2half_rn(block_c[m][3]));
+      atomic_add_pk4_f16(out, r01, r23);
+    } else {
+      half2 r01 = __halves2half2(__float2half_rn(block_c[m][0]),
+                                 __float2half_rn(block_c[m][1]));
+      atomic_add_pk2_f16(out, r01);
+    }
   }
 }
 
@@ -312,7 +349,7 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
 // Launcher
 // ---------------------------------------------------------------------------
 
-template <int BLOCK_SIZE_M>
+template <int BLOCK_SIZE_M, int N_PER_THREAD>
 void launch_moe_gemm_q4(
     const half* a, half* c, const uint32_t* b_q_weight, const half* b_scales,
     const uint32_t* b_qzeros, const float* topk_weights,
@@ -323,15 +360,37 @@ void launch_moe_gemm_q4(
     int output_topk, int zero_offset, cudaStream_t stream) {
   dim3 block(THREADS_X);
   dim3 grid(num_token_blocks,
-            (size_n + BLOCK_KN_SIZE * 4 - 1) / (BLOCK_KN_SIZE * 4),
+            (size_n + BLOCK_KN_SIZE * N_PER_THREAD - 1) /
+                (BLOCK_KN_SIZE * N_PER_THREAD),
             (size_k + BLOCK_KN_SIZE - 1) / BLOCK_KN_SIZE);
 
-  moe_gemm_q4_kernel_gfx906<BLOCK_SIZE_M><<<grid, block, 0, stream>>>(
-      a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
-      expert_ids, num_tokens_post_padded, size_m, size_n, size_k, groups,
-      top_k, expert_weight_stride, expert_scales_stride, expert_zeros_stride,
-      mul_topk_weight, output_topk, zero_offset);
+  moe_gemm_q4_kernel_gfx906<BLOCK_SIZE_M, N_PER_THREAD>
+      <<<grid, block, 0, stream>>>(
+          a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
+          expert_ids, num_tokens_post_padded, size_m, size_n, size_k, groups,
+          top_k, expert_weight_stride, expert_scales_stride,
+          expert_zeros_stride, mul_topk_weight, output_topk, zero_offset);
 }
+
+// N_PER_THREAD selection. BM < 8 keeps the original 4-column layout (decode
+// regime is latency-bound, not occupancy-bound). For BM >= 8 the default is
+// 2 columns/thread: ~half the accumulator/dequant register pressure,
+// doubling occupancy at BM=16 (4 -> 8 waves/CU) for a small but consistent
+// prefill speedup. VLLM_GFX906_MOE_NPT=4|2 overrides for tuning.
+static int select_n_per_thread(int block_size_m) {
+  if (block_size_m < 8) return 4;
+  const char* e = getenv("VLLM_GFX906_MOE_NPT");
+  return (e && e[0] == '4') ? 4 : 2;
+}
+
+#define LAUNCH_MOE(BM, NPT)                                                \
+  launch_moe_gemm_q4<BM, NPT>(a, c, b_q_weight, b_scales, b_qzeros,       \
+                              topk_weights, sorted_token_ids, expert_ids, \
+                              num_tokens_post_padded, num_token_blocks,   \
+                              size_m, size_n, size_k, groups, top_k,      \
+                              expert_weight_stride, expert_scales_stride, \
+                              expert_zeros_stride, mul_topk_weight,       \
+                              output_topk, zero_offset, stream)
 
 void dispatch_moe_gemm_q4(
     const half* a, half* c, const uint32_t* b_q_weight, const half* b_scales,
@@ -341,46 +400,30 @@ void dispatch_moe_gemm_q4(
     int size_n, int size_k, int groups, int top_k, int block_size_m,
     int expert_weight_stride, int expert_scales_stride, int expert_zeros_stride,
     bool mul_topk_weight, int output_topk, int zero_offset, cudaStream_t stream) {
+  const int npt = select_n_per_thread(block_size_m);
   switch (block_size_m) {
     case 1:
-      launch_moe_gemm_q4<1>(a, c, b_q_weight, b_scales, b_qzeros, topk_weights,
-                            sorted_token_ids, expert_ids, num_tokens_post_padded,
-                            num_token_blocks, size_m, size_n, size_k, groups,
-                            top_k, expert_weight_stride, expert_scales_stride,
-                            expert_zeros_stride, mul_topk_weight, output_topk,
-                            zero_offset, stream);
+      LAUNCH_MOE(1, 4);
       break;
     case 2:
-      launch_moe_gemm_q4<2>(a, c, b_q_weight, b_scales, b_qzeros, topk_weights,
-                            sorted_token_ids, expert_ids, num_tokens_post_padded,
-                            num_token_blocks, size_m, size_n, size_k, groups,
-                            top_k, expert_weight_stride, expert_scales_stride,
-                            expert_zeros_stride, mul_topk_weight, output_topk,
-                            zero_offset, stream);
+      LAUNCH_MOE(2, 4);
       break;
     case 4:
-      launch_moe_gemm_q4<4>(a, c, b_q_weight, b_scales, b_qzeros, topk_weights,
-                            sorted_token_ids, expert_ids, num_tokens_post_padded,
-                            num_token_blocks, size_m, size_n, size_k, groups,
-                            top_k, expert_weight_stride, expert_scales_stride,
-                            expert_zeros_stride, mul_topk_weight, output_topk,
-                            zero_offset, stream);
+      LAUNCH_MOE(4, 4);
       break;
     case 8:
-      launch_moe_gemm_q4<8>(a, c, b_q_weight, b_scales, b_qzeros, topk_weights,
-                            sorted_token_ids, expert_ids, num_tokens_post_padded,
-                            num_token_blocks, size_m, size_n, size_k, groups,
-                            top_k, expert_weight_stride, expert_scales_stride,
-                            expert_zeros_stride, mul_topk_weight, output_topk,
-                            zero_offset, stream);
+      if (npt == 2) {
+        LAUNCH_MOE(8, 2);
+      } else {
+        LAUNCH_MOE(8, 4);
+      }
       break;
     case 16:
-      launch_moe_gemm_q4<16>(a, c, b_q_weight, b_scales, b_qzeros, topk_weights,
-                             sorted_token_ids, expert_ids, num_tokens_post_padded,
-                             num_token_blocks, size_m, size_n, size_k, groups,
-                             top_k, expert_weight_stride, expert_scales_stride,
-                             expert_zeros_stride, mul_topk_weight, output_topk,
-                             zero_offset, stream);
+      if (npt == 2) {
+        LAUNCH_MOE(16, 2);
+      } else {
+        LAUNCH_MOE(16, 4);
+      }
       break;
     default:
       TORCH_CHECK(false,
