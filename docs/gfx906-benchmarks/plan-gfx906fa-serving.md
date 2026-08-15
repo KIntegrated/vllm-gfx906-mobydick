@@ -2,11 +2,47 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 
-Status: v2 (2026-08-15). Sub-plan of Phase 3 **P3-3a** (parent:
-`plan-decode-phase3.md` v6 — **P3-3a currently suspended** pending M0
-go/no-go). Evidence, bench history and the bug-hunt narrative live in
-`DEVLOG-moe-opt.md` §"P3-3". Review findings that drove v2:
-`gfx906fa-serving-plan-rev-claude.md` (merged claude + ds4 + qwen).
+Status: v3 (2026-08-15). Sub-plan of Phase 3 **P3-3a** (parent:
+`plan-decode-phase3.md` v9). Evidence, bench history and the bug-hunt
+narrative live in `DEVLOG-moe-opt.md` (§"P3-3", §"Serving-mode backend
+findings", §"P3-3a: CUSTOM serving correctness probe"). Review findings
+that drove v2: `gfx906fa-serving-plan-rev-claude.md` (merged claude + ds4
++ qwen).
+
+**v2→v3 changes** (all from the 2026-08-15 serving findings):
+- **The premise "dead code at runtime" is stale**: the plugin entry point
+  is now active — CUSTOM wins backend selection by default (and
+  `VLLM_ATTENTION_BACKEND` was dropped upstream; the knob is
+  `attention_config["backend"]`).
+- **New anchor: 52.07 t/s** (LEGACY=1 default + requested PIECEWISE +
+  GEMV on) — already beats the 44.09 Triton-FULL record. The v2 M1 stop
+  condition ("< +0.3 ms/step vs Triton-PIECEWISE → P3-3b") is moot unless
+  Triton-PIECEWISE itself exceeds 52 (queued in run_ab2).
+- **M0 re-scored**: item 1 (gather micro-bench) passed (21.7 µs/layer —
+  but that measured the LEGACY=0 *fused* gather; serving default is
+  LEGACY=1 with the PyTorch `_gather_kv` + inline `quantize_q8_0` — the
+  52.07 end-to-end number is the real gate and already passes). Items 2–3
+  (Triton-PIECEWISE baseline, attention slice) still queued/pending.
+- **Correctness probe PASSED** (128/128 greedy tokens identical vs
+  Triton-FULL at pp=2048) — LEGACY=1 serving decode is correct under KV
+  growth; COW/multi-batch items stand (they are LEGACY=0-adjacent and only
+  bite if the Q8 side-buffer path is enabled).
+- **RC1/RC2/W1/W2/T1/T2 demoted**: they are LEGACY=0-only. The LEGACY=1
+  path has no Q8 side buffer, so none of that lifecycle work is needed for
+  the default serving path. M1-as-specified (enable LEGACY=0 fused
+  gather) is now an *optional optimization track*, not the critical path.
+- **M2 is now the critical path** — experiment in flight: the LEGACY=1
+  decode path may already be FULL-capture-safe (first FULL capture uses
+  `profile_seq_lens=max_model_len` → Sk-sized buffers allocated at
+  capacity; metadata is runner-staged into pointer-stable buffers and
+  re-read live at replay). `GFX906_FA_CG=decode` knob added to test
+  without flipping the default. If it passes: M2 = W8 support flip +
+  T3 capture test, no W5 buffer surgery needed for LEGACY=1.
+- **New engine bug (parent v9)**: requested FULL_DECODE_ONLY +
+  CGSupport.NEVER downgrades to PIECEWISE *after* the model is compiled
+  non-piecewise → decode degrades toward eager (22.44 t/s). With M2's
+  support flip (≠ NEVER) the downgrade stops firing for this backend;
+  the bug remains for other NEVER backends (documented, upstream class).
 
 ## 0. Goal and target
 
@@ -18,9 +54,10 @@ and cudagraphs as strong as the Triton baseline's.
 | config | decode | attention slice/step |
 |--------|--------|----------------------|
 | serving, Triton, FULL_DECODE_ONLY (baseline) | **44.09 t/s** (22.7 ms e2e) | 10 × ~194 µs ≈ 1.94 ms ¹ |
-| serving, Triton, PIECEWISE (M0 reference) | TBD | TBD |
-| serving, CUSTOM M1 (PIECEWISE) | TBD after M0 | 10 × 72 µs + gather TBD |
-| serving, CUSTOM M2 (FULL_DECODE_ONLY) | TBD after M1 | TBD |
+| serving, CUSTOM (default LEGACY=1) + requested PIECEWISE + GEMV | **52.07 t/s** (19.2 ms/step) — **new best** | 10 × (FA + LEGACY gather) ≈ TBD (M0-3) |
+| serving, Triton, PIECEWISE (M0 reference) | queued (run_ab2) | TBD |
+| serving, CUSTOM + requested FULL_DECODE_ONLY + `GFX906_FA_CG=decode` (M2 experiment) | in flight | TBD |
+| serving, CUSTOM + requested FULL_DECODE_ONLY, CGSupport=NEVER (current default) | 22.44 t/s — **broken downgrade path** (parent v9) | — |
 | eager, CUSTOM LEGACY=0 (works today) | 19.33 t/s | — |
 
 ¹ "10 × 194 µs" comes from a P3-0 profile at seq~500. The 44.09 t/s bench
@@ -118,9 +155,9 @@ All legal eagerly (PIECEWISE), illegal/fragile inside FULL capture.
 
 ## 2. Milestones
 
-### M0 — pre-work (go/no-go gate; ~half day; do before any M1 code)
+### M0 — pre-work (go/no-go gate) — **item 1 PASSED; items 2–3 in flight/pending**
 
-Required before any M1 coding per parent plan v6:
+Required before M1/M2 coding per parent plan v6 (re-scored v3):
 
 1. **Gather micro-bench**: measure `gather_paged_kv_q8` + `q.float()` cost
    per layer at serving shapes (B=1, Sk≈2176–2816, Hkv=8, D=256) in
@@ -138,10 +175,23 @@ Required before any M1 coding per parent plan v6:
 **M0 exit / go condition**: gather ≤ ~80 µs/layer → proceed to M1.
 If gather > ~80 µs/layer → P3-3a suspended; switch to P3-2.
 
-### M1 — PIECEWISE serving, correct (no capture-safety work needed)
+**v3 re-score**: item 1 measured 21.7 µs/layer (2.0× HBM floor) — gate
+passed, though the measured kernel was the LEGACY=0 fused path; the
+serving default (LEGACY=1) PyTorch gather is validated end-to-end by the
+52.07 t/s number (which already beats the 44.09 baseline by 3.5 ms/step —
+more than the raw FA kernel delta, i.e. the LEGACY=1 gather path is
+cheaper than the §0/§5 pessimism assumed). **Proceed.**
 
-Attention runs eagerly between piecewise graphs → dynamic shapes and
-allocations stay legal. Work items:
+### M1 — LEGACY=0 serving path (v3: demoted to optional optimization track)
+
+v3: the default serving path is LEGACY=1 (inline quant, no Q8 side
+buffer), which already serves at 52.07 t/s with a passed correctness
+probe. M1-as-specified (enable the LEGACY=0 fused gather + Q8 side
+buffer) remains valuable only if a later A/B shows the fused gather
+beats the LEGACY=1 PyTorch gather by a meaningful margin at serving
+shapes; W1/W2/W4-T1/T2 are then required (RC1/RC2 apply to LEGACY=0
+only). Attention runs eagerly between piecewise graphs → dynamic shapes
+and allocations stay legal. Work items (unchanged):
 
 - **W1 side-buffer lifecycle**: in `do_kv_cache_update`, if `_k_cache_q8`
   is None or `(key_cache.data_ptr(), key_cache.shape, key_cache.device)`
@@ -212,10 +262,15 @@ allocations stay legal. Work items:
 6. Report state: `NO_PREFIX_CACHE` flag on/off, bench entrypoint, sample
    count.
 
-### M2 — FULL_DECODE_ONLY (CGSupport.UNIFORM_SINGLE_TOKEN_DECODE)
+### M2 — FULL_DECODE_ONLY (CGSupport.UNIFORM_SINGLE_TOKEN_DECODE) — **critical path (v3); experiment in flight**
 
-Only if M1 nets ≥ +0.3 ms/step vs the Triton-PIECEWISE baseline, or if
-piecewise boundary overhead is clearly visible in the M1 trace. Work items:
+v3: promoted ahead of M1 (see v2→v3 changes). The LEGACY=1 decode path
+has no Q8 side buffer, so M2 on the default path needs no W1/W2; the
+open question is capture-safety of the LEGACY gather allocations, which
+the `GFX906_FA_CG=decode` experiment answers empirically (hypothesis:
+safe, because the first FULL capture runs at
+profile_seq_lens=max_model_len → capacity-sized buffers, and metadata is
+runner-staged). Work items:
 
 - **W5 static decode shapes** (correctness requirement, not just perf):
   Replace the exact-shape reuse check in `_ensure_gather_buffers` with a
