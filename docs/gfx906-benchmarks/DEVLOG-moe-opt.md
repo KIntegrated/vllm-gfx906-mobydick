@@ -888,3 +888,76 @@ Next candidates: (a) cudagraph-safe CUSTOM (fix capture view handling or
 pad the side buffer at capture sizes), (b) prefill uses CUSTOM (it wins
 there per the vendored docs; our serving prefill could improve), (c) back
 to the original P3-3 Triton partitioning for the serving path.
+
+### Day-1 pre-step pair — gather micro-bench + P3-2(a) probe (2026-08-15)
+
+Plan v6's two Day-1 gates, run in the same session. Scripts:
+`benchmarks/kernels/gfx906/bench_gfx906_fa_gather.py` and
+`bench_llmm1_rows_per_block.py` (7.14 image, repo source-mounted,
+HIP_VISIBLE_DEVICES=0).
+
+**Gather micro-bench (P3-3a go/no-go) — GO.**
+`gather_paged_kv_q8` at B=1, Hkv=2, D=256, bs=16, pre-allocated out
+buffers (serving steady state); correctness vs torch reference
+byte-identical incl. V-tail zeroing:
+
+| Sk | µs/layer | GB/s | ×floor(798 GB/s) |
+|----|----------|------|------------------|
+| 2048 | 18.6 | 345 | 2.3× |
+| 2816 | **21.7** | 407 | 2.0× |
+| 3328 | 25.3 | 412 | 1.9× |
+
+Q-fp32 side costs per FA layer (Sq=1): q.float 3.9 + q_pad.zero_ 2.7 +
+q copy 7.0 + out unpack 8.3 = **21.9 µs/layer** (launch-bound small
+copies). Combined tax **43.6 µs/layer** vs 122 µs/layer FA kernel win
+(194−72) → net **~0.78 ms/step** over 10 layers — inside the plan's
+M1 expectation (0.7–1.2 ms → 46–48 t/s). **P3-3a RESUMES** per plan §4,
+as the time-fenced parallel line; the Triton PIECEWISE baseline bench
+(deconfound vs FULL_DECODE_ONLY) is required before reporting M1
+numbers. Note for M2: the Q-side 21.9 µs is as large as the gather
+itself — zero+copy+unpack are the natural next trim.
+
+**P3-2(a) aiter probe — STOPPED (structurally a no-op on gfx906).**
+Code audit of `rocm_unquantized_gemm_impl` (vllm/model_executor/layers/
+utils.py):
+- `VLLM_ROCM_USE_AITER` defaults **False** (envs.py).
+- Every aiter gemm path (aiter triton `gemm_a16w16`, `wvSplitKrc`) is
+  inside `if not on_gfx906():` — unreachable on MI50.
+- `ops.wvSplitK` explicitly excluded on gfx906 ("matrix cores not
+  supported", GCN5/Vega20).
+- aiter triton-gemm whitelist is GPT-OSS shapes (m==5120/k==2880, …);
+  none match this model.
+→ aiter rejection reason recorded: **arch exclusion, not shape/dtype
+selection** — the P3-1-era "collapse into P3-2(b)" path confirmed.
+
+**LLGemm1 `rows_per_block` sweep** (the one real knob; dispatch
+hardcodes 4):
+
+| shape (M×K) | ×/step | rpb2 | rpb4 (cur) | rpb8 | rpb16 | floor |
+|-------------|--------|------|------|------|-------|-------|
+| 12288×2048 in_proj | 30 | 57.8 | 64.7 | 60.1 | 61.0 | 63.1 |
+| 248320×2048 LM head | 1 | 1134.6 | 1209.8 | 1244.2 | 1178.6 | 1274.6 |
+| 9216×2048 qkv | 10 | 43.9 | 60.9 | 49.7 | 51.0 | 47.3 |
+| 2048×4096 o_proj | 40 | 21.5 | 23.0 | 25.3 | 28.9 | 21.0 |
+| 1024×2048 shared gate_up | 40 | **47.7** | 7.6 | 8.8 | 9.9 | 5.3 |
+| 2048×512 shared down | 40 | 5.5 | 7.1 | 6.8 | 7.8 | 2.6 |
+| 256×2048 router | 40 | 4.7 | 5.0 | 5.1 | 5.9 | 1.3 |
+| 64×2048 GDN small | 30 | 4.6 | 4.6 | 4.6 | 5.7 | 0.3 |
+
+Weighted per-step: rpb4 5604 µs (current), rpb8 5523 µs (+1.4% best),
+rpb2 6626 µs, rpb16 5793 µs. No shape moves ≥20% vs current → probe
+stop condition met; config retune alone is not worth a change.
+Anomaly: rpb=2 is 6× slower than rpb=4 on shared gate_up (M=1024)
+while winning 6–11% on the big shapes — block-count tail/occupancy
+effect (512 blocks vs 256 on 60 CUs); rpb=2 net negative.
+
+**Scoping for P3-2(b)** (custom M=1 W16A16):
+- Big rows (in_proj/LM head/qkv/o_proj) are **BW-bound at rpb=4**:
+  0.95–1.29× floor. Realistic capture there ≈ 0.2–0.5 ms/step (qkv
+  1.29× is the main one).
+- Small rows (gate_up/down/router/GDN-small, 150 calls/step) are
+  **launch/latency-bound**: 3.6–14× floor. LLGemm1 at M=64 is 16 blocks
+  × 256 threads — it does not fill 60 CUs; a K-split (MoE-kernel-style)
+  M=1 kernel attacks this. Ceiling ≈ 0.5–0.6 ms/step.
+- Total realistic P3-2(b) capture ≈ **0.7–1.1 ms/step**, consistent
+  with (slightly under) the plan's 1–1.5 ms estimate.
