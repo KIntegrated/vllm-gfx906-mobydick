@@ -14,9 +14,12 @@ A/B, separate commits, positive AND negative results in the DEVLOG.
 Model facts (Qwen3.5-35B-A3B-AWQ, this deployment): 40 layers, all MoE
 (E=256, topk=8, hidden 2048, expert w13 N=1024×K=2048 fused gate+up,
 w2 N=2048×K=512, AWQ w4a16 128-group), shared expert N=512 (dense
-W4A16 through the LLGemm1/LLMM1/GEMV surface), 30 GDN + 10 FA layers,
-single-request serving, **no spec decode** (the GDN empty-core-out gate
-in v15 relies on that).
+**fp16** — the checkpoint's `modules_to_not_convert` excludes
+`shared_expert` — through the LLGemm1/LLMM1/GEMV surface), 30 GDN +
+10 FA layers, single-request serving, **no spec decode** (the GDN
+empty-core-out gate in v15 relies on that). The checkpoint also
+excludes `model.layers.0.` — layer 0's routed experts ship fp16 and
+run the unquantized Triton path (C4, O1 resolved).
 
 ## 1. Where the MoE time goes (B=1 decode step)
 
@@ -33,7 +36,7 @@ torch-profiler attribution (DEVLOG "P3-4", `/tmp/bench/fillprof_result.txt`):
 | `w1_out.zero_()` [8,1024] | 38.7 | **121** | required by the atomic K-splits |
 | `output.zero_()` [1,2048] | 38.7 | **113** | required; **aliases** w1_out's memory (see §2) |
 | MoE-adjacent `copy_` [1,2048] | ~40 | **~158** (half of the 316 µs/80.3 group) | exact call site not yet pinned (P3-4 left the other half = GEMV pad, now fixed) |
-| `fused_moe_kernel.kd` (Triton, residual) | 2.0 | **414** (206.8 µs/call) | identity uncharacterized — open item O1 |
+| `fused_moe_kernel.kd` (Triton) | 2.0 | **414** (206.8 µs/call) | **layer 0's routed experts** — checkpoint `modules_to_not_convert` leaves `model.layers.0.` fp16 → unquantized TritonExperts oracle (O1 resolved 2026-08-16; C4) |
 | `moe_sum_vec_kernel` | 1.0 | 6 | — |
 | **total** | ~245 | **≈ 3.80 ms** | |
 
@@ -144,28 +147,42 @@ never writes the common buffer). Saves one launch each ≈ −190 µs/step
 Risk: low (no numerics change) but it is cross-kernel surgery in the
 align + activation paths.
 
-### C4 — Identify and route the Triton residual (measured 414 µs)
+### C4 — Layer-0 fp16 routed experts (measured 414 µs) — identity RESOLVED
 
-`fused_moe_kernel.kd` runs 2×/step at 206.8 µs/call — identity
-uncharacterized (open item O1). If it is a mis-routed expert path (e.g.
-an MTP or shared-expert fallback the oracle did not claim), fixing the
-dispatch is a direct ~400 µs win; if it is a genuinely different op, it
-joins the "leave alone" list. Gate: 30-minute profiler attribution
-(reuse the P3-4 method, `docs/gfx906-benchmarks/fillprof_probe.py`
-pattern) — do this **first**, it is the cheapest item here.
+`fused_moe_kernel.kd` (2×/step, 206.8 µs/call) is **layer 0's routed
+MoE**: the AWQ checkpoint's `modules_to_not_convert` lists
+`model.layers.0.`, so that layer's 256 experts ship fp16 and the
+quant-method oracle routes them to the unquantized Triton path
+(`unquantized.py: Using TritonExperts MoE backend` in the load log;
+`int_wna16.py: Using Gfx906WNA16Experts` covers layers 1–39).
+Attribution done 2026-08-16 with the P3-4 method (kernel External id →
+`vllm::moe_forward_shared` cpu_op → enclosing layer frame; 114/114
+ops in `Qwen3NextSparseMoeBlock_0`, eager trace
+`/tmp/bench/fillprof/`). Options: **(a) leave** — 414 µs is ~2.4% of
+the 17.5 ms step; **(b) re-quantize layer 0 to AWQ at load** —
+calibration-free per-group W4A16 of the fp16 weights for the excluded
+modules inside the AWQ loader; removes the only Triton dependency in
+the decode path and shrinks layer 0's weight bytes 4×, but changes
+layer 0 numerics → PPL gate mandatory, and it is a quant-method
+change (upstream-class, nontrivial). An fp16-dense replacement
+(gather + per-expert aiter GEMM, like the shared expert) was
+estimated at no better than ~200–300 µs for 8 active experts × 2
+legs — not a clear win. Verdict: **(b) only if the 70 t/s target is
+live**; otherwise (a).
 
 ### C5 — Shared-expert chain fusion (derived ~300–400 µs)
 
-The shared expert is three sequential small GEMMs/acts
-(w13 [1024,2048] → SiLU·mul → w2 [2048,512]) at B=1; P3-2(b) put each
-leg at its GEMM-kernel optimum ("3.6–14× floor rows, launch/latency
-bound, no GEMM kernel closes them") — but that adjudicated the legs
-separately. Fusing the **chain** (w13+act+w2 in one kernel with an
-in-block or grid-sync barrier) removes 2 launches × 40 layers. At B=1
-the intermediate is [1,1024] fp16 = 2 KB — trivially shareable inside a
-block or via one barrier. Effort: high (new kernel + a fused activation
-for the W4A16 format); risk: medium; expected −150 to −250 µs after
-the §2.4 discount.
+The shared expert (dense **fp16**, see header) is three sequential
+small GEMMs/acts (w13 [1024,2048] → SiLU·mul → w2 [2048,512]) at B=1;
+P3-2(b) put each leg at its GEMM-kernel optimum ("3.6–14× floor rows,
+launch/latency bound, no GEMM kernel closes them") — but that
+adjudicated the legs separately. Fusing the **chain** (w13+act+w2 in
+one kernel with an in-block or grid-sync barrier) removes 2 launches ×
+40 layers. At B=1 the intermediate is [1,1024] fp16 = 2 KB —
+trivially shareable inside a block or via one barrier. Effort: high
+(new fp16 kernel + fused SiLU·mul — simpler than a W4A16 version
+since there is no dequant); risk: medium; expected −150 to −250 µs
+after the §2.4 discount.
 
 ### C6 — Q8_1 activation quant (llama.cpp's decode mechanism) — likely NO on gfx906
 
@@ -214,11 +231,12 @@ multi-batch project where the overlap window is larger.
 
 ## 4. Recommended sequencing (if the phase is ever started)
 
-1. **Phase 0 — characterization (days, no model-path changes):** C4
-   (residual identity) + C8 (TCC on the gemm) + C1 gate micro-bench
-   (routing kernels at M=1/8/32/128) + C2 ablation bench (V1–V4 at
-   gemm1/gemm2 shapes). Output: a DEVLOG table deciding which of C1/C2
-   is real.
+1. **Phase 0 — characterization (days, no model-path changes):** C8
+   (TCC on the gemm) + C1 gate micro-bench (routing kernels at
+   M=1/8/32/128) + C2 ablation bench (V1–V4 at gemm1/gemm2 shapes).
+   (C4's identity question was resolved 2026-08-16 — layer 0's fp16
+   routed experts; see §6.) Output: a DEVLOG table deciding which of
+   C1/C2 is real.
 2. **Phase 4a — C1 + C2** (the ~2–2.5 ms pair): routing small-M path or
    fusion, then the gemm re-tile with the zeroing kill riding along.
    Gates per item: isolated micro-bench, 12/12 MoE tests, PPL probe
@@ -235,8 +253,10 @@ record (P3-4 precedent: 350 µs removed → +0.7 t/s, ~2× discount).
 
 ## 5. Open questions
 
-- **O1:** what are the 2×/step `fused_moe_kernel.kd` Triton calls
-  (206.8 µs each)? (C4)
+- **O1 (resolved 2026-08-16):** the 2×/step `fused_moe_kernel.kd`
+  Triton calls (206.8 µs each) are layer 0's routed experts — the
+  checkpoint's `modules_to_not_convert` excludes `model.layers.0.`, so
+  they ship fp16 and take the unquantized Triton oracle. See C4.
 - **O2:** exact call site of the ~40/step MoE-adjacent `copy_` [1,2048]
   (158 µs/step).
 - **O3:** llama.cpp's per-component kernel budget on the same box
@@ -245,6 +265,35 @@ record (P3-4 precedent: 350 µs removed → +0.7 t/s, ~2× discount).
 - **O4:** MI50 L2 size + expert-weight residency (C8).
 - **O5:** does `topkGating`'s 14 µs include an HBM round trip
   (256-expert logits row = 1 KB, likely L2) or pure structure? (C1 gate)
+
+## 6. Phase-2 (MoE) open-items cross-reference
+
+Phase 2 (`plan-moe-phase2.md`) closed with these items open; where each
+lands in this roadmap:
+
+- **P2-4 fused topk+align** (≈1 ms/step routing, high correctness
+  risk) → **C1** (routing small-M path or fusion).
+- **P2-5 "shared-expert Triton elimination"** (~0.55 ms/step as
+  profiled in P2) → premise corrected 2026-08-16 with the O1
+  resolution: the P2 profile's "shared expert (Triton fused_moe)" line
+  was **layer 0's routed experts** (fp16 unquantized), not the shared
+  experts. The shared experts were **already dense fp16** all along
+  (`modules_to_not_convert` excludes `shared_expert`) — there was no
+  Triton to eliminate. P2-5's residual substance splits into **C4**
+  (the layer-0 Triton, 414 µs) and **C5** (shared-expert chain fusion,
+  now fp16-fp16 rather than W4A16 — simpler).
+- **P2-1(e) persistent-CTA B-in-LDS prefill gemm** (the only path to
+  the ~2× prefill gemm goal; a/b/c landed for +26% and stalled at
+  ~5.9 TFLOPS ≈ 30% of the practical dot2 peak) → **out of scope for
+  this decode roadmap** (prefill). Parked here so it is not lost; the
+  DEVLOG "P2-1" section holds the measurements.
+- **P2-3 decode-MoE small-M latency** (skipped in P2 on the premise
+  "MoE is a small fraction of the step") → premise superseded by the
+  Phase 3 budget (§1: MoE ≈ 3.8 ms of a 17.5 ms step); this document
+  is the rescope of P2-3.
+- **P2-6** (dense GEMMs, decode paged attention, elementwise/norm
+  fusion — non-MoE) → became Phase 3's scope (P3-1/2/4); no MoE
+  residue.
 
 ## Appendix A — `moe_gemm_q4_kernel_gfx906` facts (csrc/rocm/moe_q_gemm_gfx906.cu)
 

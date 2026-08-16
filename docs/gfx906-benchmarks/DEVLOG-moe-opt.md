@@ -1658,3 +1658,37 @@ Phase 3 is declared done here. The MoE-side residual (routed gemm
 uncharacterized Triton residual ≈ 3.8 ms/step vs ~1.0 ms floor) is
 catalogued for a possible future phase in
 `plan-moe-decode-future.md`.
+
+## O1 resolved: the Triton residual is layer 0 (2026-08-16)
+
+The 2×/step `fused_moe_kernel.kd` (206.8 µs/call, 414 µs/step) from the
+post-FA-track trace is **layer 0's routed MoE**, not the shared expert
+and not MTP.
+
+Method (P3-4 pattern, eager torch-profiler trace
+`/tmp/bench/fillprof/`): kernel External id → correlated cpu_op =
+`vllm::moe_forward_shared` (dims [1,2048]×3) → enclosing
+`python_function` frame. All 114 Triton-launching ops over 114 steps
+sit inside `Qwen3NextSparseMoeBlock_0`; zero in layers 1–39. A
+model-load log probe confirms the split:
+`unquantized.py: Using TritonExperts MoE backend` (layer 0) +
+`int_wna16.py: Using Gfx906WNA16Experts` (layers 1–39).
+
+Root cause: the AWQ checkpoint's `quantization_config.
+modules_to_not_convert` = `["visual", "linear_attn", "self_attn",
+"shared_expert", "mlp.gate", "model.layers.0.", "mtp"]`. So
+- **layer 0's 256 routed experts ship fp16** → unquantized oracle →
+  Triton `fused_moe` (the 414 µs),
+- **all shared experts are dense fp16** (not W4A16) → they already run
+  the LLGemm1/LLMM1/GEMV dense surface — the P2-5 premise "shared
+  expert dispatches through the generic Triton fused_moe_kernel
+  (~40 launches/pass)" was a misattribution of this same layer-0
+  signal; there was never a Triton shared expert.
+
+Roadmap updated (`plan-moe-decode-future.md`): O1 resolved, C4
+rewritten (layer-0 options: leave / re-quantize to AWQ at load —
+(b) only if the 70 t/s target is live), C5 corrected to fp16-fp16
+(no dequant), header + §1 table fixed, new §6 cross-references the
+open Phase-2 items (P2-4→C1, P2-5→C4+C5, P2-1(e) persistent-CTA =
+prefill, out of scope, parked in §6, P2-3 = this roadmap's rescope,
+P2-6 → Phase 3).
