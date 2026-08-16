@@ -82,6 +82,10 @@ _TORCH_GATHER = _os.environ.get("GFX906_FA_TORCH_GATHER", "0") == "1"
 # (bit-equal to gather_paged_kv_fp16 + quantize_q8_0). GFX906_FA_FUSED_QUANT=0
 # reverts to the two-kernel path.
 _FUSED_QUANT = _os.environ.get("GFX906_FA_FUSED_QUANT", "1") != "0"
+# P3-4: skip the LEGACY-path q_pad zero_ on the Sq=1 decode fast path
+# (pad rows are per-row-independent and discarded; the q8_0 quantization
+# clamps NaN/Inf garbage). GFX906_FA_QPAD_EMPTY=0 reverts to the zero_.
+_QPAD_EMPTY = _os.environ.get("GFX906_FA_QPAD_EMPTY", "1") != "0"
 _DUMP_DIR = _os.environ.get("GFX906_FA_DUMP", "")
 _dump_n = 0
 
@@ -438,6 +442,14 @@ def forward_paged(
                 K_q8 = gfx906_fa.quantize_q8_0(K_bhsd)
 
     # Переиспользуем buffer если подходит по размеру; иначе создаём новый.
+    # Sq=1 decode fast path: pad rows are never read by consumers (the
+    # kernel computes per-row independently and Python keeps row 0 only;
+    # NaN/Inf garbage is clamped inside the q8_0 quantization), so the
+    # zero fill is skipped (GFX906_FA_QPAD_EMPTY, P3-4). PREFILL and
+    # multi-token decode keep the zero_ (their pad rows feed
+    # causal-masked computation).
+    _decode_fast = (
+        _QPAD_EMPTY and max_seqlen_q == 1 and num_tokens == num_seqs)
     if (q_pad_buf is not None
             and q_pad_buf.shape[0] >= num_seqs
             and q_pad_buf.shape[1] >= Hq
@@ -445,11 +457,17 @@ def forward_paged(
             and q_pad_buf.shape[3] == D
             and q_pad_buf.dtype == query.dtype):
         q_padded = q_pad_buf[:num_seqs, :Hq, :Sq_pad, :].contiguous()
-        q_padded.zero_()
+        if not _decode_fast:
+            q_padded.zero_()
     else:
-        q_padded = torch.zeros(
-            (num_seqs, Hq, Sq_pad, D),
-            dtype=query.dtype, device=query.device
+        q_padded = (
+            torch.empty(
+                (num_seqs, Hq, Sq_pad, D),
+                dtype=query.dtype, device=query.device
+            ) if _decode_fast else torch.zeros(
+                (num_seqs, Hq, Sq_pad, D),
+                dtype=query.dtype, device=query.device
+            )
         )
 
     cu = cu_seqlens_q.to(torch.long)

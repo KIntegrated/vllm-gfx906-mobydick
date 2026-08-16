@@ -4,6 +4,8 @@
 
 from typing import Literal
 
+import os
+
 import torch
 from einops import rearrange
 from torch import nn
@@ -64,6 +66,12 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+# gfx906 decode micro-opt: skip the core_attn_out zero fill on the non-spec
+# packed-decode fast path (all rows are rewritten by the Triton kernel);
+# see DEVLOG "fill/copy pile". Spec decode keeps the fill (upstream
+# PR #28182 invariant).
+_GDN_EMPTY_CORE_OUT = os.environ.get("GFX906_GDN_EMPTY_CORE_OUT", "0") == "1"
 
 # Optional ROCm AITER Triton kernels for the GDN decode path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -870,7 +878,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Note: we should not use torch.empty here like other attention backends,
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
+        # (spec-decode padding rows are never written by the core kernel).
+        # gfx906 micro-opt: on the non-spec packed-decode fast path every
+        # row is rewritten by fused_recurrent_gated_delta_rule_packed_decode,
+        # so the zero fill is dead weight (~3 us x 30 layers/step, DEVLOG
+        # "fill/copy pile"). GFX906_GDN_EMPTY_CORE_OUT=1 uses torch.empty
+        # there; this fork's serving deployment does not use spec decode.
+        core_attn_out = torch.zeros
+        if _GDN_EMPTY_CORE_OUT:
+            _fc = get_forward_context()
+            _am = None
+            if isinstance(_fc.attn_metadata, dict):
+                _am = _fc.attn_metadata.get(self.prefix)
+            if (
+                _am is not None
+                and self.enable_packed_recurrent_decode
+                and _am.spec_sequence_masks is None
+                and _am.num_prefills == 0
+                and _am.num_decodes > 0
+            ):
+                core_attn_out = torch.empty
+        core_attn_out = core_attn_out(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,

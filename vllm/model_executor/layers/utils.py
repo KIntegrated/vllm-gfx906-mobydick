@@ -219,8 +219,8 @@ def triton_matmul(a, b):
 
 
 def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor:
-    """ops.LLMM1 requires weight rows % 4 == 0; zero-pad tiny m (e.g. the
-    Qwen3-Next shared-expert gate [1, K]) and slice the result back.
+    """ops.LLMM1 requires weight rows % 4 == 0; zero-pad tiny m and slice
+    the result back.
 
     gfx906: the custom row-parallel W16A16 GEMV (dense_gemv_gfx906) beats
     LLMM1 rpb=4 on K=2048 rows with N==256 (router, -17%) or N>=2048
@@ -229,6 +229,12 @@ def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor:
     (o_proj K=4096, gate_up 1024, shared down K=512, N=64) stay on LLMM1.
     The GEMV is measured only on gfx906 (MI50) and is gated to it; other
     ROCm targets fall through to LLMM1.
+
+    m==1 (the Qwen3-Next shared-expert gate [1, K]) also goes to the GEMV
+    (RPT=1): the LLMM1 route zero-pads the *constant* weight to [4, K]
+    every call (a fill + copy per layer per step); GEMV RPT=1 is 4.7x
+    faster in isolation and bit-equal at N=1, K=2048
+    (bench /tmp/bench/bench_gate_gemv.py).
     """
     m = weight.shape[0]
     from vllm.platforms.rocm import on_gfx906
@@ -240,7 +246,7 @@ def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor:
         and x_view.dtype == torch.float16
         and weight.is_contiguous()
         and weight.shape[1] == 2048
-        and (m == 256 or m >= 2048)
+        and (m == 1 or m == 256 or m >= 2048)
     ):
         return ops.dense_gemv_gfx906(weight, x_view, 2048)
     if m % 4 == 0:

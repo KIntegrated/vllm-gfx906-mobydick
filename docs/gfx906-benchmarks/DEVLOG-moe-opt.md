@@ -1555,3 +1555,100 @@ it pollutes the in-source build state (CMakeCache.txt/build.ninja/CMakeFiles
 at the root) and derails the pip editable flow; the canonical build dir is
 the pip-generated one, and `.deps/*-subbuild` caches are path-bound
 (delete stale subbuilds, keep -src, if FetchContent complains).
+
+## P3-4: the fill/copy pile — attributed, three fixes LANDED (2026-08-16)
+
+The fresh post-FA-track trace showed 1178 µs/step in small fills + D2D
+copies (246.8 launches/step, median 4.64 µs — 100% launch-latency-bound,
+so the only lever is removing launches, not bytes). Attributed via an
+eager-mode torch profiler run (`docs/gfx906-benchmarks/fillprof_probe.py`,
+correlation-id join of cpu_op → kernel → python stack; the GPU-queue-lag
+makes kernel-timestamp-based stack attribution unreliable, CPU-op-timestamp
+windows are the reliable one) — 114 decode steps of the standard bench:
+
+| shape | n/step | µs/step | origin |
+|---|---|---|---|
+| fill [4,2048] | 39.7 | 125 | `F.pad(weight,(0,0,0,4-m))` in `_llmm1_tiny_m` (utils.py) — re-pads the *constant* shared-expert-gate weight [1,2048] every layer every step (LLMM1 needs rows%4==0) |
+| fill [8,1024] | 39.7 | 121 | `w1_out.zero_()` before MoE gemm1 (atomic K-split accumulation) |
+| fill [1,2048] | 39.7 | 39 | `output.zero_()` before MoE gemm2 |
+| fill [1,32,128] | 30+ | ~94 avg | GDN `core_attn_out = torch.zeros(...)` in qwen_gdn_linear_attn.py (upstream PR #28182, spec-decode invariant) |
+| copy [1,2048] | 80.3 | 316 | ~40 MoE apply copies + ~40 LLMM1 pad copies (F.pad above) |
+| copy [1,4096] | 10 | 36 | FA output fp32→fp16 cast (C++ requires fp32 q/o) |
+| fill [1,16,2,256] | 10 | 33 | FA `q_pad.zero_()` in forward_paged (LEGACY) |
+| runner H2D micro-copies | ~17 | ~60 | zero_block_ids / commit_block_table / _prepare_inputs (upstream) |
+
+### Fixes landed (all bit-exact or provably output-identical)
+
+1. **shared_expert_gate [1,K] → GEMV RPT=1** (utils.py `_llmm1_tiny_m`):
+   the GEMV dispatch condition gains `m == 1` (auto RPT=1 for N=1).
+   Kills the F.pad fill + pad copy per layer per step. Micro-bench
+   (`/tmp/bench/bench_gate_gemv.py`): 22.2 → 4.7 µs/call (4.7×) and
+   **bit-equal** to the pad+LLMM1 path at N=1, K=2048 (both 0.0 vs an
+   fp32 reference). Call sites of `_llmm1_tiny_m` guarantee n==1 and
+   bias is None, so the GEMV preconditions hold.
+2. **FA q_pad zero_ skip on the decode fast path**
+   (gfx906_fa_paged.py, LEGACY branch): for `max_seqlen_q==1 and
+   num_tokens==num_seqs` the pad rows are never consumed — the tile
+   kernel computes q rows independently (no cross-row reduction), Python
+   keeps row 0 only, and the q8_0 quantization clamps NaN/Inf garbage to
+   int8 range (fmaxf NaN semantics) so garbage pad rows stay finite even
+   through KVSPLIT combine. Prefill / multi-token decode keep the zero_.
+   15/15 test_gfx906_fa.py (incl. the cudagraph capture test) pass.
+3. **GDN core_attn_out torch.empty on the non-spec packed-decode fast
+   path** (qwen_gdn_linear_attn.py `forward_cuda`), env-gated
+   `GFX906_GDN_EMPTY_CORE_OUT=1` (default 0 keeps the upstream
+   PR #28182 zeros). Safe because
+   `fused_recurrent_gated_delta_rule_packed_decode_kernel` stores
+   unconditionally for every (token, head, dim) cell — including an
+   explicit zero store on the invalid-state branch — so no byte of the
+   output buffer survives from the allocation. The gate mirrors
+   `_forward_core`'s fast-path condition exactly.
+
+### Fix REJECTED: MoE zero_ reorder (aliasing trap)
+
+Reordering `output.zero_()` to overlap with `w1_out.zero_()` corrupted
+prefill (PPL 6.69 → 1.09e7). modular_kernel.py `_allocate_buffers`
+**reuses one `common_workspace` for both `workspace13` (gemm1 out) and
+the fused `output`** ("Reuse workspace13 for the output since there is
+only one chunk") — they alias, so the gemm2 zeroing must happen after
+gemm1+activation have finished using the same memory. Reverted.
+(Both gemms also K-split via grid.z atomics, so direct-store epilogues
+are off the table for either — the two zeroings are genuinely required
+and cannot be merged.)
+
+### Deferred (measured, not worth it / needs upstream)
+
+- FA fp16 q in / fp16 out (~80 µs/step, 2 casts × 10 layers): needs
+  templatizing `flash_attn_tile_q8` + the Q-quantizer + the C++
+  launcher; the quantization would stay bit-equal (fp16→fp32 is exact)
+  but it touches the vendor kernel for ~0.5%. Noted, not done.
+- MoE `output.zero_()` / `w1_out.zero_()` themselves: required by the
+  atomic K-splits (see above).
+- runner H2D micro-copies (~60 µs/step): upstream v1 worker code.
+- GDN fill on the prefill/spec path: upstream invariant, left intact.
+
+### Gates
+
+- PPL probe (prefill logprobs): baseline 6.6862 vs fixes 6.6889 —
+  inside run-to-run MoE-atomic noise (the AWQ gemm2 atomic-add order is
+  not deterministic across runs; same-magnitude deltas appear between
+  two runs of identical code).
+- MB greedy probe (B=2 decode, FULL_DECODE_ONLY): heads identical; one
+  token-0 flip BETWEEN TWO RUNS OF THE SAME (fixed) BUILD — the known
+  engine multi-batch near-tie non-determinism, not a regression signal.
+- Unit: 15/15 test_gfx906_fa.py, 12/12 test_gfx906_moe_gemm.py.
+- Ruff: no new errors (utils.py 12→12, gfx906_fa_paged.py 31→31, the
+  other two files clean).
+
+### Serving A/B (local venv, util 0.95, fastsafetensors, FULL_DECODE_ONLY,
+pp=2048/tg=256, 2 samples each, sequential)
+
+- baseline (all fixes stashed): 63.175 / 63.53
+- fixes (1)+(2)+(3, env on): **64.102 / 64.062 → record 64.08 t/s**
+  (fixed-run spread 0.04 vs baseline 0.36; min-fixed > max-baseline).
+
+Net +0.7 t/s (+1.15%) vs the 63.56 record. Smaller than the ~350
+µs/step the isolated per-op numbers predict: at 99.5% GPU busy, part of
+the removed fills was already partially overlapped by async compute, so
+only the critical-path share of each launch is recovered. llama.cpp gap:
+70.3/64.08 ≈ 1.10×.

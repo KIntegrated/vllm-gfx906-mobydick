@@ -2,6 +2,28 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 
+Status: v15 (2026-08-16) — **P3-4 landed: the fill/copy pile
+attributed + three bit-exact fixes.** The 1.18 ms/step (246.8 launches,
+median 4.64 µs, 100% launch-latency-bound) fill/D2D-copy pile was
+attributed via an eager torch-profiler correlation pass: shared-expert
+gate weight re-padded every step (F.pad in `_llmm1_tiny_m`), FA q_pad
+zeros, GDN core_attn_out zeros, MoE gemm zeroings, runner micro-copies.
+Fixes: (1) m==1 shared-expert-gate rows → GEMV RPT=1 (4.7× isolated,
+bit-equal; kills the per-step constant-weight pad fill+copy), (2) FA
+q_pad zero_ skipped on the Sq=1 decode fast path (pad rows are
+per-row-independent and discarded; prefill keeps the zero), (3) GDN
+core_attn_out torch.empty on the non-spec packed-decode fast path
+(env-gated `GFX906_GDN_EMPTY_CORE_OUT=1`; the Triton kernel stores
+unconditionally, so the fill is dead weight). REJECTED: MoE zero_
+reorder — modular_kernel aliases workspace13 and the fused output in
+one common buffer (prefill PPL 6.69 → 1.09e7; reverted). Serving A/B:
+baseline 63.18/63.53 vs **fixes 64.10/64.06 → new record 64.08 t/s
+(+1.15%)**; PPL 6.6862 → 6.6889 (MoE-atomic run noise); 15/15 FA +
+12/12 MoE tests. Gap vs llama.cpp: 1.11× → **1.10×**. Deferred (with
+measured costs): FA fp16 q/in-out (~80 µs/step, vendor kernel
+change), runner H2D micro-copies (~60 µs/step, upstream), the two MoE
+gemm zeroings (required by grid.z atomic K-splits). DEVLOG "P3-4".
+
 Status: v14 (2026-08-16) — **P3-3a stage 2 landed: fused
 gather-and-quantize.** The LEGACY decode two-kernel sequence
 (gather_paged_kv_fp16 + quantize_q8_0) is one kernel: V fp16 copy + K
@@ -35,6 +57,15 @@ P3-3a: stage-2 quantize-during-gather (quantize_q8_0 ~312 µs/step),
 FA micro-follow-ups (y-auto-tune, ncols=16 config-table tuning),
 LEGACY=0 optional track. `plan-gfx906fa-serving.md` at v7. DEVLOG
 "FA kernel track (P3-3a)" + "Local-venv bench environment".
+
+**v14→v15 changelog** (2026-08-16, DEVLOG "P3-4"): attribution of
+the 1.18 ms/step fill/copy pile (eager torch-profiler correlation;
+per-op origins in the DEVLOG table) + three bit-exact fixes (GEMV m==1
+shared-expert-gate dispatch; FA q_pad zero_ skip on the Sq=1 decode
+fast path; env-gated GDN core_attn_out empty on the non-spec packed
+decode fast path) and one rejected fix (MoE zero_ reorder —
+workspace13/output common-buffer aliasing in modular_kernel). Serving
+A/B 63.35 → 64.08 t/s mean (record 64.10).
 
 **v13→v14 changelog** (2026-08-16, DEVLOG "Post-FA-track trace +
 stage 2"):
@@ -327,10 +358,12 @@ top-8 MoE), MI50 32 GB (gfx906, 60 CU), single request:
 | llama.cpp (Q4_K_XL) | 807 t/s | **70.3 t/s** (14.2 ms/step) |
 | vLLM + cudagraphs, Triton attn, post-P3-1 (historical baseline) | ~2140 t/s | 44.09 t/s (22.7 ms e2e step; ~19.0 ms profiled step) |
 | vLLM + cudagraphs FULL_DECODE_ONLY, CUSTOM Q8 FA + GEMV + V1 fused gather | ~2140 t/s | 57.09 t/s (17.5 ms e2e step; 5-sample mean, σ≈0.09) |
-| vLLM + cudagraphs FULL_DECODE_ONLY, CUSTOM Q8 FA + GEMV + fused gather-quantize + FA NC2=8/KVSPLIT=16 (**current default, v14**) | ~2140 t/s | **~63.6 t/s** (15.7 ms e2e step; local venv 0.95: 63.534/63.581, A/B-OFF 62.594/62.695) |
+| vLLM + cudagraphs FULL_DECODE_ONLY, CUSTOM Q8 FA + GEMV + fused gather-quantize + FA NC2=8/KVSPLIT=16 + P3-4 fill cuts (**current default, v15**) | ~2140 t/s | **~64.1 t/s** (15.5 ms e2e step; local venv 0.95: 64.102/64.062, A/B-baseline 63.175/63.53) |
+| vLLM + cudagraphs FULL_DECODE_ONLY, CUSTOM Q8 FA + GEMV + fused gather-quantize + FA NC2=8/KVSPLIT=16 (v14) | ~2140 t/s | **~63.6 t/s** (15.7 ms e2e step; local venv 0.95: 63.534/63.581, A/B-OFF 62.594/62.695) |
 | vLLM + cudagraphs FULL_DECODE_ONLY, CUSTOM Q8 FA + GEMV + V1 gather + FA NC2=8/KVSPLIT=16 (v13) | ~2140 t/s | **~62.7 t/s** (15.9 ms e2e step; docker 0.85: 62.81/62.92, local venv 0.95 3-sample: 62.677/62.668/62.671) |
 
-Gap: **1.11× (~1.6 ms e2e/step)** (was 1.12× at 62.7, 1.23× at 57.09,
+Gap: **1.10× (~1.4 ms e2e/step)** (was 1.11× at 63.6, 1.12× at 62.7,
+1.23× at 57.09,
 1.59× at the
 44.09 baseline; the default-request config served 22.44 t/s via the
 downgrade bug before the M2/Route B work — see
@@ -353,7 +386,7 @@ construction; DEVLOG P3-0 for method):
 | gfx906 MoE routed kernel (Phase 1/2) | 1.75 | ~78 | done |
 | routing pipeline (topk+align+count_sort) | 1.06 | 79 | P2-4 deferred |
 | GDN decode (recurrent + conv1d) | ~0.5 | 60 | leave alone (faster than llama.cpp) |
-| elementwise/norm/copy pile | ~2.3 | ~300 | deprioritized (P3-4) |
+| elementwise/norm/copy pile | ~2.3 → ~1.9 | ~290 | **P3-4 DONE (v15)**: the launch-bound fill/copy sub-pile (1.18 ms, 247 launches) attributed; 3 bit-exact fixes (GEMV m==1, FA q_pad skip, GDN empty) net ~0.3 ms/step e2e; MoE zeroings + runner micro-copies + FA fp16 q/o deferred (DEVLOG P3-4) |
 | fused_moe_kernel (Triton, residual, 2/step) | 0.39 | ~2 | out of scope |
 | other small kernels (GDN/attn per-row ops) | ~2.2 | — | watch |
 | **kernel total** | **~17.6** | | |
@@ -586,7 +619,7 @@ while the Triton baseline serves with FULL_DECODE_ONLY.
 
 **Gate**: FA prefill advantage must not regress — bench both phases.
 
-### P3-4 — elementwise/norm pile (~2.3 ms/step) — DEPRIORITIZED
+### P3-4 — elementwise/norm pile (~2.3 ms/step) — fill/copy sub-pile LANDED (v15)
 
 P3-0 Q5: the pile is Fill/zeros 0.37 + copyBuffer 0.32 + rmsnorm variants
 ~0.6 + act/sigmoid ~0.4 + misc triton ~0.6. llama.cpp spends ~3.5 ms/step on
@@ -595,6 +628,20 @@ at or better than the reference**, so there is no demonstrated win here.
 Keep as a watch item; only revisit if P3-1/P3-3 land and the gap vs
 llama.cpp still exceeds 2 ms. (If revisited: inductor has already fused most
 of it — the lever would be graph breaks, not pass_config.)
+
+**v15 update** (user-requested revisit): the fresh serving trace put the
+Fill+copyBuffer sub-pile at 1.18 ms/step (246.8 launches, median 4.64 µs —
+100% launch-latency-bound). Attributed per-op (DEVLOG "P3-4" table) and
+three bit-exact launch cuts landed: shared-expert-gate m==1 rows → GEMV
+RPT=1 (kills the per-step constant-weight F.pad fill+copy, 4.7× isolated),
+FA q_pad zero_ skip on the Sq=1 decode fast path, env-gated GDN
+core_attn_out empty (kernel stores unconditionally). A fourth candidate
+(MoE zero_ reorder) was **rejected** — modular_kernel aliases workspace13
+and the fused output in one common buffer. Net serving: 63.35 → 64.08 t/s
+mean (record 64.10). Deferred with measured costs: FA fp16 q/in-out
+(~80 µs/step, vendor kernel change), runner H2D micro-copies (~60 µs,
+upstream), the two MoE gemm zeroings (required by grid.z atomic K-splits,
+cannot be merged).
 
 ### P3-5 — LM head (~1.2 ms/step, inside LLGemm1) — SKIP
 

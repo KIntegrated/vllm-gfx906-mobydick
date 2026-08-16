@@ -2,6 +2,15 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 
+Status: v9 (2026-08-16) — **P3-4 (parent plan v15) touched the FA path:**
+the LEGACY decode q_pad zero_ is skipped on the Sq=1 fast path (pad rows
+are per-row-independent and discarded; prefill/multi-token keep the
+zero; 15/15 FA tests). No FA kernel change. Whole-stack serving record
+moved 63.56 → **64.08 t/s** (gap 1.10×) from the P3-4 fill cuts (GEMV
+m==1 shared-expert-gate, FA q_pad skip, GDN empty). FA micro-follow-ups
+(y auto-tune, ncols=16 table, PMC counters) and the LEGACY=0 optional
+track remain. Detail: DEVLOG §"P3-4" + plan-decode-phase3.md v15.
+
 Status: v8 (2026-08-16) — **Stage 2 (quantize-during-gather) LANDED.**
 The LEGACY decode two-kernel sequence (gather_paged_kv_fp16 +
 quantize_q8_0, 458 µs/step under tracer; both latency/launch-bound at
@@ -292,6 +301,14 @@ kernel per FA decode layer replaces gather_paged_kv_fp16 + quantize_q8_0
 rocprofv3 trace: FA stack ≈ 621 µs/step (was 3272); dense dispatch at
 micro-bench optimum; ~1.18 ms/step fill/copy pile uncharacterized
 (next: P3-4 characterization). Record: 63.56 t/s; llama.cpp gap 1.11×.
+
+**v9 (2026-08-16) — P3-4 fill cuts (parent plan v15).** The 1.18
+ms/step fill/copy pile was attributed per-op (eager torch-profiler
+correlation; DEVLOG table). FA-adjacent fix: LEGACY q_pad zero_ skipped
+on the Sq=1 decode fast path (pad rows per-row-independent, discarded;
+NaN/Inf garbage clamped inside the q8_0 quantization). Whole-stack
+serving record 64.08 t/s (gap 1.10×). Deferred: FA fp16 q in / fp16
+out (~80 µs/step, vendor kernel templatization).
 
 ### M1 — LEGACY=0 serving path (v3: demoted to optional optimization track)
 
