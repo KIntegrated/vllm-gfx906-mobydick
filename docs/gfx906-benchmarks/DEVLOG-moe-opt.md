@@ -1124,6 +1124,10 @@ Triton reference). Then the W8 default flip.
 | 6 | ROCM_ATTN (Triton) | FULL_DECODE_ONLY | off | — | 43.986 | 22.73 ms | reproduces 44.09 archive (−0.2%) |
 | 7 | ROCM_ATTN | FULL_DECODE_ONLY | on | — | 44.808 | 22.32 ms | GEMV +1.9% |
 | 8 | ROCM_ATTN | PIECEWISE | on | — | 43.955 | 22.75 ms | M0-2 mode-matched FA reference |
+| 9 | CUSTOM | FULL_DECODE_ONLY | on | (default) | 52.90 | 18.90 ms | W8 default flip; 5-sample mean, σ≈0.06 |
+| 10 | CUSTOM | FULL_DECODE_ONLY | on | (default) | 49.56 | 20.18 ms | Route B stage 1, V2 fused fp16 gather — REGRESSION |
+| 11 | CUSTOM | FULL_DECODE_ONLY | on | (default) | 56.92 | 17.57 ms | Route B, V1 fused gather (`GATHER_V=1`), single |
+| 12 | CUSTOM | FULL_DECODE_ONLY | on | (default) | **57.09** | 17.52 ms | Route B, V1 default; 5-sample mean, σ≈0.09 — **new best = default config** |
 
 Conclusions:
 - 44.09 archive confirmed reproducible (43.99); the 22.44 default-request
@@ -1137,6 +1141,10 @@ Conclusions:
 - Attention win over Triton, mode-matched: FULL 53.09 vs 44.81 = +8.3 t/s
   (+18.5%); PIECEWISE 50.88 (GEMV off) vs 43.99 (GEMV off) = +6.9 t/s
   (+15.7%).
+- Route B (fused fp16 gather, V1 default): 57.09 t/s — +4.2 t/s (+7.9%) over
+  the 52.90 torch-gather default; probe-verified correct (128/128 greedy,
+  bit-exact vs Triton FULL). Default-request config is now 22.44 → 57.09
+  (2.54×).
 
 ### P3-3a M2 closed (2026-08-15)
 
@@ -1165,3 +1173,99 @@ Conclusions:
 Remaining P3-3a items (optional, see sub-plan v4): M0-3 attention-slice
 profile, LEGACY=0 fused-gather track (W1/W2/T1/T2) if an A/B ever shows it
 beats the LEGACY=1 PyTorch gather.
+
+### Re-baselined decode budget at 52.90 t/s (rocprofv3 --kernel-trace, 2026-08-15)
+
+Profiled the final default config (FULL_DECODE_ONLY + GEMV) under
+`rocprofv3 --kernel-trace` (46.2 t/s under tracer; per-dispatch overhead
+inflates absolute values ~10-15%, shares are the reliable signal).
+Steady-state window: last 4 s of the decode cluster, 185 steps, GPU 99%
+busy. Top rows (µs/step, profiler scale): dense_gemv 4366 (91.5 calls —
+GEMV covers FA qkv/in_proj/router + GDN in_proj_qkvz/router + LM head),
+FA kernel 3272 (11.3 calls ≈ 327 µs/layer @ Sk~2176, i.e. ~4.3× the
+Sk~500 72 µs — Sk-linear, as expected), LLMM1/LLGemm1 2505 (the non-GEMV
+rows: o_proj K=4096, gate_up N=1024, shared expert, GDN small), MoE wna16
+2390 + routing/fused_moe ~1900, GDN rec/conv ~590, and the LEGACY FA
+gather+side pile (torch gather + contiguous/mask/permute copies + Fill +
+quantize_q8_0 + q_pad zero/copy) ≈ 4-5 ms.
+
+**M0-3 resolved (the sub-plan's outstanding question)**: the LEGACY=1
+serving attention slice is NOT "FA 327 µs + gather ~40 µs" — the PyTorch
+fancy-index `_gather_kv` costs **128-190 µs/layer** in isolation
+(micro-bench, bench_gfx906_fa_gather.py LEGACY section: 189.5 @ Sk=2048,
+128.3 @ Sk=2816) vs the fused gather at 19-25 µs/layer. **The v3 demotion
+of the M1 fused-gather track was premature** — it is now the biggest
+remaining lever: ~0.9-1.4 ms/step (10 FA layers).
+
+**Route B chosen** (stage 1): fused fp16-K gather op
+(`gather_paged_kv_fp16`, reuses the byte-generic v2 gather kernel with
+bytes_per_row=2D — K stays fp16 in the cache, quantize_q8_0 still runs on
+the gathered K, no Q8 side buffer, no RC1/RC2 lifecycle). Expected +4-6
+t/s. Stage 2 (if quantize remains visible): fused fp16→q8
+quantize-during-gather. Stage 3 (the LEGACY=0 Q8 side-buffer track, W1/W2)
+only if more is needed.
+
+### Route B stage 1: fused fp16 gather — built, correct, the V2 serving trap (2026-08-16)
+
+**Implementation.** `gather_paged_kv_fp16` (C++ binding over the byte-generic
+gather kernel, `bytes_per_row = 2D`): K stays fp16 in the cache,
+`quantize_q8_0` still runs on the gathered K, no Q8 side buffer, no RC1/RC2
+lifecycle. Python: LEGACY branch of `forward_paged` now calls the fused op at
+`Sk_pad`; `GFX906_FA_TORCH_GATHER=1` reverts to the torch `_gather_kv` for A/B.
+Test: `test_fused_fp16_gather_matches_torch_gather`.
+
+**Bug found + fixed:** stride-domain mixup — K is `const uint8_t*` (byte
+strides = element stride × 2) but V is `__half*` (element strides, no ×2).
+L=32 "worked" by luck (doubled offsets still in-bounds); L=512 faulted.
+
+**Correctness:** probe3 (128/128 greedy tokens) — Triton-FULL vs CUSTOM-FULL
+with the fused gather: **bit-exact**, same degenerate-repetition fingerprint as
+the earlier probes. The fused path is correct end-to-end.
+
+**Serving regression (V2):** 49.56 t/s vs 52.83 (torch) — the fused op was
+SLOWER in serving. Investigation:
+
+- Isolated, the fused fp16 gather is **27-42 µs in every state**: contiguous /
+  unbind-view / identity / random bt, pools up to 6.6 GB, with and without a
+  512 MB L2 evictor, per-call synced or pipelined. The kernel is not slow.
+- Serving profile (rocprofv3 --kernel-trace): the gather kernel runs
+  **~285 µs/call, uniform** (p10-p90 = 282-287), vs 41 µs isolated.
+- Graph replay IS visible to the kernel trace: the final decode burst contains
+  ~2560 gather calls = 256 steps × 10 FA layers — so the 285 µs is real
+  replay time, not a windowing artifact.
+- **rocprofv3 grid-axis columns are untrustworthy in this build**: for known
+  kernels the reported Grid_Size_X/Y/Z does not match the source-computed
+  grid under any consistent axis mapping. Use timestamps/durations, not grids.
+- Probe artifact (avoid): one L2 test put the evictor `zero_()` INSIDE the
+  timed window — 256 MB of zeroes ≈ 320 µs masqueraded as "L2-miss gather
+  cost". With the evictor outside the window: 41 µs.
+
+**The decisive A/B (serving, FULL_DECODE_ONLY, same config):**
+
+| LEGACY FA gather | t/s |
+|---|---|
+| V2 fused (416 WG × 128 thr, `__syncthreads`) | 49.56 |
+| torch `_gather_kv` (fancy index) | 52.83 |
+| **V1 fused** (`GFX906_FA_GATHER_V=1`, per-token, grid (B,Hkv,Sk), 64 thr, no barriers) | **56.92** |
+
+V1 — the "old" per-token kernel with 16× more WGs and no shared memory — wins
+the serving context; V2 degrades 7× (isolated 41 → serving 285 µs) only in
+serving. Mechanism not isolated (wave-scheduling / barrier + low-WG-count
+interaction with the graph context is the leading candidate), but the
+empirical result is unambiguous. **Launcher default flipped to V1**
+(`GFX906_FA_GATHER_V=2` selects the old V2). All 4 FA tests pass on the new
+default. 5-sample confirmation bench: see below.
+
+**5-sample confirmation (new default, no env):** 57.13 / 57.14 / 57.18 /
+57.00 / 57.00 → **mean 57.09 t/s, σ≈0.09**. New best; the default-request
+config is now 22.44 → 57.09 (2.54×). llama.cpp gap narrows from 1.43× to
+≈1.23×.
+
+**Decision: Route B stage 1 LANDED** (V1 default; V2 behind
+`GFX906_FA_GATHER_V=2`; torch path behind `GFX906_FA_TORCH_GATHER=1`).
+Remaining FA-side levers, re-ranked by the 52.90 profile: FA kernel itself
+(327 µs/layer, Sk-linear — the big one, P3-3 track 2), quantize_q8_0
+(~312 µs/step — stage 2 quantize-during-gather candidate), q_pad zero/copy
+pile. The V2-serving-degradation mechanism stays an open note (barrier +
+low-WG-count kernel in FULL-graph context) — if future kernels for gfx906
+serve low-WG shapes, prefer many-small-WG layouts or A/B both.

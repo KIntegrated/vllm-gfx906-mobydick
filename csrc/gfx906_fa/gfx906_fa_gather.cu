@@ -391,14 +391,17 @@ extern "C" hipError_t launch_gather_paged_kv_q8(
     if (num_seqs == 0 || num_kv_heads == 0 || Sk == 0) return hipSuccess;
     if (D % 32 != 0) return hipErrorInvalidValue;
 
-    // Level 3c-step-A: GFX906_FA_GATHER_V=2 включает paged-block-coalesced kernel.
-    // По умолчанию — V2 (newer, faster). Старый per-token kernel остаётся как
-    // safety fallback через GFX906_FA_GATHER_V=1.
+    // Level 3c-step-A: GFX906_FA_GATHER_V выбирает вариант kernel'а.
+    // По умолчанию — V1 (per-token, grid (B, Hkv, Sk), 64 threads):
+    // в serving (FULL decode graph, D=256, Sk=3328) V1 на 15% быстрее V2
+    // (56.9 vs 49.6 t/s e2e) — V2 (416 WG + __syncthreads) деградирует в
+    // serving-контексте (285 us/call vs 41 us изолированно). V2 остаётся
+    // через GFX906_FA_GATHER_V=2.
     // env var читается один раз (thread-safe: amort over all calls).
     static int cached_version = -1;
     if (cached_version < 0) {
         const char * env = getenv("GFX906_FA_GATHER_V");
-        cached_version = (env && env[0] == '1') ? 1 : 2;
+        cached_version = (env && env[0] == '2') ? 2 : 1;
     }
 
     if (cached_version == 1) {

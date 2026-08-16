@@ -67,6 +67,10 @@ _DIRECT_PAGED_MAX_SQ = int(_os.environ.get("GFX906_FA_DIRECT_PAGED_MAX_SQ", "16"
 _ZERO_KTAIL = _os.environ.get("GFX906_FA_ZERO_KTAIL", "0") == "1"
 _NO_BUF_REUSE = _os.environ.get("GFX906_FA_NO_BUF_REUSE", "0") == "1"
 _DOUBLE_CHECK = _os.environ.get("GFX906_FA_DOUBLE_CHECK", "0") == "1"
+# LEGACY-path gather: fused HIP kernel (default) vs torch fancy-index path
+# (A/B switch; the torch path is 128-190 us/layer at Sk~2176-3328 vs ~40 us
+# for the fused fp16 gather).
+_TORCH_GATHER = _os.environ.get("GFX906_FA_TORCH_GATHER", "0") == "1"
 _DUMP_DIR = _os.environ.get("GFX906_FA_DUMP", "")
 _dump_n = 0
 
@@ -398,11 +402,26 @@ def forward_paged(
         gathered_sk = max_seqlen_k
     else:
         # Legacy-path: gather FP16 → quantize on the fly.
-        K_bhsd, V_bhsd = _gather_kv(
-            key_cache, value_cache, block_table, seq_lens, max_seqlen_k
-        )
+        # Fused HIP gather (P3-3a): replaces torch fancy-index _gather_kv
+        # (128-190 us/layer at Sk~2176-3328 vs ~40 us fused). V tail is
+        # zeroed; K tail unmasked — FA kernel cuts it via kv_max, same
+        # semantics as the Q8 side-buffer path. GFX906_FA_TORCH_GATHER=1
+        # reverts to the torch path for A/B.
+        if _TORCH_GATHER:
+            K_bhsd, V_bhsd = _gather_kv(
+                key_cache, value_cache, block_table, seq_lens, max_seqlen_k
+            )
+            gathered_sk = max_seqlen_k
+        else:
+            bt_i32 = (block_table if block_table.dtype == torch.int32
+                      else block_table.to(torch.int32)).contiguous()
+            sl_i32 = (seq_lens if seq_lens.dtype == torch.int32
+                      else seq_lens.to(torch.int32)).contiguous()
+            K_bhsd, V_bhsd = gfx906_fa.gather_paged_kv_fp16(
+                key_cache, value_cache, bt_i32, sl_i32, Sk_pad
+            )
+            gathered_sk = Sk_pad
         K_q8 = gfx906_fa.quantize_q8_0(K_bhsd)
-        gathered_sk = max_seqlen_k
 
     # Переиспользуем buffer если подходит по размеру; иначе создаём новый.
     if (q_pad_buf is not None

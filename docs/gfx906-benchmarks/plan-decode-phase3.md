@@ -2,21 +2,39 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 
-Status: v10 (2026-08-15) — **P3-1 landed** (41.51 → 44.09); **P3-2(b)
+Status: v11 (2026-08-16) — **P3-1 landed** (41.51 → 44.09); **P3-2(b)
 landed** (micro −401 µs/step; serving +0.45 ms/step = +2.3%, e2e-verified
-in the A/B matrix); **P3-3a M2 landed**: the CUSTOM Q8 FA backend's
-LEGACY decode path is FULL-capture-safe — CGSupport default flipped to
-UNIFORM_SINGLE_TOKEN_DECODE (GFX906_FA_CG=never|always override kept),
-52.90 t/s mean (σ≈0.06, n=6) under FULL_DECODE_ONLY + GEMV, 128/128
-greedy probe identical to the Triton-FULL reference, T3 capture/replay
-test passing. **New best serving: 52.90 t/s — now the default-request
-config** (was 22.44 via the downgrade bug; that bug is dormant for this
-backend but remains for other NEVER-support backends — upstream class).
-Full matrix in DEVLOG "Serving A/B matrix". `plan-gfx906fa-serving.md`
-at v4 (M2 done). Remaining P3-3a: M0-3 attention-slice profile, LEGACY=0
-track (side-buffer lifecycle/COW) demoted to optional. Gap vs llama.cpp:
-~1.32× at 52.90 vs ~70 t/s. Prefill already 2.6× faster than llama.cpp —
-out of scope unless a candidate helps both for free.
+in the A/B matrix); **P3-3a M2 + Route B stage 1 landed**: CUSTOM Q8 FA
+LEGACY decode path is FULL-capture-safe (CGSupport default flipped), and
+the LEGACY gather is now a fused HIP op (fp16-K, V1 per-token kernel
+default; V2/torch paths behind env knobs) — M0-3's torch gather
+(128-190 µs/layer) is gone. **New best serving: 57.09 t/s mean (σ≈0.09,
+n=5) — now the default-request config** (was 22.44 via the downgrade
+bug; that bug is dormant for this backend but remains for other
+NEVER-support backends — upstream class). 128/128 greedy probes
+identical to the Triton-FULL reference on both PIECEWISE and FULL paths;
+T3 capture/replay test passing. Full matrix in DEVLOG "Serving A/B
+matrix". `plan-gfx906fa-serving.md` at v5 (M2 + Route B stage 1 done).
+Remaining P3-3a: FA kernel itself (327 µs/layer @ Sk~2176, the big one),
+stage-2 quantize-during-gather (quantize_q8_0 ~312 µs/step), LEGACY=0
+track demoted to optional. Gap vs llama.cpp: ~1.23× at 57.09 vs ~70 t/s.
+Prefill already 2.6× faster than llama.cpp — out of scope unless a
+candidate helps both for free.
+
+**v10→v11 changelog** (2026-08-16, DEVLOG "Route B stage 1"):
+- M0-3 resolved: torch `_gather_kv` = 128-190 µs/layer isolated — the v3
+  demotion of the fused-gather track was premature; it was the biggest
+  remaining lever.
+- Route B stage 1 implemented: `gather_paged_kv_fp16` (byte-generic
+  gather kernel, bytes_per_row=2D; no Q8 side buffer, no RC1/RC2).
+  Stride-domain bug fixed (K byte-strides vs V element strides).
+  Correctness probe PASSED (128/128 bit-exact).
+- Serving A/B exposed the V2 trap: 41 µs isolated → 285 µs/call in the
+  FULL-graph context (49.56 t/s, regression); V1 (per-token, no
+  barriers) wins → launcher default flipped. Mechanism not isolated
+  (open note).
+- 57.09 t/s 5-sample mean, no env vars = default config. 22.44 → 57.09
+  (2.54×).
 
 **v9→v10 changelog** (2026-08-15, DEVLOG "Serving A/B matrix" + "P3-3a M2
 experiment"):

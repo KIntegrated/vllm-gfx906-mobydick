@@ -176,6 +176,34 @@ def test_cudagraph_capture_replay_legacy_decode_path():
     assert ((out1 - ref200).norm() / ref200.norm()).item() < 2e-2
 
 
+def test_fused_fp16_gather_matches_torch_gather():
+    """LEGACY-path fused gather (gather_paged_kv_fp16) must match the torch
+    _gather_kv reference in the valid region; V tail zeroed; K tail
+    unmasked (FA kernel cuts via kv_max)."""
+    dev = "cuda"
+    torch.manual_seed(4)
+    L = 500  # not a multiple of 32: exercises Sk_pad tail handling
+    n_blocks = (L + BLOCK - 1) // BLOCK
+    kc, vc, kv = _make_paged_cache(n_blocks, dev)
+    k16 = torch.randn(n_blocks, BLOCK, HKV, D, device=dev,
+                      dtype=torch.float16) * 0.5
+    V = torch.randn(L, HKV, D, device=dev, dtype=torch.float16) * 0.5
+    _write_v(kv, V)
+
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, -1)
+    sl = torch.tensor([L], dtype=torch.int32, device=dev)
+    Sk_pad = (L + 31) // 32 * 32
+
+    from vllm.gfx906_fa.gfx906_fa_paged import _gather_kv
+
+    k_ref, v_ref = _gather_kv(k16, vc, bt, sl, L)
+    k_f, v_f = fa.gather_paged_kv_fp16(k16, vc, bt, sl, Sk_pad)
+    assert k_f.shape == (1, HKV, Sk_pad, D) and v_f.shape == (1, HKV, Sk_pad, D)
+    assert torch.equal(k_f[0, :, :L], k_ref[0, :, :L])
+    assert torch.equal(v_f[0, :, :L], v_ref[0, :, :L])
+    assert bool((v_f[0, :, L:] == 0).all())
+
+
 def test_forward_decode_prefill_vs_sdpa_on_unbind_cache():
     dev = "cuda"
     torch.manual_seed(2)

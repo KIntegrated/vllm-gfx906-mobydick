@@ -515,6 +515,106 @@ std::vector<torch::Tensor> gather_paged_kv_q8(
     return {k_out, v_out};
 }
 
+// LEGACY-path fused gather: fp16 K cache (no Q8 side buffer) + fp16 V.
+// Reuses the byte-generic gather_paged_kv_q8 kernel with bytes_per_row = 2D.
+// Output K is fp16 [B, Hkv, Sk, D] (caller quantizes, as the LEGACY path
+// does today); V tail is zeroed per seq_lens, K tail unmasked (FA kernel
+// cuts via kv_max — same semantics as the Q8 path).
+std::vector<torch::Tensor> gather_paged_kv_fp16(
+    torch::Tensor key_cache,     // fp16 [num_blocks, block_size, Hkv, D]
+    torch::Tensor value_cache,   // fp16 [num_blocks, block_size, Hkv, D]
+    torch::Tensor block_table,   // int32 [num_seqs, max_num_blocks]
+    torch::Tensor seq_lens,      // int32 [num_seqs]
+    int64_t Sk,
+    c10::optional<torch::Tensor> k_out_opt = c10::nullopt,  // fp16 [B,Hkv,Sk,D]
+    c10::optional<torch::Tensor> v_out_opt = c10::nullopt   // fp16 [B,Hkv,Sk,D]
+) {
+    TORCH_CHECK_CUDA(key_cache);
+    TORCH_CHECK_CUDA(value_cache);
+    TORCH_CHECK_CUDA(block_table);
+    TORCH_CHECK_CUDA(seq_lens);
+
+    TORCH_CHECK(key_cache.dtype() == torch::kFloat16, "key_cache must be fp16");
+    TORCH_CHECK(value_cache.dtype() == torch::kFloat16, "value_cache must be fp16");
+    TORCH_CHECK(seq_lens.dtype() == torch::kInt32, "seq_lens must be int32");
+    TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4, "caches must be 4D");
+
+    const int num_blocks     = key_cache.size(0);
+    const int block_size     = key_cache.size(1);
+    const int num_kv_heads   = key_cache.size(2);
+    const int D              = key_cache.size(3);
+
+    TORCH_CHECK(value_cache.size(0) == num_blocks, "value_cache blocks mismatch");
+    TORCH_CHECK(value_cache.size(1) == block_size, "value_cache block_size mismatch");
+    TORCH_CHECK(value_cache.size(2) == num_kv_heads, "value_cache Hkv mismatch");
+    TORCH_CHECK(value_cache.size(3) == D, "value_cache D mismatch");
+    TORCH_CHECK(D % 32 == 0, "D must be multiple of 32");
+
+    TORCH_CHECK(block_table.dtype() == torch::kInt32,
+                "block_table must be int32");
+    TORCH_CHECK(block_table.is_contiguous(), "block_table must be contiguous");
+    TORCH_CHECK(seq_lens.is_contiguous(), "seq_lens must be contiguous");
+
+    const int num_seqs           = block_table.size(0);
+    const int max_blocks_per_seq = block_table.size(1);
+    TORCH_CHECK(seq_lens.size(0) == num_seqs, "seq_lens vs block_table batch mismatch");
+    TORCH_CHECK(Sk > 0 && (Sk % 32) == 0, "Sk must be positive multiple of 32, got ", Sk);
+
+    const int bytes_per_row = D * 2;
+    auto opts = key_cache.options();
+    auto use_or_alloc = [&](const c10::optional<torch::Tensor>& buf,
+                            int64_t dim3) -> torch::Tensor {
+        if (buf.has_value()) {
+            const auto & t = buf.value();
+            if (t.dim() == 4
+                && t.size(0) == num_seqs
+                && t.size(1) == num_kv_heads
+                && t.size(2) == Sk
+                && t.size(3) == dim3
+                && t.dtype() == opts.dtype()
+                && t.device() == opts.device()
+                && t.is_contiguous()) {
+                return t;
+            }
+        }
+        return torch::empty({(int64_t)num_seqs, (int64_t)num_kv_heads, Sk, dim3}, opts);
+    };
+    auto k_out = use_or_alloc(k_out_opt, D);
+    auto v_out = use_or_alloc(v_out_opt, D);
+
+    // Stride domains differ by pointer type (the gather kernel is
+    // byte-generic for K but uses element strides for the __half* V):
+    //   K: uint8_t*  -> byte strides (fp16 element stride x 2)
+    //   V: __half*   -> element strides, as the Q8 path passes them
+    const int64_t k_cache_block_stride  = key_cache.stride(0)  * 2;
+    const int64_t k_cache_token_stride  = key_cache.stride(1)  * 2;
+    const int64_t k_cache_head_stride   = key_cache.stride(2)  * 2;
+    const int64_t v_cache_block_stride  = value_cache.stride(0);
+    const int64_t v_cache_token_stride  = value_cache.stride(1);
+    const int64_t v_cache_head_stride   = value_cache.stride(2);
+    TORCH_CHECK(key_cache.stride(3) == 1 && value_cache.stride(3) == 1,
+                "gather_paged_kv_fp16: last dim must be contiguous");
+
+    auto stream = c10::hip::getCurrentHIPStream().stream();
+    hipError_t err = launch_gather_paged_kv_q8(
+        reinterpret_cast<const uint8_t*>(key_cache.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(value_cache.data_ptr<at::Half>()),
+        block_table.data_ptr<int32_t>(),
+        seq_lens.data_ptr<int32_t>(),
+        reinterpret_cast<uint8_t*>(k_out.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(v_out.data_ptr<at::Half>()),
+        num_seqs, num_kv_heads, (int)Sk, D, bytes_per_row, block_size,
+        max_blocks_per_seq,
+        k_cache_block_stride, k_cache_token_stride, k_cache_head_stride,
+        v_cache_block_stride, v_cache_token_stride, v_cache_head_stride,
+        stream
+    );
+    TORCH_CHECK(err == hipSuccess,
+                "launch_gather_paged_kv_fp16 failed: ", hipGetErrorString(err));
+
+    return {k_out, v_out};
+}
+
 // ============================================================================
 // Level 3c: Direct-paged FlashAttention.
 //
@@ -703,6 +803,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "k_out/v_out: optional pre-allocated buffers (exact shape match) to "
           "avoid peak VRAM spikes on large Sk.",
           py::arg("key_cache_q8"), py::arg("value_cache"),
+          py::arg("block_table"), py::arg("seq_lens"), py::arg("Sk"),
+          py::arg("k_out") = c10::nullopt,
+          py::arg("v_out") = c10::nullopt);
+    m.def("gather_paged_kv_fp16", &gather_paged_kv_fp16,
+          "LEGACY-path fused gather: paged fp16 K + paged fp16 V -> contiguous "
+          "BHSD outputs. Returns [k_out, v_out]. V tail zeroed per seq_lens; "
+          "K tail unmasked (FA kernel cuts via kv_max).",
+          py::arg("key_cache"), py::arg("value_cache"),
           py::arg("block_table"), py::arg("seq_lens"), py::arg("Sk"),
           py::arg("k_out") = c10::nullopt,
           py::arg("v_out") = c10::nullopt);

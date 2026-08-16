@@ -2,11 +2,12 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 
-Status: v4 (2026-08-15) — **M2 LANDED**: LEGACY decode path
-FULL-capture-safe, CGSupport default flipped to
-UNIFORM_SINGLE_TOKEN_DECODE, 52.90 t/s mean (σ≈0.06, n=6) on the
-default-request config (was 22.44 via the downgrade bug), 128/128 greedy
-probes identical on both PIECEWISE and FULL paths, T3 capture/replay test
+Status: v5 (2026-08-16) — **M2 LANDED + Route B stage 1 LANDED**:
+LEGACY decode path FULL-capture-safe, CGSupport default flipped to
+UNIFORM_SINGLE_TOKEN_DECODE, fused fp16 gather (V1) default —
+**57.09 t/s mean (σ≈0.09, n=5) on the default-request config** (was
+22.44 via the downgrade bug, 52.90 after M2), 128/128 greedy probes
+identical on both PIECEWISE and FULL paths, T3 capture/replay test
 passing. Sub-plan of Phase 3 **P3-3a** (parent:
 `plan-decode-phase3.md` v10). Evidence, bench history and the bug-hunt
 narrative live in `DEVLOG-moe-opt.md` (§"P3-3", §"Serving-mode backend
@@ -187,6 +188,21 @@ serving default (LEGACY=1) PyTorch gather is validated end-to-end by the
 52.07 t/s number (which already beats the 44.09 baseline by 3.5 ms/step —
 more than the raw FA kernel delta, i.e. the LEGACY=1 gather path is
 cheaper than the §0/§5 pessimism assumed). **Proceed.**
+
+**v5 (2026-08-16) — M0-3 resolved, Route B stage 1 landed.** Item 3
+(LEGACY attention slice) measured at the 52.90 baseline: the torch
+`_gather_kv` costs **128-190 µs/layer** isolated (the v3 demotion of the
+fused-gather track was premature). Route B stage 1 — fused fp16-K gather
+op, no Q8 side buffer — implemented, stride-domain bug fixed
+(K byte-strides vs V element strides), correctness probe PASSED (128/128
+bit-exact vs Triton FULL). Serving A/B exposed a trap: the V2
+(paged-block, 416 WG + `__syncthreads`) kernel is 41 µs isolated but
+285 µs/call in the FULL-graph serving context (49.56 t/s — regression);
+the V1 (per-token, grid (B,Hkv,Sk), 64 thr, no barriers) kernel wins:
+**57.09 t/s 5-sample mean** (new best = default config; launcher default
+flipped to V1, `GFX906_FA_GATHER_V=2` / `GFX906_FA_TORCH_GATHER=1` keep
+the alternatives). V2's serving degradation mechanism is not isolated —
+see DEVLOG "Route B stage 1".
 
 ### M1 — LEGACY=0 serving path (v3: demoted to optional optimization track)
 

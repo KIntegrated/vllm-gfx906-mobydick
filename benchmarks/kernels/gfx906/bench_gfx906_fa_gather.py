@@ -125,6 +125,27 @@ def main():
     print(f"  out unpack      {us_unpack:6.1f} us")
     print(f"  side total      {side:6.1f} us/layer")
 
+    # -------- LEGACY=1 serving path: torch _gather_kv (fp16 K) --------
+    # The default serving path (GFX906_FA_LEGACY=1) gathers fp16 K + fp16 V
+    # via PyTorch fancy indexing with mask+permute copies; the P3-0/v10
+    # serving profile suggests it costs far more than the fused Q8 gather.
+    from vllm.gfx906_fa.gfx906_fa_paged import _gather_kv
+
+    k16 = torch.randn(num_blocks, BLOCK, Hkv, D, dtype=torch.float16,
+                      device=dev)
+    print("\nLEGACY torch _gather_kv  B=1 Hkv=2 D=256 (fp16 K + fp16 V, "
+          "mask+permute)")
+    print(f"{'Sk':>6} {'us/call':>9} {'vs fused q8':>12}")
+    for sk in SK_LIST:
+        sl = torch.tensor([sk], dtype=torch.int32, device=dev)
+        bt = bt_full[:, : (sk + BLOCK - 1) // BLOCK]
+
+        def call_legacy():
+            _gather_kv(k16, vc, bt, sl, sk)
+
+        us = time_us(call_legacy)
+        print(f"{sk:>6} {us:>9.1f} {us/gather[sk]:>11.1f}x")
+
     # -------- gate verdict --------
     sk_g = 2816
     g = gather[sk_g]
