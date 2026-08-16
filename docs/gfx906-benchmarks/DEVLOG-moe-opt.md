@@ -1570,7 +1570,7 @@ windows are the reliable one) — 114 decode steps of the standard bench:
 |---|---|---|---|
 | fill [4,2048] | 39.7 | 125 | `F.pad(weight,(0,0,0,4-m))` in `_llmm1_tiny_m` (utils.py) — re-pads the *constant* shared-expert-gate weight [1,2048] every layer every step (LLMM1 needs rows%4==0) |
 | fill [8,1024] | 39.7 | 121 | `w1_out.zero_()` before MoE gemm1 (atomic K-split accumulation) |
-| fill [1,2048] | 39.7 | 39 | `output.zero_()` before MoE gemm2 |
+| fill [1,2048] | 38.7 | 113 | `output.zero_()` before MoE gemm2 (aliases w1_out's memory — see REJECTED below) |
 | fill [1,32,128] | 30+ | ~94 avg | GDN `core_attn_out = torch.zeros(...)` in qwen_gdn_linear_attn.py (upstream PR #28182, spec-decode invariant) |
 | copy [1,2048] | 80.3 | 316 | ~40 MoE apply copies + ~40 LLMM1 pad copies (F.pad above) |
 | copy [1,4096] | 10 | 36 | FA output fp32→fp16 cast (C++ requires fp32 q/o) |
@@ -1652,3 +1652,9 @@ Net +0.7 t/s (+1.15%) vs the 63.56 record. Smaller than the ~350
 the removed fills was already partially overlapped by async compute, so
 only the critical-path share of each launch is recovered. llama.cpp gap:
 70.3/64.08 ≈ 1.10×.
+
+Phase 3 is declared done here. The MoE-side residual (routed gemm
+1.92 ms, routing 1.05 ms, gemm zeroings 0.23 ms, plus a 0.41 ms
+uncharacterized Triton residual ≈ 3.8 ms/step vs ~1.0 ms floor) is
+catalogued for a possible future phase in
+`plan-moe-decode-future.md`.

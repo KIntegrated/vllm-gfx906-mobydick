@@ -22,7 +22,9 @@ baseline 63.18/63.53 vs **fixes 64.10/64.06 → new record 64.08 t/s
 12/12 MoE tests. Gap vs llama.cpp: 1.11× → **1.10×**. Deferred (with
 measured costs): FA fp16 q/in-out (~80 µs/step, vendor kernel
 change), runner H2D micro-copies (~60 µs/step, upstream), the two MoE
-gemm zeroings (required by grid.z atomic K-splits). DEVLOG "P3-4".
+gemm zeroings (required by grid.z atomic K-splits). **Phase 3 is
+complete**; the MoE-side residual is catalogued for a possible future
+phase in `plan-moe-decode-future.md`. DEVLOG "P3-4".
 
 Status: v14 (2026-08-16) — **P3-3a stage 2 landed: fused
 gather-and-quantize.** The LEGACY decode two-kernel sequence
@@ -660,6 +662,12 @@ warmup/capture region. No action; recorded so nobody re-chases it.
 
 - Prefill GEMMs (we are 2.6× ahead of llama.cpp there).
 - MoE routed kernel (Phase 1/2 done; 8–9% of step, at its issue-bound ceiling).
+  NOTE v15: the post-FA-track trace puts the routed gemm at 1.92 ms/step
+  and the routing pipeline at 1.05 ms/step (~3.8 ms/step total MoE-side
+  vs ~1.0 ms derived floor) — a future-phase roadmap with per-item
+  evidence states is now in `plan-moe-decode-future.md` (Phase 3 was
+  closed at 64.08 t/s / 1.10× gap; the roadmap activates only if the
+  70 t/s target stays the goal).
 - P2-4 routing pipeline (~1 ms) — revisit only if P3 lands and gap vs
   llama.cpp is still >2 ms.
 - Multi-batch serving (single-request bench; batched decode changes the whole
