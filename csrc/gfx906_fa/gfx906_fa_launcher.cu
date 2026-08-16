@@ -97,6 +97,28 @@ static hipError_t gfx906_fa_launch_impl(
     } else if (heads_q % nc2 != 0 || (nc2 & (nc2 - 1)) != 0) {
         fprintf(stderr, "[gfx906_fa] nc2=%d must be a power of two dividing heads_q=%d\n", nc2, heads_q);
         return hipErrorInvalidValue;
+    } else {
+        // A packed tile shares ONE kv head (K/V base = head0 / gqa_ratio),
+        // so a tile must not straddle GQA groups: gqa_ratio % nc2 == 0.
+        // E.g. Hq=24/Hkv=4 (ratio 6) with nc2=8 would read wrong KV heads
+        // for half the Q heads. Only NC2=1 and NC2=8 are instantiated in the
+        // dispatch below, so fail closed to the validated NC2=1 path when
+        // packing is not valid (do NOT clamp to 2/4: dispatch would still
+        // run the NC2=8 kernel and silently mispack).
+        const int gqa_ratio = heads_q / heads_kv;
+        if (nc2 != 8) {
+            fprintf(stderr, "[gfx906_fa] nc2=%d unsupported (instantiated: 1, 8)\n", nc2);
+            return hipErrorInvalidValue;
+        }
+        if (gqa_ratio % nc2 != 0) {
+            static bool warned = false;
+            if (!warned) {
+                fprintf(stderr, "[gfx906_fa] gqa_ratio=%d not divisible by nc2=%d, "
+                        "falling back to nc2=1\n", gqa_ratio, nc2);
+                warned = true;
+            }
+            nc2 = 1;
+        }
     }
     if (kv_split < 1) {
         kv_split = 1;

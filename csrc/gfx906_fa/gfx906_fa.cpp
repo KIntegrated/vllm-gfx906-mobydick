@@ -246,7 +246,14 @@ torch::Tensor gfx906_fa_forward(
     // [B, Sq, Hq, y, D] + meta [B, Sq, Hq, y, 2] (unscaled, (m, l)); merged
     // into o_bshd by gfx906_fa_split_combine.
     const int nc2 = get_fa_nc2();
-    const int kv_split = get_fa_kv_split();
+    int kv_split = get_fa_kv_split();
+    if (seq_q > 2) {
+        // KV-split is a B=1-decode parallelism trick (Sq=1 -> 16 blocks per
+        // head tile); at prefill the seq_q tiles already fill the machine and
+        // the partial-output buffer [B, Sq, Hq, kv_split, D] fp32 scales with
+        // Sq (588 MiB at Sq=1568, Hq=24, D=256, split=16) -- OOM on 32 GB.
+        kv_split = 1;
+    }
     torch::Tensor o_part, o_meta_split;
     float * o_fp32_ptr = o_bshd.data_ptr<float>();
     float2 * o_meta_ptr = reinterpret_cast<float2 *>(o_meta.data_ptr<float>());
