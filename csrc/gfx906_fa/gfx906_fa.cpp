@@ -21,6 +21,7 @@
 #include <c10/hip/HIPStream.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <cstdlib>
 
 // Launcher объявлен в gfx906_fa_launcher.cu
 extern "C" hipError_t gfx906_fa_launch(
@@ -38,8 +39,40 @@ extern "C" hipError_t gfx906_fa_launch(
     int batch, int heads_q, int heads_kv,
     int seq_q, int seq_kv, int head_dim,
     float scale,
+    hipStream_t stream,
+    int nc2,
+    int kv_split
+);
+
+// KV-split (gridDim.y > 1) partials merge (gfx906_fa_launcher.cu).
+extern "C" hipError_t gfx906_fa_split_combine(
+    float     *O_part,
+    float2    *meta,
+    float     *O_out,
+    int        rows,
+    int        y,
+    int        D,
     hipStream_t stream
 );
+
+// FA decode parallelism knobs (FA kernel track). Defaults: GQA head-packing
+// (ncols2=8) + KV split (gridDim.y=16) — ~4.2x faster than legacy at the
+// B=1 decode tile, +10% e2e (57.1 -> 62.9 t/s). Legacy behavior is the
+// kill switch: GFX906_FA_NC2=1 GFX906_FA_KVSPLIT=1.
+static int get_fa_nc2() {
+    static int v = [] {
+        const char *e = std::getenv("GFX906_FA_NC2");
+        return e ? std::atoi(e) : 8;
+    }();
+    return v;
+}
+static int get_fa_kv_split() {
+    static int v = [] {
+        const char *e = std::getenv("GFX906_FA_KVSPLIT");
+        return e ? std::atoi(e) : 16;
+    }();
+    return v;
+}
 
 // Device-side quantize launchers (gfx906_fa_quant.cu)
 extern "C" hipError_t launch_quantize_q8_0_dense(
@@ -185,6 +218,21 @@ torch::Tensor gfx906_fa_forward(
     // но kernel может писать при прохождении dead branches — выделяем).
     torch::Tensor o_meta = torch::empty({batch, seq_q, heads_q, 2}, opts_f32);
 
+    // KV-split (GFX906_FA_KVSPLIT>1): kernel writes per-split partials
+    // [B, Sq, Hq, y, D] + meta [B, Sq, Hq, y, 2] (unscaled, (m, l)); merged
+    // into o_bshd by gfx906_fa_split_combine.
+    const int nc2 = get_fa_nc2();
+    const int kv_split = get_fa_kv_split();
+    torch::Tensor o_part, o_meta_split;
+    float * o_fp32_ptr = o_bshd.data_ptr<float>();
+    float2 * o_meta_ptr = reinterpret_cast<float2 *>(o_meta.data_ptr<float>());
+    if (kv_split > 1) {
+        o_part = torch::empty({batch, seq_q, heads_q, kv_split, head_dim}, opts_f32);
+        o_meta_split = torch::empty({batch, seq_q, heads_q, kv_split, 2}, opts_f32);
+        o_fp32_ptr = o_part.data_ptr<float>();
+        o_meta_ptr = reinterpret_cast<float2 *>(o_meta_split.data_ptr<float>());
+    }
+
     auto stream = c10::hip::getCurrentHIPStream().stream();
 
     // kv_max: опциональный int32 tensor[B] для per-sequence cutoff.
@@ -252,18 +300,31 @@ torch::Tensor gfx906_fa_forward(
         q.data_ptr<float>(),
         k_q8.data_ptr<uint8_t>(),
         reinterpret_cast<const __half *>(v_fp16.data_ptr<at::Half>()),
-        o_bshd.data_ptr<float>(),
-        reinterpret_cast<float2 *>(o_meta.data_ptr<float>()),
+        o_fp32_ptr,
+        o_meta_ptr,
         kv_max_ptr,
         mask_ptr,
         mask_seq_kv_padded,
         q_abs_offset_ptr,
         batch, heads_q, heads_kv, seq_q, seq_kv, head_dim,
         (float) scale,
-        stream
+        stream,
+        nc2,
+        kv_split
     );
 
     TORCH_CHECK(err == hipSuccess, "gfx906_fa_launch failed: ", hipGetErrorString(err));
+
+    if (kv_split > 1) {
+        const int rows = batch * seq_q * heads_q;
+        hipError_t cerr = gfx906_fa_split_combine(
+            o_part.data_ptr<float>(),
+            reinterpret_cast<float2 *>(o_meta_split.data_ptr<float>()),
+            o_bshd.data_ptr<float>(),
+            rows, kv_split, head_dim, stream);
+        TORCH_CHECK(cerr == hipSuccess, "gfx906_fa_split_combine failed: ",
+            hipGetErrorString(cerr));
+    }
 
     // Transpose [B, Sq, Hq, D] → [B, Hq, Sq, D] для API совместимости с torch SDPA.
     // .contiguous() делает единоразовую копию (~1% от времени attention на больших Sq).

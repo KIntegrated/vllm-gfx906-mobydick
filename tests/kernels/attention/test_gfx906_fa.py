@@ -11,6 +11,7 @@ that allocation path exactly.
 """
 
 import math
+import sys
 
 import pytest
 import torch
@@ -362,3 +363,66 @@ def test_forward_decode_prefill_vs_sdpa_on_unbind_cache():
             "gjl,lgd->gjd", torch.softmax(s, -1), v[: t + 1]
         ).reshape(HQ, D)
         assert ((outf[t] - ref).norm() / ref.norm()).item() < 5e-2
+
+
+# The NC2/KVSPLIT knobs are parsed once per process (C++ statics on the
+# first forward call), so each config runs in a fresh subprocess.
+_SPLIT_CHECK_SRC = """
+import math
+import sys
+import torch
+
+nc2 = int(sys.argv[1])
+ysplit = int(sys.argv[2])
+sk = int(sys.argv[3])
+kv_max = int(sys.argv[4])
+
+torch.manual_seed(0)
+dev = "cuda"
+HQ, HKV, D = 16, 2, 256
+
+from vllm import _gfx906_fa_C as fa
+
+k16 = torch.randn(1, HKV, sk, D, device=dev, dtype=torch.float16) * 0.5
+v16 = torch.randn(1, HKV, sk, D, device=dev, dtype=torch.float16) * 0.5
+q32 = torch.randn(1, HQ, 1, D, device=dev, dtype=torch.float32) * 0.5
+k_q8 = fa.quantize_q8_0(k16)
+sl = torch.tensor([kv_max], dtype=torch.int32, device=dev)
+out = fa.forward(q32, k_q8, v16, 1.0 / math.sqrt(D), kv_max=sl)[0, :, 0]
+
+g = HQ // HKV
+k, v = k16[0].float(), v16[0].float()  # [HKV, sk, D]
+qg = q32[0, :, 0].view(HKV, g, D)
+s = torch.einsum("gjd,gld->gjl", qg, k[:, :kv_max]) * (1.0 / math.sqrt(D))
+ref = torch.einsum(
+    "gjl,gld->gjd", torch.softmax(s, -1), v[:, :kv_max]
+).reshape(HQ, D)
+rel = ((out - ref).norm() / ref.norm()).item()
+print(f"nc2={nc2} ys={ysplit} sk={sk} kv_max={kv_max} rel={rel:.2e}")
+sys.exit(0 if rel < 5e-2 else 1)
+"""
+
+
+@pytest.mark.parametrize("nc2, ys, sk, kv_max", [
+    (1, 1, 512, 512),    # legacy path, no split (sanity in-subprocess)
+    (1, 4, 512, 512),    # KV-split only
+    (1, 4, 512, 481),    # KV-split with empty trailing splits (kv_max<sk)
+    (8, 1, 512, 512),    # GQA head-packing only (no combine)
+    (8, 16, 512, 512),   # serving config: GQA pack + KV-split
+    (8, 16, 123, 123),   # short Sk: more splits than KV tiles
+    (8, 16, 512, 481),   # serving config + empty trailing splits
+])
+def test_forward_kv_split_gqa_pack_vs_fp32_ref(nc2, ys, sk, kv_max):
+    import os
+    import subprocess
+
+    env = {
+        **os.environ,
+        "GFX906_FA_NC2": str(nc2),
+        "GFX906_FA_KVSPLIT": str(ys),
+    }
+    r = subprocess.run(
+        [sys.executable, "-c", _SPLIT_CHECK_SRC, str(nc2), str(ys),
+         str(sk), str(kv_max)],
+        env=env, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, f"stdout: {r.stdout}\nstderr: {r.stderr[-2000:]}"

@@ -655,7 +655,7 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter(
             }
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
-                KQ_acc[jc0] += (ncols2 > 1 || mask) ?
+                KQ_acc[jc0] += mask != nullptr ?
                     slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
 
                 // Level 3a: inline causal — overrides KQ_acc with -INF for
@@ -687,7 +687,7 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter(
                 }
 
                 if (!oob_check || i_KQ < k_VKQ_sup) {
-                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
+                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += mask != nullptr ?
                         slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
 
                     if (q_abs_offset) {
@@ -978,11 +978,20 @@ static __global__ void flash_attn_tile_q8(
         }
     } else {
         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
-            constexpr bool oob_check = false;
-            flash_attn_tile_q8_q8_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
-                (Q_values, Q_scales, K_q8, V_h2, maskh, logit_softcap, slope, KQ, K_values, K_scales, KV_tmp,
-                stride_K_q8, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max,
-                q_abs_offset, sequence, col_Q_0);
+            if (k_VKQ_0 + nbatch_fa > k_VKQ_max) {
+                // Tail strided tile crossing k_VKQ_max: mask OOB rows.
+                constexpr bool oob_check = true;
+                flash_attn_tile_q8_q8_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+                    (Q_values, Q_scales, K_q8, V_h2, maskh, logit_softcap, slope, KQ, K_values, K_scales, KV_tmp,
+                    stride_K_q8, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max,
+                    q_abs_offset, sequence, col_Q_0);
+            } else {
+                constexpr bool oob_check = false;
+                flash_attn_tile_q8_q8_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+                    (Q_values, Q_scales, K_q8, V_h2, maskh, logit_softcap, slope, KQ, K_values, K_scales, KV_tmp,
+                    stride_K_q8, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max,
+                    q_abs_offset, sequence, col_Q_0);
+            }
         }
     }
 

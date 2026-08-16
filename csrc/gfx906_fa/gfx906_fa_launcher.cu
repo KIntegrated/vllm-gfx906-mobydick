@@ -75,7 +75,9 @@ static hipError_t gfx906_fa_launch_impl(
     int                seq_q,
     int                seq_kv,
     float              scale,
-    hipStream_t        stream
+    hipStream_t        stream,
+    int                nc2,
+    int                kv_split
 ) {
     constexpr int DKQ = HD;
     constexpr int DV  = HD;
@@ -84,6 +86,26 @@ static hipError_t gfx906_fa_launch_impl(
     if (heads_q % heads_kv != 0) {
         fprintf(stderr, "[gfx906_fa] heads_q=%d must be divisible by heads_kv=%d\n", heads_q, heads_kv);
         return hipErrorInvalidValue;
+    }
+    // GQA head-packing (ncols2) and KV-split (gridDim.y) are host-tunable.
+    // The legacy NC2=1/y=1 config launches only heads_q blocks at B=1 decode
+    // (16 for Hq=16) = 64/960 wavefront slots; packing GQA heads and/or
+    // splitting the KV range restores parallelism. y>1 partials are merged
+    // by the caller via gfx906_fa_split_combine (O unscaled, meta=(m,l)).
+    if (nc2 <= 1) {
+        nc2 = 1;
+    } else if (heads_q % nc2 != 0 || (nc2 & (nc2 - 1)) != 0) {
+        fprintf(stderr, "[gfx906_fa] nc2=%d must be a power of two dividing heads_q=%d\n", nc2, heads_q);
+        return hipErrorInvalidValue;
+    }
+    if (kv_split < 1) {
+        kv_split = 1;
+    }
+    // NC2>1 (GQA head-packing) is only validated at the decode tile
+    // (seq_q <= 2 -> ncols = 2*ncols2 <= 16); prefill (larger Sq) keeps
+    // the legacy NC2=1 path (the ncols=64 NC2=8 config faults on OOB).
+    if (nc2 > 1 && seq_q > 2) {
+        nc2 = 1;
     }
 
     // nb* computed in BYTES (ggml convention)
@@ -153,16 +175,15 @@ static hipError_t gfx906_fa_launch_impl(
     //
     // Lambda-макрос для DRY — все инстанциации идентичны кроме NC1.
 
-    constexpr int NC2 = 1;
-    const int ntiles_z = (heads_q + NC2 - 1) / NC2;
-
-    auto launch = [&](auto NC1_tag, int nthreads) {
+    auto launch = [&](auto NC1_tag, auto NC2_tag) {
         constexpr int NC1 = decltype(NC1_tag)::value;
+        constexpr int NC2 = decltype(NC2_tag)::value;
         dim3 grid(
             /*x=*/ (seq_q + NC1 - 1) / NC1,
-            /*y=*/ 1,                          // KV-split (stream-k) disabled
-            /*z=*/ batch * ntiles_z
+            /*y=*/ kv_split,
+            /*z=*/ batch * ((heads_q + NC2 - 1) / NC2)
         );
+        const int nthreads = ggml_cuda_fattn_tile_q8_get_nthreads(DKQ, DV, NC1 * NC2, /*cc=*/0);
         dim3 block(32 /* warp_size */, nthreads / 32 /* nwarps */, 1);
 
         flash_attn_tile_q8<DKQ, DV, NC1, NC2, use_logit_softcap><<<grid, block, 0, stream>>>(
@@ -197,13 +218,28 @@ static hipError_t gfx906_fa_launch_impl(
     using T16 = std::integral_constant<int, 16>;
     using T32 = std::integral_constant<int, 32>;
     using T64 = std::integral_constant<int, 64>;
+    using C1 = std::integral_constant<int, 1>;
+    using C8 = std::integral_constant<int, 8>;
 
-    if      (seq_q > 32) launch(T64{}, 256);
-    else if (seq_q > 16) launch(T32{}, 256);
-    else if (seq_q >  8) launch(T16{}, 256);
-    else if (seq_q >  4) launch(T8{},  256);
-    else if (seq_q >  2) launch(T4{},  128);
-    else                 launch(T2{},  256);
+    // ncols1 ladder (llama.cpp). For NC2=8 the ladder caps ncols1 at 8 so
+    // ncols = ncols1*ncols2 stays <= 64, the config-table maximum (no rows
+    // for 128..512); larger Sq simply loses some row-packing.
+    auto dispatch1 = [&](const auto &tag) {
+        if      (seq_q > 32) launch(T64{}, tag);
+        else if (seq_q > 16) launch(T32{}, tag);
+        else if (seq_q >  8) launch(T16{}, tag);
+        else if (seq_q >  4) launch(T8{},  tag);
+        else if (seq_q >  2) launch(T4{},  tag);
+        else                 launch(T2{},  tag);
+    };
+    auto dispatch8 = [&](const auto &tag) {
+        if      (seq_q >  8) launch(T8{},  tag);
+        else if (seq_q >  4) launch(T4{},  tag);
+        else if (seq_q >  2) launch(T4{},  tag);
+        else                 launch(T2{},  tag);
+    };
+    if (nc2 == 1) dispatch1(C1{});
+    else          dispatch8(C8{});
 
     return hipGetLastError();
 }
@@ -228,13 +264,94 @@ extern "C" hipError_t gfx906_fa_launch(
     int                seq_kv,
     int                head_dim,
     float              scale,
-    hipStream_t        stream
+    hipStream_t        stream,
+    int                nc2,
+    int                kv_split
 ) {
-    if      (head_dim == 128) return gfx906_fa_launch_impl<128>(Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream);
-    else if (head_dim == 256) return gfx906_fa_launch_impl<256>(Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream);
-    else if (head_dim == 64)  return gfx906_fa_launch_impl<64> (Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream);
+    if      (head_dim == 128) return gfx906_fa_launch_impl<128>(Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream, nc2, kv_split);
+    else if (head_dim == 256) return gfx906_fa_launch_impl<256>(Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream, nc2, kv_split);
+    else if (head_dim == 64)  return gfx906_fa_launch_impl<64> (Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream, nc2, kv_split);
     fprintf(stderr, "[gfx906_fa] Unsupported head_dim=%d (supported: 64, 128, 256)\n", head_dim);
     return hipErrorInvalidValue;
+}
+
+// ============================================================================
+// KV-split (gridDim.y > 1) combine. The FA kernel writes per-split partials:
+//   O_part: [rows, y, D] fp32, unscaled (no 1/l division when gridDim.y>1)
+//   meta:   [rows, y, 2] fp32, (m = running max, l = running sum)
+// where rows = B * Sq * Hq (row-major over (sequence, sq, head)).
+// Merge: m* = max_p m_p; out[d] = sum_p exp(m_p - m*) * O_p[d] /
+//        sum_p exp(m_p - m*) * l_p. Empty splits (m_p = -FLT_MAX/2, l_p=0)
+// contribute weight exp(-inf) = 0; all-empty rows (kv_max=0) are guarded.
+// One warp per row; D/4 float4 elements, 2 float4 per thread at D=256.
+// ============================================================================
+__global__ void fa_split_combine_kernel(
+        const float4 * __restrict__ O_part,
+        const float2 * __restrict__ meta,
+        float4 * __restrict__ O_out,
+        const int y,
+        const int D) {
+    const int row = blockIdx.x;
+    const int d4  = threadIdx.x;            // float4 index
+    const int D4  = D / 4;
+
+    // m* is row-wide; all warp lanes compute it redundantly (same row).
+    float m_star = -FLT_MAX / 2.0f;
+    for (int p = 0; p < y; ++p) {
+        m_star = fmaxf(m_star, meta[row * y + p].x);
+    }
+
+    for (int i = d4; i < D4; i += blockDim.x) {
+        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+        float l_star = 0.f;
+        for (int p = 0; p < y; ++p) {
+            const float2 mp = meta[row * y + p];
+            const float w = __expf(mp.x - m_star);   // 0 for empty splits
+            if (w == 0.f) continue;
+            const float4 op = O_part[(row * y + p) * D4 + i];
+            acc.x += w * op.x;
+            acc.y += w * op.y;
+            acc.z += w * op.z;
+            acc.w += w * op.w;
+            l_star += w * mp.y;
+        }
+        if (l_star == 0.f) l_star = 1.f;   // degenerate: kv_max == 0 row
+        const float inv_l = 1.f / l_star;
+        acc.x *= inv_l;
+        acc.y *= inv_l;
+        acc.z *= inv_l;
+        acc.w *= inv_l;
+        O_out[row * D4 + i] = acc;
+    }
+}
+
+extern "C" hipError_t gfx906_fa_split_combine(
+        float  *O_part,    // [rows, y, D] fp32
+        float2 *meta,      // [rows, y, 2] fp32
+        float  *O_out,     // [rows, D] fp32
+        int     rows,
+        int     y,
+        int     D,
+        hipStream_t stream)
+{
+    if (y <= 1) {
+        // No split: kernel already wrote the final answer in O_part layout
+        // [rows, 1, D] == [rows, D].
+        if (O_part != O_out) {
+            hipError_t e = hipMemcpyAsync(O_out, O_part,
+                (size_t) rows * D * sizeof(float), hipMemcpyDeviceToDevice, stream);
+            if (e != hipSuccess) return e;
+        }
+        return hipSuccess;
+    }
+    const int D4 = D / 4;
+    const int threads = D4 < 32 ? D4 : 32;
+    dim3 grid(rows), block(threads);
+    fa_split_combine_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const float4 *>(O_part),
+        reinterpret_cast<const float2 *>(meta),
+        reinterpret_cast<float4 *>(O_out), y, D);
+    return hipGetLastError();
 }
 
 // Forward declaration for the templated paged launcher (defined below).
