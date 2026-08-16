@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """gfx906 benchmark (0.23 vs 0.26 vs main). Usage: python3 /bench/_b.py <model>
 Env: BENCH_PP (2048), BENCH_TG (256), BENCH_GPU_UTIL (0.85), BENCH_MAXLEN,
      BENCH_WARMUP (1=do untimed warmup), BENCH_SAMPLES (default 1).
@@ -29,12 +31,34 @@ def main():
 
     from vllm import LLM, SamplingParams
 
+    # BENCH_EAGER=0 runs with cudagraphs ("serving mode"); numbers are NOT
+    # comparable to the eager tables in the README. FULL_DECODE_ONLY + small
+    # capture size: this bench is single-request decode-dominated.
+    eager = os.environ.get("BENCH_EAGER", "1") == "1"
+    extra = {}
+    # This vLLM dropped VLLM_ATTENTION_BACKEND; force the backend via
+    # attention_config (AttentionConfig.backend). On gfx906 the default
+    # resolves to the CUSTOM (Q8 FA) backend.
+    attn_backend = os.environ.get("BENCH_ATTN_BACKEND")
+    if attn_backend:
+        extra["attention_config"] = {"backend": attn_backend}
+    if not eager:
+        # Hybrid GDN model: cudagraph capture requires max_num_seqs <= number
+        # of Mamba cache blocks. Single-request bench -> 32 is plenty.
+        # BENCH_CG_MODE overrides the cudagraph mode (P3-3a M0 needs
+        # Triton in PIECEWISE for the mode-matched baseline).
+        extra["max_num_seqs"] = 32
+        extra["compilation_config"] = {
+            "cudagraph_mode": os.environ.get("BENCH_CG_MODE", "FULL_DECODE_ONLY"),
+            "max_cudagraph_capture_size": 8,
+        }
     llm = LLM(
         model=model,
         gpu_memory_utilization=gpu_util,
         max_model_len=maxlen,
         dtype="auto",
-        enforce_eager=True,
+        enforce_eager=eager,
+        **extra,
     )
     tok = llm.get_tokenizer()
 
@@ -65,8 +89,10 @@ def main():
         t0 = time.time()
         outs = llm.generate([prompt], gen_params(tg))
         t1 = time.time()
-        gen_text = outs[0].outputs[0].text
-        n_out = len(tok.encode(gen_text)) if gen_text else 0
+        o = outs[0].outputs[0]
+        n_out = len(o.token_ids)
+        # token_ids-based: text re-encoding collapses on degenerate/garbage
+        # output (e.g. '!!!!...') and undercounts.
         elapsed = t1 - t0
         results.append({
             "sample": s, "out_tokens": n_out, "elapsed_s": round(elapsed, 3),

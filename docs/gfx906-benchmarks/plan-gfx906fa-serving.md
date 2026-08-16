@@ -2,7 +2,22 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 
-Status: v5 (2026-08-16) — **M2 LANDED + Route B stage 1 LANDED**:
+Status: v6 (2026-08-16) — **code-review fixes LANDED** (combined review
+`phase3_code_rev_combined.md`): C1 arch-gate on the GEMV dispatch
+(CRITICAL), F1/F6 capture-safe q_pad + gather buffer lifecycle (retired
+captured buffers stay alive; real-impl lifecycle test), F2/M1 GEMV
+numeric tests incl. K-split, F4 RPT hardening, F5/M2 V1 bounds guard +
+gridDim.z cutover, F7 LEGACY=0 RC2 loud guards, F9 doc/comment cleanup
+(vendored Russian → English), F10 repo hygiene (gitignore, probes
+checked in, stale tables fixed), F3 evidence (PPL 6.6811 vs 6.6775 =
++0.05%; multi-batch probe: no corruption; the cross-run near-tie
+non-determinism is an engine property — pure Triton shows the same),
+H3/M3 V2 mechanism re-characterized (wavefront under-fill →
+co-resident interleaving; reduced-harness negative result).
+**57.09 t/s unchanged** (3-sample post-fix bench ≈ HEAD bench ≈ 56.7,
+machine drift).
+
+v5 (2026-08-16) — **M2 LANDED + Route B stage 1 LANDED**:
 LEGACY decode path FULL-capture-safe, CGSupport default flipped to
 UNIFORM_SINGLE_TOKEN_DECODE, fused fp16 gather (V1) default —
 **57.09 t/s mean (σ≈0.09, n=5) on the default-request config** (was
@@ -63,7 +78,8 @@ and cudagraphs as strong as the Triton baseline's.
 | serving, Triton, PIECEWISE | 43.96 t/s | — |
 | serving, CUSTOM + PIECEWISE + GEMV | 52.07 t/s | 10 × (FA + LEGACY gather) ≈ TBD (M0-3) |
 | serving, CUSTOM + PIECEWISE, GEMV off | 50.88 t/s | — |
-| serving, CUSTOM + FULL_DECODE_ONLY + GEMV (flipped default, n=6) | **52.90 t/s mean, σ≈0.06** — **new best = default config** | TBD (M0-3) |
+| serving, CUSTOM + FULL_DECODE_ONLY + GEMV, torch gather (n=6) | 52.90 t/s mean, σ≈0.06 | 10 × (FA + gather + quantize) ≈ 3.6 ms (rocprofv3, post-52.90) |
+| serving, CUSTOM + FULL_DECODE_ONLY + GEMV, **V1 fused gather (current default, n=5)** | **57.09 t/s mean, σ≈0.09** — **new best = default config** | torch gather was 128–190 µs/layer isolated (M0-3); V2 in-graph trap (285 µs/call) documented — DEVLOG "Route B stage 1" |
 | serving, CUSTOM + requested FULL_DECODE_ONLY, CGSupport=NEVER (`GFX906_FA_CG=never`) | 22.44 t/s — **downgrade bug** (dormant; upstream class) | — |
 | eager, CUSTOM LEGACY=0 (works today) | 19.33 t/s | — |
 
@@ -203,6 +219,25 @@ the V1 (per-token, grid (B,Hkv,Sk), 64 thr, no barriers) kernel wins:
 flipped to V1, `GFX906_FA_GATHER_V=2` / `GFX906_FA_TORCH_GATHER=1` keep
 the alternatives). V2's serving degradation mechanism is not isolated —
 see DEVLOG "Route B stage 1".
+
+**v6 (2026-08-16) — combined code-review fixes landed** (details in
+DEVLOG §"Phase-3 code-review fixes"). Structurally: the default path is
+now capture-order independent (q_pad + LEGACY=0 gather buffers: retired
+captured buffers stay alive, `empty_cache()` gone from the forward path,
+capture-state poll latches after first capture) with a real-impl
+capture→prefill→replay test; the GEMV dispatch is gfx906-gated (C1);
+V1 gather gained the bounds guard + the Sk>65535 V1→V2 cutover; LEGACY=0
++ prefix-caching/FULL-capture now log loudly (F7/RC2). Evidence bar met:
+PPL point +0.05% vs the fp16 Triton reference (acceptance ≤2%) and the
+two-request multi-batch greedy probe (prefix-overlap, B=2 graph) shows no
+corruption — the only cross-run differences are greedy near-ties, which
+the pure-Triton reference exhibits equally (engine property, likely MoE
+routing tie-breaks). H3/M3: the V2 7× in-graph regression does NOT
+reproduce in a gather-only graph (ratio 1.06) — re-characterized as
+wavefront under-fill (416/960 ≈ 43%) letting other graph branches
+co-reside and interleave; V1's 6656 wavefronts saturate the machine.
+Numbers unchanged: 57.09 t/s 5-sample record; post-fix 3-sample bench
+≈ HEAD 3-sample bench (≈56.7, machine drift).
 
 ### M1 — LEGACY=0 serving path (v3: demoted to optional optimization track)
 

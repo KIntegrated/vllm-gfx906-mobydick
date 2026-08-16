@@ -227,10 +227,15 @@ def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor:
     (in_proj/qkv/LM-head, -6..-23%); see
     benchmarks/kernels/gfx906/bench_dense_gemv_gfx906.py. Varying shapes
     (o_proj K=4096, gate_up 1024, shared down K=512, N=64) stay on LLMM1.
+    The GEMV is measured only on gfx906 (MI50) and is gated to it; other
+    ROCm targets fall through to LLMM1.
     """
     m = weight.shape[0]
+    from vllm.platforms.rocm import on_gfx906
+
     if (
-        os.environ.get("VLLM_GFX906_DENSE_GEMV", "1") != "0"
+        on_gfx906()
+        and os.environ.get("VLLM_GFX906_DENSE_GEMV", "1") != "0"
         and weight.dtype == torch.float16
         and x_view.dtype == torch.float16
         and weight.is_contiguous()

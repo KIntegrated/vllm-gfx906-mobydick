@@ -5,32 +5,35 @@
 // Vendored from https://github.com/cassettesgoboom/gfx906-fa-vllm
 // (FlashAttention-style custom attention backend for vLLM on AMD gfx906).
 //
-// gfx906_fa_gather.cu — fused HIP gather для paged KV → contiguous BHSD.
+// gfx906_fa_gather.cu — fused HIP gather for paged KV -> contiguous BHSD.
 //
-// Level 1 оптимизация: заменяет fancy-indexing путь _gather_kv_q8 в Python,
-// который делал 2 тура через HBM:
-//   1) key_cache_q8[block_table]  → temp [B, n_blocks, bs, Hkv, bytes]
-//   2) permute + contiguous       → [B, Hkv, Sk, bytes]
+// Level 1 optimization: replaces the Python fancy-indexing path
+// (_gather_kv_q8), which did 2 passes through HBM:
+//   1) key_cache_q8[block_table]  -> temp [B, n_blocks, bs, Hkv, bytes]
+//   2) permute + contiguous       -> [B, Hkv, Sk, bytes]
 //
-// Здесь делаем то же самое за ОДИН проход: каждый workgroup обрабатывает один
-// (seq_idx, kv_head, token_pos) триплет; читает block_table[seq_idx, token_pos/bs],
-// затем копирует K_q8 row и V_fp16 row в contiguous output BHSD.
+// Here we do the same in ONE pass: each workgroup handles one
+// (seq_idx, kv_head, token_pos) triple; it reads
+// block_table[seq_idx, token_pos/bs], then copies the K_q8 row and the
+// V_fp16 row into the contiguous output BHSD.
 //
-// Дополнительно V-row за seq_lens[seq_idx] обнуляется inline (это требование
-// kernel'а: «хвост» V не должен вносить вклад в softmax). K — мусор в хвосте
-// безразличен, потому что FA kernel отсекает по KV_max.
+// Additionally, V rows beyond seq_lens[seq_idx] are zeroed inline (a
+// kernel requirement: the V "tail" must not contribute to softmax). The
+// K tail garbage is irrelevant because the FA kernel cuts at kv_max.
 //
 // ---------------------------------------------------------------------------
-// Параметризация:
-//   Block(64, 1, 1) — 1 wavefront на 1 (seq, head, tok).
-//   Grid(num_seqs, Hkv, max_seqlen_k) — big, но каждый workgroup лёгкий
-//     (копия D*34/32 байт для K + D*2 байт для V, чтение block_table = 1 int).
+// Parameterization:
+//   Block(64, 1, 1) — one wavefront per (seq, head, tok).
+//   Grid(num_seqs, Hkv, max_seqlen_k) — big, but each workgroup is light
+//     (a copy of D*34/32 bytes for K + D*2 bytes for V, plus one int
+//     block_table read).
 //
-// Оптимизации для gfx906 (LDS 64KB/CU, 64-wide waves):
-//   - byte copy через unsigned int (4 байта за load/store) → coalesced HBM.
-//   - V копируем как __half4 (8 байт за тред) — 128-бит HBM burst.
-//   - block_table / seq_lens читаем ONE thread per workgroup + broadcast через
-//     shared mem.
+// gfx906 optimizations (64 KB LDS/CU, 64-wide waves):
+//   - byte copy via unsigned int (4 bytes per load/store) -> coalesced HBM.
+//   - V copied as __half4 (8 bytes per thread) — 128-bit HBM bursts.
+//   - block_table / seq_lens read by ONE thread per workgroup + broadcast
+//     via shared memory.
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
 #ifdef __HIP_NO_HALF_OPERATORS__
@@ -59,7 +62,7 @@
 //   k_out         [num_seqs, Hkv, Sk, bytes_per_row]            uint8
 //   v_out         [num_seqs, Hkv, Sk, D]                        fp16
 //
-// Где Sk = max_seqlen_k (округление до кратного 32 делает host).
+// Sk = max_seqlen_k (the host rounds it up to a multiple of 32).
 // ---------------------------------------------------------------------------
 extern "C" __global__ void gather_paged_kv_q8_kernel(
     const uint8_t * __restrict__ key_cache_q8,
@@ -70,7 +73,7 @@ extern "C" __global__ void gather_paged_kv_q8_kernel(
     __half        * __restrict__ v_out,
     int num_seqs,
     int num_kv_heads,
-    int Sk,                       // max_seqlen_k (кратно 32)
+    int Sk,                       // max_seqlen_k (multiple of 32)
     int D,                        // head_size
     int bytes_per_row,            // (D/32) * 34
     int block_size,
@@ -89,12 +92,12 @@ extern "C" __global__ void gather_paged_kv_q8_kernel(
 
     const int lane = threadIdx.x;   // 0..63
 
-    // Читаем seq_len ОДИН раз на workgroup (lane 0), broadcast через __shfl.
+    // Read seq_len ONCE per workgroup (lane 0), broadcast via __shfl.
     int seq_len = 0;
     if (lane == 0) seq_len = seq_lens[seq_idx];
     seq_len = __shfl(seq_len, 0, 64);
 
-    // Тоже для block_table[seq, tok_pos / block_size].
+    // Same for block_table[seq, tok_pos / block_size].
     const int block_tab_idx = tok_pos / block_size;
     const int block_offset  = tok_pos % block_size;
 
@@ -105,8 +108,9 @@ extern "C" __global__ void gather_paged_kv_q8_kernel(
         ((int64_t)seq_idx * num_kv_heads + head_idx) * (int64_t)Sk * bytes_per_row
         + (int64_t)tok_pos * bytes_per_row;
 
-    // Hot-case: out-of-range → обнулить V (K не трогаем, kernel отсекает).
-    if (tok_pos >= seq_len) {
+    // Out-of-range (or block_table shorter than Sk — guard, same as V2)
+    // -> zero V (leave K alone; the FA kernel cuts it).
+    if (tok_pos >= seq_len || block_tab_idx >= max_blocks_per_seq) {
         __half * vdst = v_out + v_dst_base;
         for (int i = lane; i < D; i += 64) {
             vdst[i] = __float2half(0.0f);
@@ -114,7 +118,7 @@ extern "C" __global__ void gather_paged_kv_q8_kernel(
         return;
     }
 
-    // Валидный токен → читаем block_table[seq, block_tab_idx].
+    // Valid token -> read block_table[seq, block_tab_idx].
     int phys_block = 0;
     if (lane == 0) {
         phys_block = block_table[seq_idx * max_blocks_per_seq + block_tab_idx];
@@ -129,18 +133,19 @@ extern "C" __global__ void gather_paged_kv_q8_kernel(
         + (int64_t)head_idx     * cache_head_stride_q8;
     uint8_t * k_dst = k_out + k_dst_base;
 
-    // bytes_per_row = (D/32)*34. Для D=128 это 136 байт. Копируем uint32_t-ами
-    // где это возможно, хвост — побайтно.
-    const int n_u32 = bytes_per_row >> 2;          // ← целых 4-байтных chunks
-    const int tail_start = n_u32 << 2;             // хвост в байтах
+    // bytes_per_row = (D/32)*34. For D=128 that is 136 bytes. Copy via
+    // uint32_t where possible, the tail byte by byte.
+    const int n_u32 = bytes_per_row >> 2;          // whole 4-byte chunks
+    const int tail_start = n_u32 << 2;             // tail, in bytes
     const uint32_t * k_src_u32 = reinterpret_cast<const uint32_t *>(k_src);
     uint32_t       * k_dst_u32 = reinterpret_cast<uint32_t       *>(k_dst);
     for (int i = lane; i < n_u32; i += 64) {
         k_dst_u32[i] = k_src_u32[i];
     }
-    // tail (0..3 байт). Для D%32==0 и 34*(D/32) → bytes_per_row % 4 ∈ {0, 2}:
-    // (D/32)*34 mod 4 = (D/32)*2 mod 4 → D=64 → 68 → 0; D=128→136→0. Ok.
-    // Но на всякий случай обрабатываем хвост через первого lane'а.
+    // tail (0..3 bytes). For D%32==0 and 34*(D/32) ->
+    // bytes_per_row % 4 in {0, 2}: (D/32)*34 mod 4 = (D/32)*2 mod 4 ->
+    // D=64 -> 68 -> 0; D=128 -> 136 -> 0. Fine. Handle the tail via lane 0
+    // anyway, just in case.
     if (lane == 0) {
         for (int i = tail_start; i < bytes_per_row; ++i) {
             k_dst[i] = k_src[i];
@@ -155,15 +160,17 @@ extern "C" __global__ void gather_paged_kv_q8_kernel(
         + (int64_t)head_idx     * v_cache_head_stride;
     __half * vdst = v_out + v_dst_base;
 
-    // Копируем через uint2 (8 байт = 4 × fp16) когда D выровнен по 4.
-    // Для D=128: 32 итерации по 4 fp16 → 2 burst per lane на 64 threads.
-    const int n_u2 = D >> 2;                       // D/4 chunks по 8 байт
+    // Copy via uint2 (8 bytes = 4 x fp16) when D is 4-aligned.
+    // For D=128: 32 iterations of 4 fp16 -> 2 bursts per lane over 64
+    // threads.
+    const int n_u2 = D >> 2;                       // D/4 chunks of 8 bytes
     const uint2 * v_src_u2 = reinterpret_cast<const uint2 *>(v_src);
     uint2       * v_dst_u2 = reinterpret_cast<uint2       *>(vdst);
     for (int i = lane; i < n_u2; i += 64) {
         v_dst_u2[i] = v_src_u2[i];
     }
-    // tail: D % 4. Для D=128 и D=64 это 0 → можно не обрабатывать, но оставим.
+    // tail: D % 4. For D=128 and D=64 this is 0 -> could be skipped, but
+    // keep it.
     const int v_tail = D & 3;
     if (v_tail != 0 && lane == 0) {
         for (int i = D - v_tail; i < D; ++i) vdst[i] = v_src[i];
@@ -173,26 +180,26 @@ extern "C" __global__ void gather_paged_kv_q8_kernel(
 // ---------------------------------------------------------------------------
 // V2: Paged-block-coalesced gather (1 workgroup = 1 paged block, 16 tokens).
 //
-// Мотивация (rocprof_decode.py на 60K, batch=4):
-//   Текущий per-token kernel: grid(4, 8, 61440) = ~2M workgroups, 64 threads.
-//   Эффективная HBM BW ~330 GB/s из ~1 TB/s пика MI50 (33% utilization).
-//   Основная причина — launch overhead от 2M wavefronts + мелкие transfers
-//   по 392 bytes/wg без полного burst-fill.
+// Motivation (rocprof_decode.py at 60K, batch=4):
+//   The per-token kernel: grid(4, 8, 61440) = ~2M workgroups, 64 threads.
+//   Effective HBM BW ~330 GB/s of the MI50's ~1 TB/s peak (33% utilization).
+//   Main cause: launch overhead from 2M wavefronts + small 392 bytes/wg
+//   transfers without full burst fill.
 //
-// V2 подход:
-//   * 1 workgroup обслуживает ОДИН (seq, head, paged-block) тройник
-//   * block_size=16 токенов сразу → 16×(136+256)=6272 bytes per wg
-//   * 128 threads/wg → ~49 bytes/thread = 2-3 uint4 each
-//   * block_table читается 1 раз за весь блок (вместо 1 на каждый токен)
+// V2 approach:
+//   * 1 workgroup serves ONE (seq, head, paged-block) triple
+//   * block_size=16 tokens at once -> 16x(136+256)=6272 bytes per wg
+//   * 128 threads/wg -> ~49 bytes/thread = 2-3 uint4 each
+//   * block_table is read once per block (instead of once per token)
 //
-// Layout контракт — идентичен V1 (чтобы безопасно переключаться через env):
+// Layout contract — identical to V1 (so the env switch is safe):
 //   src:  [num_blocks, block_size, Hkv, bytes_per_row | D]
 //   dst:  [num_seqs, Hkv, Sk, bytes_per_row | D]
-//   Sk кратно 32 (округляет host).
+//   Sk is a multiple of 32 (host rounds it).
 //
-// bytes_per_row = (D/32)*34 для q8_0 (D=128 → 136 bytes). Не кратно 16,
-// так что для K делаем 8×uint4 (128 bytes) + 1×uint2 (8 bytes) tail.
-// Для V (D*2 bytes, D%4==0) полностью кратно 16 → чистые uint4 loads.
+// bytes_per_row = (D/32)*34 for q8_0 (D=128 -> 136 bytes). Not a multiple
+// of 16, so for K we do 8xuint4 (128 bytes) + a 1xuint2 (8 bytes) tail.
+// For V (D*2 bytes, D%4==0) it is fully 16-aligned -> pure uint4 loads.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
     const uint8_t * __restrict__ key_cache_q8,
@@ -224,7 +231,7 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
     const int tid = threadIdx.x;
     const int nth = blockDim.x;   // 128
 
-    // ---------- Прочитать phys_block + seq_len ОДИН раз на wg ----------
+    // ---------- Read phys_block + seq_len ONCE per workgroup ----------
     __shared__ int s_phys_block;
     __shared__ int s_seq_len;
     if (tid == 0) {
@@ -238,7 +245,7 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
     const int phys_block = s_phys_block;
     const int seq_len    = s_seq_len;
 
-    // Базовые указатели источника (для валидного phys_block).
+    // Source base pointers (for a valid phys_block).
     const uint8_t * k_src_base_bh = (phys_block >= 0)
         ? key_cache_q8
           + (int64_t)phys_block * cache_block_stride
@@ -250,50 +257,53 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
           + (int64_t)head_idx     * v_cache_head_stride
         : nullptr;
 
-    // Базовые offset'ы dst: [seq, head, tok, 0]. Fixed per wg.
+    // dst base offsets: [seq, head, tok, 0]. Fixed per workgroup.
     const int64_t dst_K_sh_base =
         ((int64_t)seq_idx * num_kv_heads + head_idx) * (int64_t)Sk * bytes_per_row;
     const int64_t dst_V_sh_base =
         ((int64_t)seq_idx * num_kv_heads + head_idx) * (int64_t)Sk * D;
 
-    // Предрасчёт uint4-/uint2-границ для K.
-    // bytes_per_row может быть не кратен 16. Для D=128: 136 = 8*16 + 8.
-    const int k_n_u4  = bytes_per_row >> 4;           // 8 при D=128
-    const int k_tail  = bytes_per_row & 15;           // 8 при D=128
-    const int k_tail_u2 = k_tail >> 3;                // 1 (если есть 8 байт)
-    const int k_tail_byte = k_tail & 7;               // оставшиеся 0..7 байт (обычно 0)
+    // Precompute the uint4/uint2 boundaries for K.
+    // bytes_per_row may not be a multiple of 16. For D=128: 136 = 8*16 + 8.
+    const int k_n_u4  = bytes_per_row >> 4;           // 8 for D=128
+    const int k_tail  = bytes_per_row & 15;           // 8 for D=128
+    const int k_tail_u2 = k_tail >> 3;                // 1 (when there are 8 bytes)
+    const int k_tail_byte = k_tail & 7;               // remaining 0..7 bytes (usually 0)
 
-    // V layout: D*2 bytes per token. D=128 → 256 bytes = 16 × uint4. Чистый vectorised путь.
-    const int v_n_u4 = (D * (int)sizeof(__half)) >> 4;  // 16 при D=128
+    // V layout: D*2 bytes per token. D=128 -> 256 bytes = 16 x uint4. Pure
+    // vectorized path.
+    const int v_n_u4 = (D * (int)sizeof(__half)) >> 4;  // 16 for D=128
 
-    // Если ни один токен paged-блока не валиден — просто обнуляем V, K не трогаем.
+    // If no token in the paged block is valid — just zero V, leave K alone.
     const bool full_oob = (block_start_tok >= seq_len) || (phys_block < 0);
 
-    // ---------- FLAT ITERATION: вся работа WG распределена равномерно ----------
+    // ---------- FLAT ITERATION: the WG's work is spread evenly ----------
     //
-    // Главное отличие от первой версии V2: нет внутреннего `for t` цикла. Вместо
-    // этого все uint4-chunks для K, V по ВСЕМ 16 токенам blok'a распределены
-    // между 128 threads одним глобальным range-for. Это даёт:
-    //   * равномерную загрузку всех threads (раньше 8 из 128 делали работу)
-    //   * consecutive threads обращаются к consecutive адресам (coalesced HBM)
-    //   * меньше divergence на token-boundary
+    // Main difference from the first V2 version: no inner `for t` loop.
+    // Instead, all uint4 chunks for K and V over ALL 16 tokens of the block
+    // are distributed across the 128 threads by a single global range-for.
+    // This gives:
+    //   * even load on all threads (earlier 8 of 128 did the work)
+    //   * consecutive threads touch consecutive addresses (coalesced HBM)
+    //   * less divergence at token boundaries
     //
-    // Размеры работы per wg:
-    //   V: block_size × v_n_u4 = 16 × 16 = 256 uint4  (4096 bytes)
-    //   K: block_size × k_n_u4 = 16 × 8  = 128 uint4  (2048 bytes)
-    //   K tail: block_size × k_tail_u2 = 16 × 1 = 16 uint2 (128 bytes)
+    // Work size per workgroup:
+    //   V: block_size x v_n_u4 = 16 x 16 = 256 uint4  (4096 bytes)
+    //   K: block_size x k_n_u4 = 16 x 8  = 128 uint4  (2048 bytes)
+    //   K tail: block_size x k_tail_u2 = 16 x 1 = 16 uint2 (128 bytes)
     //
-    // На 128 threads это 2 uint4/thread для V и 1 uint4/thread для K — отличная
-    // утилизация и одновременно сhort программа.
+    // Over 128 threads that is 2 uint4/thread for V and 1 uint4/thread for
+    // K — excellent utilization and a short program at the same time.
 
     const int v_total_u4 = block_size * v_n_u4;       // 256
     const int k_total_u4 = block_size * k_n_u4;       // 128
     const int k_total_u2 = block_size * k_tail_u2;    // 16
 
     // --------- V pass: copy-or-zero per index ----------
-    // Раскладка idx -> (t, c): consecutive threads в wave попадают на соседние
-    // uint4-chunks ВНУТРИ одного токена (так как v_n_u4=16 ≥ warpsize тоже 16
-    // хотя на gfx906 лучше 64; здесь wave=64 покрывает 4 токена что ок).
+    // idx -> (t, c) layout: consecutive threads in a wave land on adjacent
+    // uint4 chunks WITHIN one token (v_n_u4=16 is >= the 16 used here, even
+    // though gfx906 prefers 64; a 64-wide wave covers 4 tokens, which is
+    // fine).
     for (int idx = tid; idx < v_total_u4; idx += nth) {
         const int t = idx / v_n_u4;
         const int c = idx - t * v_n_u4;
@@ -312,15 +322,15 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
         reinterpret_cast<uint4 *>(v_dst_tok)[c] = val;
     }
 
-    // --------- K pass (uint4 body): copy только для tok_valid ----------
-    // K tail (8 байт из 136) обрабатывается отдельно внизу.
+    // --------- K pass (uint4 body): copy only for tok_valid ----------
+    // The K tail (8 of the 136 bytes) is handled separately below.
     if (!full_oob) {
         for (int idx = tid; idx < k_total_u4; idx += nth) {
             const int t = idx / k_n_u4;
             const int c = idx - t * k_n_u4;
             const int tok_global = block_start_tok + t;
             if (tok_global >= Sk) continue;
-            if (tok_global >= seq_len) continue;  // out-of-range — не трогаем K
+            if (tok_global >= seq_len) continue;  // out-of-range — leave K
 
             const uint8_t * k_src_tok = k_src_base_bh + (int64_t)t * cache_token_stride;
             uint8_t       * k_dst_tok = k_out + dst_K_sh_base + (int64_t)tok_global * bytes_per_row;
@@ -328,7 +338,7 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
                 reinterpret_cast<const uint4 *>(k_src_tok)[c];
         }
 
-        // --------- K tail uint2 (8 байт) — один на токен при D=128 ----------
+        // --------- K tail uint2 (8 bytes) — one per token for D=128 ----------
         if (k_tail_u2 > 0) {
             for (int idx = tid; idx < k_total_u2; idx += nth) {
                 const int t = idx / k_tail_u2;
@@ -346,7 +356,7 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
             }
         }
 
-        // --------- K byte-tail (0..7 байт, при D=128 их 0) — cold path ----------
+        // --------- K byte tail (0..7 bytes; 0 for D=128) — cold path ----------
         if (k_tail_byte > 0) {
             for (int idx = tid; idx < block_size * k_tail_byte; idx += nth) {
                 const int t = idx / k_tail_byte;
@@ -391,18 +401,22 @@ extern "C" hipError_t launch_gather_paged_kv_q8(
     if (num_seqs == 0 || num_kv_heads == 0 || Sk == 0) return hipSuccess;
     if (D % 32 != 0) return hipErrorInvalidValue;
 
-    // Level 3c-step-A: GFX906_FA_GATHER_V выбирает вариант kernel'а.
-    // По умолчанию — V1 (per-token, grid (B, Hkv, Sk), 64 threads):
-    // в serving (FULL decode graph, D=256, Sk=3328) V1 на 15% быстрее V2
-    // (56.9 vs 49.6 t/s e2e) — V2 (416 WG + __syncthreads) деградирует в
-    // serving-контексте (285 us/call vs 41 us изолированно). V2 остаётся
-    // через GFX906_FA_GATHER_V=2.
-    // env var читается один раз (thread-safe: amort over all calls).
+    // Level 3c-step-A: GFX906_FA_GATHER_V selects the kernel variant.
+    // Default is V1 (per-token, grid (B, Hkv, Sk), 64 threads): in serving
+    // (FULL decode graph, D=256, Sk=3328) V1 is 15% faster than V2 (56.9 vs
+    // 49.6 t/s e2e) — V2 (416 WG + __syncthreads) degrades in the serving
+    // context (285 us/call vs 41 us isolated). V2 stays available via
+    // GFX906_FA_GATHER_V=2.
+    // The env var is read once (thread-safe: amortized over all calls).
     static int cached_version = -1;
     if (cached_version < 0) {
         const char * env = getenv("GFX906_FA_GATHER_V");
         cached_version = (env && env[0] == '2') ? 2 : 1;
     }
+    // HIP's gridDim.z is capped at 65535 and V1 puts Sk directly in
+    // gridDim.z: for very long contexts (max_model_len ~ 65-70K) switch to
+    // V2 (gridDim.z = ceil(Sk/block_size) — safe).
+    if (cached_version == 1 && Sk > 65535) cached_version = 2;
 
     if (cached_version == 1) {
         dim3 block(64, 1, 1);
@@ -417,7 +431,7 @@ extern "C" hipError_t launch_gather_paged_kv_q8(
             v_cache_block_stride, v_cache_token_stride, v_cache_head_stride
         );
     } else {
-        // V2: 1 wg = 1 paged block, 128 threads, grid уменьшен в block_size раз.
+        // V2: 1 wg = 1 paged block, 128 threads, grid reduced by block_size.
         const int n_paged_blocks = (Sk + block_size - 1) / block_size;
         dim3 block(128, 1, 1);
         dim3 grid(num_seqs, num_kv_heads, n_paged_blocks);

@@ -244,6 +244,14 @@ torch::Tensor dense_gemv_gfx906(torch::Tensor weight, torch::Tensor x,
   int rpt = -1;
   if (const char* e = getenv("VLLM_GFX906_GEMV_RPT")) {
     rpt = atoi(e);
+    TORCH_CHECK(rpt != 0,
+                "VLLM_GFX906_GEMV_RPT must be 1, 2 or 4 (got 0)");
+    if (rpt != 1 && rpt != 2 && rpt != 4) {
+      TORCH_WARN_ONCE(
+          "VLLM_GFX906_GEMV_RPT (", rpt, ") is not one of 1/2/4; using the "
+          "default rule instead.");
+      rpt = -1;
+    }
   }
   if (rpt < 0) {
     if (kchunk == 2048 && (N == 256 || N >= 2048))

@@ -1269,3 +1269,116 @@ Remaining FA-side levers, re-ranked by the 52.90 profile: FA kernel itself
 pile. The V2-serving-degradation mechanism stays an open note (barrier +
 low-WG-count kernel in FULL-graph context) — if future kernels for gfx906
 serve low-WG shapes, prefer many-small-WG layouts or A/B both.
+
+### Phase-3 code-review fixes (`phase3_code_rev_combined.md`, 2026-08-16)
+
+Addressed the combined adversarial review (qwen + ds4). All items below
+landed unless noted.
+
+**C1 (CRITICAL) — GEMV dispatch arch-gating.** `dense_gemv_gfx906` was
+routed on every ROCm arch under the skinny condition. Added the
+`on_gfx906()` gate in `_llmm1_tiny_m` (both call sites). Mock dispatch
+tests (m ∈ {256, 2048, 1024} + an off-gfx906 never-routes guard) added to
+`tests/model_executor/layers/test_rocm_unquantized_gemm.py`.
+
+**F1/F6 (HIGH) — capture-safe q_pad + gather buffer lifecycle.**
+`_ensure_forward_buffers` / `_ensure_gather_buffers` no longer
+free-then-realloc + `empty_cache()` on grow. A buffer that was current
+during a capture (tracked by `_q_pad_captured` / `_gather_captured`
+latches) is retired into a keep-alive list instead of freed, because the
+graph bakes in its VA. The capture-state poll runs only until the first
+capture latches the flag → zero steady-state cost (the first version
+polled `is_current_stream_capturing()` every step; the latch removes it
+from the hot path). New test
+`test_q_pad_buffer_survives_capture_then_prefill_grow` drives the real
+`Gfx906FAImpl` in the hazardous order — small decode → capture → large
+prefill (grow) → decode replay — and asserts retired-buffer liveness +
+replay numerics.
+
+**F2/M1 — GEMV numeric tests.** Real kernel vs `F.linear` at K=2048:
+kchunk=2048 (model path, RPT=2) and kchunk=512 (K-split atomic CAS
+epilogue, bench-only path), m ∈ {256, 2048}, atol=0.15 / rtol=2e-2.
+All pass. (M1 resolved as numeric tests rather than a bench-only
+carve-out.)
+
+**F4 — RPT env hardening.** `VLLM_GFX906_GEMV_RPT=0` is a hard error;
+non-{1,2,4} values warn and fall back to the default rule.
+
+**F5/M2 — V1 gather robustness.** V1 now has the `block_tab_idx >=
+max_blocks_per_seq` bounds guard (V2 parity); the launcher switches
+V1→V2 when `Sk > 65535` (HIP `gridDim.z` limit).
+
+**F7 — LEGACY=0 RC2 guards.** `get_cudagraph_support` logs a loud ERROR
+when LEGACY=0 with prefix caching enabled and a WARNING that LEGACY=0 is
+inconsistent with FULL capture and prefix caching. F7b: the three debug
+env hooks in `gfx906_fa_paged.py` are documented as eager-only
+(host-device syncs, illegal during capture).
+
+**F9 — dead code / stale docs.** Dead `gathered_sk` assignments removed;
+`ops.h` kchunk doc corrected; the vendored Russian comments/docstrings in
+`gfx906_fa_backend.py`, `gfx906_fa_paged.py`, `__init__.py` translated to
+English (the files had never been reviewed); Kevin Read SPDX notice
+added alongside the vendor notice in the three `vllm/gfx906_fa/` files;
+stale "MVP" header docstrings rewritten.
+
+**F10 — repo hygiene.** `.gitignore` gained `.rocprofv3/` and
+`gpucore.*.gpu` (the root-owned 207 MB dumps remain on disk — need sudo
+to delete). Root duplicates consolidated: `_bench_gfx906.py` /
+`_pp_bench.py` are canonical in `docs/gfx906-benchmarks/` (this phase's
+established bench-script home); `run_bench_gfx906.sh` checked in there
+(path-fixed); probes `_p31_ab.py`, `probe_custom_fa.py`,
+`probe2_custom_fa_full.py` checked in there too (W4 "tests/ or tools/" —
+used the project's established scripts area). `bench_ab2.py` /
+`test_backend_vs_legacy.py` no longer exist (one-off; their results are
+recorded above). The two stale tables fixed: parent plan §1 (44.09 /
+1.59× → 57.09 / 1.23×) and sub-plan §0 (52.90 "new best" → 57.09 row).
+
+**F3 (evidence) — perplexity point + multi-batch probe.**
+- PPL (fixed 12-prompt natural-text set, 442 prompt tokens,
+  prompt-logprob PPL with k=20 top-k, actual-token lookup):
+  CUSTOM **6.6811** vs Triton **6.6775** → **+0.05%** (acceptance
+  ≤ 2%) — the Q8-K attention quantization is PPL-negligible.
+- Multi-batch greedy (2 requests, req2 = req1 prefix + continuation so
+  APC COW's the shared blocks; B=2 decode graph; 128 tokens):
+  - req1: **128/128 bit-identical** CUSTOM vs Triton, and identical
+    across repeated runs.
+  - req2: 127/128 vs Triton — first diff at the LAST token, inside a
+    degenerate repetition loop (near-tie).
+  - req2 vs no-share control (fresh engine, P2 alone): exactly one
+    near-tie position (token 120), sequences re-sync afterwards.
+  - **Pure Triton shows the same class of non-determinism**: two runs of
+    the Triton reference differ on req2 at 2 loop-region positions
+    (req1 identical) → engine-level property (likely MoE routing
+    tie-breaks), not introduced by the CUSTOM backend.
+  - Production B=1 path (probe2, two independent launches): logs
+    **byte-identical** → bit-deterministic.
+  Interpretation: no corruption in the multi-batch / prefix-sharing
+  path; greedy near-tie resolution can differ between runs/backends at
+  tied positions (model/engine property); the PPL point is the correct
+  aggregate metric.
+
+**H3/M3 — V2 7× in-graph regression, root-cause pass.** Reduced harness
+(gather-only graph, no model): V1 eager 33.7 / graph 40.5 µs; **V2 eager
+36.5 / graph 38.6 µs (ratio 1.06)**. A gather-only graph does NOT
+reproduce the 7× — the anomaly is not a kernel-local graph effect; it
+needs the full decode graph context. Mechanism re-characterized: V2's
+416 wavefronts fill ~43% of the MI50's 960 wavefront slots, so under a
+graph the other branches (MoE / GDN / elementwise) co-reside and
+interleave, inflating the observed duration; V1's 6656 wavefronts
+saturate the machine, so nothing co-resides. (Full proof would need a
+serving kernel trace showing the overlap window — optional follow-up.
+Supersedes the earlier "barrier + low-WG-count in graph context"
+leading candidate.)
+
+**Bench — no regression from the fixes.** Default-config 3-sample
+bench after the fixes: 56.75 / 56.81 / 56.73 (before the capture-poll
+latch: 56.77); the same bench on HEAD (`01526dfc69`, the 57.09 commit)
+run today: 56.79 / 56.83 / 56.58 → mean 56.73. The 57.09 → ~56.7 drift
+is machine-state drift, not code (HEAD ≈ current tree within 0.05%);
+57.09 remains the 5-sample record.
+
+**Test status.** `test_gfx906_fa.py`: 5/5 (existing 4 + new lifecycle
+test; the fp16-gather test gained a B=2 disjoint-blocks case).
+`test_rocm_unquantized_gemm.py`: 8 new GEMV tests pass; the 8
+pre-existing mock-based failures (CPU-tensor mocks vs this ROCm/Triton
+build) fail identically on HEAD — not ours.

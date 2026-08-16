@@ -53,7 +53,7 @@ void moe_gptq_gemm_gfx906(torch::Tensor a, torch::Tensor c,
                           int64_t zero_offset);
 
 // M=1 W16A16 dense GEMV for gfx906 (P3-2b; see dense_gemv_gfx906.cu).
-// weight [N, K] row-major fp16, x [1, K] fp16, kchunk 512|2048 (divides K).
+// weight [N, K] row-major fp16, x [1, K] fp16, kchunk 512|2048|4096 (divides K).
 // Returns out [1, N] fp16.
 torch::Tensor dense_gemv_gfx906(torch::Tensor weight, torch::Tensor x,
                                 int64_t kchunk);

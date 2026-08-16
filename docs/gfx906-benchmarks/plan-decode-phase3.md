@@ -2,7 +2,12 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 
-Status: v11 (2026-08-16) — **P3-1 landed** (41.51 → 44.09); **P3-2(b)
+Status: v12 (2026-08-16) — **code-review fixes landed** (combined review
+`phase3_code_rev_combined.md`: C1 GEMV arch-gate, F1/F6 capture-safe
+buffer lifecycle + real-impl lifecycle test, F2/M1 GEMV numeric tests,
+F4/F5/M2/F7/F9/F10, F3 evidence: PPL +0.05% + multi-batch probe clean,
+H3/M3 V2 mechanism re-characterized) on top of **P3-1 landed**
+(41.51 → 44.09); **P3-2(b)
 landed** (micro −401 µs/step; serving +0.45 ms/step = +2.3%, e2e-verified
 in the A/B matrix); **P3-3a M2 + Route B stage 1 landed**: CUSTOM Q8 FA
 LEGACY decode path is FULL-capture-safe (CGSupport default flipped), and
@@ -14,12 +19,36 @@ bug; that bug is dormant for this backend but remains for other
 NEVER-support backends — upstream class). 128/128 greedy probes
 identical to the Triton-FULL reference on both PIECEWISE and FULL paths;
 T3 capture/replay test passing. Full matrix in DEVLOG "Serving A/B
-matrix". `plan-gfx906fa-serving.md` at v5 (M2 + Route B stage 1 done).
-Remaining P3-3a: FA kernel itself (327 µs/layer @ Sk~2176, the big one),
-stage-2 quantize-during-gather (quantize_q8_0 ~312 µs/step), LEGACY=0
-track demoted to optional. Gap vs llama.cpp: ~1.23× at 57.09 vs ~70 t/s.
-Prefill already 2.6× faster than llama.cpp — out of scope unless a
-candidate helps both for free.
+matrix". `plan-gfx906fa-serving.md` at v6 (M2 + Route B stage 1 +
+code-review fixes done). Remaining P3-3a: FA kernel itself (327 µs/layer
+@ Sk~2176, the big one), stage-2 quantize-during-gather
+(quantize_q8_0 ~312 µs/step), LEGACY=0 track demoted to optional. Gap vs
+llama.cpp: ~1.23× at 57.09 vs ~70 t/s. Prefill already 2.6× faster than
+llama.cpp — out of scope unless a candidate helps both for free.
+
+**v11→v12 changelog** (2026-08-16, DEVLOG "Phase-3 code-review fixes"):
+- C1 (CRITICAL): `dense_gemv_gfx906` dispatch now gated on `on_gfx906()`
+  (was routing every ROCm arch); mock dispatch tests added.
+- F1/F6: q_pad + LEGACY=0 gather buffers are capture-order independent —
+  retired captured buffers stay alive (graph VA safety), `empty_cache()`
+  gone from the forward path, capture-state poll latches after first
+  capture; new real-impl test (small decode → capture → prefill grow →
+  replay).
+- F2/M1: GEMV numeric tests (model path + K-split CAS path) vs F.linear.
+- F4: `VLLM_GFX906_GEMV_RPT=0` hard error; F5/M2: V1 bounds guard +
+  Sk>65535 V1→V2 cutover; F7: LEGACY=0 + prefix-caching/FULL-capture
+  loud guards; F9: vendored Russian comments → English, dead code out;
+  F10: gitignore profiler output, probes checked in, two stale tables
+  fixed (§1 now shows 57.09 / 1.23×).
+- F3 evidence: PPL CUSTOM 6.6811 vs Triton 6.6775 (+0.05% ≤ 2%); 
+  multi-batch probe (B=2, prefix overlap): no corruption; cross-run
+  near-tie non-determinism shown to be an engine property (pure Triton
+  reproduces it). Production B=1 path bit-deterministic across launches.
+- H3/M3: V2 7× in-graph regression does not reproduce in a gather-only
+  graph (1.06×) → re-characterized as wavefront under-fill (416/960)
+  allowing co-resident interleaving with other graph branches.
+- Numbers unchanged: 57.09 t/s 5-sample record; post-fix 3-sample bench
+  ≈ HEAD 3-sample bench (≈56.7, machine drift).
 
 **v10→v11 changelog** (2026-08-16, DEVLOG "Route B stage 1"):
 - M0-3 resolved: torch `_gather_kv` = 128-190 µs/layer isolated — the v3
@@ -225,12 +254,14 @@ top-8 MoE), MI50 32 GB (gfx906, 60 CU), single request:
 | engine | prefill pp=2048 | decode |
 |--------|-----------------|--------|
 | llama.cpp (Q4_K_XL) | 807 t/s | **70.3 t/s** (14.2 ms/step) |
-| vLLM + cudagraphs, Triton attn, post-P3-1 | ~2140 t/s | **44.09 t/s** (22.7 ms e2e step; ~19.0 ms profiled step) |
+| vLLM + cudagraphs, Triton attn, post-P3-1 (historical baseline) | ~2140 t/s | 44.09 t/s (22.7 ms e2e step; ~19.0 ms profiled step) |
+| vLLM + cudagraphs FULL_DECODE_ONLY, CUSTOM Q8 FA + GEMV + V1 fused gather (**current default**) | ~2140 t/s | **57.09 t/s** (17.5 ms e2e step; 5-sample mean, σ≈0.09) |
 
-Gap: **1.59× (~8.5 ms e2e/step)**. ~2.4 ms of the e2e step is outside the
-profiled kernel window (host/scheduler/sampling) — kernel-side targets can
-only attack the remaining ~6 ms. Primary metric: **serving mode**
-(`BENCH_EAGER=0`), decode tok/s and ms/step. Note: eager best is 19.49 t/s.
+Gap: **1.23× (~3.3 ms e2e/step)** (was 1.59× at the 44.09 baseline; the
+default-request config served 22.44 t/s via the downgrade bug before the
+M2/Route B work — see plan-gfx906fa-serving.md). Primary metric: **serving
+mode** (`BENCH_EAGER=0`), decode tok/s and ms/step. Note: eager best is
+19.49 t/s.
 
 ---
 

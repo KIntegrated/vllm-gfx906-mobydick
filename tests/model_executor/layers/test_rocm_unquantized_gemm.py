@@ -221,6 +221,99 @@ def test_rocm_unquantized_gemm_tiny_m_real_kernel(monkeypatch):
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("m,expect_gemv", [(256, True), (2048, True),
+                                           (1024, False)])
+def test_rocm_unquantized_gemm_tiny_m_gemv_dispatch(monkeypatch, m,
+                                                    expect_gemv):
+    # gfx906 custom W16A16 GEMV (P3-2b) dispatch rule: K=2048 rows with
+    # N==256 (router) or N>=2048 (in_proj/qkv/LM head) take the GEMV; other
+    # N (e.g. 1024 gate_up) stay on LLMM1. Mock-based, arch-independent.
+    monkeypatch.delenv("VLLM_GFX906_DENSE_GEMV", raising=False)
+    x = torch.randn(1, 2048, dtype=torch.float16)
+    weight = torch.randn(m, 2048, dtype=torch.float16)
+
+    gemv_mock = MagicMock(side_effect=lambda w, xv, _: xv @ w.t())
+    llmm1_mock = MagicMock(side_effect=lambda w, xv, _: xv @ w.t())
+    monkeypatch.setattr(utils.ops, "dense_gemv_gfx906", gemv_mock)
+    monkeypatch.setattr(utils.ops, "LLMM1", llmm1_mock)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx906", lambda: True)
+
+    out = utils._llmm1_tiny_m(weight, x)
+    ref = torch.nn.functional.linear(x, weight)
+
+    assert gemv_mock.called is expect_gemv
+    assert llmm1_mock.called is (not expect_gemv)
+    assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
+
+
+def test_rocm_unquantized_gemm_tiny_m_gemv_never_off_gfx906(monkeypatch):
+    # Regression guard: the custom GEMV is measured only on gfx906 and must
+    # never route onto other ROCm targets, even for GEMV-eligible shapes.
+    monkeypatch.delenv("VLLM_GFX906_DENSE_GEMV", raising=False)
+    x = torch.randn(1, 2048, dtype=torch.float16)
+    weight = torch.randn(256, 2048, dtype=torch.float16)
+
+    gemv_mock = MagicMock(side_effect=lambda w, xv, _: xv @ w.t())
+    llmm1_mock = MagicMock(side_effect=lambda w, xv, _: xv @ w.t())
+    monkeypatch.setattr(utils.ops, "dense_gemv_gfx906", gemv_mock)
+    monkeypatch.setattr(utils.ops, "LLMM1", llmm1_mock)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx906", lambda: False)
+
+    out = utils._llmm1_tiny_m(weight, x)
+    ref = torch.nn.functional.linear(x, weight)
+
+    gemv_mock.assert_not_called()
+    llmm1_mock.assert_called_once()
+    assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(),
+                    reason="ROCm-only kernel test")
+@pytest.mark.parametrize("m", [256, 2048])
+def test_rocm_unquantized_gemm_dense_gemv_real_kernel(monkeypatch, m):
+    # Numeric gate for the gfx906 custom GEMV on its default model path
+    # (K=2048, kchunk=2048 single-pass, RPT=2): must match F.linear at
+    # fp16 precision. Catches row-mapping / RPT dispatch regressions.
+    from vllm.platforms.rocm import on_gfx906
+
+    if not on_gfx906():
+        pytest.skip("dense_gemv_gfx906 is measured only on gfx906")
+    torch.manual_seed(0)
+    x = torch.randn(1, 2048, device="cuda", dtype=torch.float16)
+    weight = torch.randn(m, 2048, device="cuda", dtype=torch.float16)
+
+    out = utils.ops.dense_gemv_gfx906(weight, x, 2048)
+    ref = torch.nn.functional.linear(x, weight)
+
+    assert out.shape == (1, m)
+    torch.testing.assert_close(out.float(), ref.float(),
+                               atol=0.15, rtol=2e-2)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(),
+                    reason="ROCm-only kernel test")
+@pytest.mark.parametrize("m", [256, 2048])
+def test_rocm_unquantized_gemm_dense_gemv_ksplit_real_kernel(monkeypatch, m):
+    # Numeric gate for the K-split (atomic packed-CAS) epilogue: kchunk=512
+    # over K=2048 → ksplit=4, RPT=4 (64-bit pk4 CAS). The model path never
+    # takes this branch (kchunk is hardcoded to K); this test keeps the
+    # bench-only path honest.
+    from vllm.platforms.rocm import on_gfx906
+
+    if not on_gfx906():
+        pytest.skip("dense_gemv_gfx906 is measured only on gfx906")
+    torch.manual_seed(1)
+    x = torch.randn(1, 2048, device="cuda", dtype=torch.float16)
+    weight = torch.randn(m, 2048, device="cuda", dtype=torch.float16)
+
+    out = utils.ops.dense_gemv_gfx906(weight, x, 512)
+    ref = torch.nn.functional.linear(x, weight)
+
+    assert out.shape == (1, m)
+    torch.testing.assert_close(out.float(), ref.float(),
+                               atol=0.15, rtol=2e-2)
+
+
 def test_rocm_unquantized_gemm_gfx950_wvsplitkrc_path(monkeypatch):
     x = torch.randn(1024, 16, dtype=torch.float16).t()
     weight = torch.randn(256, 1024, dtype=torch.float16)

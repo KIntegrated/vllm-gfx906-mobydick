@@ -1,20 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Copyright (C) Nick — nick413@gmail.com
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 #
 # Vendored from https://github.com/cassettesgoboom/gfx906-fa-vllm
 # (FlashAttention-style custom attention backend for vLLM on AMD gfx906).
 #
-"""Paged KV cache wrapper для gfx906_fa.
+"""Paged KV cache wrapper for gfx906_fa.
 
-Два пути:
-  * fast-path: key_cache_q8 передан → читаем уже квантованный K напрямую,
-    квантование не выполняется. Используется когда backend держит side-buffer.
-  * legacy-path: key_cache_q8 = None → gather FP16 K → quantize_q8_0 (device).
-    Медленнее (лишний gather + квантование каждый шаг), но корректно.
+Two paths:
+  * fast-path: key_cache_q8 given -> read the already-quantized K directly,
+    no quantization. Used when the backend holds the Q8 side-buffer.
+  * legacy-path: key_cache_q8 = None -> gather fp16 K -> quantize_q8_0
+    (device). Slower (extra gather + quantize per step), but correct.
 
-API-уровневая обёртка: собирает вход из vLLM paged layout в contiguous
-тензоры и вызывает gfx906_fa.forward().
+API-level wrapper: builds the inputs from the vLLM paged layout into
+contiguous tensors and calls gfx906_fa.forward().
+
+Eager-only debug hooks (host-device syncs; illegal during CUDA graph
+capture and they serialize eager execution — do not enable in serving):
+  * GFX906_FA_FWD_DEBUG=1    — sync + per-call log to /tmp/gfx906_fa_debug/
+  * GFX906_FA_DOUBLE_CHECK=1 — cross-check the gather vs torch (.item())
+  * GFX906_FA_DUMP=DIR       — dump inputs/outputs via torch.save
 """
 from __future__ import annotations
 
@@ -104,18 +111,18 @@ def _gather_kv(
     seq_lens: torch.Tensor,         # [num_seqs]                        int32
     max_seqlen_k: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Собирает K, V из paged cache в contiguous layout.
+    """Gather K, V from the paged cache into a contiguous layout.
 
-    Возвращает:
+    Returns:
       K: [B, Hkv, max_seqlen_k, D]  fp16
       V: [B, Hkv, max_seqlen_k, D]  fp16
 
-    Позиции token'ов за пределами seq_lens[i] получают нулевые значения
-    (чтобы softmax с дополнительным KV_max-срезом в kernel видел их как
-     out-of-bounds; kernel уже умеет KV_max).
+    Token positions beyond seq_lens[i] are zero-filled so the FA kernel's
+    kv_max cut sees them as out-of-bounds.
 
-    Текущая реализация — через fancy indexing torch. Будет заменена
-    custom HIP kernel'ом в v2 для снижения overhead'а (оценка 2-3x на prefill).
+    This torch fancy-indexing implementation is the A/B reference; the
+    default path is the fused HIP kernels (gather_paged_kv_fp16 /
+    gather_paged_kv_q8).
     """
     num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
     num_seqs = block_table.shape[0]
@@ -126,15 +133,15 @@ def _gather_kv(
     assert seq_lens.shape == (num_seqs,), \
         f"seq_lens shape {seq_lens.shape} vs num_seqs={num_seqs}"
 
-    # Количество блоков на последовательность (округление вверх)
+    # Blocks needed per sequence (ceiling of seqlen / block_size)
     max_blocks_needed = (max_seqlen_k + block_size - 1) // block_size
     assert block_table.shape[1] >= max_blocks_needed, \
         f"block_table columns {block_table.shape[1]} < {max_blocks_needed}"
 
     bt = block_table[:, :max_blocks_needed].to(torch.long)  # [B, n_blocks]
 
-    # Fancy indexing: выбираем block'и и reshape'им в [B, n_blocks*block_size, Hkv, D]
-    # key_cache[bt] → [B, n_blocks, block_size, Hkv, D]
+    # Fancy indexing: key_cache[bt] -> [B, n_blocks, block_size, Hkv, D],
+    # then reshape to [B, n_blocks*block_size, Hkv, D]
     k_gathered = key_cache[bt]    # fp16
     v_gathered = value_cache[bt]
 
@@ -379,7 +386,6 @@ def forward_paged(
             k_out=kbuf, v_out=vbuf,
         )
         # K_q8: [B, Hkv, Sk_pad, bytes]; V_bhsd: [B, Hkv, Sk_pad, D] — уже padded.
-        gathered_sk = Sk_pad
         if _DOUBLE_CHECK:
             k_ref, v_ref = _gather_kv_q8(
                 key_cache_q8, value_cache, block_table, seq_lens, max_seqlen_k)
@@ -399,7 +405,6 @@ def forward_paged(
         K_q8, V_bhsd = _gather_kv_q8(
             key_cache_q8, value_cache, block_table, seq_lens, max_seqlen_k
         )
-        gathered_sk = max_seqlen_k
     else:
         # Legacy-path: gather FP16 → quantize on the fly.
         # Fused HIP gather (P3-3a): replaces torch fancy-index _gather_kv
@@ -411,7 +416,6 @@ def forward_paged(
             K_bhsd, V_bhsd = _gather_kv(
                 key_cache, value_cache, block_table, seq_lens, max_seqlen_k
             )
-            gathered_sk = max_seqlen_k
         else:
             bt_i32 = (block_table if block_table.dtype == torch.int32
                       else block_table.to(torch.int32)).contiguous()
@@ -420,7 +424,6 @@ def forward_paged(
             K_bhsd, V_bhsd = gfx906_fa.gather_paged_kv_fp16(
                 key_cache, value_cache, bt_i32, sl_i32, Sk_pad
             )
-            gathered_sk = Sk_pad
         K_q8 = gfx906_fa.quantize_q8_0(K_bhsd)
 
     # Переиспользуем buffer если подходит по размеру; иначе создаём новый.

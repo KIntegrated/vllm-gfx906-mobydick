@@ -145,7 +145,8 @@ def test_cudagraph_capture_replay_legacy_decode_path():
     # (b) capture B=2 after B=1, then replay B=1 (dangling-buffer check)
     # Both rows share the same 32 blocks (arange(n_blocks).view(2, -1) would
     # be (2, 16) — wrong column count).
-    bt2 = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, -1).expand(2, -1).contiguous()
+    bt2 = torch.arange(n_blocks, dtype=torch.int32,
+                       device=dev).view(1, -1).expand(2, -1).contiguous()
     sl2 = torch.tensor([100, 150], dtype=torch.int32, device=dev)
     cu2 = torch.arange(3, dtype=torch.int32, device=dev)
     q2 = torch.randn(2, HQ, D, device=dev, dtype=torch.float32) * 0.5
@@ -179,9 +180,13 @@ def test_cudagraph_capture_replay_legacy_decode_path():
 def test_fused_fp16_gather_matches_torch_gather():
     """LEGACY-path fused gather (gather_paged_kv_fp16) must match the torch
     _gather_kv reference in the valid region; V tail zeroed; K tail
-    unmasked (FA kernel cuts via kv_max)."""
+    unmasked (FA kernel cuts via kv_max). Covers B=1 (Sk not a multiple
+    of 32 — Sk_pad tail handling) and B=2 (per-row lengths and disjoint
+    block ranges)."""
     dev = "cuda"
     torch.manual_seed(4)
+    from vllm.gfx906_fa.gfx906_fa_paged import _gather_kv
+
     L = 500  # not a multiple of 32: exercises Sk_pad tail handling
     n_blocks = (L + BLOCK - 1) // BLOCK
     kc, vc, kv = _make_paged_cache(n_blocks, dev)
@@ -194,14 +199,127 @@ def test_fused_fp16_gather_matches_torch_gather():
     sl = torch.tensor([L], dtype=torch.int32, device=dev)
     Sk_pad = (L + 31) // 32 * 32
 
-    from vllm.gfx906_fa.gfx906_fa_paged import _gather_kv
-
     k_ref, v_ref = _gather_kv(k16, vc, bt, sl, L)
     k_f, v_f = fa.gather_paged_kv_fp16(k16, vc, bt, sl, Sk_pad)
     assert k_f.shape == (1, HKV, Sk_pad, D) and v_f.shape == (1, HKV, Sk_pad, D)
     assert torch.equal(k_f[0, :, :L], k_ref[0, :, :L])
     assert torch.equal(v_f[0, :, :L], v_ref[0, :, :L])
     assert bool((v_f[0, :, L:] == 0).all())
+
+    # B=2: row 1 uses physical blocks disjoint from row 0's; different
+    # lengths; unbind(1) strided views as in serving.
+    L1, L2 = 300, 500
+    n1 = (L1 + BLOCK - 1) // BLOCK
+    n2 = (L2 + BLOCK - 1) // BLOCK
+    width = n1 + n2
+    kv2 = torch.randn(width, 2, BLOCK, HKV, D, device=dev,
+                      dtype=torch.float16) * 0.5
+    k16_2, vc2 = kv2.unbind(1)
+    bt2 = torch.zeros(2, width, dtype=torch.int32, device=dev)
+    bt2[0, :n1] = torch.arange(n1, dtype=torch.int32, device=dev)
+    bt2[1, :n2] = torch.arange(n1, n1 + n2, dtype=torch.int32, device=dev)
+    sl2 = torch.tensor([L1, L2], dtype=torch.int32, device=dev)
+    k_ref2, v_ref2 = _gather_kv(k16_2, vc2, bt2, sl2, L2)
+    k_f2, v_f2 = fa.gather_paged_kv_fp16(k16_2, vc2, bt2, sl2, Sk_pad)
+    assert torch.equal(k_f2[0, :, :L1], k_ref2[0, :, :L1])
+    assert torch.equal(v_f2[0, :, :L1], v_ref2[0, :, :L1])
+    assert torch.equal(k_f2[1, :, :L2], k_ref2[1, :, :L2])
+    assert torch.equal(v_f2[1, :, :L2], v_ref2[1, :, :L2])
+    assert bool((v_f2[0, :, L1:] == 0).all())
+    assert bool((v_f2[1, :, L2:] == 0).all())
+
+
+def test_q_pad_buffer_survives_capture_then_prefill_grow():
+    """Review F1: a captured graph bakes in the VA of the q_pad buffer
+    that was current at capture time. An eager prefill with a larger
+    Sq_pad afterwards grows that buffer; the old one must be retired
+    (kept alive) rather than freed-then-realloc'd, and the replayed
+    decode must stay numerically correct. Drives the real Gfx906FAImpl
+    (not hand-fed buffers) in the hazardous production order: small
+    decode → capture → large prefill → decode replay.
+    """
+    dev = "cuda"
+    torch.manual_seed(7)
+    from vllm.gfx906_fa.gfx906_fa_backend import (
+        Gfx906FAImpl,
+        Gfx906FAMetadata,
+    )
+
+    impl = Gfx906FAImpl(
+        num_heads=HQ, head_size=D, scale=1.0 / math.sqrt(D),
+        num_kv_heads=HKV, alibi_slopes=None, sliding_window=None,
+        kv_cache_dtype="float16",
+    )
+    assert impl._legacy  # this test targets the default serving path
+
+    n_blocks = 16  # 256 tokens
+    _, vc, kv = _make_paged_cache(n_blocks, dev)
+    k16 = kv[:, 0]
+    K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    V = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    k16.copy_(K.view(n_blocks, BLOCK, HKV, D))
+    _write_v(kv, V)
+
+    def meta(num_tokens, sq, sk, bt_, sl_, cu_):
+        return Gfx906FAMetadata(
+            num_actual_tokens=num_tokens,
+            max_query_len=sq,
+            max_seq_len=sk,
+            query_start_loc=cu_,
+            seq_lens=sl_,
+            block_table=bt_,
+            slot_mapping=torch.empty(0, dtype=torch.int64, device=dev),
+        )
+
+    layer = None  # impl.forward does not touch the layer object
+    s = torch.cuda.Stream()
+
+    # (1) small decode (eager): allocates the small q_pad (Sq_pad=2)
+    bt_d = torch.arange((100 + BLOCK - 1) // BLOCK, dtype=torch.int32,
+                        device=dev).view(1, -1)
+    sl_d = torch.tensor([100], dtype=torch.int32, device=dev)
+    cu_d = torch.arange(2, dtype=torch.int32, device=dev)
+    q_d = torch.randn(1, HQ, D, device=dev, dtype=torch.float16) * 0.5
+    out_d = torch.zeros(1, HQ, D, device=dev, dtype=torch.float16)
+    m_d = meta(1, 1, 100, bt_d, sl_d, cu_d)
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            impl.forward(layer, q_d, q_d, q_d, kv, m_d, output=out_d)
+    torch.cuda.current_stream().wait_stream(s)
+    ref_d = out_d.clone()
+    small_buf = impl._q_pad_buf
+    assert small_buf.shape[2] == 2
+
+    # (2) capture the decode graph (bakes small_buf's VA in)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        impl.forward(layer, q_d, q_d, q_d, kv, m_d, output=out_d)
+    assert impl._q_pad_captured
+    assert impl._q_pad_buf is small_buf
+
+    # (3) eager prefill with larger Sq_pad → grow branch
+    q_p = torch.randn(64, HQ, D, device=dev, dtype=torch.float16) * 0.5
+    out_p = torch.zeros(64, HQ, D, device=dev, dtype=torch.float16)
+    m_p = meta(64, 64, 64,
+               torch.arange(4, dtype=torch.int32, device=dev).view(1, -1),
+               torch.tensor([64], dtype=torch.int32, device=dev),
+               torch.tensor([0, 64], dtype=torch.int32, device=dev))
+    impl.forward(layer, q_p, q_p, q_p, kv, m_p, output=out_p)
+    assert impl._q_pad_buf is not small_buf
+    assert impl._q_pad_buf.shape[2] == 64
+    assert bool(torch.isfinite(out_p.float()).all())
+
+    # (4) the captured buffer was retired, not freed
+    assert any(t is small_buf for t in impl._q_pad_retired)
+    assert small_buf.data_ptr() != impl._q_pad_buf.data_ptr()
+
+    # (5) replay: the graph writes q_pad through the retired-but-alive VA
+    out_d.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    assert ((out_d - ref_d).norm() / ref_d.norm()).item() < 2e-2
 
 
 def test_forward_decode_prefill_vs_sdpa_on_unbind_cache():
