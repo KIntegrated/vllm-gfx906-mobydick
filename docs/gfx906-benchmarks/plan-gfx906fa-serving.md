@@ -2,7 +2,33 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 
-Status: v6 (2026-08-16) — **code-review fixes LANDED** (combined review
+Status: v7 (2026-08-16) — **FA kernel track LANDED** (the §"M0-3 /
+remaining P3-3a" item: the FA kernel itself, 327 µs/layer at B=1).
+Root cause: the launcher hardcoded NC2=1 + gridDim.y=1 → 16 blocks =
+6.7% of the MI50's wavefront slots at B=1 (latency-bound, 111
+ns/token, 14% HBM). Enabled GQA head-packing (`GFX906_FA_NC2`) + KV
+split (`GFX906_FA_KVSPLIT`) + new `fa_split_combine_kernel`; fixed
+three bugs along the way (vendor null-mask deref at NC2>1; NC2=8×
+prefill ncols=64 OOB → packing restricted to decode `seq_q≤2`; vendor
+OOB-tail: the NC2>1 strided KV loop never enabled `oob_check` for the
+tail tile → wrong softmax for kv_max % nbatch_fa ≠ 0). Evidence: 12/12
+`test_gfx906_fa.py` (7 new split/GQA subprocess cases incl. empty
+trailing splits); PPL 6.6999→6.6895 (−0.15%, bar ≤2%; the greedy
+4×128 A/B is not a valid gate — legacy×2, new×2 and Triton×2 all
+diverge cross-run: engine-level MoE near-tie non-determinism). Serving:
+legacy 57.08 / NC2=1,y=8 62.13 / **NC2=8,y=16 62.81+62.92 (docker
+0.85)**; default flipped to NC2=8/KVSPLIT=16 (kill switch: both =1);
+new-default 3-sample on the local venv bench (util 0.95 +
+fastsafetensors): **62.677/62.668/62.671**. Default-request decode:
+57.09 → ~62.7 t/s (+9.8%); llama.cpp gap 1.23× → 1.12×. Also this
+session: serving benches moved from docker to the local `.venv`
+(editable vllm + ROCm 7.14 gfx906 env script +
+`FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` + fastsafetensors with a
+one-line vLLM GDS-fallback catch fix) — DEVLOG "Local-venv bench
+environment". M0–M3 below unchanged; M3 outcome stands with the new
+number. Bench-history detail: DEVLOG §"FA kernel track (P3-3a)".
+
+v6 (2026-08-16) — **code-review fixes LANDED** (combined review
 `phase3_code_rev_combined.md`): C1 arch-gate on the GEMV dispatch
 (CRITICAL), F1/F6 capture-safe q_pad + gather buffer lifecycle (retired
 captured buffers stay alive; real-impl lifecycle test), F2/M1 GEMV
@@ -79,7 +105,8 @@ and cudagraphs as strong as the Triton baseline's.
 | serving, CUSTOM + PIECEWISE + GEMV | 52.07 t/s | 10 × (FA + LEGACY gather) ≈ TBD (M0-3) |
 | serving, CUSTOM + PIECEWISE, GEMV off | 50.88 t/s | — |
 | serving, CUSTOM + FULL_DECODE_ONLY + GEMV, torch gather (n=6) | 52.90 t/s mean, σ≈0.06 | 10 × (FA + gather + quantize) ≈ 3.6 ms (rocprofv3, post-52.90) |
-| serving, CUSTOM + FULL_DECODE_ONLY + GEMV, **V1 fused gather (current default, n=5)** | **57.09 t/s mean, σ≈0.09** — **new best = default config** | torch gather was 128–190 µs/layer isolated (M0-3); V2 in-graph trap (285 µs/call) documented — DEVLOG "Route B stage 1" |
+| serving, CUSTOM + FULL_DECODE_ONLY + GEMV, **V1 fused gather (n=5)** | 57.09 t/s mean, σ≈0.09 | torch gather was 128–190 µs/layer isolated (M0-3); V2 in-graph trap (285 µs/call) documented — DEVLOG "Route B stage 1" |
+| serving, CUSTOM + FULL_DECODE_ONLY + GEMV + V1 gather + **FA NC2=8/KVSPLIT=16 (current default, v7)** | **~62.7 t/s** (docker 0.85: 62.81/62.92; local venv 0.95: 62.677/62.668/62.671) | FA 245 → 58.3 µs/layer @Sk=2176 (4.2×; HBM floor ~8 µs) — DEVLOG "FA kernel track" |
 | serving, CUSTOM + requested FULL_DECODE_ONLY, CGSupport=NEVER (`GFX906_FA_CG=never`) | 22.44 t/s — **downgrade bug** (dormant; upstream class) | — |
 | eager, CUSTOM LEGACY=0 (works today) | 19.33 t/s | — |
 

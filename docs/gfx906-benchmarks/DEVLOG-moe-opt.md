@@ -1382,3 +1382,102 @@ test; the fp16-gather test gained a B=2 disjoint-blocks case).
 `test_rocm_unquantized_gemm.py`: 8 new GEMV tests pass; the 8
 pre-existing mock-based failures (CPU-tensor mocks vs this ROCm/Triton
 build) fail identically on HEAD — not ours.
+
+---
+
+## FA kernel track (P3-3a) — B=1 decode parallelism — LANDED
+
+`flash_attn_tile_q8` was the largest remaining non-MoE decode cost
+(3.27 ms/step = 10 × 327 µs, Sk-linear). Root cause at B=1: the
+launcher hardcoded NC2=1 (no GQA head-packing) and gridDim.y=1 (no KV
+split) → 16 blocks = 64 of 960 wavefront slots (6.7%). The vendored
+kernel already supported both; the launcher never used them.
+
+**Implementation.** `GFX906_FA_NC2` / `GFX906_FA_KVSPLIT` env knobs in
+`gfx906_fa_launcher.cu` (dispatch ladders per ncols1; grid
+`(ceil(Sq/NC1), kv_split, B·ceil(Hq/NC2))`), new
+`fa_split_combine_kernel` (flash-decoding merge of the per-split m/l
+partials, one warp per row) wired through `gfx906_fa::forward` (y>1
+allocates `o_part`/`o_meta_split` + combine; y≤1 no-op/memcpy).
+
+**Bugs found & fixed (3).**
+1. **Vendor null-mask deref**: `(ncols2 > 1 || mask)` dereferenced
+   `mask` unconditionally when NC2>1 → GPU fault at 0x0 with mask=null.
+   → `mask != nullptr` in 4 sites (both fattn-q8 .cuh files).
+2. **NC2=8 × prefill fault**: ncols=64 config OOB-faults at large Sq
+   (first serving run of g8s16 died in prefill). GQA-packing is only
+   validated at the decode tile → launcher guard: `nc2>1 && seq_q>2`
+   falls back to NC2=1.
+3. **Vendor OOB-tail bug (NC2>1 + KV split)**: the strided KV loop
+   (step `gridDim.y·nbatch_fa`) never enabled `oob_check=true` for the
+   tail tile, unlike the NC2==1 branch → when kv_max is not a multiple
+   of nbatch_fa (128 for ncols=16) padding tokens enter the softmax
+   (rel err 0.24–0.60 in tests). Fixed in both fattn-q8 .cuh files:
+   per-tile `k_VKQ_0 + nbatch_fa > k_VKQ_max` → oob_check=true variant.
+
+**Micro-bench** (`bench_gfx906_fa_decode.py`, B=1, Hq16/Hkv2/D256,
+Sq=2, correctness vs fp32 ref at every Sk, maxerr ≤ 0.0048):
+legacy 111 ns/token @ 14% HBM; @Sk=2176: NC2=1/y=1 245 µs →
+NC2=1/y=8 82.9 → **NC2=8/y=16 58.3 µs (4.2×)**. y=16 is the knee
+(y=32/64 regress: combine + empty-split overhead).
+
+**Serving A/B** (docker 0.85, FULL_DECODE_ONLY, default backend;
+note: an earlier all-44.7 matrix was self-inflicted — a stale
+`BENCH_ATTN_BACKEND=ROCM_ATTN` forced the Triton backend, diagnosed via
+kernel trace showing `kernel_paged_attention_2d` 6.46 ms/step and no
+`flash_attn_tile_q8`):
+| config | t/s |
+|---|---|
+| NC2=1, y=1 (legacy default) | 57.08 / 57.16 |
+| NC2=1, y=8 | 62.13 / 62.15 |
+| **NC2=8, y=16** | **62.81 / 62.92** |
+
+**Correctness.** 12/12 `test_gfx906_fa.py` (7 new subprocess tests:
+split ± empty trailing splits, GQA pack ± split, short Sk=123 vs
+nbatch_fa=128, kv_max 481/512 — the OOB-tail cases fail without fix
+3). PPL (12-prompt, 442 tokens, deterministic): legacy 6.6999 vs new
+6.6895 = **−0.15%** (Triton 6.6775) — inside noise, far under the 2%
+bar. Greedy 4×128-token A/B is **not a valid gate** for this probe set:
+legacy×2, new×2, and Triton×2 all diverge across launches (8–115
+diffs/req, first-diff positions prompt-specific) — engine-level
+non-determinism (MoE routing near-ties), consistent with the earlier
+multi-batch finding; the PPL point is the accepted aggregate metric.
+
+**Default flipped** to NC2=8/KVSPLIT=16 (kill switch:
+`GFX906_FA_NC2=1 GFX906_FA_KVSPLIT=1`).
+
+**Regression (new default).** Local venv, util 0.95 + fastsafetensors
+(see bench-env note below): **62.677 / 62.668 / 62.671** (σ≈0.005) —
+matches the docker 0.85 g8s16 pair (62.81/62.92) within machine drift.
+Default-request decode: 57.09 → **~62.7 t/s (+9.8%)**; vs the original
+44.09 Triton-FULL record 1.42×; llama.cpp ~70 t/s gap 1.23× → **1.12×**.
+
+## Local-venv bench environment (replaces docker for serving benches)
+
+- `source ~/env-rocm-7.14-gfx906.sh` — sets `LD_LIBRARY_PATH` to
+  `/opt/rocm-7.14/lib` (the gfx906 ROCm build; the system `/opt/rocm`
+  libs are the wrong vintage: libhipsparse symbol mismatch, then RCCL
+  missing `ncclCommResume` until the 7.14 point release was updated).
+- `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` **required**: the venv's
+  `flash_attn` is the `/local/git/flash-attention-gfx906` fork without a
+  built C ext; the env selects the Triton-AMD path. Needed at import
+  time for this model's ViT attention wrapper (`fa_utils.py` →
+  `flash_attn_varlen_func`).
+- `.venv` vllm is an editable install of this repo; the compiled exts
+  live in the tree, so docker `pip install -e .` rebuilds are picked up
+  without reinstall.
+- **fastsafetensors**: GDS unsupported here (cuFileRead errno 22).
+  vLLM's GDS→nogds fallback only caught `RuntimeError`; fastsafetensors
+  raises a bare `Exception` → engine death. One-line fix in
+  `weight_utils.py` (catch `Exception`, keeping the `"gds" in str(e)`
+  + not-yielded guards). Load: 41 s vs 117 s default (2.6×).
+  Cost: +2.8 GiB live at init (25.21 vs 22.41 GiB) → needs
+  `gpu_util 0.95` (KV 1.37 GiB ≈ the 2.11 GiB docker-0.85 headroom;
+  B=1 decode numbers unaffected — KV capacity is not the bottleneck).
+- Bench recipe: `HIP_VISIBLE_DEVICES=0 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+  BENCH_EAGER=0 BENCH_PP=2048 BENCH_TG=256 BENCH_MAXLEN=3328
+  BENCH_GPU_UTIL=0.95 BENCH_CG_MODE=FULL_DECODE_ONLY
+  BENCH_LOAD_FORMAT=fastsafetensors BENCH_SAMPLES=N .venv/bin/python
+  /tmp/bench/_b.py /local/models/QuantTrio/Qwen3.5-35B-A3B-AWQ`
+  (`_b.py` gained `BENCH_LOAD_FORMAT`; model path is the real /local
+  path now, no docker remap).

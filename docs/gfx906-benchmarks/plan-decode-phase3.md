@@ -2,6 +2,45 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 
+Status: v13 (2026-08-16) — **FA kernel track landed** (the remaining
+"FA kernel itself" P3-3a item): B=1 decode parallelism fix — GQA
+head-packing + KV split + split-combine in the vendored FA launcher
+(3 bugs fixed en route: null-mask deref, NC2×prefill OOB guard, OOB-tail
+masking in the NC2>1 strided KV loop). FA decode 245 → 58.3 µs/layer
+@Sk=2176 (4.2×); serving **57.09 → ~62.7 t/s** (docker 0.85: 62.81/
+62.92; local venv 0.95 3-sample: 62.677/62.668/62.671), now the
+default-request config (NC2=8/KVSPLIT=16; kill switch both =1).
+PPL −0.15% (bar ≤2%); 12/12 FA tests. Gap vs llama.cpp ~70 t/s:
+1.23× → **1.12×**. Serving benches moved to the local `.venv`
+(ROCm 7.14 gfx906 env + `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` +
+fastsafetensors, one-line vLLM GDS-fallback catch fix). Remaining
+P3-3a: stage-2 quantize-during-gather (quantize_q8_0 ~312 µs/step),
+FA micro-follow-ups (y-auto-tune, ncols=16 config-table tuning),
+LEGACY=0 optional track. `plan-gfx906fa-serving.md` at v7. DEVLOG
+"FA kernel track (P3-3a)" + "Local-venv bench environment".
+
+**v12→v13 changelog** (2026-08-16, DEVLOG "FA kernel track (P3-3a)"):
+- FA B=1 decode was latency-bound at 6.7% wavefront occupancy (16
+  blocks; the launcher hardcoded NC2=1 + gridDim.y=1 while the kernel
+  supported GQA packing + KV split). Enabled both behind
+  `GFX906_FA_NC2`/`GFX906_FA_KVSPLIT` + new `fa_split_combine_kernel`.
+- Fixed: vendor null-mask deref at NC2>1 (4 sites); NC2=8×prefill
+  ncols=64 OOB fault → packing restricted to decode (seq_q≤2); vendor
+  OOB-tail bug — NC2>1 strided KV loop lacked the `oob_check=true`
+  tail handling (wrong softmax when kv_max % nbatch_fa ≠ 0; both
+  fattn-q8 .cuh files).
+- Micro-bench 4.2× @Sk=2176 (245→58.3 µs; y=16 the knee). Serving A/B:
+  57.08 / 62.13 (NC2=1,y=8) / 62.81+62.92 (NC2=8,y=16). An earlier
+  all-44.7 matrix was a self-inflicted stale `BENCH_ATTN_BACKEND` env
+  (forced Triton) — diagnosed via kernel trace.
+- Correctness: 12/12 FA tests (7 new split/GQA subprocess cases);
+  PPL 6.6999→6.6895 (−0.15%); the greedy 4×128 A/B ruled out as a
+  gate — legacy×2, new×2, Triton×2 all diverge cross-run (engine-level
+  MoE near-tie non-determinism).
+- Default flipped to NC2=8/KVSPLIT=16; new-default 3-sample 62.67
+  (local venv, util 0.95 + fastsafetensors — comparable KV headroom;
+  B=1 decode unaffected by the 0.85→0.95 shift).
+
 Status: v12 (2026-08-16) — **code-review fixes landed** (combined review
 `phase3_code_rev_combined.md`: C1 GEMV arch-gate, F1/F6 capture-safe
 buffer lifecycle + real-impl lifecycle test, F2/M1 GEMV numeric tests,
@@ -255,12 +294,14 @@ top-8 MoE), MI50 32 GB (gfx906, 60 CU), single request:
 |--------|-----------------|--------|
 | llama.cpp (Q4_K_XL) | 807 t/s | **70.3 t/s** (14.2 ms/step) |
 | vLLM + cudagraphs, Triton attn, post-P3-1 (historical baseline) | ~2140 t/s | 44.09 t/s (22.7 ms e2e step; ~19.0 ms profiled step) |
-| vLLM + cudagraphs FULL_DECODE_ONLY, CUSTOM Q8 FA + GEMV + V1 fused gather (**current default**) | ~2140 t/s | **57.09 t/s** (17.5 ms e2e step; 5-sample mean, σ≈0.09) |
+| vLLM + cudagraphs FULL_DECODE_ONLY, CUSTOM Q8 FA + GEMV + V1 fused gather | ~2140 t/s | 57.09 t/s (17.5 ms e2e step; 5-sample mean, σ≈0.09) |
+| vLLM + cudagraphs FULL_DECODE_ONLY, CUSTOM Q8 FA + GEMV + V1 gather + FA NC2=8/KVSPLIT=16 (**current default, v13**) | ~2140 t/s | **~62.7 t/s** (15.9 ms e2e step; docker 0.85: 62.81/62.92, local venv 0.95 3-sample: 62.677/62.668/62.671) |
 
-Gap: **1.23× (~3.3 ms e2e/step)** (was 1.59× at the 44.09 baseline; the
-default-request config served 22.44 t/s via the downgrade bug before the
-M2/Route B work — see plan-gfx906fa-serving.md). Primary metric: **serving
-mode** (`BENCH_EAGER=0`), decode tok/s and ms/step. Note: eager best is
+Gap: **1.12× (~1.7 ms e2e/step)** (was 1.23× at 57.09, 1.59× at the
+44.09 baseline; the default-request config served 22.44 t/s via the
+downgrade bug before the M2/Route B work — see
+plan-gfx906fa-serving.md). Primary metric: **serving mode**
+(`BENCH_EAGER=0`), decode tok/s and ms/step. Note: eager best is
 19.49 t/s.
 
 ---
@@ -274,7 +315,7 @@ construction; DEVLOG P3-0 for method):
 |-----------|---------|------------|--------|
 | LLGemm1 dense projections (aiter, incl. shared expert 80 + LM head) | **5.83** | 230 | **P3-2 target** |
 | `triton_matmul` = `shared_expert_gate` [1×2048] ×40 layers | 1.63 → **0.29** | 40 | **P3-1 DONE** (padded LLMM1, 40 × 7.3 µs) |
-| paged attention, 10 layers × ~194 µs (Triton) | **1.94** | 10 | **P3-3a target** — in-tree CUSTOM kernel is 72 µs/layer; serving integration pending (`plan-gfx906fa-serving.md`); fallback P3-3b |
+| paged attention (CUSTOM Q8 FA, NC2=8/KVSPLIT=16) | **~0.6–1.0** (was 3.27 serving-trace / 1.94 Triton) | 10 | **P3-3a DONE** (v13) — micro 58.3 µs/layer @Sk=2176 (4.2× vs legacy FA; B=1 parallelism fix); fresh serving trace pending |
 | gfx906 MoE routed kernel (Phase 1/2) | 1.75 | ~78 | done |
 | routing pipeline (topk+align+count_sort) | 1.06 | 79 | P2-4 deferred |
 | GDN decode (recurrent + conv1d) | ~0.5 | 60 | leave alone (faster than llama.cpp) |
