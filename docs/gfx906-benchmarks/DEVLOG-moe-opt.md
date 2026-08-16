@@ -1481,3 +1481,77 @@ Default-request decode: 57.09 → **~62.7 t/s (+9.8%)**; vs the original
   /tmp/bench/_b.py /local/models/QuantTrio/Qwen3.5-35B-A3B-AWQ`
   (`_b.py` gained `BENCH_LOAD_FORMAT`; model path is the real /local
   path now, no docker remap).
+
+## Post-FA-track trace + stage 2: fused gather-and-quantize — LANDED (2026-08-16)
+
+### Fresh rocprofv3 serving trace (NC2=8/KVSPLIT=16 default)
+
+`rocprofv3 --kernel-trace` of the post-FA-track default (55.48 t/s under
+tracer; shares only, absolute times inflated 10-15%): 17.49 ms/step kernel
+budget, GPU busy 99.5%. Top rows vs the pre-FA-track budget:
+
+| Kernel | µs/step | notes |
+|---|---|---|
+| dense_gemv<2,2048> | 3936 | 80.7 calls; LM head (N=248320) is 1 call ≈ 1138 µs at 0.9× HBM floor — nothing left |
+| LLGemm1<Half,4> | 2021 | 189.3 calls — o_proj/gate_up/shared-down/GDN-small shapes; micro-bench already adjudicated these AGAINST GEMV (o_proj kc4096/r2 +4% vs LLMM1). Dispatch is at its measured optimum |
+| moe_gemm_q4 | 2662 | P2-4 territory |
+| FillFunctor<Half> + copyBuffer | 1178 | **uncharacterized pile** (~118 fills + 115 D2D copies/step); FA path contributes only ~10 small q_pad zeros + tiny staging; rest is GDN/MoE/runner — candidate P3-4 pass |
+| topkGating + align + count_sort | 1044 | P2-4 routing pipeline |
+| flash_attn_tile_q8<256,256,2,8> | 475 | 10 calls — FA tile decode (was ~3.0 ms/step pre-FA-track) |
+| fa_split_combine | 146 | +146 combine; **FA stack total ≈ 621 µs/step vs 3272 pre-FA-track** |
+| quantize_q8_0_dense | 284 | ← stage 2 target |
+| gather_paged_kv_q8 (V1) | 174 | ← stage 2 target |
+
+Dense GEMM verdict: dispatch already at the micro-bench optimum (P3-2(b)
+evidence: o_proj 2048×4096 GEMV kc4096/r2 is +4% SLOWER than LLMM1; N=1024
+gate_up same). No lever there.
+
+### Stage 2: quantize-during-gather (GFX906_FA_FUSED_QUANT, default on)
+
+Replaces the LEGACY decode two-kernel sequence
+(`gather_paged_kv_fp16` + `quantize_q8_0`, 174+284 = 458 µs/step under
+tracer) with one fused kernel per FA layer: V fp16 copy (V1 semantics,
+tail zeroed) + K read from the fp16 paged cache and quantized to q8_0
+in-kernel. At B=1 both original kernels are latency/launch-bound
+(78-18 GB/s effective vs 798 GB/s HBM), so fusion saves a launch per
+layer plus the K fp16 round trip.
+
+Implementation:
+- `csrc/gfx906_fa/kernel/q8_0_quantize.cuh` — `quantize_block_q8_0_halfwarp`
+  extracted from gfx906_fa_quant.cu (both TUs include it; bit-exact shared
+  helper, per-32-block amax via shfl_xor width 32).
+- `gather_paged_kv_quant_kernel` in gfx906_fa_gather.cu: grid (B, Hkv,
+  Sk), 64 threads/token; halfwave 0 → q8 blocks 0,2,4,6; halfwave 1 →
+  1,3,5,7; tail tokens zero V / leave K (same as V1); Sk ≤ 65535
+  (gridDim.z cap, same as V1; Python falls back beyond it).
+- C++ binding `gather_paged_kv_quantized` (per-call allocs, same
+  capture-safety properties as the fp16 gather).
+- Python: LEGACY branch of `forward_paged`; `GFX906_FA_FUSED_QUANT=0`
+  kill switch reverts to the two-kernel path.
+
+Correctness: `test_fused_gather_quantized_bit_equal_to_gather_then_quantize`
+(3 shapes: B=2 [100,300], B=1 [3328], B=1 [33]) asserts the fused K_q8 is
+**bit-equal** to quantize_q8_0(gather_paged_kv_fp16) and V bit-equal, on the
+production unbind(1) non-contiguous cache layout. 15/15 file pass (incl.
+the cudagraph capture test, which now exercises the fused kernel). Because
+the FA inputs are bit-identical to the previous default, PPL is unchanged by
+construction (6.6895) — no separate PPL gate needed.
+
+Numbers (B=1, Hkv=2, D=256, isolated): Sk=2176: 41.7 → 25.6 µs/call;
+Sk=3328: 64.3 → 36.9 µs/call (−27.4 µs/call × 10 layers ≈ −274 µs/step).
+
+Serving A/B (local venv, util 0.95, fastsafetensors, FULL_DECODE_ONLY,
+pp=2048/tg=256): OFF (two-kernel) 62.594 / 62.695; **DEFAULT (fused)
+63.534 / 63.581 → new record 63.56 t/s** (+1.47% over the 62.67 record).
+
+### Build-system note: hipify.py in-source guard
+
+`cmake/hipify.py` did `shutil.copytree(csrc, csrc)` for in-source builds —
+`copytree(dir, dir)` raises SameFileError on this image's Python 3.12, so
+any rebuild after a `.cu` edit crashed at the hipify step. Added a 3-line
+`abspath(project) != abspath(output)` guard (the copy is a no-op in that
+case). Also: never run a bare `cmake <repo>` diagnostic in the repo root —
+it pollutes the in-source build state (CMakeCache.txt/build.ninja/CMakeFiles
+at the root) and derails the pip editable flow; the canonical build dir is
+the pip-generated one, and `.deps/*-subbuild` caches are path-bound
+(delete stale subbuilds, keep -src, if FetchContent complains).

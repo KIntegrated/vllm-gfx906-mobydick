@@ -82,6 +82,52 @@ def test_fused_gather_matches_torch_gather_on_unbind_cache():
         assert bool((v_f[b, :, L:] == 0).all().item())
 
 
+@pytest.mark.parametrize("B,seq_lens", [(2, [100, 300]), (1, [3328]), (1, [33])])
+def test_fused_gather_quantized_bit_equal_to_gather_then_quantize(B, seq_lens):
+    """Stage-2 fused gather+quantize must be bit-equal to the two-kernel
+    sequence (gather_paged_kv_fp16 + quantize_q8_0): same quantization
+    helper, same arithmetic. Guards against future drift between the
+    fused kernel and the reference quantizer."""
+    dev = "cuda"
+    torch.manual_seed(3)
+    max_len = max(seq_lens)
+    n_blocks_needed = (max_len + BLOCK - 1) // BLOCK
+    num_blocks = B * n_blocks_needed + 4
+    # Same allocation as Gfx906FABackend LEGACY path: one [N,2,B,H,D]
+    # tensor, unbind(1) -> non-contiguous K/V views (2x block stride).
+    kv = torch.zeros(num_blocks, 2, BLOCK, HKV, D,
+                     dtype=torch.float16, device=dev)
+    key_cache, value_cache = kv.unbind(1)
+    assert not key_cache.is_contiguous() and not value_cache.is_contiguous()
+    K = torch.randn(num_blocks, BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    V = torch.randn(num_blocks, BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    kv[:, 0].copy_(K)
+    kv[:, 1].copy_(V)
+
+    n_blocks = (max_len + BLOCK - 1) // BLOCK
+    bt = torch.arange(0, B * n_blocks, dtype=torch.int32, device=dev)
+    bt = bt.view(B, n_blocks).contiguous()
+    sl = torch.tensor(seq_lens, dtype=torch.int32, device=dev)
+    Sk_pad = (max_len + 31) // 32 * 32
+
+    k_two, v_two = fa.gather_paged_kv_fp16(
+        key_cache, value_cache, bt, sl, Sk_pad)
+    k_ref = fa.quantize_q8_0(k_two)
+    k_one, v_one = fa.gather_paged_kv_quantized(
+        key_cache, value_cache, bt, sl, Sk_pad)
+
+    assert k_one.shape == k_ref.shape
+    assert k_one.dtype == torch.uint8
+    for b, L in enumerate(seq_lens):
+        # Valid region: bit-exact (K quantized, V copied).
+        assert torch.equal(k_one[b, :, :L], k_ref[b, :, :L])
+        assert torch.equal(v_one[b, :, :L], v_two[b, :, :L])
+        # Tail: V zeroed, K may be garbage (FA kernel cuts via kv_max).
+        assert bool((v_one[b, :, L:] == 0).all().item())
+
+
 def test_cudagraph_capture_replay_legacy_decode_path():
     """M2 gate: the LEGACY (inline-quant) decode path must be FULL-capture-safe.
 

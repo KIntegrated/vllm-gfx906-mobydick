@@ -2,6 +2,25 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 
+Status: v8 (2026-08-16) — **Stage 2 (quantize-during-gather) LANDED.**
+The LEGACY decode two-kernel sequence (gather_paged_kv_fp16 +
+quantize_q8_0, 458 µs/step under tracer; both latency/launch-bound at
+B=1) is now one fused kernel: V fp16 copy + K gathered and quantized to
+q8_0 in-kernel via the same `quantize_block_q8_0_halfwarp` helper as
+the standalone quantizer → output **bit-equal** to the two-kernel path
+(3-shape bit-exact unit test; PPL unchanged by construction, 6.6895).
+Micro: Sk=3328 64.3 → 36.9 µs/call (−27.4 µs × 10 layers ≈ −274
+µs/step). Serving A/B (local venv): OFF 62.594/62.695 vs
+**DEFAULT 63.534/63.581 → record 63.56 t/s** (+1.47% over 62.67).
+Default flipped: `GFX906_FA_FUSED_QUANT` default on, `=0` kill switch.
+New rocprofv3 trace also firmed up the per-step budget: FA stack now
+≈ 621 µs/step (was 3272); dense-GEMV/LLMM1 dispatch confirmed at its
+micro-bench optimum (no lever); a ~1.18 ms/step fill+D2D-copy pile is
+uncharacterized (FA contributes only ~10 small q_pad zeros) →
+candidate P3-4 pass. Build note: `cmake/hipify.py` gained a
+same-directory copytree guard (in-source rebuilds crashed on Python
+3.12 SameFileError). Detail: DEVLOG §"Post-FA-track trace + stage 2".
+
 Status: v7 (2026-08-16) — **FA kernel track LANDED** (the §"M0-3 /
 remaining P3-3a" item: the FA kernel itself, 327 µs/layer at B=1).
 Root cause: the launcher hardcoded NC2=1 + gridDim.y=1 → 16 blocks =
@@ -106,7 +125,8 @@ and cudagraphs as strong as the Triton baseline's.
 | serving, CUSTOM + PIECEWISE, GEMV off | 50.88 t/s | — |
 | serving, CUSTOM + FULL_DECODE_ONLY + GEMV, torch gather (n=6) | 52.90 t/s mean, σ≈0.06 | 10 × (FA + gather + quantize) ≈ 3.6 ms (rocprofv3, post-52.90) |
 | serving, CUSTOM + FULL_DECODE_ONLY + GEMV, **V1 fused gather (n=5)** | 57.09 t/s mean, σ≈0.09 | torch gather was 128–190 µs/layer isolated (M0-3); V2 in-graph trap (285 µs/call) documented — DEVLOG "Route B stage 1" |
-| serving, CUSTOM + FULL_DECODE_ONLY + GEMV + V1 gather + **FA NC2=8/KVSPLIT=16 (current default, v7)** | **~62.7 t/s** (docker 0.85: 62.81/62.92; local venv 0.95: 62.677/62.668/62.671) | FA 245 → 58.3 µs/layer @Sk=2176 (4.2×; HBM floor ~8 µs) — DEVLOG "FA kernel track" |
+| serving, CUSTOM + FULL_DECODE_ONLY + GEMV + V1 gather + FA NC2=8/KVSPLIT=16 + **fused gather-quantize (current default, v8)** | **~63.6 t/s** (local venv 0.95: 63.534/63.581; OFF A/B: 62.594/62.695) | gather+quant 64.3 → 36.9 µs/layer @Sk=3328 (1.7×) — DEVLOG "Post-FA-track trace + stage 2" |
+| serving, CUSTOM + FULL_DECODE_ONLY + GEMV + V1 gather + **FA NC2=8/KVSPLIT=16 (v7)** | **~62.7 t/s** (docker 0.85: 62.81/62.92; local venv 0.95: 62.677/62.668/62.671) | FA 245 → 58.3 µs/layer @Sk=2176 (4.2×; HBM floor ~8 µs) — DEVLOG "FA kernel track" |
 | serving, CUSTOM + requested FULL_DECODE_ONLY, CGSupport=NEVER (`GFX906_FA_CG=never`) | 22.44 t/s — **downgrade bug** (dormant; upstream class) | — |
 | eager, CUSTOM LEGACY=0 (works today) | 19.33 t/s | — |
 
@@ -265,6 +285,13 @@ wavefront under-fill (416/960 ≈ 43%) letting other graph branches
 co-reside and interleave; V1's 6656 wavefronts saturate the machine.
 Numbers unchanged: 57.09 t/s 5-sample record; post-fix 3-sample bench
 ≈ HEAD 3-sample bench (≈56.7, machine drift).
+
+**v8 (2026-08-16) — stage 2 (quantize-during-gather) landed.** One fused
+kernel per FA decode layer replaces gather_paged_kv_fp16 + quantize_q8_0
+(bit-equal outputs; `GFX906_FA_FUSED_QUANT` default on). Fresh
+rocprofv3 trace: FA stack ≈ 621 µs/step (was 3272); dense dispatch at
+micro-bench optimum; ~1.18 ms/step fill/copy pile uncharacterized
+(next: P3-4 characterization). Record: 63.56 t/s; llama.cpp gap 1.11×.
 
 ### M1 — LEGACY=0 serving path (v3: demoted to optional optimization track)
 

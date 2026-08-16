@@ -2,6 +2,23 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 
+Status: v14 (2026-08-16) — **P3-3a stage 2 landed: fused
+gather-and-quantize.** The LEGACY decode two-kernel sequence
+(gather_paged_kv_fp16 + quantize_q8_0) is one kernel: V fp16 copy + K
+quantized to q8_0 in-kernel via the shared `quantize_block_q8_0_halfwarp`
+helper → **bit-equal** outputs (3-shape unit test; PPL unchanged by
+construction, 6.6895). Micro: 64.3 → 36.9 µs/layer @Sk=3328. Serving
+A/B: OFF 62.65 mean vs **DEFAULT 63.56 t/s (new record, +1.47%)**;
+`GFX906_FA_FUSED_QUANT` default on, `=0` kill switch. Fresh rocprofv3
+trace firms the budget: FA stack ≈ 0.62 ms/step (was 3.27); dense
+GEMV/LLMM1 dispatch confirmed at its micro-bench optimum (no lever);
+~1.18 ms/step fill+D2D-copy pile uncharacterized → P3-4 candidate.
+Gap vs llama.cpp: 1.12× → **1.11×**. Build note: hipify.py same-dir
+copytree guard (in-source rebuilds crashed on Py3.12). Remaining
+P3-3a: FA micro-follow-ups (y auto-tune, ncols=16 tuning, PMC
+counters); LEGACY=0 optional track. `plan-gfx906fa-serving.md` at v8.
+DEVLOG "Post-FA-track trace + stage 2".
+
 Status: v13 (2026-08-16) — **FA kernel track landed** (the remaining
 "FA kernel itself" P3-3a item): B=1 decode parallelism fix — GQA
 head-packing + KV split + split-combine in the vendored FA launcher
@@ -18,6 +35,21 @@ P3-3a: stage-2 quantize-during-gather (quantize_q8_0 ~312 µs/step),
 FA micro-follow-ups (y-auto-tune, ncols=16 config-table tuning),
 LEGACY=0 optional track. `plan-gfx906fa-serving.md` at v7. DEVLOG
 "FA kernel track (P3-3a)" + "Local-venv bench environment".
+
+**v13→v14 changelog** (2026-08-16, DEVLOG "Post-FA-track trace +
+stage 2"):
+- Fresh serving trace (NC2=8/KVSPLIT=16): FA stack ≈ 621 µs/step (tile
+  475 + combine 146; was 3272). Dense area (GEMV 3936 + LLGemm1 2021
+  µs/step) re-verified against the P3-2(b) micro-bench evidence —
+  dispatch already at the measured optimum (o_proj GEMV kc4096/r2 is
+  +4% SLOWER than LLMM1); no lever. Top uncharacterized pile: 118
+  fills + 115 D2D copies ≈ 1.18 ms/step (FA contributes only ~10 small
+  q_pad zeros + tiny staging; rest is GDN/MoE/runner).
+- Stage 2: `gather_paged_kv_quantized` (new kernel + binding); bit-exact
+  vs the two-kernel path by construction (shared quantization helper);
+  15/15 FA tests; A/B 62.65 → 63.56 t/s.
+- Build: hipify.py in-source copytree guard; pitfall noted (bare
+  in-repo `cmake` diagnostics pollute the in-source build state).
 
 **v12→v13 changelog** (2026-08-16, DEVLOG "FA kernel track (P3-3a)"):
 - FA B=1 decode was latency-bound at 6.7% wavefront occupancy (16
@@ -295,9 +327,11 @@ top-8 MoE), MI50 32 GB (gfx906, 60 CU), single request:
 | llama.cpp (Q4_K_XL) | 807 t/s | **70.3 t/s** (14.2 ms/step) |
 | vLLM + cudagraphs, Triton attn, post-P3-1 (historical baseline) | ~2140 t/s | 44.09 t/s (22.7 ms e2e step; ~19.0 ms profiled step) |
 | vLLM + cudagraphs FULL_DECODE_ONLY, CUSTOM Q8 FA + GEMV + V1 fused gather | ~2140 t/s | 57.09 t/s (17.5 ms e2e step; 5-sample mean, σ≈0.09) |
-| vLLM + cudagraphs FULL_DECODE_ONLY, CUSTOM Q8 FA + GEMV + V1 gather + FA NC2=8/KVSPLIT=16 (**current default, v13**) | ~2140 t/s | **~62.7 t/s** (15.9 ms e2e step; docker 0.85: 62.81/62.92, local venv 0.95 3-sample: 62.677/62.668/62.671) |
+| vLLM + cudagraphs FULL_DECODE_ONLY, CUSTOM Q8 FA + GEMV + fused gather-quantize + FA NC2=8/KVSPLIT=16 (**current default, v14**) | ~2140 t/s | **~63.6 t/s** (15.7 ms e2e step; local venv 0.95: 63.534/63.581, A/B-OFF 62.594/62.695) |
+| vLLM + cudagraphs FULL_DECODE_ONLY, CUSTOM Q8 FA + GEMV + V1 gather + FA NC2=8/KVSPLIT=16 (v13) | ~2140 t/s | **~62.7 t/s** (15.9 ms e2e step; docker 0.85: 62.81/62.92, local venv 0.95 3-sample: 62.677/62.668/62.671) |
 
-Gap: **1.12× (~1.7 ms e2e/step)** (was 1.23× at 57.09, 1.59× at the
+Gap: **1.11× (~1.6 ms e2e/step)** (was 1.12× at 62.7, 1.23× at 57.09,
+1.59× at the
 44.09 baseline; the default-request config served 22.44 t/s via the
 downgrade bug before the M2/Route B work — see
 plan-gfx906fa-serving.md). Primary metric: **serving mode**
@@ -315,7 +349,7 @@ construction; DEVLOG P3-0 for method):
 |-----------|---------|------------|--------|
 | LLGemm1 dense projections (aiter, incl. shared expert 80 + LM head) | **5.83** | 230 | **P3-2 target** |
 | `triton_matmul` = `shared_expert_gate` [1×2048] ×40 layers | 1.63 → **0.29** | 40 | **P3-1 DONE** (padded LLMM1, 40 × 7.3 µs) |
-| paged attention (CUSTOM Q8 FA, NC2=8/KVSPLIT=16) | **~0.6–1.0** (was 3.27 serving-trace / 1.94 Triton) | 10 | **P3-3a DONE** (v13) — micro 58.3 µs/layer @Sk=2176 (4.2× vs legacy FA; B=1 parallelism fix); fresh serving trace pending |
+| paged attention (CUSTOM Q8 FA, NC2=8/KVSPLIT=16, fused gather-quant) | **~0.62 serving-trace** (tile 0.48 + combine 0.15; was 3.27 / 1.94 Triton) | 10 | **P3-3a DONE** (v13+v14) — B=1 parallelism fix (4.2× micro) + stage-2 fused gather-quantize (bit-exact); v14 serving trace: 621 µs/step |
 | gfx906 MoE routed kernel (Phase 1/2) | 1.75 | ~78 | done |
 | routing pipeline (topk+align+count_sort) | 1.06 | 79 | P2-4 deferred |
 | GDN decode (recurrent + conv1d) | ~0.5 | 60 | leave alone (faster than llama.cpp) |

@@ -78,6 +78,10 @@ _DOUBLE_CHECK = _os.environ.get("GFX906_FA_DOUBLE_CHECK", "0") == "1"
 # (A/B switch; the torch path is 128-190 us/layer at Sk~2176-3328 vs ~40 us
 # for the fused fp16 gather).
 _TORCH_GATHER = _os.environ.get("GFX906_FA_TORCH_GATHER", "0") == "1"
+# Stage 2: fuse the legacy-path gather + quantize into one kernel
+# (bit-equal to gather_paged_kv_fp16 + quantize_q8_0). GFX906_FA_FUSED_QUANT=0
+# reverts to the two-kernel path.
+_FUSED_QUANT = _os.environ.get("GFX906_FA_FUSED_QUANT", "1") != "0"
 _DUMP_DIR = _os.environ.get("GFX906_FA_DUMP", "")
 _dump_n = 0
 
@@ -407,24 +411,31 @@ def forward_paged(
         )
     else:
         # Legacy-path: gather FP16 → quantize on the fly.
-        # Fused HIP gather (P3-3a): replaces torch fancy-index _gather_kv
-        # (128-190 us/layer at Sk~2176-3328 vs ~40 us fused). V tail is
-        # zeroed; K tail unmasked — FA kernel cuts it via kv_max, same
-        # semantics as the Q8 side-buffer path. GFX906_FA_TORCH_GATHER=1
-        # reverts to the torch path for A/B.
+        # Stage 2 (default): one fused kernel — V fp16 gather + K gathered
+        # and quantized to q8_0 in-kernel (bit-equal to the two-kernel
+        # sequence; same quantization helper). Stage 1 fallback:
+        # gather_paged_kv_fp16 + quantize_q8_0 (GFX906_FA_FUSED_QUANT=0).
+        # Both: V tail zeroed; K tail unmasked — FA kernel cuts it via
+        # kv_max. GFX906_FA_TORCH_GATHER=1 reverts to the torch path.
         if _TORCH_GATHER:
             K_bhsd, V_bhsd = _gather_kv(
                 key_cache, value_cache, block_table, seq_lens, max_seqlen_k
             )
+            K_q8 = gfx906_fa.quantize_q8_0(K_bhsd)
         else:
             bt_i32 = (block_table if block_table.dtype == torch.int32
                       else block_table.to(torch.int32)).contiguous()
             sl_i32 = (seq_lens if seq_lens.dtype == torch.int32
                       else seq_lens.to(torch.int32)).contiguous()
-            K_bhsd, V_bhsd = gfx906_fa.gather_paged_kv_fp16(
-                key_cache, value_cache, bt_i32, sl_i32, Sk_pad
-            )
-        K_q8 = gfx906_fa.quantize_q8_0(K_bhsd)
+            if _FUSED_QUANT and Sk_pad <= 65535:
+                K_q8, V_bhsd = gfx906_fa.gather_paged_kv_quantized(
+                    key_cache, value_cache, bt_i32, sl_i32, Sk_pad
+                )
+            else:
+                K_bhsd, V_bhsd = gfx906_fa.gather_paged_kv_fp16(
+                    key_cache, value_cache, bt_i32, sl_i32, Sk_pad
+                )
+                K_q8 = gfx906_fa.quantize_q8_0(K_bhsd)
 
     # Переиспользуем buffer если подходит по размеру; иначе создаём новый.
     if (q_pad_buf is not None

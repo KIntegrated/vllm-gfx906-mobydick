@@ -129,6 +129,30 @@ extern "C" hipError_t gfx906_fa_launch_paged(
     hipStream_t     stream
 );
 
+// Stage 2: fused gather + inline K quantization (LEGACY decode path).
+extern "C" hipError_t launch_gather_paged_kv_quant(
+    const __half  * key_cache,
+    const __half  * value_cache,
+    const int32_t * block_table,
+    const int32_t * seq_lens,
+    uint8_t       * k_q8_out,
+    __half        * v_out,
+    int num_seqs,
+    int num_kv_heads,
+    int Sk,
+    int D,
+    int bytes_per_row,
+    int block_size,
+    int max_blocks_per_seq,
+    int64_t k_block_stride,
+    int64_t k_token_stride,
+    int64_t k_head_stride,
+    int64_t v_block_stride,
+    int64_t v_token_stride,
+    int64_t v_head_stride,
+    hipStream_t stream
+);
+
 // Level 1: fused paged gather K_q8 + V_fp16 → contiguous BHSD.
 // Заменяет Python-путь _gather_kv_q8 (fancy-indexing + permute).
 extern "C" hipError_t launch_gather_paged_kv_q8(
@@ -677,6 +701,94 @@ std::vector<torch::Tensor> gather_paged_kv_fp16(
 }
 
 // ============================================================================
+// Stage 2: fused gather + inline K quantization (LEGACY decode path).
+//
+// Replaces the two-kernel sequence
+//   gather_paged_kv_fp16 -> quantize_q8_0
+// with one kernel pass: V copied fp16 (V1 semantics, tail zeroed), K read
+// from the fp16 paged cache and quantized to q8_0 in-kernel. K output is
+// bit-equal to quantize_q8_0(gather_paged_kv_fp16(...)) — the kernel reuses
+// the same quantization helper as quantize_q8_0_dense_kernel.
+// ============================================================================
+std::vector<torch::Tensor> gather_paged_kv_quantized(
+    torch::Tensor key_cache,     // fp16 [num_blocks, block_size, Hkv, D]
+    torch::Tensor value_cache,   // fp16 [num_blocks, block_size, Hkv, D]
+    torch::Tensor block_table,   // int32 [num_seqs, max_num_blocks]
+    torch::Tensor seq_lens,      // int32 [num_seqs]
+    int64_t Sk
+) {
+    TORCH_CHECK_CUDA(key_cache);
+    TORCH_CHECK_CUDA(value_cache);
+    TORCH_CHECK_CUDA(block_table);
+    TORCH_CHECK_CUDA(seq_lens);
+
+    TORCH_CHECK(key_cache.dtype() == torch::kFloat16, "key_cache must be fp16");
+    TORCH_CHECK(value_cache.dtype() == torch::kFloat16, "value_cache must be fp16");
+    TORCH_CHECK(seq_lens.dtype() == torch::kInt32, "seq_lens must be int32");
+    TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4, "caches must be 4D");
+
+    const int num_blocks     = key_cache.size(0);
+    const int block_size     = key_cache.size(1);
+    const int num_kv_heads   = key_cache.size(2);
+    const int D              = key_cache.size(3);
+
+    TORCH_CHECK(value_cache.size(0) == num_blocks, "value_cache blocks mismatch");
+    TORCH_CHECK(value_cache.size(1) == block_size, "value_cache block_size mismatch");
+    TORCH_CHECK(value_cache.size(2) == num_kv_heads, "value_cache Hkv mismatch");
+    TORCH_CHECK(value_cache.size(3) == D, "value_cache D mismatch");
+    TORCH_CHECK(D % 32 == 0, "D must be multiple of 32");
+
+    TORCH_CHECK(block_table.dtype() == torch::kInt32,
+                "block_table must be int32");
+    TORCH_CHECK(block_table.is_contiguous(), "block_table must be contiguous");
+    TORCH_CHECK(seq_lens.is_contiguous(), "seq_lens must be contiguous");
+
+    const int num_seqs           = block_table.size(0);
+    const int max_blocks_per_seq = block_table.size(1);
+    TORCH_CHECK(seq_lens.size(0) == num_seqs, "seq_lens vs block_table batch mismatch");
+    TORCH_CHECK(Sk > 0 && (Sk % 32) == 0, "Sk must be positive multiple of 32, got ", Sk);
+    TORCH_CHECK(Sk <= 65535, "Sk must fit in gridDim.z (<= 65535), got ", Sk);
+
+    const int bytes_per_row = (D / 32) * 34;
+
+    auto k_out = torch::empty(
+        {(int64_t)num_seqs, (int64_t)num_kv_heads, Sk, (int64_t)bytes_per_row},
+        key_cache.options().dtype(torch::kUInt8));
+    auto v_out = torch::empty(
+        {(int64_t)num_seqs, (int64_t)num_kv_heads, Sk, (int64_t)D},
+        key_cache.options());
+
+    // Element strides for both caches (the kernel reads K as __half*).
+    const int64_t k_block_stride = key_cache.stride(0);
+    const int64_t k_token_stride = key_cache.stride(1);
+    const int64_t k_head_stride  = key_cache.stride(2);
+    const int64_t v_block_stride = value_cache.stride(0);
+    const int64_t v_token_stride = value_cache.stride(1);
+    const int64_t v_head_stride  = value_cache.stride(2);
+    TORCH_CHECK(key_cache.stride(3) == 1 && value_cache.stride(3) == 1,
+                "gather_paged_kv_quantized: last dim must be contiguous");
+
+    auto stream = c10::hip::getCurrentHIPStream().stream();
+    hipError_t err = launch_gather_paged_kv_quant(
+        reinterpret_cast<const __half*>(key_cache.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(value_cache.data_ptr<at::Half>()),
+        block_table.data_ptr<int32_t>(),
+        seq_lens.data_ptr<int32_t>(),
+        k_out.data_ptr<uint8_t>(),
+        reinterpret_cast<__half*>(v_out.data_ptr<at::Half>()),
+        num_seqs, num_kv_heads, (int)Sk, D, bytes_per_row, block_size,
+        max_blocks_per_seq,
+        k_block_stride, k_token_stride, k_head_stride,
+        v_block_stride, v_token_stride, v_head_stride,
+        stream
+    );
+    TORCH_CHECK(err == hipSuccess,
+                "launch_gather_paged_kv_quant failed: ", hipGetErrorString(err));
+
+    return {k_out, v_out};
+}
+
+// ============================================================================
 // Level 3c: Direct-paged FlashAttention.
 //
 // НЕТ gather step: kernel читает K/V directly from paged cache через
@@ -875,6 +987,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("block_table"), py::arg("seq_lens"), py::arg("Sk"),
           py::arg("k_out") = c10::nullopt,
           py::arg("v_out") = c10::nullopt);
+    m.def("gather_paged_kv_quantized", &gather_paged_kv_quantized,
+          "Stage-2 LEGACY-path fused gather: paged fp16 K + V -> K quantized "
+          "in-kernel to q8_0 (bit-equal to quantize_q8_0 of the fp16 gather) "
+          "+ V fp16. Returns [k_q8 uint8 [B,Hkv,Sk,(D/32)*34], "
+          "v_bhsd fp16 [B,Hkv,Sk,D]]. V tail zeroed; K tail unmasked.",
+          py::arg("key_cache"), py::arg("value_cache"),
+          py::arg("block_table"), py::arg("seq_lens"), py::arg("Sk"));
     m.def("forward_paged_direct", &gfx906_fa_forward_paged_direct,
           "Level 3c: Direct-paged FA (no gather). Reads K/V from paged cache "
           "via block_table indirection. Output: fp32 [B, Hq, Sq, D].",

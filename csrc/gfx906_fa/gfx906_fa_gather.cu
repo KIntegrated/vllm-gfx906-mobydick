@@ -50,6 +50,7 @@
 #include <hip/hip_fp16.h>
 #include <cstdint>
 #include <cstdlib>
+#include "kernel/q8_0_quantize.cuh"
 
 // ---------------------------------------------------------------------------
 // Fused gather K_q8 + V_fp16 → contiguous BHSD.
@@ -374,8 +375,173 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
 }
 
 // ---------------------------------------------------------------------------
+// Fused gather-and-quantize for the LEGACY (inline-quant) decode path.
+//
+// Motivation (P3-3a stage 2): the legacy path ran two kernels per FA
+// layer at decode:
+//   1) gather_paged_kv_fp16  — K fp16 + V fp16 from paged blocks
+//   2) quantize_q8_0_dense   — K fp16 -> K q8_0 (second read of K)
+// At B=1 both are latency/launch bound (effective HBM BW << peak), so
+// fusing saves a full kernel launch per layer plus the K fp16 round
+// trip. This kernel does in one pass:
+//   * V: fp16 copy, identical semantics to V1 (tail zeroed inline)
+//   * K: fp16 row read from the paged cache and quantized to q8_0 via
+//     the SAME quantize_block_q8_0_halfwarp helper as
+//     quantize_q8_0_dense_kernel — output is bit-equal to
+//     quantize_q8_0(gather_paged_kv_fp16(x)) by construction.
+// K tail (tok >= seq_len) is left unmasked, exactly like V1: the FA
+// kernel cuts it via kv_max.
+//
+// Grid (num_seqs, num_kv_heads, Sk), block (64,1,1): one wavefront per
+// (seq, head, tok). K quantization: halfwave 0 -> blocks 0,2,4,...;
+// halfwave 1 -> blocks 1,3,5,... (stride 2), each thread loads one
+// value per block (32 consecutive halfs per block -> coalesced).
+//
+// Constraint: Sk must fit in gridDim.z (<= 65535) — same as V1. The
+// caller falls back to the two-kernel path beyond that.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void gather_paged_kv_quant_kernel(
+    const __half  * __restrict__ key_cache,   // fp16 [num_blocks, bs, Hkv, D]
+    const __half  * __restrict__ value_cache, // fp16 [num_blocks, bs, Hkv, D]
+    const int32_t * __restrict__ block_table, // [num_seqs, max_blocks_per_seq]
+    const int32_t * __restrict__ seq_lens,    // [num_seqs]
+    uint8_t       * __restrict__ k_q8_out,    // [num_seqs, Hkv, Sk, bytes_per_row]
+    __half        * __restrict__ v_out,       // [num_seqs, Hkv, Sk, D]
+    int num_seqs,
+    int num_kv_heads,
+    int Sk,
+    int D,
+    int bytes_per_row,            // (D/32) * 34
+    int block_size,
+    int max_blocks_per_seq,
+    int64_t k_block_stride,       // block_size * Hkv * D (elements)
+    int64_t k_token_stride,       // Hkv * D
+    int64_t k_head_stride,        // D
+    int64_t v_block_stride,
+    int64_t v_token_stride,
+    int64_t v_head_stride
+) {
+    const int seq_idx  = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int tok_pos  = blockIdx.z;
+    if (seq_idx >= num_seqs || head_idx >= num_kv_heads || tok_pos >= Sk) return;
+
+    const int lane = threadIdx.x;   // 0..63
+
+    int seq_len = 0;
+    if (lane == 0) seq_len = seq_lens[seq_idx];
+    seq_len = __shfl(seq_len, 0, 64);
+
+    const int block_tab_idx = tok_pos / block_size;
+    const int block_offset  = tok_pos % block_size;
+
+    int64_t v_dst_base =
+        ((int64_t)seq_idx * num_kv_heads + head_idx) * (int64_t)Sk * D
+        + (int64_t)tok_pos * D;
+    int64_t k_dst_base =
+        ((int64_t)seq_idx * num_kv_heads + head_idx) * (int64_t)Sk * bytes_per_row
+        + (int64_t)tok_pos * bytes_per_row;
+
+    // Tail token: zero V, leave K (FA kernel cuts it via kv_max).
+    if (tok_pos >= seq_len || block_tab_idx >= max_blocks_per_seq) {
+        __half * vdst = v_out + v_dst_base;
+        for (int i = lane; i < D; i += 64) {
+            vdst[i] = __float2half(0.0f);
+        }
+        return;
+    }
+
+    int phys_block = 0;
+    if (lane == 0) {
+        phys_block = block_table[seq_idx * max_blocks_per_seq + block_tab_idx];
+    }
+    phys_block = __shfl(phys_block, 0, 64);
+
+    // ---------- K: gather + quantize to q8_0 ----------
+    const __half * k_src =
+        key_cache
+        + (int64_t)phys_block   * k_block_stride
+        + (int64_t)block_offset * k_token_stride
+        + (int64_t)head_idx     * k_head_stride;
+    uint8_t * k_dst = k_q8_out + k_dst_base;
+
+    const int half_id = lane / 32;   // 0 or 1
+    const int lane_in = lane % 32;   // 0..31
+    const int blocks_per_row = D / QK8_0_SZ;
+    for (int b0 = 0; b0 < blocks_per_row; b0 += 2) {
+        const int b = b0 + half_id;
+        if (b < blocks_per_row) {
+            quantize_block_q8_0_halfwarp(
+                k_src + b * QK8_0_SZ,
+                k_dst + b * Q8_0_BYTES,
+                lane_in
+            );
+        }
+    }
+
+    // ---------- V: fp16 copy (V1 semantics) ----------
+    const __half * v_src =
+        value_cache
+        + (int64_t)phys_block   * v_block_stride
+        + (int64_t)block_offset * v_token_stride
+        + (int64_t)head_idx     * v_head_stride;
+    __half * vdst = v_out + v_dst_base;
+
+    const int n_u2 = D >> 2;                       // D/4 chunks of 8 bytes
+    const uint2 * v_src_u2 = reinterpret_cast<const uint2 *>(v_src);
+    uint2       * v_dst_u2 = reinterpret_cast<uint2       *>(vdst);
+    for (int i = lane; i < n_u2; i += 64) {
+        v_dst_u2[i] = v_src_u2[i];
+    }
+    const int v_tail = D & 3;
+    if (v_tail != 0 && lane == 0) {
+        for (int i = D - v_tail; i < D; ++i) vdst[i] = v_src[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Host launcher
 // ---------------------------------------------------------------------------
+extern "C" hipError_t launch_gather_paged_kv_quant(
+    const __half  * key_cache,
+    const __half  * value_cache,
+    const int32_t * block_table,
+    const int32_t * seq_lens,
+    uint8_t       * k_q8_out,
+    __half        * v_out,
+    int num_seqs,
+    int num_kv_heads,
+    int Sk,
+    int D,
+    int bytes_per_row,
+    int block_size,
+    int max_blocks_per_seq,
+    int64_t k_block_stride,
+    int64_t k_token_stride,
+    int64_t k_head_stride,
+    int64_t v_block_stride,
+    int64_t v_token_stride,
+    int64_t v_head_stride,
+    hipStream_t stream
+) {
+    if (num_seqs == 0 || num_kv_heads == 0 || Sk == 0) return hipSuccess;
+    if (D % 32 != 0) return hipErrorInvalidValue;
+    if (Sk > 65535) return hipErrorInvalidValue;   // gridDim.z cap (V1 same)
+
+    dim3 block(64, 1, 1);
+    dim3 grid(num_seqs, num_kv_heads, Sk);
+    gather_paged_kv_quant_kernel<<<grid, block, 0, stream>>>(
+        key_cache, value_cache,
+        block_table, seq_lens,
+        k_q8_out, v_out,
+        num_seqs, num_kv_heads, Sk, D, bytes_per_row, block_size,
+        max_blocks_per_seq,
+        k_block_stride, k_token_stride, k_head_stride,
+        v_block_stride, v_token_stride, v_head_stride
+    );
+    return hipGetLastError();
+}
+
 extern "C" hipError_t launch_gather_paged_kv_q8(
     const uint8_t * key_cache_q8,
     const __half  * value_cache,

@@ -38,58 +38,8 @@
 #include <hip/hip_fp16.h>
 #include <cstdint>
 
-static constexpr int QK8_0_SZ = 32;
-static constexpr int Q8_0_BYTES = 34;     // sizeof(__half) + 32 int8
+#include "kernel/q8_0_quantize.cuh"
 
-// ---------------------------------------------------------------------------
-// Device helper: квантовать 32 FP16 значения в один block_q8_0.
-//
-// Каждый wavefront (64 threads) обрабатывает 2 блока одновременно —
-// lanes 0..31 делают блок A, lanes 32..63 — блок B.
-// В каждом блоке lane_in_block (0..31) держит одно значение,
-// amax находится через warp_reduce_max (DPP → __shfl_xor).
-// ---------------------------------------------------------------------------
-static __device__ __forceinline__ void quantize_block_q8_0_halfwarp(
-    const __half * __restrict__ x,   // 32 значения (один блок)
-    uint8_t      * __restrict__ y,   // 34 байта (fp16 scale + 32 int8)
-    int lane_in_block                // 0..31
-) {
-    // 1) Load fp16 → fp32
-    const float v = __half2float(x[lane_in_block]);
-    const float absv = fabsf(v);
-
-    // 2) amax reduction внутри half-wave (32 lanes).
-    //    Вся wavefront = 64 lane; используем __shfl_xor с width=32 — он
-    //    редуцит внутри каждого "halfwarp" независимо.
-    float amax = absv;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        float o = __shfl_xor(amax, offset, 32);
-        amax = fmaxf(amax, o);
-    }
-
-    // 3) scale + id
-    const float d  = amax / 127.0f;
-    const float id = d > 0.0f ? 1.0f / d : 0.0f;
-
-    // 4) quant
-    float q = v * id;
-    // rintf: round-to-nearest-even (как в ggml CPU-path)
-    int   qi = (int)rintf(q);
-    if (qi < -128) qi = -128;
-    if (qi >  127) qi =  127;
-
-    // 5) write: lane 0 пишет fp16 scale, все 32 — свой int8.
-    if (lane_in_block == 0) {
-        __half d_h = __float2half(d);
-        // memcpy через reinterpret — dst не обязательно выровнен на 2 (34-байтные блоки
-        // подряд: dst+34 невыровненный).
-        uint16_t d_bits = *reinterpret_cast<uint16_t*>(&d_h);
-        y[0] = d_bits & 0xff;
-        y[1] = (d_bits >> 8) & 0xff;
-    }
-    y[2 + lane_in_block] = (uint8_t)(int8_t)qi;
-}
 
 
 // ---------------------------------------------------------------------------
