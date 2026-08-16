@@ -1082,7 +1082,7 @@ def fastsafetensors_weights_iterator(
             for name, tensor in pl.iterate_weights():
                 yielded = True
                 yield name, tensor
-        except RuntimeError as e:
+        except Exception as e:  # noqa: BLE001 - fastsafetensors raises a bare Exception on GDS read failure
             if nogds or yielded or "gds" not in str(e):
                 raise
             logger.warning_once(
