@@ -374,6 +374,115 @@ AI-assistance disclosure), these are the items:
   benefit is eager-path only — inductor fuses the decomposition in
   compiled mode.
 
+## 9. Code-review items (parked from the pre-merge review, 2026-08-17)
+
+The pre-merge code review of the branch (`gfx906_qwen_impr_code_rev_qwen.md`
+in `docs/gfx906/` plus the combined review at the repo root) resolved its
+four severity findings in `01499157a8` (symmetric W4A16 repack crash +
+wrong zp fill, GDN platform gate, oracle GPTQ exclusion, `top_k` guard).
+The remainder is parked here. None of it affects the default
+configuration (LEGACY=1, gfx906 build); it is edge-path correctness,
+cross-platform hygiene, and cleanup. IDs are R*, severities as
+P2/P3/P4 per the review. House rule applies: P3/P4 items get bundled
+with the next substantive touch of the affected file, not their own
+commit.
+
+### 9.1 Edge-path correctness (fix before enabling the affected mode)
+
+- **R1 — direct-paged path builds an fp16 Q buffer; the C API requires
+  fp32 (P2).** `forward_paged`'s direct branch checks
+  `q_pad_buf.dtype == query.dtype`, but `q_pad_buf` is always allocated
+  fp32 → the fallback `torch.zeros(..., dtype=query.dtype)` is fp16 →
+  `forward_paged_direct`'s `TORCH_CHECK` fails. Reachable only under
+  `GFX906_FA_LEGACY=0` + B≥2/Sq≤16 (the experimental Q8 side-buffer
+  mode); dormant in the default configuration, but the documented
+  `GFX906_FA_DIRECT_PAGED` A/B knobs would hit it. One-line fix: use
+  the fp32 buffer / drop the dtype condition. Evidence: **verified**
+  (code walk; probe-able via the knobs in `running.md`).
+- **R2 — LEGACY=0 + prefix caching logs an error but continues (P3).**
+  `get_cudagraph_support` logs the corruption warning (the Q8
+  side-buffer lags the fp16 cache during warmup/COW/graph-replay
+  writes) but keeps the backend. Should fail closed (raise, behind an
+  explicit override if a diagnostic use case exists) — the README
+  already says "do not use"; the code should agree.
+- **R3 — `_ensure_gather_buffers` retired-buffer growth is unbounded in
+  LEGACY=0 (P3).** Exact-shape-match realloc plus a retired list that
+  keeps the old tensors alive: every `Sk_pad` growth after the first
+  capture (decode grows it in 32-token steps over long contexts)
+  permanently retains the previous K+V pair (tens of MiB each at
+  serving shapes). Inert in the default LEGACY=1 (buffers are `None`).
+  Fix: grow-only capacity buffer with an exact-size view.
+- **R4 — MoE kernel caller contract is partially unenforced (P3).**
+  `moe_gptq_gemm_gfx906` checks dims/dtypes/`N % 4` (and `top_k > 0`
+  since `01499157a8`) but not `K % 8`, `groups | K`, or `N % 8` (the
+  qzeros row width); the oracle-side shape gates are deferred (the
+  repack's layout detection rejects unrecognized shapes loudly — the
+  observed failure mode for exotic shapes is a load-time `ValueError`,
+  not silent miscomputation). Add the cheap `TORCH_CHECK` group and the
+  oracle divisibility check when the kernel/oracle is next touched.
+
+### 9.2 Cross-platform / build hygiene (fix before the fork is built
+or run on non-gfx906 hardware)
+
+- **R5 — plugin entry point logs a full traceback on every non-gfx906
+  vLLM startup (P2).** The pyproject registers `gfx906_fa = vllm.gfx906_fa
+  .gfx906_fa_backend:register` unconditionally; importing that module
+  hard-imports the gfx906-only `_gfx906_fa_C` extension. The plugin
+  loader catches it (graceful: backend simply absent) but via
+  `logger.exception` → a traceback in every CUDA/non-gfx906 startup
+  log. The explicit-registration path in `platforms/rocm.py` already
+  has the `try/except ImportError`; the plugin path doesn't. Fix: make
+  `register()` import-tolerant.
+- **R6 — setup.py requests a CMake target that may not exist (P2).**
+  `_targets_gfx906()` returns True when `PYTORCH_ROCM_ARCH` is *empty*
+  (auto-detect), but the `_gfx906_fa_C` CMake target is defined only
+  when `VLLM_GPU_ARCHES` matches gfx906. On a non-gfx906 ROCm machine
+  with arch auto-detection the build fails on a nonexistent target.
+  Fix: append the extension only when `"gfx906" in rocm_arch` (the
+  CMake gate is the source of truth).
+
+### 9.3 Cleanup / debt (bundle with the next touch of the file)
+
+- **R7 — ncols1 tile ladder copied three times (P3).** The
+  `Sq>32→64 … Sq≤2→2` ladder lives in `forward_paged` (Python), the C
+  launcher dispatch, and the C kv_max expansion (annotated "keep in
+  sync!"). Any ladder change (e.g. a new NC2 cap) must hit all three;
+  a divergence mis-pads Q or mis-expands kv_max. Consolidate or pin
+  the mapping with a unit test.
+- **R8 — `gather_paged_kv_quantized` allocates fresh outputs per call
+  (P3).** Unlike its two sibling gather paths it has no `use_or_alloc`
+  grow-buffer parameter; the fused-quant gather is the one actually
+  used on the default LEGACY decode path. Benign under graph capture
+  (private pool) and cheap in eager (caching allocator); inconsistent
+  with the VRAM-spike rationale documented for the siblings.
+- **R9 — MoE `apply()` aliasing order dependency undocumented (P3).**
+  `workspace13`/`fused_out` alias one `common_workspace` (§2.1); the
+  sequence gemm1 → activation → `output.zero_()` → gemm2 is load-
+  bearing (an earlier zero would wipe `w1_out`). Correct today; one
+  reorder away from silent corruption. Add the warning comment (or
+  split the buffer for this experts class).
+- **R10 — stale docs/comments (P4).** The `kchunk 512|2048|4096`
+  docstrings in `csrc/rocm/ops.h` + `vllm/_custom_ops.py` omit 1024
+  (a supported and *used* value — K=17408 down_proj); the
+  `forward_paged_direct` pybind help says output `[B, Hq, Sq, D]`, it
+  is native BSHD `[B, Sq, Hq, D]`; the launcher header's "TODO: vLLM
+  block table" is implemented; the MoE kernel header's `grid = (…, 
+  N/1024, …)` is only true for NPT=4 (NPT=2 → N/512); `/tmp/bench/…`
+  references in code comments (volatile); the dead `mask_buf=None`
+  parameter on `forward_paged` (Level-3a leftover).
+- **R11 — lint debt in vendored/bench files (P4).** ~63 ruff errors in
+  `vllm/gfx906_fa/*.py`, `benchmarks/kernels/gfx906/*`, and the docs
+  bench scripts (B023/E501/F821 in the timeit-closure bench patterns;
+  the F821s are outer-scope names, verified harmless); pre-existing
+  E501s + ruff-format drift in `utils.py`. Pre-commit will flag these
+  if the files are restaged — a `per-file-ignores` entry or a cleanup
+  pass, bundled, not standalone.
+- **R12 — debug env knobs (P4).** 8 debug-only `GFX906_FA_*` switches
+  (`_DOUBLE_CHECK`, `_DUMP`, `_FUSED`, `_FWD_DEBUG`, `_NO_BUF_REUSE`,
+  `_QPAD_EMPTY`, `_TORCH_GATHER`, `_ZERO_KTAIL`) — candidates for a
+  single `GFX906_FA_DEBUG=1` master switch; all are read once at
+  import and documented in the README knob table.
+
 ## Appendix A — `moe_gemm_q4_kernel_gfx906` facts (csrc/rocm/moe_q_gemm_gfx906.cu)
 
 - Template `<BM, NPT>` with instantiations `<1,4>`, `<4,4>`, `<8,2>`;

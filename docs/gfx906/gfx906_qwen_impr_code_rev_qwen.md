@@ -266,9 +266,13 @@ landed:
 | `top_k > 0` guard missing in MoE GEMM | combined #4, this doc P3-7 | `TORCH_CHECK` in `moe_q_gemm_gfx906.cu`; probe-verified |
 | MoE oracle shape gates (N%4/K%8/groups) | this doc P2-1 | deferred — repack layout detection rejects unknown shapes loudly; revisit if a new layout is added |
 
-Still open from this document: P2-2 (direct-paged fp16-Q), P2-3 (plugin
-traceback), P2-4 (setup.py/CMake gate), P3-1…P3-6, P4 nits, and the
-three new lint errors (I001 ×2, SIM102).
+Still open from this document — parked as R1–R12 in
+`moe-decode-roadmap.md` §9 (2026-08-17): P2-2 → R1, P3-1 → R2,
+P3-2 → R3, P2-1-shape-gates/P3-7 → R4, P2-3 → R5, P2-4 → R6,
+P3-5 → R7, P3-6 → R8, P3-3 → R9, P4 nits → R10–R12. The three
+branch-introduced lint errors (I001 ×2, SIM102) are fixed in
+`01499157a8` (pre-existing E501/format debt in `utils.py` and the
+vendored files remains — R11).
 
 ## 6. Suggested pre-merge actions (ordered)
 
