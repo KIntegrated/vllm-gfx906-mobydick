@@ -2312,3 +2312,58 @@ Linear history kept (fork convention: merge commits only for upstream
 merges). All gates current at the merge tip: 4 suites 74 passed /
 2 skipped, PPL MoE 6.6825 (band 6.6817-6.6832), serving records 25.60
 t/s dense / 67.39 t/s MoE (see the serving sections above).
+
+---
+
+## 2026-08-17 — Dense 27B load test in the 0.27.99rc0-rocm-7.14 docker image
+
+Image `unverbraucht/vllm-gfx906:0.27.99rc0-rocm-7.14` (built from the merged
+`gfx906/main` tip `e861d0b30f`) served Qwen3.5-27B-AWQ (48 GDN + 16 FA)
+single-GPU MI50. Load test: chat + completions endpoints, 25..2124-token
+prompts, bursts/sustained/long-context, ~48 requests, **zero failures,
+zero hipError/assert in server logs**.
+
+### Findings
+
+- **Hybrid-model steady-state footprint on MI50 32GB** (the reason the
+  first three configs OOMed):
+  - weights 18.9 GiB (visual tower dropped via
+    `--limit-mm-per-prompt '{"image":0,"video":0}'`);
+  - mamba (GDN) state workspace ≈ 72 MB *per sequence* (48 linear layers ×
+    48 v-heads × 128×128) — `max_num_seqs` is the biggest lever;
+  - the custom-FA **capture-generation gather buffers**
+    (`_ensure_gather_buffers` in `gfx906_fa_backend.py`) are sized
+    `max_num_seqs × pad32(max_model_len)` and linger in the R3 retirement
+    list after the first reallocate — 1.64 GiB at 16×32768, 83 MB at
+    8×3328. This is what made max-model-len 131072 unbootable (8.5-9.1 GiB
+    allocation during cudagraph profiling) and what ate the headroom at
+    16 seqs × 32768 (engine died on ~2K prefills, `free: 0`, fixed
+    340/600 MiB inductor allocations);
+  - inductor AOT static workspace scales with the compiled range
+    (`max_num_batched_tokens`).
+  - `--kv-cache-memory-bytes` skips memory profiling entirely → all of the
+    above must be budgeted manually (vLLM's auto-sizing over-commits by
+    ~0.7 GiB at gpu_util ≥ 0.92).
+- **Working config** (32K context, stable): `--max-model-len 32768
+  --gpu-memory-utilization 0.92 --max-num-seqs 8
+  --max-num-batched-tokens 512 --kv-cache-memory-bytes 5368709120
+  --enable-prefix-caching --limit-mm-per-prompt '{"image":0,"video":0}'
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY",
+  "max_cudagraph_capture_size":8}'`. KV pool: 85,333 tokens
+  (125 × 784-token blocks, mamba page aligned), 2.6× concurrency at 32K.
+  Idle VRAM 28.8 GiB, ~3.2 GiB headroom.
+- **Prefix caching works**: 2124-token prompt cold 11.1 s → warm 4.7 s;
+  metrics `prefix_cache_hits_total 1568 / queries 6129` (1568 = two
+  784-token mamba-aligned blocks).
+- **Latency reality check** (512-token chunk cap for stability):
+  - prefill ≈ 250-300 tok/s (chunk-capped; TTFT median 56 s for an
+    8×2048 burst — the 512 cap, not the GPU, is the TTFT bottleneck);
+  - decode ≈ 25 t/s single-stream (matches the 25.60 t/s record),
+    ≈ 30 t/s aggregate at batch 8;
+  - sustained capacity ≈ 0.18 rps for 1024-in/128-out (2 rps saturates the
+    queue: 24 peak concurrent, 16 waiting, P99 TTFT 101 s).
+- Qwen3.5-27B is a thinking model: use
+  `chat_template_kwargs: {"enable_thinking": false}` for concise answers.
+- Bench driver gotchas: `vllm bench serve --backend openai --model
+  <served-name> --tokenizer <model-path>` (model name must match the
+  served name; tokenizer needs the path).
