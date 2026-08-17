@@ -6,6 +6,17 @@ This fork optimizes vLLM for AMD **gfx906 (Vega 20)** — MI50/MI60, 60 CUs,
 measured on a single MI50 with ROCm 7.14, torch 2.13, single request,
 `pp=2048`/`tg=256`, `cudagraph_mode=FULL_DECODE_ONLY`.
 
+## Fork heritage
+
+- This repository is the gfx906 vLLM port
+  [**ai-infos/vllm-gfx906-mobydick**](https://github.com/ai-infos/vllm-gfx906-mobydick),
+  itself based on [**nlzy/vllm-gfx906**](https://github.com/nlzy/vllm-gfx906),
+  the original gfx906 port of vLLM.
+- The custom Q8 FlashAttention kernels come from
+  [**cassettesgoboom/gfx906-fa-vllm**](https://github.com/cassettesgoboom/gfx906-fa-vllm),
+  vendored early in this fork's history and substantially extended for the
+  decode path (see §What changed).
+
 Test models:
 
 - **MoE:** `QuantTrio/Qwen3.5-35B-A3B-AWQ` (40 layers, 256 experts × 8

@@ -1,5 +1,15 @@
 ## Mini Install Guide for GFX906
 
+## Fork heritage
+
+This repository is the gfx906 vLLM port
+[**ai-infos/vllm-gfx906-mobydick**](https://github.com/ai-infos/vllm-gfx906-mobydick),
+based on [**nlzy/vllm-gfx906**](https://github.com/nlzy/vllm-gfx906), the
+original gfx906 port of vLLM. The custom Q8 FlashAttention kernels below are
+vendored from
+[**cassettesgoboom/gfx906-fa-vllm**](https://github.com/cassettesgoboom/gfx906-fa-vllm).
+See [`docs/gfx906/`](docs/gfx906/) for the full optimization record.
+
 ## Custom FlashAttention backend (gfx906 FA, `CUSTOM`)
 
 This fork vendors a custom Q8 FlashAttention attention backend for gfx906
