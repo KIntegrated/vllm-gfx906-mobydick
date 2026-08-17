@@ -54,6 +54,15 @@ also why nothing in §3 is scheduled yet: the plan's own P2-4 gate was
 "gap > 2 ms" and the gap is 1.4 ms, so this roadmap only activates if
 the 70 t/s target stays the goal.
 
+**2026-08-18 re-anchor** (eager torch-profiler, DEVLOG-moe-m1-sprint):
+topkGating 17.9 µs/call (713 µs/step), expert gemm 27.8 µs/call
+(2149 µs/step). The table above is the FA-track rocprofv3 snapshot; the
+fresh eager numbers are ~10% higher for these two rows (build/date
+drift, not a regression). The sprint worked from the fresh table.
+Note for micro-kernel work below ~10 µs: per-kernel profiler rows are
+pipeline-state dependent (measured 1.8–20 µs for the SAME kernel in
+different contexts) — wall-clock serving A/B is the gate.
+
 ## 2. Structural facts (constraints for any design)
 
 1. **Atomic K-splits force two zeroings.** The gemm kernel tiles K via
@@ -98,17 +107,34 @@ increasing order of surgery:
   histogram-over-256-buckets / prefix-sum structure; topk via a single
   wavefront, align via straight insertion of 8 (expert, slot) pairs.
   Target: all three ≤ ~5 µs → −350 to −450 µs/step.
+  - **(a)-topk was attempted (S2, 2026-08-18): the dedicated M=1 kernel
+    is bit-equal and wins in isolation (12.5 vs 17.3 µs) and eager
+    serving (+0.11 t/s) but LOSES in CUDA-graph replay (−0.95 t/s at
+    66 t/s). Shipped default-OFF behind `VLLM_GFX906_TOPK_M1`. A
+    standalone small-M topk kernel does not survive the gapless regime —
+    see the S2 table in DEVLOG-moe-m1-sprint.**
 - (b) **Fuse topk+align+count into one kernel per layer** (they already
   form a 3-stage pipeline on 8 elements). Target: 40 × ~6 µs = 240 µs →
   −800 µs/step. Needs one output-layout design (the gemm kernel consumes
   `sorted_token_ids`/`expert_ids`/`num_tokens_post_padded`).
+- (c) **S2' — fold topk into the router GEMV epilogue** (the post-S2
+  lead): the gate GEMV [256,2048] already reads the token; computing
+  softmax+top8 in its epilogue (or a 1-wave follow-up fused with the
+  GEMV) removes one of the 40×/step kernel launches entirely, which is
+  the only regime-safe way to win the topk budget. Same output-layout
+  design as (b) for the align/count side.
 
 Risk: low–medium (standalone kernels, unit-testable in isolation; the
 gemm contract is unchanged for (a)). Gate: micro-bench the three kernels
 at M=1/8/32/128 with PMC counters (TCC + wavefront occupancy) to confirm
-the 14 µs/call is structure, not DRAM latency.
+the 14 µs/call is structure, not DRAM latency. (Superseded for the
+µs-scale verdicts by the wall-clock A/B gate — see §1 note.)
 
 ### C2 — Routed-gemm re-tile at decode sizes (measured 1922 µs vs 602 µs floor)
+
+(2026-08-18 re-anchor: 2149 µs/step = 27.8 µs/call in the fresh eager
+probe; this is the sprint's **S5** — the V2 in-block K-parallel GEMV
+re-tile is the design under construction.)
 
 The BM=1/NPT=4 tiling launches 4096 blocks (gemm1: 8 slots × 8 n-tiles ×
 64 K-splits, 32 threads each) per layer; each (slot, n-column) cell is

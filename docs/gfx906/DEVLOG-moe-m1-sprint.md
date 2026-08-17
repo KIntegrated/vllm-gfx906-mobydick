@@ -143,3 +143,101 @@ router-alone (~130 µs, mostly subsumed by the fused kernel).
 **Final sprint order:** (1) S2 fused router+topk — closes parity;
 (2) S5 M=1 expert-kernel parallelism; (3) S3 shared-down K=512 GEMV;
 (4) S4 shared gate_up; B1/B2 demoted to stretch.
+
+## S2 — dedicated M=1 topk kernel (implementation)
+
+**Generic topkGating semantics extracted** (topk_softmax_kernels.cu,
+SCORING_SOFTMAX, no bias/padding): per-lane (VPT=8) `max()` (=fmaxf,
+NaN-ignoring) → width-32 xor(16..1) butterfly; `expf(x - row_max)` with
+sequential per-lane sum in expert order → width-32 xor(16..1) butterfly
+sum; `p = e * (1.f/row_sum)`; `isnan||isinf → 0.f`; 8× (local argmax
+strict `>` i-ascending, xor-butterfly argmax with lowest-expert-index
+tie-break, blank winner to -10000.f, `selected_sum += winner_p` in k
+order); renorm: `scale = 1.f/denom` (denom≤0→1.f), `out[k] *= scale`.
+
+**Kernel** (`csrc/rocm/moe_topk_gfx906.cu`): one 64-lane wave. Lanes
+0-31 own 8 consecutive experts (the generic's exact TPR=32/VPT=8
+partition, one 16B load each); lanes 32-63 hold 8×-inf so one code path
+runs on all 64 lanes (their p is exactly 0, their expert ids 256..1023
+can never win the tie-break).
+
+**Bit-equality argument** (finite inputs):
+- max: exact, tree-shape irrelevant → LDS scan ok.
+- sum: the generic's xor(16,8,4,2,1) tree reproduced round-for-round via
+  LDS (each round: write cur, barrier, cur += s_row[t^mask]).
+- argmax: strict total order (value desc, expert asc) → any
+  reduction order gives the identical winner; blanking is local to the
+  owner lane.
+- per-lane pieces (expf, local sum order, recip multiply, NaN clamp,
+  selected_sum k-order accumulation, renorm scale) are byte-identical
+  operations on byte-identical operands.
+
+**gfx906 ISA finding (measured)**: every `__shfl_xor` pattern — width 32
+*or* 64 — lowers through the E32 extended-register file (width 32:
+558 v_readlane + 357 v_writelane + 526 v_mov_b32_e32; width 64:
+155 ds_bpermute + 183 v_mov_b32_e32). `v_perm_b32` only appears for
+constant-lane shuffles. Three variants measured (torch-profiler GPU
+self-time, M=1/E=256/k=8 fp16):
+
+| variant | GPU self-time | notes |
+|---|---|---|
+| generic topkGating<8,256,4,16,64> | 17.3–17.5 µs | 4-warp block, row machinery |
+| width-32 cut (this file, SHIPPED) | **12.5 µs** | 1 wave, 32 active lanes, generic's exact shuffles |
+| width-64 + 32 dummy -inf lanes | (not measured — rejected) | 2× per-lane work; shuffles no cheaper (ds_bpermute) |
+| LDS scans + forced s_barrier | 35.5 µs | 22 barriers + 8×32 ds_read2 scan; 2.8× SLOWER |
+
+So the shuffle path wins despite the ugly lowering — one wave with no
+row machinery is the real win over the generic. The LDS variant was
+verified correct (3000-trial stress harness `tmp_tp_probe/topk_harness.cu`,
+bit-equal to a CPU reference incl. tie/sparse cases) but is dead weight;
+keep the harness for future top-k experiments. Side finding: the backend
+elides `__syncthreads()` for single-wave CTAs (per-wave LDS FIFO
+ordering); the stress harness passed with elision, which is why the
+forced-barrier cost was isolated as the suspect in the 35.5 µs number.
+
+**Dispatch** (fused_topk_router.py): `VLLM_GFX906_TOPK_M1` env (default
+on), gates = on_gfx906 + M==1 + E==256 + k==8 + fp16 gating + int32
+outputs + contiguous + softmax + no bias + no padding.
+
+**Build gotcha (this week)**: the in-tree `.deps/triton_kernels-subbuild`
+is root-owned (docker-era) and any CMake reconfigure dies writing its
+CMakeLists there. Workaround already in running.md (`FETCHCONTENT_BASE_DIR=/tmp/vllm-deps`);
+added `TRITON_KERNELS_SRC_DIR=$PWD/.deps/triton_kernels-src/python/triton_kernels/triton_kernels`
+to skip the ROCm/triton git clone after reboots wipe /tmp.
+
+## S2 — result: mode-dependent, shipped default-OFF
+
+Bit-equality gates: pytest `test_gfx906_m1_topk_bit_equal_to_generic`
+4/4 (random×6 + all-equal + all-zero + 64-way tie, renorm on/off),
+micro-bench bit-equal PASS.
+
+Serving A/B (pp=2048 tg=256, 4 samples each, same day, this build):
+
+| regime | generic (TOPK=0) | new kernel (TOPK=1) | Δ |
+|---|---|---|---|
+| isolated GPU self-time | 17.3 µs/call | 12.5 µs/call (64t) | −4.8 ✓ |
+| eager serving | 23.98 t/s | 24.09 t/s | **+0.11** ✓ |
+| CUDA-graph serving | 66.31 t/s | 65.32 (64t) / 65.38 (256t) | **−0.95** ✗ |
+
+The same kernel gains in eager (CPU-gapped pipeline) and loses in
+graph replay (gapless pipeline). Thread count (64 vs 256) does not
+change either number. The in-model profiler table is NOT reliable for
+this micro-kernel: the 256t build read 19.9–20.1 µs/call in-model vs
+7.2 µs solo vs 1.8 µs interleaved-solo in the torch profiler — the
+activity records for small kernels depend on surrounding pipeline
+state. Wall-clock A/B is the only trustworthy gate for µs-scale
+kernels; treat per-kernel tables with suspicion below ~10 µs.
+
+Hypothesis (unverified): the width-32 shuffle lowering's E32-file
+footprint is cheap when CPU launch gaps let the wave set up lazily,
+but is exposed in graph replay's back-to-back dispatch. The LDS
+variant's true graph-mode number is unknown (its 35.5 µs came from the
+unreliable in-model profiler).
+
+**Decision: `VLLM_GFX906_TOPK_M1` defaults to OFF** (opt-in for
+eager-only use). Kernel, op, binding, test, and bench ship as the
+experimental record; the generic topkGating remains the default path.
+The 713 µs/step topk budget stays open: a real fix needs a design
+that is fast in the gapless regime (candidate: fuse topk into the
+router GEMV epilogue so there is no separate kernel at all — moved to
+the roadmap as S2').

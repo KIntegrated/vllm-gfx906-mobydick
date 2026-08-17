@@ -58,6 +58,15 @@ void moe_gptq_gemm_gfx906(torch::Tensor a, torch::Tensor c,
 torch::Tensor dense_gemv_gfx906(torch::Tensor weight, torch::Tensor x,
                                 int64_t kchunk);
 
+// M=1 fused top-k softmax router for gfx906, E=256, topk=8 (S2; see
+// moe_topk_gfx906.cu). Bit-equal to the generic topkGating for the exact
+// decode shape it serves (M==1, half, no bias/padding).
+void moe_topk_softmax_m1_gfx906(torch::Tensor topk_weights,     // [1, 8] f32
+                                torch::Tensor topk_ids,         // [1, 8] i32
+                                torch::Tensor token_expert_ids, // [1, 8] i32
+                                torch::Tensor gating,           // [1, 256] f16
+                                bool renormalize);
+
 void paged_attention(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
     torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,

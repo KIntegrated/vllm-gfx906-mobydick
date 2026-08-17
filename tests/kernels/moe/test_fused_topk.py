@@ -8,11 +8,19 @@ Run `pytest tests/kernels/moe/test_fused_topk.py`.
 import pytest
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 from vllm.platforms import current_platform
+
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
 
 
 def torch_topk(
@@ -271,3 +279,48 @@ def test_fused_topk_bias_nan_inf_clamp(
             f"Row {row} has non-finite weights {topk_weights[row].tolist()} "
             f"(bad_value={bad_value}, scoring_func={scoring_func})"
         )
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() and on_gfx906()),
+    reason="gfx906 M=1 topk kernel test (S2)")
+@pytest.mark.parametrize("scale", [0.5, 4.0])
+@pytest.mark.parametrize("renormalize", [True, False])
+def test_gfx906_m1_topk_bit_equal_to_generic(scale, renormalize):
+    """The dedicated M=1 kernel (moe_topk_gfx906.cu) reproduces the generic
+    topkGating's arithmetic in the same order (max/expf/sum butterflies,
+    reciprocal scale, NaN clamp, lowest-index tie-break, renormalize), so
+    outputs must be bit-equal — stronger than the torch-approx gates above.
+    Covers random logits plus tie-heavy degenerate cases."""
+    dev = "cuda"
+    cases = []
+    for seed in range(6):
+        g = torch.Generator(device=dev).manual_seed(seed)
+        cases.append(
+            (torch.randn(1, 256, generator=g, device=dev) * scale).half())
+    cases.append(torch.full((1, 256), 0.25, device=dev, dtype=torch.half))
+    cases.append(torch.zeros(1, 256, device=dev, dtype=torch.half))
+    tied = torch.zeros(1, 256, device=dev, dtype=torch.half)
+    tied[0, ::4] = 1.0  # 64-way tie for the max
+    cases.append(tied)
+
+    for gating in cases:
+        def run(fast: bool):
+            w = torch.empty(1, 8, dtype=torch.float32, device=dev)
+            i = torch.empty(1, 8, dtype=torch.int32, device=dev)
+            tei = torch.empty(1, 8, dtype=torch.int32, device=dev)
+            if fast:
+                ops.moe_topk_softmax_m1_gfx906(w, i, tei, gating,
+                                               renormalize)
+            else:
+                ops.topk_softmax(w, i, tei, gating, renormalize)
+            return w, i, tei
+
+        fast_w, fast_i, fast_tei = run(True)
+        ref_w, ref_i, ref_tei = run(False)
+        assert torch.equal(fast_i, ref_i), (
+            f"ids diverge: {fast_i.tolist()} vs {ref_i.tolist()} "
+            f"gating={gating[0, :16].tolist()}")
+        assert torch.equal(fast_w, ref_w), (
+            f"weights diverge: {fast_w.tolist()} vs {ref_w.tolist()}")
+        assert torch.equal(fast_tei, ref_tei)

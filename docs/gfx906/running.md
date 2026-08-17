@@ -49,7 +49,14 @@ source ~/env-rocm-7.14-gfx906.sh        # LD_LIBRARY_PATH=/opt/rocm-7.14/lib (RE
   ```
 
 - `FETCHCONTENT_BASE_DIR` is needed because the in-tree `.deps` is
-  root-owned (docker-era); setup.py honours the env var.
+  root-owned (docker-era); setup.py honours the env var. Reboots wipe
+  `/tmp/vllm-deps`, so also export `TRITON_KERNELS_SRC_DIR` at the
+  already-fetched package dir (in-tree `.deps/triton_kernels-src` is
+  kept) to skip the ROCm/triton git clone:
+
+  ```bash
+  export TRITON_KERNELS_SRC_DIR=$PWD/.deps/triton_kernels-src/python/triton_kernels/triton_kernels
+  ```
 - `ccache` is wired in automatically by setup.py; incremental rebuilds are
   minutes, a full flag-change rebuild of all HIP objects ~5 min on 16 cores.
 - **Extra HIP flags**: the `CMAKE_HIP_FLAGS` env var is NOT imported into
