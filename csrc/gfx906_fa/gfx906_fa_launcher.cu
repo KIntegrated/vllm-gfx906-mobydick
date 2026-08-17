@@ -101,23 +101,34 @@ static hipError_t gfx906_fa_launch_impl(
         // A packed tile shares ONE kv head (K/V base = head0 / gqa_ratio),
         // so a tile must not straddle GQA groups: gqa_ratio % nc2 == 0.
         // E.g. Hq=24/Hkv=4 (ratio 6) with nc2=8 would read wrong KV heads
-        // for half the Q heads. Only NC2=1 and NC2=8 are instantiated in the
-        // dispatch below, so fail closed to the validated NC2=1 path when
-        // packing is not valid (do NOT clamp to 2/4: dispatch would still
-        // run the NC2=8 kernel and silently mispack).
+        // for half the Q heads. Only NC2 in {1, 2, 8} are instantiated in
+        // the dispatch below; any other value is rejected loudly (clamping
+        // to a non-instantiated value would still run the NC2=8 kernel and
+        // silently mispack).
+        // The DEFAULT nc2=8 auto-downgrades 8 -> 2 -> 1 so GQA ratios like
+        // 6 (or 1, MHA) keep a valid path; an explicit env value that is
+        // GQA-invalid is an error.
         const int gqa_ratio = heads_q / heads_kv;
-        if (nc2 != 8) {
-            fprintf(stderr, "[gfx906_fa] nc2=%d unsupported (instantiated: 1, 8)\n", nc2);
+        if (nc2 != 1 && nc2 != 2 && nc2 != 8) {
+            fprintf(stderr, "[gfx906_fa] nc2=%d unsupported (instantiated: 1, 2, 8)\n", nc2);
             return hipErrorInvalidValue;
         }
         if (gqa_ratio % nc2 != 0) {
-            static bool warned = false;
-            if (!warned) {
-                fprintf(stderr, "[gfx906_fa] gqa_ratio=%d not divisible by nc2=%d, "
-                        "falling back to nc2=1\n", gqa_ratio, nc2);
-                warned = true;
+            if (nc2 == 8) {
+                static bool warned = false;
+                const int down = (gqa_ratio % 2 == 0) ? 2 : 1;
+                if (!warned) {
+                    fprintf(stderr, "[gfx906_fa] gqa_ratio=%d not divisible by "
+                            "nc2=8, using nc2=%d\n", gqa_ratio, down);
+                    warned = true;
+                }
+                nc2 = down;
+            } else {
+                fprintf(stderr, "[gfx906_fa] nc2=%d invalid for gqa_ratio=%d "
+                        "(need ratio %% nc2 == 0; use GFX906_FA_NC2=1 or 2)\n",
+                        nc2, gqa_ratio);
+                return hipErrorInvalidValue;
             }
-            nc2 = 1;
         }
     }
     if (kv_split < 1) {
@@ -241,6 +252,7 @@ static hipError_t gfx906_fa_launch_impl(
     using T32 = std::integral_constant<int, 32>;
     using T64 = std::integral_constant<int, 64>;
     using C1 = std::integral_constant<int, 1>;
+    using C2 = std::integral_constant<int, 2>;
     using C8 = std::integral_constant<int, 8>;
 
     // ncols1 ladder (llama.cpp). For NC2=8 the ladder caps ncols1 at 8 so
@@ -254,6 +266,14 @@ static hipError_t gfx906_fa_launch_impl(
         else if (seq_q >  2) launch(T4{},  tag);
         else                 launch(T2{},  tag);
     };
+    auto dispatch2 = [&](const auto &tag) {
+        // ncols = NC1*2; cap NC1 at 32 (ncols <= 64, config-table max).
+        if      (seq_q > 32) launch(T32{}, tag);
+        else if (seq_q > 16) launch(T16{}, tag);
+        else if (seq_q >  8) launch(T8{},  tag);
+        else if (seq_q >  4) launch(T4{},  tag);
+        else                 launch(T2{},  tag);
+    };
     auto dispatch8 = [&](const auto &tag) {
         if      (seq_q >  8) launch(T8{},  tag);
         else if (seq_q >  4) launch(T4{},  tag);
@@ -261,7 +281,8 @@ static hipError_t gfx906_fa_launch_impl(
         else                 launch(T2{},  tag);
     };
     if (nc2 == 1) dispatch1(C1{});
-    else          dispatch8(C8{});
+    else if (nc2 == 2) dispatch2(C2{});
+    else                dispatch8(C8{});
 
     return hipGetLastError();
 }

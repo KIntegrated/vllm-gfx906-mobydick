@@ -71,7 +71,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 # packed-decode fast path (all rows are rewritten by the Triton kernel);
 # see DEVLOG "fill/copy pile". Spec decode keeps the fill (upstream
 # PR #28182 invariant).
-_GDN_EMPTY_CORE_OUT = os.environ.get("GFX906_GDN_EMPTY_CORE_OUT", "0") == "1"
+_GDN_EMPTY_CORE_OUT = os.environ.get("GFX906_GDN_EMPTY_CORE_OUT", "1") != "0"
 
 # Optional ROCm AITER Triton kernels for the GDN decode path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -879,11 +879,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Note: we should not use torch.empty here like other attention backends,
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
         # (spec-decode padding rows are never written by the core kernel).
-        # gfx906 micro-opt: on the non-spec packed-decode fast path every
-        # row is rewritten by fused_recurrent_gated_delta_rule_packed_decode,
-        # so the zero fill is dead weight (~3 us x 30 layers/step, DEVLOG
-        # "fill/copy pile"). GFX906_GDN_EMPTY_CORE_OUT=1 uses torch.empty
-        # there; this fork's serving deployment does not use spec decode.
+        # gfx906 micro-opt (default on; GFX906_GDN_EMPTY_CORE_OUT=0 to
+        # disable): on the non-spec packed-decode fast path every row is
+        # rewritten by fused_recurrent_gated_delta_rule_packed_decode,
+        # so the zero fill is dead weight (~3 us/layer/step; 30 GDN layers
+        # on the MoE 35B, 48 on the dense 27B; DEVLOG "fill/copy pile" and
+        # the dense handover section). This fork's serving deployments do
+        # not use spec decode; the spec path below keeps the fill.
         core_attn_out = torch.zeros
         if _GDN_EMPTY_CORE_OUT:
             _fc = get_forward_context()

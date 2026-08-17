@@ -1692,3 +1692,154 @@ rewritten (layer-0 options: leave / re-quantize to AWQ at load —
 open Phase-2 items (P2-4→C1, P2-5→C4+C5, P2-1(e) persistent-CTA =
 prefill, out of scope, parked in §6, P2-3 = this roadmap's rescope,
 P2-6 → Phase 3).
+
+## Dense Qwen3.5-27B handover (2026-08-16)
+
+The other agent's dense-model session handed over mid-flight; companion
+doc `qwen35_dense_opt.md`. Dense 27B now *runs* in serving mode (it OOMed
+on every attempt at session start). Its two FA fixes (NC2 GQA fail-closed
+guard + kv_split prefill clamp) are commit `b4873459f8`. This section
+tracks the profiling/baseline/improvement work taken over.
+
+### FA fixes on this build: MoE gates
+
+- PPL (MoE model, prompt logprobs = prefill path): 6.6942 / 6.6918 (two
+  draws, build `b4873459f8`) vs 6.6889 on the previous build. The
+  difference (+0.003..+0.005) is explained: the probe measures the
+  **prefill** path, and `b4873459f8` changed prefill FA from kv_split=16
+  to kv_split=1 (same math, different float summation order — ulp-level
+  reordering, same class as the accepted P3-4 decode shift +0.0027).
+  Decode path is bit-identical for the MoE model (ratio 8 % 8 == 0 →
+  NC2=8 unchanged). Two same-build draws agree within 0.0024 (the known
+  ~0.003 probe noise). **Gate: PASS.**
+- Serving A/B (2 samples vs the 63.2–64.1 distribution): pending.
+
+### rocprofv3 is unusable for full-model dense runs on this box (rocprofv2 gone)
+
+rocprofv2 no longer ships in ROCm 7.14 (`/opt/rocm-7.14/bin` has only
+rocprofv3/rocprof-sys-*). rocprofv3 1.3.2's *exit finalization* is broken
+for full-model runs in every mode tried:
+
+| mode | result |
+|---|---|
+| spawn + `-f csv` (their prof1) | CSV opened at finalization, `ring_buffer: munmap EINVAL` → CHECK → abort → 0-byte CSV |
+| in-proc + `-f csv` (their prof2) | same CHECK at natural exit after the bench completed |
+| spawn + SQLite (their prof3) | EngineCore's shutdown TERM beat its own clean-exit flush; signal-finalization wrote all info tables but **0 kernel dispatches** |
+| in-proc + SQLite + external TERM (prof4) | rocprofv3 `exec`s into the target (the `$!` is the python itself; `pgrep -P` found no child); TERM never sent; **natural exit hit the same ring-buffer CHECK — and the process survived the abort** (torch's chained SIGABRT handler swallowed it), **stuck holding 28 GiB VRAM** until `kill -9` |
+
+The MoE `trace_fa` run (complete 275 MB DB) succeeded because the
+EngineCore's clean-exit flush finished *before* the parent's shutdown
+TERM arrived — a race the dense runs lose (faster parent shutdown).
+The ring-buffer CHECK itself is rocprofv3 tearing down a kernel-dispatch
+ring the HSA runtime already unmapped during process exit.
+
+**Pitfall: a crashed profile finalization can leave the python process
+alive holding all VRAM** (state S, ~90 threads) — every subsequent
+bench OOMs with "Free memory 3.26/31.98 GiB". Check VRAM after any
+profiled run; `kill -9` the straggler if needed.
+
+**Fallback (used):** in-proc eager torch.profiler decode-window budget
+(`dense_budget_probe.py`, the devlog-documented fallback; same kernels as
+cudagraph decode, launch overhead differs). Kernel times transfer.
+
+### Dense model facts (Qwen3.5-27B-AWQ, runs at dtype=float16)
+
+- 64 layers = 48 GDN + 16 FA (every 4th), hidden 5120, inter 17408.
+- FA: Hq=24/Hkv=4 (ratio **6**), D=256, **attn_output_gate=True** →
+  fused `qkv_proj` = [24×2×256 + 2×4×256, 5120] = **[14336, 5120]** fp16.
+- AWQ `modules_to_not_convert`: visual, `linear_attn.in_proj_a/b`,
+  `self_attn.q/k/v_proj`, `model.layers.0.*`, mtp. lm_head is fp16
+  [248320, 5120] (2.37 GiB). GDN `in_proj_a` [2048, 5120] /
+  `in_proj_b` [6144, 5120] fp16; GDN in_proj_qkv/z + out_proj +
+  gate/up/down + o_proj are AWQ (exllama gptq path).
+- **fp16 GEMV floor (M=1, 798 GB/s): lm_head 3193 µs + qkv×16 2944 µs +
+  in_proj_b×48 3787 µs + in_proj_a×48 1253 µs ≈ 11.2 ms/step** — vs a
+  ~39.5 ms/step total at 25.3 t/s decode. All of it currently runs
+  LLMM1 (the GEMV gate hardcodes K==2048). Extending `dense_gemv` to
+  K=5120 is the top lever (handover §6b#3 estimated 0.2–0.5 ms/step;
+  the floor math says the real room is larger — the budget will tell).
+- K=5120 options (MI50 max workgroup = 256 threads → KCHUNK ≤ 2048):
+  kchunk=512 (KSPLIT=10, existing) or **kchunk=1024 (KSPLIT=5, added)**;
+  2048/4096 don't divide 5120. KSPLIT>1 uses the fp16-CAS accumulation
+  path (P3-2(b): "supported but no model shape used it" — this will be
+  its first production use → dense greedy/PPL gate mandatory).
+
+### Resolved (same day, handover-takeover session)
+
+**Budget (in-proc eager torch.profiler, 96-step decode window, Sk≈2050):**
+per-step kernel time (µs/step; the probe's raw µs were off by 1e3 due to
+a unit bug in my aggregation — cross-validated against LLMM1/gptq
+micro-benches and the eager wall time, which the corrected numbers
+reproduce):
+
+| bucket | µs/step | note |
+|---|---|---|
+| gptq W4 GEMM (exllama `gemm_half_q_half_gptq_4bit<1>`) | ~19,500–24,400 | 64×(gate+up+down) + 48×GDN-out; standalone probe: 87/102/39 µs per 44.6/44.6/15.6 MB call = 144–198% of HBM floor |
+| LLGemm1 (fp16: in_proj a/b/qkv, qkv, o) | ~7,100 | **already 98–114% of floor — no lever** |
+| elementwise/reduce pile (vec_elem 753 + reduce 159 + unroll ~300 + act_and_mul 63 calls/step) | ~9,000–11,000 | launch-latency class (P3-4 style); next attribution target |
+| FA decode (tile 1.32 + gather 0.72 + combine 0.30 ms) | ~2,300 | NC2=1 fallback for ratio 6 |
+| GDN recurrent + conv1d | ~1,100 | 48 layers |
+| triton_matmul (1/step, ~8 µs) | ~740 | small-N path, not lm_head |
+
+**Gates (all PASS):**
+- MoE PPL (b4873459f8): 6.6942/6.6918 vs 6.6889 — the prefill kv_split
+  16→1 ulp reorder (documented above).
+- MoE serving: **65.361/65.392 t/s — new record** (prev 64.08); includes
+  the GDN empty-out default flip (MoE 30 GDN layers ≈ 90 µs/step) —
+  comfortably above the 63.2–64.1 distribution.
+- Dense FA (CUSTOM vs Triton reference, 12 prompts × 128 greedy):
+  10/12 sequences identical; the 2 divergences are exact/near ties —
+  logprob margins 0.000 (perfect tie "entered"/"walked") and 0.016–0.063
+  at the flip position. PPL 6.7197 (CUSTOM) vs 6.7036 (Triton) is inside
+  the dense probe's ~2% run-to-run band (4 draws: 6.7000×3, 6.7197).
+- GDN empty-out flip (default 0→1): the C config (empty=1) is
+  deterministic (rerun 0/12 greedy divergence); the old config
+  (empty=0) itself varies 2/12 between identical runs — the fill is
+  load-bearing at the noise level on the old path, so greedy identity
+  was never a valid gate here (same as MoE). PPL in band.
+
+**Serving A/B (dense 27B, tg256, 2 samples each):**
+
+| stack | t/s | decode-only t/s |
+|---|---|---|
+| current (CUSTOM FA, NC2=1 fallback) | 23.15 / 23.12 | 28.10 (35.6 ms/step) |
+| baseline (Triton FA + GEMV off) | 18.89 / 18.89 | 22.55 (44.4 ms/step) |
+| eager current / eager base | 15.74 / 15.77 | — |
+
+Custom FA = **+22.5% serving / −19.7% decode step time** on dense; the
+eager A/B is a tie because eager decode is launch-bound (both backends
+leave comparable idle bubbles; graph mode collapses them).
+
+**NC2=2 (new instantiation) for ratio-6 GQA:** micro-bench at the dense
+shape (24/4/256), NC2=1 vs NC2=2, KVSPLIT=16: Sk=2048 102.8→76.1 µs
+(−26%), Sk=3328 132.1→101.2 (−23%), maxerr 0.0038 (same as NC2=1).
+25% off the FA tile kernel; the gather (per-Q-tile KV reads) halves the
+same way → ~0.6 ms/step total. Default nc2=8 now auto-downgrades
+8→2 (ratio%2==0) or 8→1 (MHA ratio 1, preserves pre-b4873459f8
+behavior); an explicit GFX906_FA_NC2=2 that is GQA-invalid is an error.
+NC2=2 is the largest valid packing for ratio 6 (divisors of 6 that are
+powers of 2: 1, 2).
+
+**GEMV K=5120: NEGATIVE.** `dense_gemv` (new KCHUNK=1024 path,
+KSPLIT=5) vs LLMM1 rpb4 at all dense fp16 shapes: LM head
+[248320,5120] 3114 vs 3128 µs (tie, both ~98% of floor); FA qkv
+[14336,5120] 194 vs 184 (LLMM1 wins); in_proj_b 90 vs 81; in_proj_a
+38 vs 28; kv rows 23 vs 15. LLMM1 is at the HBM floor for every dense
+shape — the "lm_head GEMV" lever from the handover estimate does not
+exist. KCHUNK=1024 stays as a bench-only path (also documents the MI50
+256-thread workgroup limit for KCHUNK=4096).
+
+**W4A16 dense: moe-kernel reuse = ~3%, rejected; new kernel = roadmap.**
+Cross-kernel probe (`/tmp/bench/dense_qgemm_probe.py`, synthetic AWQ-
+layout weights): `moe_gptq_gemm_gfx906` with a 1-expert identity-routing
+view is only 3–8% faster than the exllama gptq kernel on the dense
+shapes (its tuning targets the MoE N/K). A purpose-built W4A16 dense
+GEMV (fp16-GEMV structure, int4 rows) could plausibly reach ~80–90% of
+floor → ~6 ms/step off the 19.5 ms bucket — the top remaining dense
+lever. The (probe) kernels' outputs disagreed on synthetic data
+(maxdiff ~2–4) — layout subtlety, moot unless the new kernel lands.
+
+**Remaining dense work (priority):** (1) land NC2=2 + GDN flip (this
+commit); (2) attribute + cut the elementwise/reduce pile (~9–11
+ms/step, 753+159+300 small kernels/step); (3) W4A16 dense kernel
+(roadmap); (4) hybrid-KV auto-sizing over-commit note (~0.7 GiB).
