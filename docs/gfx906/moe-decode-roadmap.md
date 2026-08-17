@@ -296,6 +296,46 @@ lands in this roadmap:
   fusion — non-MoE) → became Phase 3's scope (P3-1/2/4); no MoE
   residue.
 
+## 7. Non-MoE items (dense/general; parked from the dense takeover, 2026-08-17)
+
+- **N1 — silence the expected AutoAWQMoEMarlin fallback warning
+  (cleanup, expected-on-gfx906).** `auto_awq.py`
+  `get_quant_method` (RoutedExperts branch): `check_moe_marlin_supports_layer`
+  fails for this checkpoint, so every MoE layer logs
+  `Layer '...mlp.experts' is not supported by AutoAWQMoEMarlin. Falling
+  back to Moe WNA16 kernels.` — one `logger.warning_once` per layer
+  prefix, ~39 lines per engine start. On gfx906 this fallback is
+  **expected and is the intended fast path** (Moe WNA16 → the custom
+  gfx906 W4A16 kernel); the warning mis-signals a problem. Proposed
+  fix: platform gate — on gfx906 (where Marlin W4 MoE is unavailable)
+  emit a single info/debug line; keep the per-layer warning on other
+  platforms where the fallback may be a genuine surprise. Log-only
+  change, but still run the PPL + serving sanity gate (behavior must
+  not change). Evidence state: **measured** (site pinned;
+  `vllm/model_executor/layers/quantization/auto_awq.py`).
+- **N2 — FA B>1 decode direct kernel store (derived ~192 KB/layer at
+  B=8).** After the 2026-08-17 native-BSHD output work, B=1 decode has
+  zero output-path copies; B>1 decode still pays one reshape copy per
+  layer (the [B,Hq,D] row block extracted from BSHD is 192 KB at B=8).
+  The real fix is a decode-specialized kernel store: when the real
+  seq_q == 1, allocate [B,Hq,D] (no Sq dim), store only the j==0 column
+  into (b,h) rows, and make kv_split partials [B,Hq,kv_split,D]. The
+  kernel needs a `decode_single` flag — the launcher sees Sq_pad=2,
+  not the real seq_q, so it cannot infer this today. Only matters for
+  batched decode (the production bench is single-request); B=1 is
+  already copy-free. Evidence state: **derived** (per-call probe +
+  stride analysis in the DEVLOG "FA decode per-layer copy pile").
+- **N3 — GDN [3,1,32] state-bookkeeping copies (measured 32/step,
+  ~180 µs/step eager).** The timeline probe
+  (`/tmp/bench/dense_ewp_timeline.py`) attributes the 32 [3,1,32]
+  copies/step (~180 µs, launch-latency-bound) to upstream vLLM
+  mamba/GDN state management around `_causal_conv1d_update` +
+  `fused_recurrent_gated_delta_rule` — not FA, not model code. A fix
+  means reducing the count in upstream state handling or folding it
+  into the GDN core custom op; deferred because it is upstream code,
+  small, and the production graph path amortizes the launch cost.
+  Evidence state: **measured** (attribution); fix = **hypothesis**.
+
 ## Appendix A — `moe_gemm_q4_kernel_gfx906` facts (csrc/rocm/moe_q_gemm_gfx906.cu)
 
 - Template `<BM, NPT>` with instantiations `<1,4>`, `<4,4>`, `<8,2>`;
