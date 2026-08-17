@@ -1843,3 +1843,79 @@ lever. The (probe) kernels' outputs disagreed on synthetic data
 commit); (2) attribute + cut the elementwise/reduce pile (~9–11
 ms/step, 753+159+300 small kernels/step); (3) W4A16 dense kernel
 (roadmap); (4) hybrid-KV auto-sizing over-commit note (~0.7 GiB).
+
+## Elementwise attribution + production-path recharacterization (dense)
+
+**EWP probe (eager, in-proc torch.profiler, 96-step decode window, NC2=2
+installed):** the eager elementwise/reduce pile breaks down as —
+aten::copy_ 4.73 ms/step (944 calls, [1,5120]/[5120] shapes, 5.0 µs each =
+launch-latency-bound), elementwise vec<4> ~5.3 ms, reduce/mean 1.87 ms
+(159/step), manual_unroll 1.38 ms (191/step), mul 1.80 + add 1.64 ms
+(782 calls), silu_and_mul 0.65 ms (63/step). The mean/rsqrt/pow/mul
+quadruple (~159/step) is the unfused RMSNorm decomposition (see below).
+
+**GemmaRMSNorm was dispatching the torch decomposition on CUDA/ROCm.**
+`forward_native` builds `weight.float() + 1.0` (fp32), which fails the
+vllm_c fused impl's `weight.dtype == x.dtype` supports_args check → both
+`rms_norm` and `fused_add_rms_norm` fell back to native (8–13 kernels per
+call). Fixed `forward_cuda` to dispatch with `weight.to(x.dtype) + 1.0`
+(a plain scaled RMS norm with w' = 1+w) → fused `vllm::rms_norm_kernel` /
+`fused_add_rms_norm` selected. Unit: maxdiff 0.002 (fp16 rounding),
+residual exact; 8–13 kernels → 2 per call. PPL: dense 6.6993 (band
+6.7000–6.7197), MoE 6.6817 (band 6.6889–6.6942, probe noise).
+
+**Production-path recharacterization (important):** the serving stack is
+`VLLM_COMPILE (mode 3) + inductor + FULL_DECODE_ONLY` graphs. In that
+mode (a) the platform IR priority is `['native']` for both norm ops, so
+inductor fuses the norm decompositions into codegen kernels — the
+GemmaRMSNorm fix is an eager-path improvement (enforce_eager users +
+graph-fallback steps), not a production one; (b) the eager elementwise
+pile is largely fused by inductor in production. Torch-profiler on the
+production path only sees the ~5–6 eager-fallback steps per 256
+(92 FA-tile calls, 1165 gptq calls ≈ 4.6/step) — graph-internal kernels
+are not per-kernel-attributed, so its 862 µs/step "total" is NOT the
+production kernel budget.
+
+**Three-anchor inference for the production decode budget** (all
+consistent): eager budget 47 ms/step (kernel, under-profiler) ≈
+41 ms true; production wall 34.9 ms/step (28.69 t/s decode-only);
+eager − fused-pile (~8.7 ms) + codegen (~1.7 ms) ≈ 34 ms ≈ wall at
+95–99% busy. So production decode IS ~97% GPU-busy at ~34 ms/step, and
+the eager kernel map is the right optimization map:
+
+| bucket (eager, true µs/step) | prod est. | lever |
+|---|---|---|
+| gptq W4 (exllama) | ~19–20 ms (56%) | W4A16 dense kernel (~6 ms) |
+| LLGemm1 fp16 | ~6–7 ms (18%) | at floor, none |
+| elementwise residual after inductor fusion | ~2–4 ms | copy pile, per-site |
+| FA tile+gather (NC2=2) | ~1.7 ms | done |
+| GDN recurrent+conv | ~1.1 ms | small |
+| down_proj triton_matmul [5120,17408] | ~0.8 ms | GEMV kc1024 rpt2 (224 µs, 100.2% floor) → −0.57 ms |
+
+Combined remaining levers ≈ 7.5–8.5 ms/step → dense decode-only
+28.7 → ~37 t/s if all land.
+
+**down_proj GEMV K=17408:** the dense 27B ships the MLP down proj fp16
+(2.0 GB, [5120, 17408]); it hits `rocm_unquantized_gemm` →
+`triton_matmul` (794 µs/step; the `n==1 and k<=8192` GEMV gate excludes
+K=17408). LLMM1 crashes at K=17408 (NUM_THREADS = K*2/16 = 2176 > MI50's
+256-thread workgroup limit; K=5120 → 640 works empirically, i.e. the
+effective LLMM1 K ceiling is ~2048). `dense_gemv` kc=1024 KSPLIT=17
+rpt2: 223.8 µs = **100.2% of HBM floor** (err 0.0016). rpt2 beats rpt4
+here (259.7, 116%) — the auto-RPT (N%4→4) is suboptimal for mid-N
+shapes; a per-shape rpt override is needed.
+
+**rocprofv3 dense trace: FAILED, not pursued.** The MoE trace
+(719850_results.db) succeeds because the agent's SIGTERM handler writes
+the DB (incl. the 2.6 s ring-buffer read) before chaining to vLLM's
+handler, keeping HSA alive. Dense EngineCore consistently dies during
+finalization: first attempt hit `ring_buffer: munmap failed: Invalid
+argument` at the dispatch-read (buffer already invalid before the read);
+subsequent runs die before "writing SQL database". No in-run HSA error
+found. Not needed: the three-anchor inference above is anchored to
+(eager budget, production wall, NC2=2 A/B delta mapping 1:1 to wall).
+
+**Remaining dense work (priority):** (1) W4A16 dense kernel (~6
+ms/step, top lever) — bundle with the down_proj GEMV gate extension
+(both need a `_rocm_C` rebuild); (2) copy-pile call-site attribution
+(eager stacks) for the ~1–2 ms residual; (3) hybrid-KV over-commit note.

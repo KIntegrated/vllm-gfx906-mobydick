@@ -164,7 +164,16 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(x, residual)
+        # The fused vllm_c kernels require weight.dtype == x.dtype, which the
+        # native path's float32 (1 + w) breaks. Gemma's (1 + w) factorization
+        # is a plain scaled RMS norm with w' = 1 + w in the input dtype, so
+        # dispatch with that instead of the fp32 decomposition.
+        weight = self.weight.to(x.dtype) + 1.0
+        if residual is None:
+            return ir.ops.rms_norm(x, weight, self.variance_epsilon)
+        return ir.ops.fused_add_rms_norm.maybe_inplace(
+            x, residual, weight, self.variance_epsilon
+        )
 
 
 # --8<-- [start:rms_norm_gated]
