@@ -238,6 +238,7 @@ def forward_paged(
     scale: Optional[float] = None,
     key_cache_q8: Optional[torch.Tensor] = None,  # fast-path: [num_blocks,bs,Hkv,(D/32)*34]
     q_pad_buf: Optional[torch.Tensor] = None,
+    q_pad_decode_buf: Optional[torch.Tensor] = None,  # [B,Hq,2,D] fp32, Sq=1 only
     mask_buf:  Optional[torch.Tensor] = None,
     k_gather_buf: Optional[torch.Tensor] = None,  # [B,Hkv,Sk_pad,bytes_per_row] uint8
     v_gather_buf: Optional[torch.Tensor] = None,  # [B,Hkv,Sk_pad,D]             fp16
@@ -248,10 +249,15 @@ def forward_paged(
     Внутри собирает KV из paged layout в BHSD, квантует K → Q8_0
     и вызывает gfx906_fa.forward().
 
+    query может быть fp16: копирование в fp32 q_pad буфер делает cast
+    внутри copy_ (без отдельного .float() ядра).
+
     Возвращает out: [num_tokens, Hq*D] fp32 (для совместимости с vLLM).
     """
     num_tokens, Hq, D = query.shape
-    assert query.dtype == torch.float32, "query must be fp32 for FA-q8 path"
+    assert query.dtype in (torch.float16, torch.float32), (
+        "query must be fp16/fp32 for FA-q8 path (cast into the fp32 "
+        "q_pad buffer at store)")
     num_seqs = block_table.shape[0]
 
     if scale is None:
@@ -351,14 +357,17 @@ def forward_paged(
                 _fwdlog(f"forward_paged DIRECT_PAGED FAILED: {e!r}")
             raise
 
+        # C returns native BSHD [B, Sq, Hq, D]; the Sq=0 row
+        # [:, 0, :, :] is a contiguous [B, Hq, D] view -> zero copies.
         if max_seqlen_q == 1 and num_tokens == num_seqs:
-            return out_padded[:, :, 0, :].reshape(num_tokens, Hq * D).contiguous()
+            return out_padded[:, 0, :, :].reshape(num_tokens, Hq * D)
 
         out_flat = torch.empty((num_tokens, Hq * D), dtype=torch.float32, device=query.device)
         for s in range(num_seqs):
             n = int(cu[s + 1] - cu[s])
             if n > 0:
-                out_flat[cu[s]:cu[s] + n] = out_padded[s, :, :n, :].permute(1, 0, 2).reshape(n, Hq * D)
+                # BSHD: [:n] is a contiguous [n, Hq, D] -> plain view/reshape.
+                out_flat[cu[s]:cu[s] + n] = out_padded[s, :n, :, :].reshape(n, Hq * D)
         return out_flat
 
     # -------- gather KV + (возможно) quantize K --------
@@ -450,12 +459,25 @@ def forward_paged(
     # causal-masked computation).
     _decode_fast = (
         _QPAD_EMPTY and max_seqlen_q == 1 and num_tokens == num_seqs)
-    if (q_pad_buf is not None
+    # Sq=1 decode: dedicated exact-shape buffer; [:num_seqs] is a
+    # leading-dim prefix slice -> contiguous, zero copies (the grown
+    # q_pad_buf slice below would copy after a prefill-sized grow).
+    if (max_seqlen_q == 1
+            and q_pad_decode_buf is not None
+            and q_pad_decode_buf.shape[0] >= num_seqs
+            and q_pad_decode_buf.shape[1] == Hq
+            and q_pad_decode_buf.shape[2] == Sq_pad
+            and q_pad_decode_buf.shape[3] == D
+            and q_pad_decode_buf.dtype == torch.float32):
+        q_padded = q_pad_decode_buf[:num_seqs]
+        if not _decode_fast:
+            q_padded.zero_()
+    elif (q_pad_buf is not None
             and q_pad_buf.shape[0] >= num_seqs
             and q_pad_buf.shape[1] >= Hq
             and q_pad_buf.shape[2] >= Sq_pad
             and q_pad_buf.shape[3] == D
-            and q_pad_buf.dtype == query.dtype):
+            and q_pad_buf.dtype == torch.float32):
         q_padded = q_pad_buf[:num_seqs, :Hq, :Sq_pad, :].contiguous()
         if not _decode_fast:
             q_padded.zero_()
@@ -463,21 +485,21 @@ def forward_paged(
         q_padded = (
             torch.empty(
                 (num_seqs, Hq, Sq_pad, D),
-                dtype=query.dtype, device=query.device
+                dtype=torch.float32, device=query.device
             ) if _decode_fast else torch.zeros(
                 (num_seqs, Hq, Sq_pad, D),
-                dtype=query.dtype, device=query.device
+                dtype=torch.float32, device=query.device
             )
         )
 
-    cu = cu_seqlens_q.to(torch.long)
-    # Сложить Q в [B, Hq, Sq_pad, D].
+    # Сложить Q в [B, Hq, Sq_pad, D] (copy_ делает fp16->fp32 cast).
     # При Sq=1 (decode) — максимально частый случай: не гоняем Python-цикл
     # если все sequences имеют Sq=1 и num_tokens == num_seqs.
     if max_seqlen_q == 1 and num_tokens == num_seqs:
         # query: [num_seqs, Hq, D] → [num_seqs, Hq, 1, D] → паддинг по Sq_pad
         q_padded[:, :, :1, :] = query.unsqueeze(2)
     else:
+        cu = cu_seqlens_q.to(torch.long)
         for s in range(num_seqs):
             n = int(cu[s + 1] - cu[s])
             if n > 0:
@@ -546,14 +568,17 @@ def forward_paged(
         raise
 
     # -------- распаковать обратно в flat [num_tokens, Hq*D] --------
+    # C возвращает нативный BSHD [B, Sq, Hq, D]; на Sq=1 decode fast path
+    # строка Sq=0 ([:, 0, :, :]) — contiguous [B, Hq, D] view, без копий.
     if max_seqlen_q == 1 and num_tokens == num_seqs:
-        # Быстрый путь: out_padded[:, :, 0, :] → [B, Hq, D] → [B, Hq*D]
-        return out_padded[:, :, 0, :].reshape(num_tokens, Hq * D).contiguous()
+        return out_padded[:, 0, :, :].reshape(num_tokens, Hq * D)
 
+    cu = cu_seqlens_q.to(torch.long)
     out_flat = torch.empty((num_tokens, Hq * D), dtype=torch.float32, device=query.device)
     for s in range(num_seqs):
         n = int(cu[s + 1] - cu[s])
         if n > 0:
-            out_flat[cu[s]:cu[s] + n] = out_padded[s, :, :n, :].permute(1, 0, 2).reshape(n, Hq * D)
+            # BSHD: [:n] is a contiguous [n, Hq, D] -> plain view/reshape.
+            out_flat[cu[s]:cu[s] + n] = out_padded[s, :n, :, :].reshape(n, Hq * D)
 
     return out_flat

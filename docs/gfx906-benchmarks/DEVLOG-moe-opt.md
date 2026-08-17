@@ -2007,3 +2007,56 @@ confirmed no measurable shift.
   ("corrupted double-linked list", "malloc_consolidate(): unaligned
   fastbin chunk") *after* clean test output — host heap quirk of the
   torch/HIP runtime on this box, not kernel-related.
+
+### TODO (user-requested, 2026-08-17)
+
+- [ ] **Measure the impact of `CMAKE_HIP_FLAGS='-mllvm -amdgpu-sched-strategy=max-ilp'`** on our gfx906 kernels (rebuild FA + GEMV + MoE W4A16 with it; micro-bench the decode kernels and a serving A/B). Run after the FA copy-reduction step lands.
+
+### FA decode per-layer copy pile: attributed + cut 7→2 (2026-08-17)
+
+Isolated per-call probe (`/tmp/bench/fa_percall_probe.py`) profiles a
+single `forward_paged` call at the production decode shape (B=1, Sq=1,
+Hq=24/Hkv=4/D=256, Sk=2048, legacy path) — deterministic op census, no
+windowing. Found **7 copies per FA layer (~47 µs, launch-bound)**:
+
+| copy | shape | µs | fix |
+|---|---|---|---|
+| backend `q.float()` cast | [1,24,256] | 7.0 | drop: copy_ into the fp32 q_pad buffer casts |
+| q_pad_buf slice `.contiguous()` | [1,24,2,256] | 9.0 | dedicated decode buffer [maxB,Hq,2,D]; `[:B]` prefix slice is contiguous |
+| q→q_pad assign | [1,24,1,256] | 8.2 | KEPT (now carries the cast) |
+| `cu_seqlens_q.to(long)` | [2] | 6.9 | deferred into the multi-seq branch only |
+| C launcher `.transpose(1,2).contiguous()` | [1,24,2,256] | 8.8 | C returns native BSHD |
+| Python `[:,:,0,:].reshape().contiguous()` | [1,24,256] | ~7 | gone: BSHD `[:, 0, :, :]` is a contiguous [B,Hq,D] view |
+| `out_flat.to(fp16)` + `copy_` | [1,6144]×2 | 6.7 | one `out_view.copy_(out_flat)` (cast fused) |
+
+Result: **2 copies/layer** (the two unavoidable ones), ~425 µs/step in
+eager. The B>1 decode path goes from 2 copies/layer (384 KB each at
+B=8) to 1 (192 KB); the fully-zero-copy B>1 path needs a
+decode-specialized kernel store ([B,Hq,D] direct, j==0 guard) —
+follow-up, only matters for batched decode.
+
+**Interim bug (caught by the PPL gate):** my first BSHD edit left a
+`.permute(1, 0, 2)` in the general output path — with BSHD,
+`out_padded[s, :n]` is already a contiguous [n, Hq, D], so the permute
+scrambled the reshape. PPL dense dropped to 11.89 (was 6.70); removed
+the permute → fixed. PPL is the right gate for prefill-path layout
+changes (the eager kernel tests cover the Sq=1 fast path but the
+probe's prompts exercise the general path).
+
+**[3,1,32] copy pile (32/step, ~180 µs) — attributed to GDN, not FA.**
+Timeline-context probe (`/tmp/bench/dense_ewp_timeline.py`): the copies
+sandwich `_causal_conv1d_update` + `fused_recurrent_gated_delta_rule`
+in the GDN layers — vLLM upstream mamba state bookkeeping. Deferred
+(upstream code, small).
+
+**Gates (all green):** FA tests 15/15; PPL dense **6.7026** (band
+6.6993–6.7197), MoE **6.6863** (band 6.6817–6.6942); serving dense
+**24.061 / 24.028 t/s** (record; was 23.845/23.801, +0.9% — the in-graph
+gain is smaller than the eager estimate because launch overhead is
+cheap inside the graph; the GPU copy time itself is ~0.15–0.25
+ms/step); serving MoE **67.024 t/s** (record; was 66.36).
+
+**Build note:** FA `.so` rebuilt locally via `/tmp/bench/build_fa_local.py`
+(only `gfx906_fa.cpp` recompiled — kernels untouched). Lint: 37 ruff
+findings after vs 40 before on the touched files (pre-existing debt
+only, no new ones).

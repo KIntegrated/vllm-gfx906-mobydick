@@ -336,6 +336,12 @@ class Gfx906FAImpl(AttentionImpl):
         # reachable in this context, so we use lazy grow.
         # ------------------------------------------------------------------
         self._q_pad_buf: torch.Tensor | None = None
+        # Sq=1 decode: dedicated [B, Hq, 2, D] fp32 buffer. The growing
+        # _q_pad_buf slice [:B, :Hq, :2, :D] is non-contiguous after a
+        # prefill-sized grow (dim2=512) and costs a copy per layer; the
+        # [:num_seqs] prefix slice of this exact-shape buffer is always
+        # contiguous, so the decode path needs no copy at all.
+        self._q_pad_decode_buf: torch.Tensor | None = None
         # Buffers referenced by captured CUDA graphs: freed-then-realloc
         # would leave the graphs pointing at freed VAs (use-after-free on
         # replay), so retired captured buffers stay alive here.
@@ -387,7 +393,8 @@ class Gfx906FAImpl(AttentionImpl):
         else:                    ncols1 = 2
         Sq_pad = ((max_seqlen_q + ncols1 - 1) // ncols1) * ncols1
 
-        # Q buffer: [B, Hq, Sq_pad, D] query-dtype.
+        # Q buffer: [B, Hq, Sq_pad, D] fp32 (the kernel takes fp32 q; the
+        # caller passes dtype=torch.float32).
         # Capture-safety: a CUDA graph bakes in the VA of the buffer that
         # was current when it was captured. Growing by free-then-realloc
         # would leave captured graphs pointing at freed memory on replay,
@@ -424,6 +431,28 @@ class Gfx906FAImpl(AttentionImpl):
             # No grow: latch the flag the first time we serve a forward
             # during capture (the buffer VA is being baked into a graph).
             self._q_pad_captured = torch.cuda.is_current_stream_capturing()
+
+        # Sq=1 decode buffer [B, Hq, 2, D] fp32 (Sq_pad=2 for Sq=1).
+        # Grows dim0 only; capture-safe via the shared retired list.
+        if max_seqlen_q == 1:
+            if self._q_pad_decode_buf is None:
+                self._q_pad_decode_buf = torch.empty(
+                    (num_seqs, self.num_heads, 2, self.head_size),
+                    dtype=torch.float32, device=device,
+                )
+                self._q_pad_captured = (
+                    self._q_pad_captured
+                    or torch.cuda.is_current_stream_capturing())
+            elif self._q_pad_decode_buf.shape[0] < num_seqs:
+                capturing = torch.cuda.is_current_stream_capturing()
+                if self._q_pad_captured or capturing:
+                    self._q_pad_retired.append(self._q_pad_decode_buf)
+                self._q_pad_decode_buf = torch.empty(
+                    (num_seqs, self.num_heads, 2, self.head_size),
+                    dtype=torch.float32, device=device,
+                )
+                self._q_pad_captured = (
+                    self._q_pad_captured or capturing)
 
     @classmethod
     def _ensure_gather_buffers(
@@ -566,10 +595,10 @@ class Gfx906FAImpl(AttentionImpl):
         # Unbind KV cache: (..., 2, ...) → (K, V) each [num_blocks, block_size, Hkv, D]
         key_cache, value_cache = kv_cache.unbind(1)
 
-        # Our forward_paged expects: query [num_tokens, Hq, D] fp32
+        # query [num_tokens, Hq, D] fp16 (forward_paged casts it into the
+        # fp32 q_pad buffer inside the copy_ — a standalone .float() was
+        # an extra kernel per layer).
         q_actual = query[:num_actual_tokens]
-        if q_actual.dtype != torch.float32:
-            q_actual = q_actual.float()
         out_actual = output[:num_actual_tokens]
 
         # Lazy-grow the forward buffers (q_pad / mask).
@@ -579,7 +608,7 @@ class Gfx906FAImpl(AttentionImpl):
             max_seqlen_q=attn_metadata.max_query_len,
             max_seqlen_k=attn_metadata.max_seq_len,
             device=query.device,
-            dtype=q_actual.dtype,
+            dtype=torch.float32,
         )
 
         # Level 1 fused-gather buffers (class-level, shared across
@@ -610,6 +639,7 @@ class Gfx906FAImpl(AttentionImpl):
             scale=self.scale,
             key_cache_q8=self._k_cache_q8 if not self._legacy else None,
             q_pad_buf=self._q_pad_buf,
+            q_pad_decode_buf=self._q_pad_decode_buf,
             mask_buf=None,  # Level 3a: inline causal, no mask_buf
             k_gather_buf=k_gather_buf,
             v_gather_buf=v_gather_buf,
@@ -617,9 +647,10 @@ class Gfx906FAImpl(AttentionImpl):
 
         # Write the result into output in-place (it is either
         # [num_tokens, Hq, D] or [num_tokens, Hq*D], depending on the
-        # caller).
+        # caller). copy_ fuses the fp32->fp16 cast (a .to() first was
+        # an extra kernel per layer).
         out_view = out_actual.view(num_actual_tokens, -1)
-        out_view.copy_(out_flat.to(out_view.dtype))
+        out_view.copy_(out_flat)
 
         return output
 

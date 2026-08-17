@@ -390,7 +390,7 @@ def test_forward_decode_prefill_vs_sdpa_on_unbind_cache():
 
     # decode: one query, no causal
     q = torch.randn(1, HQ, 1, D, device=dev, dtype=torch.float32) * 0.5
-    out = fa.forward(q, k_q8, v_b, scale, kv_max=sl)[0, :, 0]  # [HQ, D]
+    out = fa.forward(q, k_q8, v_b, scale, kv_max=sl)[0, 0]  # [HQ, D] (BSHD)
     qg = q[0, :, 0].view(HKV, g, D)
     s = torch.einsum("gjd,lgd->gjl", qg, k) * scale
     ref = torch.einsum("gjl,lgd->gjd", torch.softmax(s, -1), v).reshape(HQ, D)
@@ -400,7 +400,8 @@ def test_forward_decode_prefill_vs_sdpa_on_unbind_cache():
     qf = torch.randn(1, HQ, L, D, device=dev, dtype=torch.float32) * 0.5
     q_abs = torch.tensor([0], dtype=torch.int32, device=dev)
     outf = fa.forward(qf, k_q8, v_b, scale, kv_max=sl, q_abs_offset=q_abs)[0]
-    outf = outf.permute(1, 0, 2)  # [L, HQ, D]
+    # native BSHD: [0] is already [L, HQ, D]
+    assert outf.shape == (L, HQ, D)
     qtok = qf[0].permute(1, 0, 2).float()  # [L, HQ, D]
     for t in (1, 63, L - 1):
         qg = qtok[t].view(HKV, g, D)
@@ -434,7 +435,7 @@ v16 = torch.randn(1, HKV, sk, D, device=dev, dtype=torch.float16) * 0.5
 q32 = torch.randn(1, HQ, 1, D, device=dev, dtype=torch.float32) * 0.5
 k_q8 = fa.quantize_q8_0(k16)
 sl = torch.tensor([kv_max], dtype=torch.int32, device=dev)
-out = fa.forward(q32, k_q8, v16, 1.0 / math.sqrt(D), kv_max=sl)[0, :, 0]
+out = fa.forward(q32, k_q8, v16, 1.0 / math.sqrt(D), kv_max=sl)[0, 0]  # BSHD
 
 g = HQ // HKV
 k, v = k16[0].float(), v16[0].float()  # [HKV, sk, D]

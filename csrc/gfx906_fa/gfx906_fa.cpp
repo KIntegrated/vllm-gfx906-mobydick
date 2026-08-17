@@ -12,9 +12,9 @@
 //     q:      fp32  [B, Hq, Sq, D]    (contiguous)
 //     k_q8:   uint8 [B, Hkv, Skv, D*34/32] — pre-quantized block_q8_0 flat bytes
 //     v_fp16: fp16  [B, Hkv, Skv, D]  (contiguous)
-//     out:    fp32  [B, Hq, Sq, D]    (BHSD-compatible output)
+//     out:    fp32  [B, Sq, Hq, D]    (native BSHD — the kernel's store
+//                                       layout; no transpose copy)
 //
-// Внутри kernel работает в BSHD layout для output; API делает transpose.
 // Квантизация K (из fp16 в block_q8_0) делается отдельной утилитой.
 
 #include <torch/extension.h>
@@ -232,9 +232,9 @@ torch::Tensor gfx906_fa_forward(
     // Output.
     // KERNEL пишет в layout [B, Sq, Hq, D] (BSHD):
     //   j_dst_unrolled = ((seq*Sq + sq_idx)*Hq + head)*gridY + split
-    // Мы поэтому аллоцируем o_bshd как BSHD, передаём его в kernel,
-    // а для API возвращаем BHSD через .transpose(1,2).contiguous().
-    // Это совпадает с MiniMax / vLLM layout (они уже BSHD internally на SDPA уровне).
+    // Мы поэтому аллоцируем o_bshd как BSHD, передаём его в kernel
+    // и возвращаем его как есть (без transpose-копии); Python-фронт
+    // вырезает строку Sq=0 (contiguous view) на decode fast path.
     auto opts_f32 = q.options().dtype(torch::kFloat32);
     torch::Tensor o_bshd = torch::empty({batch, seq_q, heads_q, head_dim}, opts_f32);
 
@@ -357,10 +357,11 @@ torch::Tensor gfx906_fa_forward(
             hipGetErrorString(cerr));
     }
 
-    // Transpose [B, Sq, Hq, D] → [B, Hq, Sq, D] для API совместимости с torch SDPA.
-    // .contiguous() делает единоразовую копию (~1% от времени attention на больших Sq).
-    // Для интеграции с vLLM стоит экспонировать и BSHD native путь — чтобы избежать копии.
-    return o_bshd.transpose(1, 2).contiguous();
+    // Native BSHD [B, Sq, Hq, D] — the kernel's store layout, returned as
+    // is (the .transpose(1,2).contiguous() here was a copy per layer).
+    // The Python front-end extracts the Sq=0 row for the Sq=1 decode fast
+    // path ([:, 0, :, :] is a contiguous [B, Hq, D] view, zero copies).
+    return o_bshd;
 }
 
 // ============================================================================
@@ -960,7 +961,8 @@ torch::Tensor gfx906_fa_forward_paged_direct(
 
     TORCH_CHECK(err == hipSuccess, "gfx906_fa_launch_paged failed: ", hipGetErrorString(err));
 
-    return o_bshd.transpose(1, 2).contiguous();
+    // Native BSHD [B, Sq, Hq, D] — see gfx906_fa_forward (no transpose copy).
+    return o_bshd;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
