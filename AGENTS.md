@@ -152,8 +152,11 @@ Security reviewers should start with [`SECURITY.md`](SECURITY.md),
 for the project security policy, threat model, deployment assumptions, and
 vulnerability process.
 
-- **gfx906 kernel work**: [`docs/gfx906/`](docs/gfx906/) — measured ISA facts,
-  latency-hiding patterns, and the LDS layout standard for MI50. Read before
+- **gfx906 kernel work**: [`docs/gfx906/`](docs/gfx906/) — the gfx906
+  optimization hub: measured ISA facts, latency-hiding patterns, and the
+  LDS layout standard for MI50, plus the change inventory, benchmark
+  record (`README.md`, `DEVLOG-moe-opt.md`), run/build recipes
+  (`running.md`), and the MoE-decode roadmap. Read the kernel notes before
   writing or modifying gfx906 kernels or interpreting kernel benchmarks.
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)

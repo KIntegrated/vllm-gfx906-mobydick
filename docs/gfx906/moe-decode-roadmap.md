@@ -268,7 +268,8 @@ record (P3-4 precedent: 350 µs removed → +0.7 t/s, ~2× discount).
 
 ## 6. Phase-2 (MoE) open-items cross-reference
 
-Phase 2 (`plan-moe-phase2.md`) closed with these items open; where each
+Phase 2 (MoE prefill tuning; see `DEVLOG-moe-opt.md` "PHASE 2") closed
+with these items open; where each
 lands in this roadmap:
 
 - **P2-4 fused topk+align** (≈1 ms/step routing, high correctness
@@ -322,8 +323,8 @@ lands in this roadmap:
 
 ## Appendix B — bench / probe recipes
 
-- Serving A/B (local venv, sequential): the standard recipe from
-  `plan-decode-phase3.md` §common protocol (`_b.py`, pp=2048/tg=256,
+- Serving A/B (local venv, sequential): the standard recipe in
+  `README.md` §Bench recipes (`_b.py`, pp=2048/tg=256,
   util 0.95, fastsafetensors, FULL_DECODE_ONLY); check `uptime` first.
 - MoE kernel tests: `tests/kernels/moe/test_gfx906_moe_gemm.py`
   (12 tests, covers both source layouts).
@@ -337,7 +338,8 @@ lands in this roadmap:
   remember the ~10–15% per-dispatch inflation under the tracer and the
   untrustworthy grid-axis columns (use timestamps/durations only).
 - Eager torch-profiler attribution (fill/copy method):
-  `docs/gfx906-benchmarks/fillprof_probe.py` — the same technique
+  the eager torch-profiler correlation method documented in
+  `DEVLOG-moe-opt.md` "P3-4" (probe script since removed) — the same technique
   answers O1/O2/O5.
 
 ## Appendix C — file map

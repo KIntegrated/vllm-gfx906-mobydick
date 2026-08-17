@@ -1,6 +1,12 @@
 # Devlog — Qwen 3.5 quantized MoE decode/prefill on gfx906
 Copyright Kevin Read <me@kevin-read.com>
 
+> **Archive note (2026-08-17):** the plan and code-review documents this log
+> references were consolidated into `README.md` (this directory) and removed
+> at merge-prep time; their final statuses are recorded in this log and in
+> the README performance history. One-off probe scripts referenced below were
+> likewise removed. This file is the historical development record.
+
 
 Branch: `gfx906/moe-opt` (from `gfx906/fa-integration`, i.e. fork main + custom FA).
 
@@ -130,7 +136,7 @@ Per decode step: ~80 WNA16 GEMM calls × 3.5ms ≈ 280ms → matches 2.5–3.5 t
 Weight traffic per w13 call ≈ 8 active experts × (1MB int4 + 40KB scales/zp)
 ≈ 8.3 MB → at 3.5ms that's ~2.4 GB/s ≈ **3% of achievable HBM bandwidth**.
 
-### gfx906 ISA notes (from [`docs/gfx906/`](../gfx906/))
+### gfx906 ISA notes (from [kernel notes](latency-hiding.md), [lds-layout](lds-layout.md))
 
 - **No `v_mfma*` on gfx906** (Vega 20, no matrix cores) → Triton `tl.dot`
   lowers to scalar fp16 FMA with poor codegen; exllama's manual
@@ -1324,7 +1330,7 @@ stale "MVP" header docstrings rewritten.
 **F10 — repo hygiene.** `.gitignore` gained `.rocprofv3/` and
 `gpucore.*.gpu` (the root-owned 207 MB dumps remain on disk — need sudo
 to delete). Root duplicates consolidated: `_bench_gfx906.py` /
-`_pp_bench.py` are canonical in `docs/gfx906-benchmarks/` (this phase's
+`_pp_bench.py` are canonical in `docs/gfx906/` (this phase's
 established bench-script home); `run_bench_gfx906.sh` checked in there
 (path-fixed); probes `_p31_ab.py`, `probe_custom_fa.py`,
 `probe2_custom_fa_full.py` checked in there too (W4 "tests/ or tools/" —
@@ -1561,7 +1567,7 @@ the pip-generated one, and `.deps/*-subbuild` caches are path-bound
 The fresh post-FA-track trace showed 1178 µs/step in small fills + D2D
 copies (246.8 launches/step, median 4.64 µs — 100% launch-latency-bound,
 so the only lever is removing launches, not bytes). Attributed via an
-eager-mode torch profiler run (`docs/gfx906-benchmarks/fillprof_probe.py`,
+eager-mode torch profiler run (`docs/gfx906/fillprof_probe.py`,
 correlation-id join of cpu_op → kernel → python stack; the GPU-queue-lag
 makes kernel-timestamp-based stack attribution unreliable, CPU-op-timestamp
 windows are the reliable one) — 114 decode steps of the standard bench:

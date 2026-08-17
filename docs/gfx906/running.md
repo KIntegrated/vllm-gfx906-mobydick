@@ -1,13 +1,68 @@
-# Running & modifying the vLLM gfx906 docker images
+# Running & building the gfx906 fork
 Copyright Kevin Read <me@kevin-read.com>
 
 
-Quick reference so this doesn't have to be rediscovered (hardware + toolchain
-selection + source mount are the three things that consistently trip people up).
+Quick reference so this doesn't have to be rediscovered. Two environments:
+the **local editable `.venv`** (canonical since 2026-08-16, §0) and the
+legacy **docker images** (§1–4). Hardware + toolchain selection + source
+mount are the three things that consistently trip people up.
 
 **Host:** single AMD MI60 (32 GB, gfx906). All examples use
 `HIP_VISIBLE_DEVICES=0`. This is a **hostless ROCm** -> every container needs
 `--device /dev/kfd --device /dev/dri` plus the video/render group IDs.
+
+---
+
+## 0. Local venv (canonical environment)
+
+The serving benches moved out of docker on 2026-08-16. The `.venv` holds an
+editable install of this repo; the compiled extensions live in-tree.
+
+```bash
+source ~/env-rocm-7.14-gfx906.sh        # LD_LIBRARY_PATH=/opt/rocm-7.14/lib (REQUIRED)
+```
+
+- The system `/opt/rocm` libs are the wrong vintage (libhipsparse symbol
+  mismatch; RCCL missing `ncclCommResume` until the 7.14 point release).
+- `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` is **required** at import time:
+  the venv's `flash_attn` is the `/local/git/flash-attention-gfx906` fork
+  without a built C ext; the env selects the Triton-AMD path the ViT
+  attention wrapper needs.
+- **fastsafetensors** loads: `BENCH_LOAD_FORMAT=fastsafetensors`, 41 s vs
+  117 s (2.6×). GDS is unsupported here; the fork's one-line fallback fix
+  catches the bare `Exception`. Cost: +2.8 GiB live at init → needs
+  `BENCH_GPU_UTIL=0.95` (dense bench uses 0.92 + explicit KV cap instead).
+- MoE serving recipe: see `README.md` §Bench recipes. Dense 27B (NFS model,
+  no fastsafetensors): `BENCH_GPU_UTIL=0.92 BENCH_KV_MEM=6442450944
+  BENCH_MAXSEQS=8 BENCH_BATCHED_TOKENS=512 BENCH_TEXT_ONLY=1`.
+
+### Building the C/HIP extensions locally
+
+- **`pip install -e .` does NOT compile** (PEP 517 editable flow only links
+  the package). Use:
+
+  ```bash
+  source ~/env-rocm-7.14-gfx906.sh
+  export PATH="$PWD/.venv/bin:$PATH"          # venv cmake must win
+  FETCHCONTENT_BASE_DIR=/tmp/vllm-deps \
+  HIP_VISIBLE_DEVICES=0 .venv/bin/python setup.py build_ext --inplace
+  ```
+
+- `FETCHCONTENT_BASE_DIR` is needed because the in-tree `.deps` is
+  root-owned (docker-era); setup.py honours the env var.
+- `ccache` is wired in automatically by setup.py; incremental rebuilds are
+  minutes, a full flag-change rebuild of all HIP objects ~5 min on 16 cores.
+- **Extra HIP flags**: the `CMAKE_HIP_FLAGS` env var is NOT imported into
+  the CMake cache by CMake. Either pass via `CMAKE_ARGS` (no spaces in the
+  value; setup.py splits it) or edit
+  `build/temp.linux-x86_64-cpython-312/CMakeCache.txt` directly
+  (`CMAKE_HIP_FLAGS:STRING=...`) and re-run; ninja rebuilds every object
+  whose flags changed.
+- **Docker-originated build trees**: a `CMakeCache.txt` created inside
+  docker (different ROCm/prefix paths) does not reconfigure cleanly with
+  different host paths; delete it for a fresh configure.
+- Verify an extension loads:
+  `.venv/bin/python -c "import torch; from vllm import _gfx906_fa_C as e; print('OK', e.forward)"`
 
 ---
 
@@ -62,7 +117,7 @@ aware if you see empty device/ROCm detection on 7.14.
 
 ## 2. GPU memory pressure
 
-The MI60 has 32 GB. Use `gpu_memory_utilization` <= `0.85` (see
+The MI60/MI50 has 32 GB. Use `gpu_memory_utilization` <= `0.85` (see
 `_bench_gfx906.py` defaults). Notebook/dense models up to ~9B AWQ fit easily;
 MoE works; large fp16 models (Qwen3.6-27B = 52 G, Qwen3.6-35B-A3B = 67 G) do
 **not** fit single-GPU.
@@ -78,14 +133,13 @@ repo over it (that shadows the installed package with an un-compiled tree).
 Instead mount only a `/bench` dir with the script:
 
 ```bash
-mkdir -p /tmp/bench && cp <fork>/docs/gfx906-benchmarks/_bench_gfx906.py /tmp/bench/_b.py
+mkdir -p /tmp/bench && cp <fork>/docs/gfx906/_bench_gfx906.py /tmp/bench/_b.py
 docker run ... -v /tmp/bench:/bench <image> -c \
   "BENCH_PP=2048 BENCH_TG=256 BENCH_GPU_UTIL=0.85 BENCH_MAXLEN=3328 python3 -u /bench/_b.py 'QuantTrio/Qwen3.5-9B-AWQ'"
 ```
 
-Full zero-ambiguity runner: `run_bench_gfx906.sh` at the repo root (not
-committed). It runs dense 0.23/0.26/main and MoE 0.26/main with the correct
-per-image HSA override and auto-cleanup.
+Full zero-ambiguity runner scripts lived here historically; the current
+canonical runner is the local venv recipe in §0.
 
 ## 4. Developing against / modifying the vLLM **source**
 
@@ -127,11 +181,11 @@ build produces no kernel/extension. Build the wheel for `gfx906`. Verify load:
 
 ## 5. Platform / backend overrides for testing
 
-- CUSTOM (gfx906 FA) is now the **default** for dense decoder attention on
-  gfx906; you don't pass `--attention-backend`.
+- CUSTOM (gfx906 FA) is the **default** for attention on gfx906 (prefill
+  AND decode); you don't pass `--attention-backend`.
 - Escape back to stock: `--attention-backend ROCM_ATTN` (or
   `VLLM_ATTENTION_BACKEND=ROCM_ATTN`).
-- The FA backend targets **prefill**; validated path is the LEGACY inline-Q8 KV
-  mode (default `GFX906_FA_LEGACY=1`). Setting `GFX906_FA_LEGACY=0` selects the
-  Q8 side-buffer fast path which desyncs on warmup (garbage output) — don't use
+- The validated decode path is LEGACY inline-Q8 KV mode (default
+  `GFX906_FA_LEGACY=1`, FULL-capture-safe). Setting `GFX906_FA_LEGACY=0`
+  selects the Q8 side-buffer fast path which desyncs on warmup (garbage output) — don't use
   it as a default.

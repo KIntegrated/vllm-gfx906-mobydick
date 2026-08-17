@@ -5,15 +5,19 @@
 This fork vendors a custom Q8 FlashAttention attention backend for gfx906
 (`AttentionBackendEnum.CUSTOM`, built from
 `https://github.com/cassettesgoboom/gfx906-fa-vllm`) and makes it the **default**
-for dense decoder attention on gfx906. No `--attention-backend` flag is needed;
+for attention on gfx906 (prefill and decode). No `--attention-backend` flag is needed;
 `CUSTOM` is automatically selected and the extension ships inside this wheel.
 
 ### What it accelerates
 
-The custom kernels target **prefill** (part of `pp`), not decode. It is most
-beneficial on **long contexts** on **full-attention models**; on *any*-attention
-hybrids (e.g. Qwen3.5, which has only a few full attention layers) the gain is
-small because the model spends little time in the attention they accelerate.
+The vendor kernels originally target **prefill** on **long contexts** of
+**full-attention models**; on *any*-attention hybrids (e.g. Qwen3.5, few
+full-attention layers) the prefill gain is small. This fork adds the decode
+path (B=1 parallelism via GQA head-packing + KV split, fused
+gather-and-quantize, native BSHD output), making `CUSTOM` the default for
+**decode** as well: 18.9 → 24.1 t/s serving on dense Qwen3.5-27B, and part
+of the MoE stack reaching 67 t/s. See [`docs/gfx906/`](docs/gfx906/) for
+the full change inventory, numbers, and bench recipes.
 
 ### Benchmarks
 
@@ -27,7 +31,9 @@ layers), pp = prefill throughput (tok/s), single MI60, eager, pp/tgen two-phase:
 | 1024 | 1483 | 1427 | +3.9% |
 | 2048 | 1399 | 1288 | **+8.6%** |
 
-Decode throughput is essentially unchanged (`CUSTOM` ≈ stock within ~1–2%).
+Decode throughput in that table reflects the vendor baseline; this
+fork's decode path (above) changes these models' decode numbers
+substantially.
 
 **Upstream gfx906-fa-vllm — full-attention `MiniMax-M2.7-AWQ-4bit` (8× MI50,
 TP=8, BS=1, from the upstream repo's README):**
