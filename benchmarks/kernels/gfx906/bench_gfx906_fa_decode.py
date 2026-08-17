@@ -94,7 +94,8 @@ def main():
         vs = v16[:, :, :sk].contiguous()
         kq = fa.quantize_q8_0(k16s)
         sl = torch.tensor([sk], dtype=torch.int32, device=dev)
-        o = fa.forward(q32, kq, vs, SCALE, kv_max=sl)
+        # C returns native BSHD; the reference is BHSD.
+        o = fa.forward(q32, kq, vs, SCALE, kv_max=sl).permute(0, 2, 1, 3)
         ref = ref_attention(q32, k16s, vs, sl)
         err = (o - ref).abs().max().item()
         worst_err = max(worst_err, err)
