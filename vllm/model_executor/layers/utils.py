@@ -255,6 +255,34 @@ def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor:
     return out[:, :m]
 
 
+def _gfx906_gemv_long_k(
+    weight: torch.Tensor, x_view: torch.Tensor
+) -> torch.Tensor | None:
+    """K=17408 MLP down_proj GEMV (gfx906 only).
+
+    The LLMM1 skinny-GEMV route is capped at K<=8192, so without this the
+    Qwen3.5-27B down_proj ([5120, 17408], n==1) falls to triton_matmul
+    (~794 us/step). The K-split GEMV (kchunk=1024, RPT=2, ksplit=17)
+    runs it in 223.8 us = 100.2% of the HBM floor (bench
+    benchmarks/kernels/gfx906/bench_dense_gemv_k5120.py). Returns None
+    for anything other than the measured shape so the caller can fall
+    back to the triton path.
+    """
+    from vllm.platforms.rocm import on_gfx906
+
+    if (
+        on_gfx906()
+        and os.environ.get("VLLM_GFX906_DENSE_GEMV", "1") != "0"
+        and weight.dtype == torch.float16
+        and x_view.dtype == torch.float16
+        and weight.is_contiguous()
+        and weight.shape[0] == 5120
+        and weight.shape[1] == 17408
+    ):
+        return ops.dense_gemv_gfx906(weight, x_view, 1024)
+    return None
+
+
 def get_token_bin_counts_and_mask(
     tokens: torch.Tensor,
     vocab_size: int,
@@ -429,20 +457,37 @@ def rocm_unquantized_gemm_impl(
             cu_count = num_compute_units()
             out = ops.wvSplitK(weight, x_view, cu_count, bias)
             return out.reshape(*x.shape[:-1], weight.shape[0])
-        elif (m % 4 == 0 or m < 4) and n == 1 and k <= 8192 and bias is None:
-            out = _llmm1_tiny_m(weight, x_view)
-            return out.reshape(*x.shape[:-1], weight.shape[0])
+        elif (
+            (m % 4 == 0 or m < 4)
+            and n == 1
+            and bias is None
+            and (k <= 8192 or (on_gfx906() and k == 17408))
+        ):
+            if k <= 8192:
+                out = _llmm1_tiny_m(weight, x_view)
+            else:
+                out = _gfx906_gemv_long_k(weight, x_view)
+            if out is not None:
+                return out.reshape(*x.shape[:-1], weight.shape[0])
+            return triton_matmul(x_view, weight)
 
     x_view = x.reshape(-1, x.size(-1))
     # Prefer skinny GEMV kernel
     if (
         (m % 4 == 0 or m < 4)
         and n == 1
-        and k <= 8192
         and bias is None
+        and (k <= 8192 or (on_gfx906() and k == 17408))
     ):
-        out = _llmm1_tiny_m(weight, x_view)
-        return out.reshape(*x.shape[:-1], weight.shape[0])
+        if k <= 8192:
+            out = _llmm1_tiny_m(weight, x_view)
+        else:
+            out = _gfx906_gemv_long_k(weight, x_view)
+        if out is not None:
+            return out.reshape(*x.shape[:-1], weight.shape[0])
+        return triton_matmul(
+            x if x.is_contiguous() else x.contiguous(), weight
+        )
     elif m > 8 and 0 < n <= 4 and (on_gfx9() or on_gfx1x()):
         out = ops.wvSplitK(weight, x_view, cu_count, bias)  # matrix cores not supported by gfx906 so excluded here
         return out.reshape(*x.shape[:-1], weight.shape[0])

@@ -1919,3 +1919,91 @@ found. Not needed: the three-anchor inference above is anchored to
 ms/step, top lever) — bundle with the down_proj GEMV gate extension
 (both need a `_rocm_C` rebuild); (2) copy-pile call-site attribution
 (eager stacks) for the ~1–2 ms residual; (3) hybrid-KV over-commit note.
+
+### W4A16 dense kernel: correctness RESOLVED, lever REJECTED (2026-08-17)
+
+**Correction to earlier entries:** the "ROCm compiler codegen bug"
+narrative (kernarg-pointer multiplier in `v_mad_i64_i32`, all kernel
+variants corrupted) was **false**. It was two bugs in my test harness,
+both invisible to the uniform random-ish test data:
+
+1. The pybind signature is `(x, qw, scales, qzeros, rpt, kchunk)`;
+   my probe/bench scripts passed scales and qzeros **swapped**. The
+   kernel read an int32 zero-tensor as fp16 scales → output exactly
+   0.0.
+2. The dequant reference flattened `[k8, n8, i]` without the
+   `permute(0, 2, 1)` before `.reshape(K, N)` → the reference itself
+   was a scrambled (transposed) matrix, so even a perfect kernel
+   "failed" against it.
+
+With the correct call order and a correct reference, the original
+kernel (as of the very first build) passes **18/18** correctness
+configs (K=5120/6144, N=128..5120, rpt=8/16/32; maxabs 1.7-2.8 = the
+expected z1×s fp16 pre-rounding, same as the production MoE kernel).
+The kernel reads q in the **exllama shuffle** order (bit
+[0,16,4,20,8,24,12,28]) and qzeros in **sequential** order
+(bit 4·i) — matching `gptq_shuffle_awq_qweight`'s output. Verified
+with targeted bit-layout probes (all-9 q → 98.0; all-8 z →
+−576×z_c).
+
+**Performance: REJECTED.** exllama's tuned gptq_gemm (the one the
+MoE path already uses via the repacked AWQ format) beats my
+purpose-built kernel on every dense shape:
+
+| shape (N×K) | exllama | W4A16 (best rpt) | floor |
+|---|---|---|---|
+| 10240×5120 (gate_up, ×2/layer) | 87 µs | 209 µs (rpt16, 187%) | 111.7 µs |
+| 16384×5120 (gdn_in) | — | 120.9 µs (rpt32, 230%) | 52.7 µs |
+| 6144×5120 (gdn_out) | 39 µs | 43.4 µs (r16, 220%) | 19.8 µs |
+
+Extrapolated: mine is ~2.5 ms/step **slower** than exllama across the
+model. The exllama kernel's vectorized load layout wins on skinny
+GEMV shapes; my 256-thread rpt-rows × kchunk-k layout does not get
+close (187-230% of floor vs exllama 87-97%). **W4A16 stays rejected;
+exllama gptq remains the dense W4 path.** Prototype lives in
+`/tmp/bench/w4a16/` (not in-tree) for the record.
+
+### down_proj GEMV (K=17408) LANDED (2026-08-17)
+
+- `csrc/rocm/dense_gemv_gfx906.cu`: auto-RPT rule now
+  `kchunk==1024 → rpt = (N%2==0) ? 2 : 1` (auto-RPT N%4→4 is
+  suboptimal at K=17408: rpt4 259.7 µs vs rpt2 223.8 µs).
+- `vllm/model_executor/layers/utils.py`: new `_gfx906_gemv_long_k()`
+  gate (gfx906 + fp16 + contiguous + [5120,17408]) invoked from both
+  skinny and general dispatch branches when k>8192; falls back to
+  triton_matmul otherwise. Kept separate from `_llmm1_tiny_m` so the
+  GEMV kill switch (`VLLM_GFX906_DENSE_GEMV=0`) cannot drag the
+  K=17408 case into LLMM1 (which crashes there: 2176 threads).
+- Fresh `_rocm_C` rebuild (local; see build note below).
+
+**Numbers:**
+
+| gate | result |
+|---|---|
+| kernel micro | 227.6 µs vs triton 795.4 µs (3.5×); 101% of HBM floor |
+| dispatch n=1 | GEMV (maxabs 0.75 = expected fp16 atomic K-split accumulation, 17 chunks); n=4/kill-switch → triton (0.125) |
+| PPL dense | 6.7153 (band 6.6993–6.7197) |
+| PPL MoE | 6.6895 (band 6.6817–6.6942) |
+| serving dense | **23.845 / 23.801 t/s** (record; was 23.553/23.524, +1.3%) |
+| serving MoE | 66.36 t/s (no regression; record 65.36) |
+| pytest `test_rocm_unquantized_gemm.py` | identical failure set before/after (9 pre-existing env failures: platform-mock tests assume a non-gfx906 host — `on_gfx906` is not monkeypatched) |
+
+The fp16 atomic accumulation adds ~0.75 maxabs on ±130-scale outputs
+(~0.6%) — a reordering-class change per the kernel header; PPL
+confirmed no measurable shift.
+
+### Build + hardware notes (2026-08-17)
+
+- **Local `_rocm_C` rebuild works** with the `FETCHCONTENT_BASE_DIR`
+  env override (setup.py honours it): the repo's default
+  `.deps/triton_kernels-*` dirs are **root-owned** (from docker builds)
+  and unwritable; `FETCHCONTENT_BASE_DIR=/tmp/vllm-deps` sidesteps it.
+  Warm `build/` tree → only the changed .cu recompiles (~3 min).
+- **MI50 HBM:** 138 correctable UMC (ECC) errors, stable across long
+  bench runs (not climbing); one transient 0x77077777 readback
+  observed during the W4A16 bisect, 40/40 clean reads after. Watch
+  item, not active corruption.
+- Recurring glibc heap crashes at **teardown** of probe processes
+  ("corrupted double-linked list", "malloc_consolidate(): unaligned
+  fastbin chunk") *after* clean test output — host heap quirk of the
+  torch/HIP runtime on this box, not kernel-related.

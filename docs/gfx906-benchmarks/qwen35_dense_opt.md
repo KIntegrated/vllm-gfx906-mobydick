@@ -1,15 +1,18 @@
 # Dense Qwen3.5/3.6 on gfx906 — porting the MoE optimization stack (handover)
 Copyright Kevin Read <me@kevin-read.com>
 
-Status: **analysis session 2026-08-16, handed over mid-flight; budget +
-gates + NC2=2 completed in the takeover session (DEVLOG dense section,
-"Resolved" subsection — read that first for current state).** Dense
-Qwen3.5-27B-AWQ now *runs* in serving mode on this fork (it did not at the
-start of the session — it OOMed on every attempt). Two real FA-backend bugs
-affecting dense models were found, fixed and committed (`b4873459f8`). The
-decode kernel-time budget was **measured** (rocprofv3 proved unusable for
-full-model dense runs; in-proc eager torch.profiler fallback used;
-§8). Branch: `gfx906/moe-opt`.
+Status: **complete (takeover session 2026-08-17; DEVLOG dense section,
+"W4A16 dense kernel" + "down_proj GEMV LANDED" subsections are the
+current state — read those first).** Everything actionable from this
+doc has been resolved: budget measured (eager kernel map +
+three-anchor inference; rocprofv3 unusable for dense full-model runs),
+NC2=2 FA fix + GDN flip (`1a895e8a01`), GemmaRMSNorm fused-kernel
+(`19c1d41cf5`), down_proj GEMV K=17408 (2026-08-17, serving
+**23.85 t/s** record, was 23.55), W4A16 dense kernel investigated and
+**rejected** (exllama gptq faster on all dense shapes; see DEVLOG). The
+two FA-backend bugs affecting dense models were found, fixed and
+committed (`b4873459f8`). Remaining low-priority items: §6b copy-pile
+call-site attribution. Branch: `gfx906/moe-opt`.
 
 Companion doc: `DEVLOG-moe-opt.md` (the MoE optimization history this builds
 on; read its "PROBE PITFALLS" section before instrumenting anything).
