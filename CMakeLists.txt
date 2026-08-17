@@ -1589,6 +1589,41 @@ endif()
       WITH_SOABI)
   endif()
 
+#
+# gfx906: LLVM max-ilp scheduler strategy for the W4/FA/skinny kernel
+# sources. Measured (docs/gfx906-benchmarks/DEVLOG-moe-opt.md, 2026-08-17):
+# gptq_gemm -15..-26%, FA decode +2..5%, dense serving +7.7% (25.52 vs
+# 23.70 t/s). The MoE routed-expert kernel (moe_q_gemm_gfx906) regresses at
+# decode shapes (serving -2.2%), so the flag is applied per source file,
+# not via CMAKE_HIP_FLAGS. Set VLLM_NO_MAX_ILP=1 to disable.
+#
+if(VLLM_GPU_LANG STREQUAL "HIP"
+   AND VLLM_GPU_ARCHES MATCHES "gfx906"
+   AND NOT DEFINED ENV{VLLM_NO_MAX_ILP})
+  set(_VLLM_MAX_ILP_SRCS)
+  if(TARGET _C_stable_libtorch)
+    list(APPEND _VLLM_MAX_ILP_SRCS
+      "${CMAKE_CURRENT_BINARY_DIR}/csrc/libtorch_stable/quantization/gptq/q_gemm.hip")
+  endif()
+  if(TARGET _gfx906_fa_C)
+    list(APPEND _VLLM_MAX_ILP_SRCS
+      "${CMAKE_CURRENT_BINARY_DIR}/csrc/gfx906_fa/gfx906_fa_launcher.hip"
+      "${CMAKE_CURRENT_BINARY_DIR}/csrc/gfx906_fa/gfx906_fa_quant.hip"
+      "${CMAKE_CURRENT_BINARY_DIR}/csrc/gfx906_fa/gfx906_fa_gather.hip")
+  endif()
+  if(TARGET _rocm_C_skinny)
+    list(APPEND _VLLM_MAX_ILP_SRCS
+      "${CMAKE_CURRENT_BINARY_DIR}/csrc/rocm/skinny_gemms.hip"
+      "${CMAKE_CURRENT_BINARY_DIR}/csrc/rocm/skinny_gemms_int4.hip")
+  endif()
+  if(_VLLM_MAX_ILP_SRCS)
+    set_source_files_properties(${_VLLM_MAX_ILP_SRCS} PROPERTIES
+      COMPILE_FLAGS "-mllvm -amdgpu-sched-strategy=max-ilp")
+    message(STATUS "gfx906: max-ilp scheduler for W4/FA/skinny kernels "
+      "(VLLM_NO_MAX_ILP=1 to disable)")
+  endif()
+endif()
+
 # Must run after the last HIP `define_extension_target` so every extension
 # has registered its sources.
 if (VLLM_GPU_LANG STREQUAL "HIP")

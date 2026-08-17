@@ -2016,7 +2016,7 @@ confirmed no measurable shift.
 
 ### TODO (user-requested, 2026-08-17)
 
-- [ ] **Measure the impact of `CMAKE_HIP_FLAGS='-mllvm -amdgpu-sched-strategy=max-ilp'`** on our gfx906 kernels (rebuild FA + GEMV + MoE W4A16 with it; micro-bench the decode kernels and a serving A/B). Run after the FA copy-reduction step lands.
+- [x] **Measure the impact of `CMAKE_HIP_FLAGS='-mllvm -amdgpu-sched-strategy=max-ilp'`** — RESOLVED: measured; adopted per-file (see "max-ilp scheduler strategy: measured, adopted per-file" below).
 
 ### FA decode per-layer copy pile: attributed + cut 7→2 (2026-08-17)
 
@@ -2091,3 +2091,49 @@ eager, launch-bound). Now cached in `_one_plus_weight(dtype)`, keyed on
 Eager-only gain (production inductor folds the +1 into the norm codegen;
 the value is bit-identical, just computed once). PPL on the final build:
 dense 6.7122, MoE 6.6832 — both in band.
+
+### max-ilp scheduler strategy: measured, adopted per-file (2026-08-17)
+
+User-requested measurement of `-mllvm -amdgpu-sched-strategy=max-ilp`.
+The flag demonstrably changes gfx906 codegen (dummy-kernel ISA diff:
+instruction reordering) and is applied per source file in
+CMakeLists.txt (`VLLM_NO_MAX_ILP=1` to disable).
+
+**Micro-bench A/B** (same session, local builds):
+
+| kernel | no flag | max-ilp | delta |
+|---|---|---|---|
+| FA decode dense 24/4, Sk=3328 | 93.3 µs | 91.0 | −2.5% |
+| FA decode MoE 16/2, Sk=13312 | 186.9 | 177.7 | −4.9% |
+| GPTQ W4 gate/up 17408×5120 | 86.2 | 73.1 | **−15.2%** |
+| GPTQ W4 down 5120×17408 | 105.3 | 77.8 | **−26.1%** |
+| GPTQ W4 gdn_out 6144×5120 | 40.4 | 37.2 | −7.9% |
+| MoE W4 kernel (same shapes) | 82.8/105.4/37.9 | 71.7/77.1/36.1 | −13/−27/−5% |
+| GEMV K=17408 | 227.6 µs | 229.6 | neutral (HBM floor) |
+
+**Serving A/B** (within the same build environment — required, because
+the local no-flag environment itself runs ~2% lower than the
+docker-built no-flag on dense, 23.70 vs 24.06 t/s):
+
+| build | dense t/s | MoE t/s |
+|---|---|---|
+| no flag | 23.55 / 23.86 | 67.08 |
+| global max-ilp (CMAKE_HIP_FLAGS) | **25.54 / 25.51** | 65.65 / 65.56 |
+| per-file max-ilp (CMakeLists) | 25.14 / 25.60 | **67.33 / 67.39** |
+
+Findings:
+- The flag is a big win on the W4 GEMM kernels (exllama gptq, −8 to
+  −26%) — the source of the dense +7–8% e2e.
+- It regresses the MoE routed-expert kernel at decode shapes: global
+  flag → MoE −2.2% (65.6 vs 67.1, two samples each). Presumed register
+  pressure: max-ilp raises VGPR usage, which hurts occupancy in the
+  wavefront-limited decode regime (the probe shapes above are M=1 rows
+  with large N; the production MoE launch is 256 experts × tiny M).
+- Per-file adoption keeps both wins: flag on q_gemm (gptq),
+  gfx906_fa_{launcher,quant,gather}, skinny_gemms{,_int4}; excluded:
+  moe_q_gemm_gfx906, dense_gemv (neutral), attention, all others.
+
+Gates on the final per-file build: PPL dense 6.7122 ✓ / MoE 6.6832 ✓;
+serving dense 25.14/25.60 (record; was 23.70), MoE 67.33/67.39 (record;
+was 67.08). Build mechanics (local setup.py recipe, CMAKE_HIP_FLAGS
+cache gotcha) are documented in docs/gfx906/running.md.
