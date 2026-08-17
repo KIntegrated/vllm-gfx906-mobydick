@@ -32,7 +32,9 @@ import torch
 dev = "cuda"
 torch.manual_seed(0)
 
-Hq, Hkv, D, SQ = 16, 2, 256, 2  # decode Sq_pad=2
+Hq = int(os.environ.get("BENCH_FA_HQ", "16"))
+Hkv = int(os.environ.get("BENCH_FA_HKV", "2"))
+D, SQ = 256, 2  # decode Sq_pad=2
 BPR = (D // 32) * 34  # 272 uint8 per Q8 row
 SK_LIST = [256, 512, 1024, 2048, 3328, 6656, 13312, 26624]
 HBM_BW = 798e9  # P3-0 Q1: measured MI50 HBM read BW
@@ -100,8 +102,11 @@ def main():
             lambda f=fa.forward, k=kq, v=vs, s=sl:
             f(q32, k, v, SCALE, kv_max=s)
         )
-        n_reads = Hq // NC2  # KV heads read (GQA packing dedups qheads)
-        bytes_ = n_reads * Hkv * sk * (BPR + 2 * D)
+        # Each Q tile (ncols2=NC2 heads) reads ONE kv head row-set; tiles
+        # may share a kv head across GQA groups, so total requested bytes
+        # = n_tiles * sk * (q8-row + 2*D) (no Hkv factor).
+        n_tiles = (Hq + NC2 - 1) // NC2
+        bytes_ = n_tiles * sk * (BPR + 2 * D)
         bw = bytes_ / (us * 1e-6)
         floor_us = bytes_ / HBM_BW * 1e6
         rows.append((sk, us, bw, floor_us))

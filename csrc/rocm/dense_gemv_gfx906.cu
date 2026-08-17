@@ -12,7 +12,9 @@
 //   - Each thread loads one 16B slice of x (shared across its RPT rows) and
 //     RPT 16B weight rows, dots via __ockl_fdot2 (v_dot2_f32_f16) — the
 //     same 16B-load / fp32-dot pattern as moe_q_gemm_gfx906.cu.
-//   - KCHUNK=512/2048/4096 → 64/256/512 threads (1/4/8 wavefronts).
+//   - KCHUNK=512/1024/2048/4096 → 64/128/256/512 threads
+//     (1/2/4/8 wavefronts; KCHUNK=4096 exceeds MI50's 256-thread
+//     workgroup limit — bench-only path, never used by model dispatch).
 //     KSPLIT = K / KCHUNK.
 //   - KSPLIT==1: cross-warp reduce in LDS, single fp16 store (no atomics).
 //   - KSPLIT>1:  grid.y spans the K-chunks; each block reduces its chunk in
@@ -94,8 +96,9 @@ __global__ void __launch_bounds__(KCHUNK / 8)
                       half* __restrict__ out,       // [N], pre-zeroed if KSPLIT>1
                       const int N, const int K,
                       const int ksplit) {
-  static_assert(KCHUNK == 512 || KCHUNK == 2048 || KCHUNK == 4096,
-                "KCHUNK must be 512, 2048 or 4096");
+  static_assert(KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 ||
+                    KCHUNK == 4096,
+                "KCHUNK must be 512, 1024, 2048 or 4096");
   static_assert(RPT == 1 || RPT == 2 || RPT == 4, "RPT must be 1, 2 or 4");
   constexpr int THREADS = KCHUNK / 8;
   constexpr int WARPS = THREADS / 64;
@@ -215,7 +218,7 @@ __global__ void __launch_bounds__(KCHUNK / 8)
 //
 //   weight: [N, K] fp16, row-major, contiguous
 //   x:      [1, K] (or [K]) fp16, contiguous
-//   kchunk: 512, 2048 or 4096 (must divide K); kchunk >= K = single pass
+//   kchunk: 512, 1024, 2048 or 4096 (must divide K); kchunk >= K = single pass
 //   rpt:    rows per thread override (VLLM_GFX906_GEMV_RPT env); default
 //           auto: 4 if N%4==0, 2 if N%2==0, else 1. RPT=1 forbids K-split.
 //
@@ -233,8 +236,9 @@ torch::Tensor dense_gemv_gfx906(torch::Tensor weight, torch::Tensor x,
   TORCH_CHECK(x.size(0) == 1, "x must be [1, K] (M=1 only)");
   TORCH_CHECK(x.size(1) == K, "x/weight K mismatch");
   TORCH_CHECK(K % 8 == 0, "K must be a multiple of 8");
-  TORCH_CHECK(kchunk == 512 || kchunk == 2048 || kchunk == 4096,
-              "kchunk must be 512, 2048 or 4096");
+  TORCH_CHECK(kchunk == 512 || kchunk == 1024 || kchunk == 2048 ||
+                  kchunk == 4096,
+              "kchunk must be 512, 1024, 2048 or 4096");
   TORCH_CHECK(K % kchunk == 0, "K must be divisible by kchunk");
 
   // Rows per thread: env override (micro-bench sweeps), else the
@@ -293,6 +297,8 @@ torch::Tensor dense_gemv_gfx906(torch::Tensor weight, torch::Tensor x,
     LAUNCH_BY_RPT(4096);
   else if (kchunk == 2048)
     LAUNCH_BY_RPT(2048);
+  else if (kchunk == 1024)
+    LAUNCH_BY_RPT(1024);
   else
     LAUNCH_BY_RPT(512);
   return out;
