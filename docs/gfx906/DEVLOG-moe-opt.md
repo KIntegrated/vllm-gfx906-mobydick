@@ -2301,3 +2301,14 @@ below.
   dense model is unaffected except via the shared FA buffers (same
   shapes/sizes as before; R3 only bounds the already-small retired
   list).
+
+---
+
+## 2026-08-18 — Merged into gfx906/main
+
+`gfx906/moe-opt` merged into `gfx906/main` by fast-forward (main was a
+direct ancestor; 71 commits, 52 files, +13818/-21, tip `1691d1dd29`).
+Linear history kept (fork convention: merge commits only for upstream
+merges). All gates current at the merge tip: 4 suites 74 passed /
+2 skipped, PPL MoE 6.6825 (band 6.6817-6.6832), serving records 25.60
+t/s dense / 67.39 t/s MoE (see the serving sections above).
