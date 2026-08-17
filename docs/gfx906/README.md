@@ -20,9 +20,9 @@ Reference point: llama.cpp (Q4_K_XL GGUF, full offload) — **70.3 t/s decode,
 
 | workload | fork base (`gfx906/main`) | now | Δ | reference |
 |---|---|---|---|---|
-| MoE serving decode | 3.49 t/s | **67.02 t/s** | 19.2× | llama.cpp 70.3 (1.05× gap) |
+| MoE serving decode | 3.49 t/s | **67.39 t/s** | 19.3× | llama.cpp 70.3 (1.04× gap) |
 | MoE prefill (pp=2048) | ~450 t/s | **~2140 t/s** | 4.7× | llama.cpp 806.5 (2.7× ahead) |
-| Dense serving decode | 18.89 t/s | **24.06 t/s** | +27% | — |
+| Dense serving decode | 18.89 t/s | **25.60 t/s** | +35% | — |
 
 Correctness gates: PPL on a fixed 442-token probe — MoE band 6.6817–6.6942,
 dense band 6.6993–6.7197. Kernel test suites: 15/15 FA, 12/12 MoE GEMM.
@@ -118,7 +118,8 @@ kill switch `VLLM_GFX906_DENSE_GEMV=0`):
 | fill/copy pile fixes (P3-4) | 64.08 | `9bdd9f4639` |
 | kv_split prefill clamp + NC2 fail-closed; NC2=2 + GDN flip | 65.36 | `b4873459f8`, `1a895e8a01` |
 | GemmaRMSNorm fused dispatch; down_proj GEMV | 66.36 | `19c1d41cf5`, `2cd5b4cafa` |
-| FA decode copy pile 7→2 (BSHD native output) | **67.02** | `d63b3ab464` |
+| FA decode copy pile 7→2 (BSHD native output) | 67.02 | `d63b3ab464` |
+| max-ilp scheduler per-file (W4/FA/skinny) | **67.39** | `c6247f729e` |
 
 ### Dense — Qwen3.5-27B-AWQ
 
@@ -128,7 +129,8 @@ kill switch `VLLM_GFX906_DENSE_GEMV=0`):
 | CUSTOM FA (NC2=1 fallback) | 23.15 | 28.10 |
 | NC2=2 for ratio-6 GQA | 23.55 | 28.69 |
 | down_proj K=17408 GEMV | 23.85 | — |
-| FA copy pile 7→2 | **24.06** | — |
+| FA copy pile 7→2 | 24.06 | — |
+| max-ilp scheduler per-file (W4/FA/skinny) | **25.60** | `c6247f729e` |
 
 ## Bench recipes
 
