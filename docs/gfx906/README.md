@@ -175,10 +175,10 @@ multi-batch greedy token identity is NOT a valid gate.
 .venv/bin/python -m pytest tests/model_executor/layers/test_rocm_unquantized_gemm.py -v
 ```
 
-The last file has 9 pre-existing failures on real gfx906 hardware: its
-platform-mock tests monkeypatch `on_gfx1x`/`on_gfx9`/etc. but not
-`on_gfx906`, which is True on this machine (identical failures with and
-without our changes).
+All three suites are green on real gfx906 hardware. In the last file the
+arch-simulation tests patch every platform predicate (incl. `on_gfx906`)
+and 2 wvSplitK real-kernel tests skip on gfx906 by design (wvSplitK
+targets matrix cores; gfx906 has none).
 
 ## Environment knobs
 
