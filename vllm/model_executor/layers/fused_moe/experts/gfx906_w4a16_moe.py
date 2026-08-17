@@ -137,6 +137,12 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
         # workspace13: gemm1 output [M*topk, N] (zeroed before use)
         # workspace2:  activation output [M*topk, N/2]
         # fused_out:   final reduced output [M, K] (zeroed before use)
+        #
+        # modular_kernel._allocate_buffers aliases workspace13 and fused_out
+        # onto one storage ("done with cache1 by the time cache3 is needed").
+        # That holds here ONLY because apply() zeroes fused_out and runs gemm2
+        # after the activation has fully consumed w1_out — do not reorder.
+        # (workspace2 is a separate allocation.)
         return (
             (M * topk, N),
             (M * topk, self.adjust_N_for_activation(N, activation)),
@@ -230,6 +236,8 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
         self.activation(activation, act_out, w1_out)
 
         # --- gemm2: [M*topk, N/2] -> [M, K] (fused weight + reduce) ---
+        # output may alias workspace13's storage (see workspace_shapes):
+        # safe because the activation above has finished reading w1_out.
         output.zero_()
         ops.moe_gptq_gemm_gfx906(
             act_out,

@@ -19,22 +19,33 @@ contiguous tensors and calls gfx906_fa.forward().
 
 Eager-only debug hooks (host-device syncs; illegal during CUDA graph
 capture and they serialize eager execution — do not enable in serving):
+  * GFX906_FA_DEBUG=1        — master switch: enables ALL debug hooks
+                               below at once
   * GFX906_FA_FWD_DEBUG=1    — sync + per-call log to /tmp/gfx906_fa_debug/
   * GFX906_FA_DOUBLE_CHECK=1 — cross-check the gather vs torch (.item())
   * GFX906_FA_DUMP=DIR       — dump inputs/outputs via torch.save
+                               (default dir /tmp/gfx906_fa_debug)
 """
 from __future__ import annotations
 
 import math
 import os as _os
 import time as _time
-from typing import Optional, Tuple
 
 import torch
 
-from vllm import _gfx906_fa_C as gfx906_fa
+try:
+    from vllm import _gfx906_fa_C as gfx906_fa
+except ImportError:
+    # Non-gfx906 platform: the extension is absent. This module is safe to
+    # import (register() is a no-op off gfx906), the wrappers just cannot
+    # run.
+    gfx906_fa = None
 
-_DBG   = _os.environ.get("GFX906_FA_FWD_DEBUG", "0") == "1"
+# Master debug switch (R12): enables every off-by-default debug hook in
+# this module at once; the individual knobs remain for finer control.
+_FA_DEBUG = _os.environ.get("GFX906_FA_DEBUG", "0") == "1"
+_DBG   = (_os.environ.get("GFX906_FA_FWD_DEBUG", "0") == "1" or _FA_DEBUG)
 # Level 1: по умолчанию используем fused gather kernel. Отключить можно
 # через GFX906_FA_FUSED=0 — тогда работает старый путь через fancy-indexing
 # (для A/B-замеров и как быстрый safety-fallback при регрессиях).
@@ -53,31 +64,38 @@ _FUSED = _os.environ.get("GFX906_FA_FUSED", "1") != "0"
 #
 # Обоснование auto-default (MI50 / gfx906, bench_ab2.py + bench_prefill.py):
 #   Decode (Sq=1, ncols1=2):
-#     * B=1: gather быстрее на ~3-6% (compact access, direct добавляет block_table indirection).
+#     * B=1: gather быстрее на ~3-6% (compact access, direct добавляет
+#       block_table indirection).
 #     * B=2: direct быстрее на ~4-7%.
 #     * B≥3: direct быстрее на 7-35%.
 #     * B=8, Sk=61K: gather → CUDA OOM (24 GiB peak); direct работает (~13 ms/step).
 #   Prefill (bench_prefill.py, occupancy-fix применён):
 #     * B=1 Sq=16 (ncols1=16): direct WIN -5..-27% (0 spill).
-#     * B=2 Sq=32 (ncols1=32): direct LOSS +13% даже при 0 spill (block_table lookup latency).
+#     * B=2 Sq=32 (ncols1=32): direct LOSS +13% даже при 0 spill
+#       (block_table lookup latency).
 #     * B=2 Sq=64 (ncols1=64): direct LOSS +34% (197 spill остался, 1 wave/EU).
 #     * B=4 Sq=32/64: direct LOSS +0.5..+27%.
 # → threshold {min_batch=2, max_sq=16} закрывает:
 #     - регрессию B=1 (gather),
 #     - регрессию ncols1=32/64 prefill (gather),
-#     - включает direct для decode multi-batch (Sq=1) и короткого chunked prefill (Sq≤16),
+#     - включает direct для decode multi-batch (Sq=1) и короткого chunked
+#       prefill (Sq≤16),
 #     - спасает от OOM на длинном Sk (mode=1 явный override).
 _DIRECT_PAGED_MODE = _os.environ.get("GFX906_FA_DIRECT_PAGED", "auto").lower()
 _DIRECT_PAGED_MIN_BATCH = int(_os.environ.get("GFX906_FA_DIRECT_PAGED_MIN_BATCH", "2"))
 _DIRECT_PAGED_MAX_SQ = int(_os.environ.get("GFX906_FA_DIRECT_PAGED_MAX_SQ", "16"))
 # Diagnostics for the LEGACY=0 corruption hunt (P3-3).
-_ZERO_KTAIL = _os.environ.get("GFX906_FA_ZERO_KTAIL", "0") == "1"
-_NO_BUF_REUSE = _os.environ.get("GFX906_FA_NO_BUF_REUSE", "0") == "1"
-_DOUBLE_CHECK = _os.environ.get("GFX906_FA_DOUBLE_CHECK", "0") == "1"
+_ZERO_KTAIL = (_os.environ.get("GFX906_FA_ZERO_KTAIL", "0") == "1"
+               or _FA_DEBUG)
+_NO_BUF_REUSE = (_os.environ.get("GFX906_FA_NO_BUF_REUSE", "0") == "1"
+                 or _FA_DEBUG)
+_DOUBLE_CHECK = (_os.environ.get("GFX906_FA_DOUBLE_CHECK", "0") == "1"
+                 or _FA_DEBUG)
 # LEGACY-path gather: fused HIP kernel (default) vs torch fancy-index path
 # (A/B switch; the torch path is 128-190 us/layer at Sk~2176-3328 vs ~40 us
 # for the fused fp16 gather).
-_TORCH_GATHER = _os.environ.get("GFX906_FA_TORCH_GATHER", "0") == "1"
+_TORCH_GATHER = (_os.environ.get("GFX906_FA_TORCH_GATHER", "0") == "1"
+                 or _FA_DEBUG)
 # Stage 2: fuse the legacy-path gather + quantize into one kernel
 # (bit-equal to gather_paged_kv_fp16 + quantize_q8_0). GFX906_FA_FUSED_QUANT=0
 # reverts to the two-kernel path.
@@ -86,8 +104,31 @@ _FUSED_QUANT = _os.environ.get("GFX906_FA_FUSED_QUANT", "1") != "0"
 # (pad rows are per-row-independent and discarded; the q8_0 quantization
 # clamps NaN/Inf garbage). GFX906_FA_QPAD_EMPTY=0 reverts to the zero_.
 _QPAD_EMPTY = _os.environ.get("GFX906_FA_QPAD_EMPTY", "1") != "0"
-_DUMP_DIR = _os.environ.get("GFX906_FA_DUMP", "")
+# Under the master switch the dump default dir is the standard debug dir.
+_DUMP_DIR = _os.environ.get(
+    "GFX906_FA_DUMP",
+    "/tmp/gfx906_fa_debug" if _FA_DEBUG else "",
+)
 _dump_n = 0
+
+def _pick_ncols1(seq_q: int) -> int:
+    """ncols1 (Q-tile columns) ladder — llama.cpp's
+    launch_fattn_tile_q8_switch_ncols1.
+
+    MUST stay in sync with the C++ mirror in
+    csrc/gfx906_fa/gfx906_fa.cpp (fa_pick_ncols1).
+    """
+    if seq_q > 32:
+        return 64
+    if seq_q > 16:
+        return 32
+    if seq_q > 8:
+        return 16
+    if seq_q > 4:
+        return 8
+    if seq_q > 2:
+        return 4
+    return 2
 
 def _should_use_direct_paged(num_seqs: int, max_seqlen_q: int) -> bool:
     """Решает, использовать ли direct-paged FA для текущего batch/seq_q."""
@@ -97,9 +138,7 @@ def _should_use_direct_paged(num_seqs: int, max_seqlen_q: int) -> bool:
         return True
     if num_seqs < _DIRECT_PAGED_MIN_BATCH:
         return False
-    if max_seqlen_q > _DIRECT_PAGED_MAX_SQ:
-        return False
-    return True
+    return not max_seqlen_q > _DIRECT_PAGED_MAX_SQ
 
 def _fwdlog(msg: str) -> None:
     if not _DBG:
@@ -118,7 +157,7 @@ def _gather_kv(
     block_table: torch.Tensor,      # [num_seqs, max_blocks]            int32
     seq_lens: torch.Tensor,         # [num_seqs]                        int32
     max_seqlen_k: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather K, V from the paged cache into a contiguous layout.
 
     Returns:
@@ -183,7 +222,7 @@ def _gather_kv_q8(
     block_table:  torch.Tensor,    # [num_seqs, max_blocks]                     int
     seq_lens:     torch.Tensor,    # [num_seqs]                                 int
     max_seqlen_k: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Fast-path gather: K уже квантован в side-buffer, V — fp16.
 
     Возвращает:
@@ -227,7 +266,7 @@ def _gather_kv_q8(
 
 
 def forward_paged(
-    query: torch.Tensor,            # [num_tokens, Hq, D]     fp32
+    query: torch.Tensor,            # [num_tokens, Hq, D] fp16 (cast into fp32 q_pad)
     key_cache: torch.Tensor,        # [num_blocks, block_size, Hkv, D]  fp16
     value_cache: torch.Tensor,      # [num_blocks, block_size, Hkv, D]  fp16
     block_table: torch.Tensor,      # [num_seqs, max_blocks]            int32
@@ -235,13 +274,13 @@ def forward_paged(
     cu_seqlens_q: torch.Tensor,     # [num_seqs+1]                      int32
     max_seqlen_q: int,
     max_seqlen_k: int,
-    scale: Optional[float] = None,
-    key_cache_q8: Optional[torch.Tensor] = None,  # fast-path: [num_blocks,bs,Hkv,(D/32)*34]
-    q_pad_buf: Optional[torch.Tensor] = None,
-    q_pad_decode_buf: Optional[torch.Tensor] = None,  # [B,Hq,2,D] fp32, Sq=1 only
-    mask_buf:  Optional[torch.Tensor] = None,
-    k_gather_buf: Optional[torch.Tensor] = None,  # [B,Hkv,Sk_pad,bytes_per_row] uint8
-    v_gather_buf: Optional[torch.Tensor] = None,  # [B,Hkv,Sk_pad,D]             fp16
+    scale: float | None = None,
+    key_cache_q8: torch.Tensor | None = None,
+    # fast-path: [num_blocks,bs,Hkv,(D/32)*34]
+    q_pad_buf: torch.Tensor | None = None,
+    q_pad_decode_buf: torch.Tensor | None = None,  # [B,Hq,2,D] fp32, Sq=1 only
+    k_gather_buf: torch.Tensor | None = None,  # [B,Hkv,Sk_pad,bytes_per_row] uint8
+    v_gather_buf: torch.Tensor | None = None,  # [B,Hkv,Sk_pad,D]             fp16
 ) -> torch.Tensor:
     """vLLM-совместимый paged-attention forward.
 
@@ -272,12 +311,7 @@ def forward_paged(
     # Важное условие: pad только если это НЕ prefill (нет causal-маски в kernel
     # бьёт по pad-позициям некорректно при ncols1<64 на реальных данных).
     # Для prefill всегда используем ncols1=64 (как до фикса).
-    if   max_seqlen_q >  32: ncols1 = 64
-    elif max_seqlen_q >  16: ncols1 = 32
-    elif max_seqlen_q >   8: ncols1 = 16
-    elif max_seqlen_q >   4: ncols1 = 8
-    elif max_seqlen_q >   2: ncols1 = 4
-    else:                    ncols1 = 2
+    ncols1 = _pick_ncols1(max_seqlen_q)
     Sq_pad = ((max_seqlen_q + ncols1 - 1) // ncols1) * ncols1
     Sk_pad = ((max_seqlen_k + 31) // 32) * 32
 
@@ -294,23 +328,40 @@ def forward_paged(
             and _should_use_direct_paged(num_seqs, max_seqlen_q)
             and key_cache_q8.dim() == 4
             and key_cache_q8.shape[1] == 16):
-        bt_i32 = block_table if block_table.dtype == torch.int32 else block_table.to(torch.int32)
-        sl_i32 = seq_lens   if seq_lens.dtype   == torch.int32 else seq_lens.to(torch.int32)
+        bt_i32 = (block_table if block_table.dtype == torch.int32
+                 else block_table.to(torch.int32))
+        sl_i32 = (seq_lens if seq_lens.dtype == torch.int32
+                 else seq_lens.to(torch.int32))
         bt_i32 = bt_i32.contiguous()
         sl_i32 = sl_i32.contiguous()
 
-        if (q_pad_buf is not None
+        # forward_paged_direct requires fp32 Q (the kernel operates in
+        # fp32); the q_pad buffers are always allocated fp32 by the
+        # backend, and the row stores below cast an fp16 query in-place —
+        # the same buffer pattern as the legacy/gather branch below
+        # (Sq=1 uses the dedicated decode buffer: the grown q_pad_buf
+        # slice would .contiguous() copy on every FA layer).
+        if (max_seqlen_q == 1
+                and q_pad_decode_buf is not None
+                and q_pad_decode_buf.shape[0] >= num_seqs
+                and q_pad_decode_buf.shape[1] == Hq
+                and q_pad_decode_buf.shape[2] == Sq_pad
+                and q_pad_decode_buf.shape[3] == D
+                and q_pad_decode_buf.dtype == torch.float32):
+            q_padded = q_pad_decode_buf[:num_seqs]
+            q_padded.zero_()
+        elif (q_pad_buf is not None
                 and q_pad_buf.shape[0] >= num_seqs
                 and q_pad_buf.shape[1] >= Hq
                 and q_pad_buf.shape[2] >= Sq_pad
                 and q_pad_buf.shape[3] == D
-                and q_pad_buf.dtype == query.dtype):
+                and q_pad_buf.dtype == torch.float32):
             q_padded = q_pad_buf[:num_seqs, :Hq, :Sq_pad, :].contiguous()
             q_padded.zero_()
         else:
             q_padded = torch.zeros(
                 (num_seqs, Hq, Sq_pad, D),
-                dtype=query.dtype, device=query.device
+                dtype=torch.float32, device=query.device
             )
 
         cu = cu_seqlens_q.to(torch.long)
@@ -328,7 +379,8 @@ def forward_paged(
         q_abs_offset_tensor = None
         if need_causal:
             sl_i64 = sl_i32.to(torch.int64)
-            cu_i64 = cu_seqlens_q.to(torch.int64) if cu_seqlens_q.dtype != torch.int64 else cu_seqlens_q
+            cu_i64 = (cu_seqlens_q.to(torch.int64)
+                      if cu_seqlens_q.dtype != torch.int64 else cu_seqlens_q)
             n_q_per_seq = cu_i64[1:num_seqs + 1] - cu_i64[:num_seqs]
             q_abs_offset_tensor = (sl_i64 - n_q_per_seq).to(torch.int32).contiguous()
 
@@ -362,7 +414,8 @@ def forward_paged(
         if max_seqlen_q == 1 and num_tokens == num_seqs:
             return out_padded[:, 0, :, :].reshape(num_tokens, Hq * D)
 
-        out_flat = torch.empty((num_tokens, Hq * D), dtype=torch.float32, device=query.device)
+        out_flat = torch.empty(
+            (num_tokens, Hq * D), dtype=torch.float32, device=query.device)
         for s in range(num_seqs):
             n = int(cu[s + 1] - cu[s])
             if n > 0:
@@ -371,33 +424,37 @@ def forward_paged(
         return out_flat
 
     # -------- gather KV + (возможно) quantize K --------
+    # pre-allocated буферы (если подходят по ТОЧНОМУ shape) — zero-copy reuse.
+    # Это критично на длинных контекстах: без этого каждая attention layer
+    # аллоцирует 24-200+ MiB в HBM → peak VRAM spike → OOM.
+    bytes_per_row_expected = (D // 32) * 34
+    hkv_k = key_cache_q8.shape[2] if key_cache_q8 is not None \
+        else key_cache.shape[2]
+    kbuf = k_gather_buf if (
+        not _NO_BUF_REUSE
+        and k_gather_buf is not None
+        and k_gather_buf.dtype == torch.uint8
+        and k_gather_buf.dim() == 4
+        and k_gather_buf.shape == (num_seqs, hkv_k, Sk_pad, bytes_per_row_expected)
+        and k_gather_buf.is_contiguous()
+    ) else None
+    vbuf = v_gather_buf if (
+        not _NO_BUF_REUSE
+        and v_gather_buf is not None
+        and v_gather_buf.dtype == torch.float16
+        and v_gather_buf.dim() == 4
+        and v_gather_buf.shape == (num_seqs, value_cache.shape[2], Sk_pad, D)
+        and v_gather_buf.is_contiguous()
+    ) else None
     if key_cache_q8 is not None and _FUSED:
         # Level 1 fused path: gather K_q8 + V_fp16 одним HIP kernel'ом.
         # Возвращает tensors с Sk=Sk_pad (хвост в V уже обнулён, K — мусор).
-        bt_i32 = block_table if block_table.dtype == torch.int32 else block_table.to(torch.int32)
-        sl_i32 = seq_lens   if seq_lens.dtype   == torch.int32 else seq_lens.to(torch.int32)
+        bt_i32 = (block_table if block_table.dtype == torch.int32
+                 else block_table.to(torch.int32))
+        sl_i32 = (seq_lens if seq_lens.dtype == torch.int32
+                 else seq_lens.to(torch.int32))
         bt_i32 = bt_i32.contiguous()
         sl_i32 = sl_i32.contiguous()
-        # pre-allocated буферы (если подходят по ТОЧНОМУ shape) — zero-copy reuse.
-        # Это критично на длинных контекстах: без этого каждая attention layer
-        # аллоцирует 24-200+ MiB в HBM → peak VRAM spike → OOM.
-        bytes_per_row_expected = (D // 32) * 34
-        kbuf = k_gather_buf if (
-            not _NO_BUF_REUSE
-            and k_gather_buf is not None
-            and k_gather_buf.dtype == torch.uint8
-            and k_gather_buf.dim() == 4
-            and k_gather_buf.shape == (num_seqs, key_cache_q8.shape[2], Sk_pad, bytes_per_row_expected)
-            and k_gather_buf.is_contiguous()
-        ) else None
-        vbuf = v_gather_buf if (
-            not _NO_BUF_REUSE
-            and v_gather_buf is not None
-            and v_gather_buf.dtype == torch.float16
-            and v_gather_buf.dim() == 4
-            and v_gather_buf.shape == (num_seqs, value_cache.shape[2], Sk_pad, D)
-            and v_gather_buf.is_contiguous()
-        ) else None
         K_q8, V_bhsd = gfx906_fa.gather_paged_kv_q8(
             key_cache_q8, value_cache, bt_i32, sl_i32, Sk_pad,
             k_out=kbuf, v_out=vbuf,
@@ -442,11 +499,16 @@ def forward_paged(
                       else seq_lens.to(torch.int32)).contiguous()
             if _FUSED_QUANT and Sk_pad <= 65535:
                 K_q8, V_bhsd = gfx906_fa.gather_paged_kv_quantized(
-                    key_cache, value_cache, bt_i32, sl_i32, Sk_pad
+                    key_cache, value_cache, bt_i32, sl_i32, Sk_pad,
+                    k_out=kbuf, v_out=vbuf,
                 )
             else:
+                # Fallback (GFX906_FA_FUSED_QUANT=0): K output is fp16 [B,Hkv,Sk,D],
+                # so the uint8 q8 kbuf does not match; only V reuses the class
+                # buffer.
                 K_bhsd, V_bhsd = gfx906_fa.gather_paged_kv_fp16(
-                    key_cache, value_cache, bt_i32, sl_i32, Sk_pad
+                    key_cache, value_cache, bt_i32, sl_i32, Sk_pad,
+                    v_out=vbuf,
                 )
                 K_q8 = gfx906_fa.quantize_q8_0(K_bhsd)
 
@@ -519,7 +581,8 @@ def forward_paged(
     q_abs_offset_tensor = None
     if need_causal:
         sl_i64 = seq_lens.to(torch.int64) if seq_lens.dtype != torch.int64 else seq_lens
-        cu_i64 = cu_seqlens_q.to(torch.int64) if cu_seqlens_q.dtype != torch.int64 else cu_seqlens_q
+        cu_i64 = (cu_seqlens_q.to(torch.int64)
+                  if cu_seqlens_q.dtype != torch.int64 else cu_seqlens_q)
         n_q_per_seq = cu_i64[1:num_seqs + 1] - cu_i64[:num_seqs]
         # shape [B]. Для padded row (j >= n_q[s]) не используется — kernel таких
         # колонок не вызывает (k_VKQ_max=seq_lens[s], + col_Q_0+j > seq_len в
@@ -574,7 +637,8 @@ def forward_paged(
         return out_padded[:, 0, :, :].reshape(num_tokens, Hq * D)
 
     cu = cu_seqlens_q.to(torch.long)
-    out_flat = torch.empty((num_tokens, Hq * D), dtype=torch.float32, device=query.device)
+    out_flat = torch.empty(
+        (num_tokens, Hq * D), dtype=torch.float32, device=query.device)
     for s in range(num_seqs):
         n = int(cu[s + 1] - cu[s])
         if n > 0:

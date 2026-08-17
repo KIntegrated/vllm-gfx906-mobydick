@@ -770,7 +770,7 @@ def dense_gemv_gfx906(
     """M=1 W16A16 dense GEMV for gfx906 (see csrc/rocm/dense_gemv_gfx906.cu).
 
     ``weight`` [N, K] row-major fp16, ``x`` [1, K] fp16, ``kchunk`` 512,
-    2048 or 4096 (must divide K). Returns ``out`` [1, N] fp16. When K >
+    1024, 2048 or 4096 (must divide K). Returns ``out`` [1, N] fp16. When K >
     kchunk the output is pre-zeroed and K-chunks atomic-add into it. Rows
     per thread (RPT) defaults to the gfx906-measured rule; override with
     VLLM_GFX906_GEMV_RPT for micro-bench sweeps.

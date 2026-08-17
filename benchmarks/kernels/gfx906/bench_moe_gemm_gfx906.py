@@ -17,6 +17,7 @@ Roofline reference per review:
   w13 fp16 FLOPs = EM*K*N*2 (EM = M*TOPK)
 """
 import os
+
 import torch
 
 torch.manual_seed(0)
@@ -44,8 +45,10 @@ def make_layer():
     w13, w2 = _pack_nib(q13), _pack_nib(q2)
     s13 = torch.rand(E, K13 // GS, N13, device=dev, dtype=torch.float16) * 0.1 + 0.01
     s2 = torch.rand(E, K2 // GS, N2, device=dev, dtype=torch.float16) * 0.1 + 0.01
-    z13 = _pack_nib(torch.randint(0, 16, (E, K13 // GS, N13), dtype=torch.int32, device=dev))
-    z2 = _pack_nib(torch.randint(0, 16, (E, K2 // GS, N2), dtype=torch.int32, device=dev))
+    z13 = _pack_nib(
+        torch.randint(0, 16, (E, K13 // GS, N13), dtype=torch.int32, device=dev))
+    z2 = _pack_nib(
+        torch.randint(0, 16, (E, K2 // GS, N2), dtype=torch.int32, device=dev))
     return w13, w2, s13, s2, z13, z2
 
 
@@ -128,10 +131,8 @@ def main():
         t1, t2 = timeit(g1), timeit(g2)
         # prefill bandwidth: all experts read (approx) once per M-slice.
         # rows per expert = EM/E (if EM >= E), else only active experts read.
-        if EM >= E:
-            r13 = max(1, (EM // E + bm - 1) // bm)  # blocks/expert over k? not exact
-        else:
-            r13 = 1
+        r13 = max(1, (EM // E + bm - 1) // bm) if EM >= E else 1
+        # (r13: blocks/expert over k? not exact)
         tf1 = EM * K13 * N13 * 2 / (t1 * 1e-6) / PEAK_F16 * 100
         tf2 = EM * K2 * N2 * 2 / (t2 * 1e-6) / PEAK_F16 * 100
         bw1 = w13_bytes * r13 / (t1 * 1e-6) / 1e9

@@ -172,6 +172,18 @@ def _backend_incompatibility_reason(
     ):
         return "GPTQ-style zero-point encoding is not supported"
 
+    # Shape contract of the gfx906 kernel (it derives group boundaries as
+    # K / groups and packs 8 nibbles per int32 — violations are silent
+    # garbage, so gate them here instead of in the kernel).
+    if backend == WNA16MoEBackend.GFX906_HIP:
+        n = moe_config.intermediate_size_per_partition
+        k = moe_config.hidden_dim
+        group_size = getattr(quant_config, "group_size", None)
+        if n % 8 != 0:
+            return "intermediate size must be a multiple of 8"
+        if group_size is None or (group_size > 0 and k % group_size != 0):
+            return "hidden size must be divisible by the group size"
+
     if backend == WNA16MoEBackend.TRITON:
         if may_have_bias:
             return "expert bias is not supported"

@@ -20,6 +20,7 @@ Run in the gfx906 vLLM image with the repo source-mounted:
   python3 -u /bench/bench_dense_gemv_gfx906.py
 """
 import os
+
 import torch
 
 dev = "cuda"

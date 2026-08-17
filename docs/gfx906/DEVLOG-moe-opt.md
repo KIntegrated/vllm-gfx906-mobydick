@@ -2194,3 +2194,110 @@ in band (recent 6.6817-6.6832). Dense PPL/serving not re-run: on
 gfx906 all four fixes are inert for the dense model (the GDN gate
 evaluates to the same value it did before; the other three are
 MoE-load-path only).
+
+---
+
+## 2026-08-18 — Parked review items R1–R12 resolved
+
+All 12 items parked in roadmap §9 (2026-08-17) are now resolved. Most
+are edge-path / hygiene fixes; three touch the default LEGACY=1 decode
+path (R8 buffer reuse, R7 ladder consolidation, R11 lint) — all gated
+below.
+
+### Edge-path correctness
+
+- **R1 (P2)** — `forward_paged` direct branch now uses the fp32
+  `q_pad_buf` (fp32 fallback allocation) instead of the fp16 fallback
+  that `forward_paged_direct`'s `TORCH_CHECK` rejects; the Sq=1 case
+  additionally uses the dedicated `q_pad_decode_buf` (zero-copy
+  `[:num_seqs]` prefix) so B≥2 decode does not pay a per-layer
+  `.contiguous()` copy. LEGACY=0-only path (dormant in default config).
+- **R2 (P3)** — `get_cudagraph_support` fails closed (RuntimeError) on
+  LEGACY=0 + prefix caching instead of logging and continuing.
+- **R3 (P3)** — `_ensure_gather_buffers` retired list is now bounded
+  (`_gather_retired_max = 4` pairs, oldest evicted). The review's
+  suggested "grow-only capacity buffer + exact-size view" was rejected
+  after inspection: the gather kernels address their output from
+  SHAPES, not strides (gfx906_fa_gather.cu), so a non-contiguous view
+  corrupts silently; a real capacity buffer needs stride-based output
+  addressing in C++. Bounding trades worst-case memory for a stale
+  graph possibly touching an evicted buffer — only reachable in the
+  LEGACY=0 + capture combination that is already inconsistent (RC2).
+- **R4 (P3)** — `moe_gptq_gemm_gfx906` host checks now include
+  `K == qweight_rows*8`, `groups > 0 and K % groups == 0` (the kernel
+  computes `groupsize = K / groups`), `N % 8 == 0`, `scales_N == N`,
+  `zeros_N*8 == N` — all were silent-garbage violations. Oracle
+  `int_wna16.py` gains the matching GFX906_HIP shape gate
+  (intermediate_size_per_partition % 8, hidden_dim % group_size).
+
+### Cross-platform / build
+
+- **R5 (P2)** — `vllm/gfx906_fa/{__init__,gfx906_fa_paged}.py` import
+  `_gfx906_fa_C` tolerantly; `register()` is a no-op off ROCm-gfx906
+  (platform check inside the function), so the general_plugins entry
+  point no longer tracebacks on every non-gfx906 startup and the
+  backend cannot be registered (hence selected) elsewhere.
+- **R6 (P2)** — resolved on the CMake side: the standard recipe builds
+  with empty `PYTORCH_ROCM_ARCH` + device auto-detect, so narrowing
+  `_targets_gfx906()` to explicit arches would break the standard
+  build. CMakeLists.txt now defines a no-op
+  `add_custom_target(_gfx906_fa_C)` + `install(CODE)` component (with a
+  WARNING) when lang=HIP and gfx906 is absent from the arches.
+  Verified: CMake reconfigures cleanly on this gfx906 machine (the
+  gfx906 branch still wins); the no-op branch is structural.
+
+### Cleanup / debt
+
+- **R7 (P3)** — the ncols1 ladder had FOUR code copies (2 Python,
+  2 C++; the review said three). Consolidated to `fa_pick_ncols1()`
+  (gfx906_fa.cpp, both C++ sites) + `_pick_ncols1()`
+  (gfx906_fa_paged.py, imported by the backend), each with a
+  cross-language keep-in-sync pointer.
+- **R8 (P3)** — `gather_paged_kv_quantized` gained the same
+  `k_out`/`v_out` grow-buffer params as `gather_paged_kv_q8`
+  (`use_or_alloc`, exact-shape match); the backend now passes the
+  class-level gather buffers on BOTH paths (previously LEGACY=1 — the
+  DEFAULT — passed None, allocating a fresh 24-200+ MiB K+V pair per
+  layer per step on long contexts). The FUSED_QUANT=0 fp16 fallback
+  reuses only V (its K output is fp16, not the q8 byte layout).
+- **R9 (P3)** — the workspace13/fused_out aliasing (modular_kernel
+  `common_workspace`) and its load-bearing order (gemm1 → activation →
+  `output.zero_()` → gemm2) are now documented in
+  `gfx906_w4a16_moe.py` (workspace_shapes + gemm2 call site).
+- **R10 (P4)** — kchunk docstrings include 1024 (ops.h +
+  _custom_ops.py); `forward_paged_direct` pybind help states the
+  native BSHD output + fp32 input; launcher header MVP block rewritten
+  (mask/KV_max/direct-paged are implemented, no host transpose); MoE
+  kernel header grid formula carries N_PER_THREAD (N/1024 was only
+  true for NPT=4); utils.py `/tmp/bench` comment → DEVLOG; dead
+  `mask_buf=None` param removed (R10-partial from the earlier session
+  is now complete); `forward_paged` query docstring corrected (fp16).
+- **R11 (P4)** — `vllm/gfx906_fa/`, the gfx906 bench scripts and the
+  two gfx906 test files are ruff-clean (UP/I/F541 auto-fixes + E501
+  wraps + F841/SIM108 manual). `benchmarks/kernels/gfx906/*` gets a
+  per-file-ignores entry for B023 + the 6 false-positive F821s
+  (deliberate timeit-closure captures). utils.py's 11 E501s are all
+  pre-existing upstream lines (none on branch-touched lines) — left.
+- **R12 (P4)** — new `GFX906_FA_DEBUG=1` master switch enables all six
+  off-by-default debug hooks at once (FWD_DEBUG, DOUBLE_CHECK, DUMP
+  with default dir /tmp/gfx906_fa_debug, NO_BUF_REUSE, TORCH_GATHER,
+  ZERO_KTAIL); individual knobs kept. The three ON-by-default
+  functional switches (FUSED, FUSED_QUANT, QPAD_EMPTY) are not debug
+  hooks and are untouched.
+
+### Gates
+
+- Rebuilt both extensions incrementally (`moe_q_gemm_gfx906.hip`,
+  `gfx906_fa.cpp`, launcher; verified new strings in the .so's).
+- 4 suites: **74 passed / 2 skipped** (72 + 2 new oracle shape-gate
+  cases). The oracle acceptance test now uses realistic Qwen3.5 MoE
+  shapes (the dummy 1x1 config trips the new shape gate by design).
+- PPL MoE: **6.6825** (band 6.6817–6.6832; prior 6.6827) — the R8
+  buffer-reuse change is on the default LEGACY=1 path, so the PPL gate
+  covers it end-to-end.
+- Serving benches NOT re-run: R8 changes allocation source, not the
+  kernel work (same bytes moved, same kernel); R1/R2/R3/R4/R5/R6/R12
+  are dormant or inert in the default serving configuration. The
+  dense model is unaffected except via the shared FA buffers (same
+  shapes/sizes as before; R3 only bounds the already-small retired
+  list).

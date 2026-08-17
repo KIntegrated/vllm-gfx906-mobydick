@@ -16,7 +16,18 @@ Importing this package (or loading the ``vllm.general_plugins`` entry point
 be selected with ``VLLM_ATTENTION_BACKEND=CUSTOM``.
 """
 
-from vllm import _gfx906_fa_C as ext  # noqa: E402  (compiled by the vLLM build)
-from vllm.gfx906_fa.gfx906_fa_backend import Gfx906FABackend, register
+try:
+    from vllm import _gfx906_fa_C as ext  # noqa: E402  (compiled by the vLLM build)
+except ImportError:
+    # The extension is only built for gfx906 ROCm. This package is loaded
+    # on every vLLM startup by the vllm.general_plugins entry point, so it
+    # must import cleanly (with a no-op register) on other platforms.
+    ext = None
 
-__all__ = ["ext", "Gfx906FABackend", "register"]
+if ext is not None:
+    from vllm.gfx906_fa.gfx906_fa_backend import Gfx906FABackend, register
+
+    __all__ = ["ext", "Gfx906FABackend", "register"]
+else:
+    def register() -> None:
+        pass

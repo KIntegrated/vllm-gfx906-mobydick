@@ -87,7 +87,7 @@ def main():
               f"(x{best/floor:.1f} floor)")
         del w, x, ref
 
-    print(f"\nweighted per-step total (sum over 230 calls + LM head):")
+    print("\nweighted per-step total (sum over 230 calls + LM head):")
     for r in RPB_LIST:
         tag = "  <- current dispatch" if r == 4 else ""
         print(f"  rpb={r:<3} {step_total[r]:>8.1f} us/step{tag}")

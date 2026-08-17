@@ -11,22 +11,24 @@
 // Запускает __global__ kernel flash_attn_tile_q8<DKQ, DV, ncols1, ncols2, use_logit_softcap>
 // на паре torch::Tensor Q/K/V + metadata → Output.
 //
-// MVP ограничения (будут расширены позже):
-//   - DKQ = DV = 128 (MiniMax M2.7)
-//   - use_logit_softcap = false
-//   - Без mask, sinks, KV_max (paged KV — TODO: vLLM block table)
-//   - K — block_q8_0 pre-quantized, V — fp16 native
+// Ограничения:
+//   - DKQ = DV = 128 (Qwen3.5 / MiniMax M2.7)
+//   - use_logit_softcap = false, без sinks
+//   - Causal — inline в kernel (Q_ABS_OFFSET), KV_max — per-seq cut
+//   - Direct paged: K/V читаются из paged cache через block table
+//     (kernel/fattn-q8-paged.cuh); gather-путь — K block_q8_0 pre-quantized
 //   - Q — fp32 contiguous
-//   - Output — BSHD layout (host API делает transpose → BHSD)
+//   - Output — native BSHD [B, Sq, Hq, D] (transpose в host API убран)
 //
-// Prefill dispatcher (t6b): cols_per_block выбирается по Sq как в llama.cpp:
+// Prefill dispatcher (t6b): cols_per_block выбирается по Sq как в llama.cpp
+// (fa_pick_ncols1 в gfx906_fa.cpp; зеркало в Python _pick_ncols1):
 //   Sq >  32 → 64, >16 → 32, >8 → 16, >4 → 8, >2 → 4, else 2.
 //
 // Раскладка tensors (как ggml):
 //   Q: [batch, heads_q, seq_q, head_dim]        float32, contiguous
 //   K: [batch, heads_kv, seq_kv, head_dim/QK8_0] block_q8_0 (34 bytes per block)
 //   V: [batch, heads_kv, seq_kv, head_dim]       float16, contiguous
-//   O: [batch, heads_q, seq_q, head_dim]         float32 (output)
+//   O: [batch, seq_q, heads_q, head_dim]         float32 (output, BSHD)
 
 // КРИТИЧНО: torch cpp_extension форсит -D__HIP_NO_HALF_OPERATORS__=1 и
 // -D__HIP_NO_HALF_CONVERSIONS__=1 в cmdline. Эти defines ломают fattn-q8.cuh

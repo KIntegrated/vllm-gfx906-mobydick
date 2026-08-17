@@ -231,8 +231,8 @@ def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor:
     m==1 (the Qwen3-Next shared-expert gate [1, K]) also goes to the GEMV
     (RPT=1): the LLMM1 route zero-pads the *constant* weight to [4, K]
     every call (a fill + copy per layer per step); GEMV RPT=1 is 4.7x
-    faster in isolation and bit-equal at N=1, K=2048
-    (bench /tmp/bench/bench_gate_gemv.py).
+    faster in isolation and bit-equal at N=1, K=2048 (measured, see
+    docs/gfx906/DEVLOG-moe-opt.md).
     """
     m = weight.shape[0]
     from vllm.platforms.rocm import on_gfx906

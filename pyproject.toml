@@ -59,6 +59,10 @@ include = ["vllm*"]
 "vllm/third_party/**" = ["ALL"]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
+# gfx906 kernel micro-benchmarks: timing lambdas deliberately capture the
+# loop-local tensors (B023); the F821s on those lambdas are false
+# positives from the same pattern.
+"benchmarks/kernels/gfx906/*" = ["B023", "F821"]
 
 [tool.ruff.lint]
 select = [

@@ -251,7 +251,8 @@ mismatched metadata and get OOB. The vLLM-side caller is correct
 - **Docs match code** on every spot-checked claim (knob table, records,
   test counts, known limitations, roadmap N1–N3).
 
-## 5. Resolution status (2026-08-17, after the combined review)
+## 5. Resolution status (2026-08-17, after the combined review;
+R1–R12 closed 2026-08-18)
 
 The combined review (`gfx906_qwen_impr_code_rev_claude.md`, repo root)
 added four findings of its own; together with this document's list, the
@@ -264,15 +265,16 @@ landed:
 | GDN zero-fill skip not platform-gated | combined #2 | `on_gfx906()` added to the condition |
 | `GFX906_HIP` accepted GPTQ-style zp configs | combined #3, this doc P2-1 | oracle excludes `AutoGPTQConfig`/`QuantizationArgs`; new rejection + acceptance oracle tests |
 | `top_k > 0` guard missing in MoE GEMM | combined #4, this doc P3-7 | `TORCH_CHECK` in `moe_q_gemm_gfx906.cu`; probe-verified |
-| MoE oracle shape gates (N%4/K%8/groups) | this doc P2-1 | deferred — repack layout detection rejects unknown shapes loudly; revisit if a new layout is added |
+| MoE oracle shape gates (N%4/K%8/groups) | this doc P2-1 | R4 (2026-08-18): oracle gates + the cheap C++ TORCH_CHECK group |
 
-Still open from this document — parked as R1–R12 in
-`moe-decode-roadmap.md` §9 (2026-08-17): P2-2 → R1, P3-1 → R2,
-P3-2 → R3, P2-1-shape-gates/P3-7 → R4, P2-3 → R5, P2-4 → R6,
-P3-5 → R7, P3-6 → R8, P3-3 → R9, P4 nits → R10–R12. The three
-branch-introduced lint errors (I001 ×2, SIM102) are fixed in
-`01499157a8` (pre-existing E501/format debt in `utils.py` and the
-vendored files remains — R11).
+The remaining findings were parked as R1–R12 in `moe-decode-roadmap.md`
+§9 (2026-08-17) and are all resolved as of 2026-08-18 (DEVLOG section
+"2026-08-18 — Parked review items R1–R12 resolved"): P2-2 → R1,
+P3-1 → R2, P3-2 → R3, P2-1-shape-gates/P3-7 → R4, P2-3 → R5,
+P2-4 → R6, P3-5 → R7, P3-6 → R8, P3-3 → R9, P4 nits → R10–R12.
+The three branch-introduced lint errors (I001 ×2, SIM102) were fixed
+in `01499157a8`; the rest of the lint debt is cleaned in R11
+(pre-existing E501s on untouched upstream lines in `utils.py` remain).
 
 ## 6. Suggested pre-merge actions (ordered)
 

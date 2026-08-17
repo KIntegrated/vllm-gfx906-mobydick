@@ -149,7 +149,10 @@ def test_wna16_oracle_rejects_incompatible_quant_structures(
 def test_gfx906_hip_oracle_accepts_awq_style_zero_points(quant_config):
     from tests.kernels.moe.utils import make_dummy_moe_config
 
-    moe_config = make_dummy_moe_config()
+    # Realistic Qwen3.5-A3B MoE shapes: the gfx906 kernel's shape gate
+    # (intermediate % 8, hidden % group_size) rejects the dummy 1x1 config.
+    moe_config = make_dummy_moe_config(
+        hidden_dim=2048, intermediate_size=1024)
 
     reason = _backend_incompatibility_reason(
         backend=WNA16MoEBackend.GFX906_HIP,
@@ -161,6 +164,34 @@ def test_gfx906_hip_oracle_accepts_awq_style_zero_points(quant_config):
     )
 
     assert reason is None
+
+
+@pytest.mark.parametrize(
+    "hidden_dim, intermediate_size, group_size, expected",
+    [
+        (2048, 10, 128, "intermediate size must be a multiple of 8"),
+        (200, 1024, 128, "hidden size must be divisible by the group size"),
+    ],
+)
+def test_gfx906_hip_oracle_shape_gate(hidden_dim, intermediate_size,
+                                      group_size, expected):
+    from tests.kernels.moe.utils import make_dummy_moe_config
+
+    moe_config = make_dummy_moe_config(
+        hidden_dim=hidden_dim, intermediate_size=intermediate_size)
+    quant_config = AutoAWQConfig(4, group_size, True, False)
+
+    reason = _backend_incompatibility_reason(
+        backend=WNA16MoEBackend.GFX906_HIP,
+        moe_config=moe_config,
+        quant_config=quant_config,
+        may_have_zp=True,
+        may_have_bias=False,
+        allow_tile_padding=True,
+    )
+
+    assert reason is not None
+    assert expected in reason
 
 
 def test_compressed_tensors_weights_are_transposed_for_triton():

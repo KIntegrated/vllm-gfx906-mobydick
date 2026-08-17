@@ -67,7 +67,6 @@ def main():
     vc = torch.randn(num_blocks, BLOCK, Hkv, D, dtype=torch.float16, device=dev)
     bt_full = torch.zeros(1, num_blocks, dtype=torch.int32, device=dev)
     bt_full[0] = torch.arange(num_blocks, dtype=torch.int32, device=dev)
-    sl_full = torch.tensor([max(SK_LIST)], dtype=torch.int32, device=dev)
 
     # -------- correctness (fused vs torch reference) --------
     # Tail test: seq_lens = Sk-15 leaves 15 masked rows inside the last block.
@@ -118,7 +117,7 @@ def main():
     us_unpack = time_us(
         lambda: out_pad[:, :, 0, :].reshape(1, Hq * D).contiguous())
     side = us_cast + us_zero + us_qcopy + us_unpack
-    print(f"\nQ-fp32 side costs per FA layer (Sq=1):")
+    print("\nQ-fp32 side costs per FA layer (Sq=1):")
     print(f"  q.float()       {us_cast:6.1f} us")
     print(f"  q_pad.zero_()   {us_zero:6.1f} us")
     print(f"  q copy into pad {us_qcopy:6.1f} us")

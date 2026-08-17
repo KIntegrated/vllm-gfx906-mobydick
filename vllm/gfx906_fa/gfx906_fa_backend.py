@@ -37,6 +37,12 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+
+# Project modules (need to be importable from the vllm package)
+from vllm.gfx906_fa.gfx906_fa_paged import (  # noqa: E402
+    _pick_ncols1,
+    forward_paged,
+)
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import (
@@ -53,9 +59,6 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
-
-# Project modules (need to be importable from the vllm package)
-from vllm.gfx906_fa.gfx906_fa_paged import forward_paged  # noqa: E402
 
 logger = init_logger(__name__)
 
@@ -97,7 +100,11 @@ class Gfx906FAMetadataBuilder(
         if _os.environ.get("GFX906_FA_LEGACY", "1") != "1":
             if getattr(vllm_config.cache_config,
                        "enable_prefix_caching", False):
-                logger.error(
+                # Fail closed: this combination corrupts the attention
+                # output (the side-buffer misses COW'd prefix blocks), so
+                # refusing to start beats logging an error and serving
+                # wrong tokens.
+                raise RuntimeError(
                     "GFX906_FA_LEGACY=0 with prefix caching enabled: the "
                     "Q8 K side-buffer misses COW'd prefix blocks and the "
                     "attention output will be CORRUPT. Disable prefix "
@@ -269,6 +276,9 @@ class Gfx906FAImpl(AttentionImpl):
     # ------------------------------------------------------------------
     _k_gather_buf: ClassVar[torch.Tensor | None] = None
     _v_gather_buf: ClassVar[torch.Tensor | None] = None
+    # Bounded keep-alive for pre-capture gather buffer generations (see
+    # _ensure_gather_buffers).
+    _gather_retired_max: ClassVar[int] = 4
     # Buffers baked into a captured CUDA graph must never be freed (the
     # graph keeps their VAs); retired captures go here and live as long
     # as the worker. Decode-sized, so negligible in practice.
@@ -385,12 +395,7 @@ class Gfx906FAImpl(AttentionImpl):
         Level 3a: mask_buf removed — causality is inlined in the kernel.
         For a 60K prefill this saves ~480 MB of fp16 mask.
         """
-        if   max_seqlen_q >  32: ncols1 = 64
-        elif max_seqlen_q >  16: ncols1 = 32
-        elif max_seqlen_q >   8: ncols1 = 16
-        elif max_seqlen_q >   4: ncols1 = 8
-        elif max_seqlen_q >   2: ncols1 = 4
-        else:                    ncols1 = 2
+        ncols1 = _pick_ncols1(max_seqlen_q)
         Sq_pad = ((max_seqlen_q + ncols1 - 1) // ncols1) * ncols1
 
         # Q buffer: [B, Hq, Sq_pad, D] fp32 (the kernel takes fp32 q; the
@@ -479,6 +484,18 @@ class Gfx906FAImpl(AttentionImpl):
         capture, retired buffers are kept in _gather_retired (not freed)
         and empty_cache() is gone from the forward path (illegal during
         capture; the caching allocator reuses freed blocks itself).
+
+        The keep-alive list is bounded (``_gather_retired_max`` pairs):
+        each Sk_pad grow after the first capture retires one K+V pair,
+        so unbounded retention would leak memory over long generations
+        (in LEGACY=0 graph capture is additionally inconsistent — replayed
+        graphs see the K state from capture time, the RC2 mode — so the
+        older generations cannot be kept meaningful anyway). Bounding the
+        list trades worst-case memory for a possible stale-graph use of an
+        evicted buffer, which only matters in that same already-broken
+        mode. A true grow-only capacity buffer would need the gather
+        kernel to take output strides (it currently addresses the output
+        from shapes).
         """
         Sk_pad = ((max_seqlen_k + 31) // 32) * 32
         bytes_per_row = (head_size // 32) * 34
@@ -499,6 +516,11 @@ class Gfx906FAImpl(AttentionImpl):
                     and (cls._gather_captured or capturing)):
                 cls._gather_retired.append(cls._k_gather_buf)
                 cls._gather_retired.append(cls._v_gather_buf)
+                # Evict the oldest pairs beyond the bound (two tensors
+                # per generation).
+                overflow = len(cls._gather_retired) - 2 * cls._gather_retired_max
+                if overflow > 0:
+                    del cls._gather_retired[:overflow]
             cls._k_gather_buf = torch.empty(
                 (num_seqs, num_kv_heads, Sk_pad, bytes_per_row),
                 dtype=torch.uint8, device=device,
@@ -611,19 +633,17 @@ class Gfx906FAImpl(AttentionImpl):
             dtype=torch.float32,
         )
 
-        # Level 1 fused-gather buffers (class-level, shared across
-        # layers). Only on the fused path (Q8 side-buffer present and
-        # not legacy).
-        if not self._legacy and self._k_cache_q8 is not None:
-            k_gather_buf, v_gather_buf = self._ensure_gather_buffers(
-                num_seqs=num_seqs,
-                num_kv_heads=self.num_kv_heads,
-                max_seqlen_k=attn_metadata.max_seq_len,
-                head_size=self.head_size,
-                device=query.device,
-            )
-        else:
-            k_gather_buf = v_gather_buf = None
+        # Fused-gather output buffers (class-level, shared across layers).
+        # Used by both the LEGACY=0 fused Q8 gather and the LEGACY=1
+        # fused gather+quantize; without reuse every attention layer
+        # allocates 24-200+ MiB per step on long contexts.
+        k_gather_buf, v_gather_buf = self._ensure_gather_buffers(
+            num_seqs=num_seqs,
+            num_kv_heads=self.num_kv_heads,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            head_size=self.head_size,
+            device=query.device,
+        )
 
         # forward_paged returns [num_tokens, Hq*D] float32.
         # Fast path: pass the Q8 side-buffer when present.
@@ -640,7 +660,6 @@ class Gfx906FAImpl(AttentionImpl):
             key_cache_q8=self._k_cache_q8 if not self._legacy else None,
             q_pad_buf=self._q_pad_buf,
             q_pad_decode_buf=self._q_pad_decode_buf,
-            mask_buf=None,  # Level 3a: inline causal, no mask_buf
             k_gather_buf=k_gather_buf,
             v_gather_buf=v_gather_buf,
         )  # [num_tokens, Hq*D] fp32
@@ -662,7 +681,15 @@ def register() -> None:
     """Register Gfx906FABackend as AttentionBackendEnum.CUSTOM.
 
     Called automatically on module import (and available to user code).
+    No-op off gfx906: the extension only exists in gfx906 builds, and
+    registering the backend elsewhere would make a broken backend
+    selectable via VLLM_ATTENTION_BACKEND=CUSTOM.
     """
+    from vllm.platforms import current_platform
+    from vllm.platforms.rocm import on_gfx906
+
+    if not (current_platform.is_rocm() and on_gfx906()):
+        return
     from vllm.v1.attention.backends.registry import (
         AttentionBackendEnum,
         register_backend,

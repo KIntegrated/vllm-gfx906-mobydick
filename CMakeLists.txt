@@ -1587,6 +1587,18 @@ endif()
       INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/csrc/gfx906_fa;${CMAKE_CURRENT_SOURCE_DIR}/csrc/gfx906_fa/kernel"
       LIBRARIES ${_GFX906_FA_TORCH_PYTHON}
       WITH_SOABI)
+  elseif(VLLM_GPU_LANG STREQUAL "HIP")
+    # setup.py requests this extension whenever PYTORCH_ROCM_ARCH is empty
+    # (arch auto-detect), so non-gfx906 ROCm builds with auto-detect would
+    # hit "unknown target _gfx906_fa_C". Provide a no-op target and install
+    # component so the build succeeds without producing a module; the
+    # Python side imports it tolerantly (no-op registration).
+    message(WARNING
+      "_gfx906_fa_C requested but gfx906 is not in VLLM_GPU_ARCHES "
+      "(${VLLM_GPU_ARCHES}); building a no-op target")
+    add_custom_target(_gfx906_fa_C)
+    install(CODE "message(STATUS \"_gfx906_fa_C: not built (non-gfx906 arches)\")"
+      COMPONENT _gfx906_fa_C)
   endif()
 
 #

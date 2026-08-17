@@ -19,7 +19,8 @@
 //     ascending n order)
 //
 // Design: THREADS_X=256 (4 waves on wave64), BLOCK_KN_SIZE=256, each thread
-// handles 4 N columns. grid = (num_token_blocks, N/1024, K/256). Output is
+// handles N_PER_THREAD N columns (4 for BM<8, 2 for BM>=8). grid =
+// (num_token_blocks, ceil(N/(256*N_PER_THREAD)), ceil(K/256)). Output is
 // accumulated with packed 64-bit CAS atomic-adds into a pre-zeroed output
 // tensor (no FP32 scratch buffer).
 
@@ -497,6 +498,25 @@ void moe_gptq_gemm_gfx906(torch::Tensor a, torch::Tensor c,
   int size_k = (int)a.size(1);
   int size_n = (int)b_q_weight.size(2);
   int groups = (int)b_scales.size(1);
+
+  // Caller contract: the kernel derives group boundaries as
+  // (size_k / groups) and packs 8 nibbles per int32, so a mismatched or
+  // non-divisible shape is silent garbage, not a crash.
+  TORCH_CHECK(
+      size_k == (int)b_q_weight.size(1) * 8,
+      "moe_gptq_gemm_gfx906: a.size(1) (", size_k, ") != qweight rows * 8 (",
+      (int)b_q_weight.size(1) * 8, ")");
+  TORCH_CHECK(groups > 0 && size_k % groups == 0,
+              "moe_gptq_gemm_gfx906: size_k (", size_k,
+              ") must be divisible by the number of groups (", groups, ")");
+  TORCH_CHECK(size_n % 8 == 0, "moe_gptq_gemm_gfx906: size_n (", size_n,
+              ") must be a multiple of 8 (packed 4-bit zero rows)");
+  TORCH_CHECK(b_scales.size(2) == size_n,
+              "moe_gptq_gemm_gfx906: scales N (", b_scales.size(2),
+              ") != qweight N (", size_n, ")");
+  TORCH_CHECK(b_qzeros.size(2) * 8 == size_n,
+              "moe_gptq_gemm_gfx906: zeros N (", b_qzeros.size(2) * 8,
+              ") != qweight N (", size_n, ")");
 
   // Per-expert strides
   int expert_weight_stride = (int)(b_q_weight.size(1) * b_q_weight.size(2));

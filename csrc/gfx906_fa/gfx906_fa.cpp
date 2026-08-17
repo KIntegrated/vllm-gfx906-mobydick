@@ -24,6 +24,20 @@
 #include <hip/hip_fp16.h>
 #include <cstdlib>
 
+// ncols1 (Q-tile columns) ladder, llama.cpp's
+// launch_fattn_tile_q8_switch_ncols1. MUST stay in sync with the mirror in
+// vllm/gfx906_fa/gfx906_fa_paged.py (_pick_ncols1): the Python side pads Sq
+// to a multiple of the ladder's choice, and the C++ wrappers derive grid_x
+// from the same seq_q.
+static inline int fa_pick_ncols1(int seq_q) {
+    if (seq_q > 32) return 64;
+    if (seq_q > 16) return 32;
+    if (seq_q > 8) return 16;
+    if (seq_q > 4) return 8;
+    if (seq_q > 2) return 4;
+    return 2;
+}
+
 // Launcher объявлен в gfx906_fa_launcher.cu
 extern "C" hipError_t gfx906_fa_launch(
     const float *  Q_fp32,
@@ -283,13 +297,7 @@ torch::Tensor gfx906_fa_forward(
         TORCH_CHECK(kvm.size(0) == batch, "kv_max[0] must equal batch");
 
         // Compute ncols1 same way as launcher dispatcher (keep in sync!)
-        int ncols1;
-        if      (seq_q > 32) ncols1 = 64;
-        else if (seq_q > 16) ncols1 = 32;
-        else if (seq_q >  8) ncols1 = 16;
-        else if (seq_q >  4) ncols1 =  8;
-        else if (seq_q >  2) ncols1 =  4;
-        else                 ncols1 =  2;
+        const int ncols1 = fa_pick_ncols1(seq_q);
         const int grid_x = (seq_q + ncols1 - 1) / ncols1;
 
         // Expand [B] → [B, grid_x] (contiguous), каждая sequence получает
@@ -724,7 +732,9 @@ std::vector<torch::Tensor> gather_paged_kv_quantized(
     torch::Tensor value_cache,   // fp16 [num_blocks, block_size, Hkv, D]
     torch::Tensor block_table,   // int32 [num_seqs, max_num_blocks]
     torch::Tensor seq_lens,      // int32 [num_seqs]
-    int64_t Sk
+    int64_t Sk,
+    c10::optional<torch::Tensor> k_out_opt = c10::nullopt,  // uint8 [B,Hkv,Sk,bytes] — grow-buffer
+    c10::optional<torch::Tensor> v_out_opt = c10::nullopt   // fp16  [B,Hkv,Sk,D]
 ) {
     TORCH_CHECK_CUDA(key_cache);
     TORCH_CHECK_CUDA(value_cache);
@@ -760,12 +770,31 @@ std::vector<torch::Tensor> gather_paged_kv_quantized(
 
     const int bytes_per_row = (D / 32) * 34;
 
-    auto k_out = torch::empty(
-        {(int64_t)num_seqs, (int64_t)num_kv_heads, Sk, (int64_t)bytes_per_row},
-        key_cache.options().dtype(torch::kUInt8));
-    auto v_out = torch::empty(
-        {(int64_t)num_seqs, (int64_t)num_kv_heads, Sk, (int64_t)D},
-        key_cache.options());
+    // Reuse a caller-provided buffer when it is the exact shape/dtype
+    // (same grow-strategy as gather_paged_kv_q8: the attention backend
+    // holds the class-level buffers; without this every attention layer
+    // allocates 24-200+ MiB per step on long contexts).
+    auto use_or_alloc = [&](const c10::optional<torch::Tensor>& buf,
+                            at::TensorOptions opts,
+                            int64_t dim3) -> torch::Tensor {
+        if (buf.has_value()) {
+            const auto & t = buf.value();
+            if (t.dim() == 4
+                && t.size(0) == num_seqs
+                && t.size(1) == num_kv_heads
+                && t.size(2) == Sk
+                && t.size(3) == dim3
+                && t.dtype() == opts.dtype()
+                && t.device() == opts.device()
+                && t.is_contiguous()) {
+                return t;
+            }
+        }
+        return torch::empty({(int64_t)num_seqs, (int64_t)num_kv_heads, Sk, dim3}, opts);
+    };
+    auto k_out = use_or_alloc(k_out_opt, key_cache.options().dtype(torch::kUInt8),
+                              (int64_t)bytes_per_row);
+    auto v_out = use_or_alloc(v_out_opt, key_cache.options(), (int64_t)D);
 
     // Element strides for both caches (the kernel reads K as __half*).
     const int64_t k_block_stride = key_cache.stride(0);
@@ -900,13 +929,7 @@ torch::Tensor gfx906_fa_forward_paged_direct(
     torch::Tensor o_meta = torch::empty({batch, seq_q, heads_q, 2}, opts_f32);
 
     // KV_max expansion [B] → [B, grid_x] (тот же приём что в forward).
-    int ncols1;
-    if      (seq_q > 32) ncols1 = 64;
-    else if (seq_q > 16) ncols1 = 32;
-    else if (seq_q >  8) ncols1 = 16;
-    else if (seq_q >  4) ncols1 =  8;
-    else if (seq_q >  2) ncols1 =  4;
-    else                 ncols1 =  2;
+    const int ncols1 = fa_pick_ncols1(seq_q);
     const int grid_x = (seq_q + ncols1 - 1) / ncols1;
 
     auto kv_max_expanded = seq_lens_c.unsqueeze(1).expand({batch, grid_x}).contiguous();
@@ -1001,12 +1024,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Stage-2 LEGACY-path fused gather: paged fp16 K + V -> K quantized "
           "in-kernel to q8_0 (bit-equal to quantize_q8_0 of the fp16 gather) "
           "+ V fp16. Returns [k_q8 uint8 [B,Hkv,Sk,(D/32)*34], "
-          "v_bhsd fp16 [B,Hkv,Sk,D]]. V tail zeroed; K tail unmasked.",
+          "v_bhsd fp16 [B,Hkv,Sk,D]]. V tail zeroed; K tail unmasked. "
+          "k_out/v_out: optional pre-allocated buffers (exact shape match).",
           py::arg("key_cache"), py::arg("value_cache"),
-          py::arg("block_table"), py::arg("seq_lens"), py::arg("Sk"));
+          py::arg("block_table"), py::arg("seq_lens"), py::arg("Sk"),
+          py::arg("k_out") = c10::nullopt,
+          py::arg("v_out") = c10::nullopt);
     m.def("forward_paged_direct", &gfx906_fa_forward_paged_direct,
           "Level 3c: Direct-paged FA (no gather). Reads K/V from paged cache "
-          "via block_table indirection. Output: fp32 [B, Hq, Sq, D].",
+          "via block_table indirection. q: fp32 [B, Hq, Sq_pad, D]; output: "
+          "fp32 [B, Sq, Hq, D] (native BSHD).",
           py::arg("q"), py::arg("key_cache_q8"), py::arg("value_cache"),
           py::arg("block_table"), py::arg("seq_lens"), py::arg("scale"),
           py::arg("mask")         = c10::nullopt,
