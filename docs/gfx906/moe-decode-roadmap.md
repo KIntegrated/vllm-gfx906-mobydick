@@ -336,6 +336,44 @@ lands in this roadmap:
   small, and the production graph path amortizes the launch cost.
   Evidence state: **measured** (attribution); fix = **hypothesis**.
 
+## 8. Upstream candidates (platform-generic fixes to offer vllm-project/vllm)
+
+Three landed changes in this branch are not gfx906-specific. If they are
+ever offered upstream (rebased onto `vllm-project/vllm` main, per vLLM's
+contribution policy: human submitter who can defend the change, tests,
+AI-assistance disclosure), these are the items:
+
+- **U1 — fastsafetensors GDS fallback** —
+  `vllm/model_executor/model_loader/weight_utils.py` (`128e948baf`).
+  The GDS→non-GDS fallback only catches `RuntimeError`, but
+  fastsafetensors raises a bare `Exception` when GDS reads fail
+  (cuFileRead errno 22 on unsupported systems) — engine death instead
+  of fallback. Broadening the catch (keeping the `"gds" in str(e)` +
+  not-yet-yielded guards) gives 2.6× faster loads where GDS works and
+  a working boot where it doesn't. One-line diff; evidence state:
+  **measured** (41 s vs 117 s load, DEVLOG "Local-venv bench
+  environment").
+- **U2 — hipify in-source build guard** — `cmake/hipify.py` (part of
+  `225448d93f`). `shutil.copytree(project_dir, output_dir)` raises
+  `SameFileError` when both are the same directory (in-source rebuilds
+  on Py3.12); guard with an `abspath` compare. Two-line diff; evidence
+  state: **measured** (repro'd the crash, DEVLOG "Build-system note:
+  hipify.py in-source guard").
+- **U3 — GemmaRMSNorm fused-kernel dispatch** —
+  `vllm/model_executor/layers/layernorm.py` (`19c1d41cf5`,
+  `70ec1d0e79`). `forward_cuda` delegates to `forward_native`, whose
+  fp32 `(1 + w)` breaks the fused `vllm_c` rms-norm kernels'
+  `weight.dtype == x.dtype` requirement → decomposed elementwise
+  fallback (~131 extra launches/step on Qwen3.5-family hybrids in
+  eager mode). Gemma's `(1 + w)` factorization is a plain scaled RMS
+  norm with `w' = 1 + w` in the input dtype; dispatching with that
+  (plus a per-instance `(1 + w)` cache keyed on
+  data_ptr/dtype/device/_version) restores the fused path. PPL-gated
+  on two models. Evidence state: **measured** (unit maxdiff 0.002,
+  PPL in band both models). Caveat for upstream reception: the
+  benefit is eager-path only — inductor fuses the decomposition in
+  compiled mode.
+
 ## Appendix A — `moe_gemm_q4_kernel_gfx906` facts (csrc/rocm/moe_q_gemm_gfx906.cu)
 
 - Template `<BM, NPT>` with instantiations `<1,4>`, `<4,4>`, `<8,2>`;
