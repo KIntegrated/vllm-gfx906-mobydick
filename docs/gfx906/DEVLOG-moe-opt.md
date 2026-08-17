@@ -2066,3 +2066,28 @@ ms/step); serving MoE **67.024 t/s** (record; was 66.36).
 (only `gfx906_fa.cpp` recompiled — kernels untouched). Lint: 37 ruff
 findings after vs 40 before on the touched files (pre-existing debt
 only, no new ones).
+
+### GemmaRMSNorm (1+w) eager cache (2026-08-17)
+
+`forward_cuda` (and `forward_native`) recomputed `weight.to(dtype) + 1.0`
+on every call: 131 [5120]+scalar adds per dense step (~0.78 ms/step in
+eager, launch-bound). Now cached in `_one_plus_weight(dtype)`, keyed on
+`(data_ptr, dtype, device, _version)`:
+
+- Inference weights are frozen after loading, and vLLM loads weights
+  before the first forward (which is where the cache is created), so
+  the version/data_ptr key is sufficient. Note: in-place ops through
+  `.data` do NOT bump `_version` (verified); that path only matters
+  pre-forward here.
+- No stream-capture guard: vLLM always warms up eagerly before cudagraph
+  capture, so the cached allocation comes from the normal pool. (A
+  `torch.cuda.is_current_stream_capturing()` guard was tried and had to
+  be removed: this torch build's dynamo cannot trace the op —
+  `Unsupported: torch.* op returned non-Tensor`.)
+- Unit: cache hit returns the same tensor; in-place op on the parameter
+  and parameter replacement invalidate; fp16/bf16 both correct; fused
+  add path residual exact.
+
+Eager-only gain (production inductor folds the +1 into the norm codegen;
+the value is bit-identical, just computed once). PPL on the final build:
+dense 6.7122, MoE 6.6832 — both in band.

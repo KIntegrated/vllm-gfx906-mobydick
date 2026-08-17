@@ -147,6 +147,27 @@ class GemmaRMSNorm(CustomOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        self._one_plus_w: tuple[tuple, torch.Tensor] | None = None
+
+    def _one_plus_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        """(1 + weight) in ``dtype``, cached.
+
+        Inference weights are frozen after loading (vLLM loads weights
+        before the first forward, which is where the cache is created);
+        the entry is keyed on data_ptr/dtype/device/_version so
+        parameter replacement and in-place ops on the parameter itself
+        invalidate it. The first call is always the eager cudagraph
+        warmup (vLLM warms up before any capture), so the cached
+        allocation comes from the normal pool, never a graph pool.
+        """
+        w = self.weight
+        key = (w.data_ptr(), dtype, w.device, w._version)
+        entry = self._one_plus_w
+        if entry is not None and entry[0] == key:
+            return entry[1]
+        one_plus = w.to(dtype) + 1.0
+        self._one_plus_w = (key, one_plus)
+        return one_plus
 
     def forward_native(
         self,
@@ -154,7 +175,7 @@ class GemmaRMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
-        weight = self.weight.float() + 1.0
+        weight = self._one_plus_weight(torch.float32)
         if residual is None:
             return ir.ops.rms_norm(x, weight, self.variance_epsilon)
         return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
@@ -168,7 +189,7 @@ class GemmaRMSNorm(CustomOp):
         # native path's float32 (1 + w) breaks. Gemma's (1 + w) factorization
         # is a plain scaled RMS norm with w' = 1 + w in the input dtype, so
         # dispatch with that instead of the fp32 decomposition.
-        weight = self.weight.to(x.dtype) + 1.0
+        weight = self._one_plus_weight(x.dtype)
         if residual is None:
             return ir.ops.rms_norm(x, weight, self.variance_epsilon)
         return ir.ops.fused_add_rms_norm.maybe_inplace(
