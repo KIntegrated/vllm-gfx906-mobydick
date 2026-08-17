@@ -2367,3 +2367,23 @@ zero hipError/assert in server logs**.
 - Bench driver gotchas: `vllm bench serve --backend openai --model
   <served-name> --tokenizer <model-path>` (model name must match the
   served name; tokenizer needs the path).
+### Chunk-cap A/B: 512 vs 1568 at 8K context
+
+Single-stream 8205-token prompt, cold (2 different prompts) + warm:
+
+| config | chunk | KV pool | max seqs | cold TTFT | prefill | warm TTFT |
+|---|---|---|---|---|---|---|
+| load-test baseline | 512 | 5 GiB (85,333 tok) | 8 | 35.3-35.6 s | 231-233 tok/s | 1.74 s |
+| raised cap | 1568 | 4.5 GiB (64,170 tok) | 4 | 32.2-32.3 s | 254-255 tok/s | 1.76 s |
+
+- 1568 only fits after giving back 0.5 GiB of KV pool **and** 4
+  sequences: at 8 seqs / 5 GiB the first 1568-chunk forward OOMs
+  (`free: 0`, same 340 MiB signature) — the per-chunk forward peak
+  needs ~3.2-4.5 GiB over the ~27.5-28.8 GiB idle footprint.
+- **The TTFT gain is only ~10% (35.4 s -> 32.3 s), not the expected
+  2-3x**: prefill on this hybrid model is *token-bound* (48/64 layers
+  are GDN), not chunk-bound. The 512 cap limits how much prefill work
+  overlaps, not the per-token rate. Earlier note ("the 512 cap, not the
+  GPU, is the TTFT bottleneck") is superseded for single-stream TTFT.
+- Warm (prefix-cache) TTFT is config-invariant (~1.75 s for 8K).
+- The 1568/4-seq/4.5-GiB config is stable (4x2048 burst, 4/4 OK).
