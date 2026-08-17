@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """Correctness test for the gfx906 WNA16 MoE grouped-GEMM kernel.
 
 Moved from /tmp/bench/_test_gfx906_moe.py into the repo (Common Protocol item 1

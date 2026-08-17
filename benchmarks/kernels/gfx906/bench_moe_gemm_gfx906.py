@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """P2-0 diagnostics for the gfx906 WNA16 MoE kernel.
 
 Runs the gfx906 kernel over the full M-bucket table and reports, per bucket,

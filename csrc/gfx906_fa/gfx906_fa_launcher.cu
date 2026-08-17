@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Copyright (C) Nick — nick413@gmail.com
+// SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 //
 // Vendored from https://github.com/cassettesgoboom/gfx906-fa-vllm
 // (FlashAttention-style custom attention backend for vLLM on AMD gfx906).

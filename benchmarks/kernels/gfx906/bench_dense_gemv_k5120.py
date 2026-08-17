@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# Copyright Kevin Read <me@kevin-read.com>
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """Dense Qwen3.5-27B K=5120 M=1 W16A16 GEMV micro-bench.
 
 Tests the dense_gemv_gfx906 kernel at the dense model's hidden size

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 //
-// Copyright (C) Nick — nick413@gmail.com
-//
-// Vendored from https://github.com/cassettesgoboom/gfx906-fa-vllm
+// Q8_0 block quantization helper for the gfx906 FA fused-gather path.
 // (FlashAttention-style custom attention backend for vLLM on AMD gfx906).
 //
 // q8_0_quantize.cuh — Q8_0 (block-32) quantization helpers shared by
