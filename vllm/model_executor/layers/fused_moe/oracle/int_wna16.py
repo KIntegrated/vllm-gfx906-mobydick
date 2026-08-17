@@ -126,8 +126,10 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
     if current_platform.is_rocm():
         from vllm.platforms.rocm import on_gfx906
 
-        if on_gfx906() and hasattr(torch.ops, "_rocm_C") and hasattr(
-            torch.ops._rocm_C, "moe_gptq_gemm_gfx906"
+        if (
+            on_gfx906()
+            and hasattr(torch.ops, "_rocm_C")
+            and hasattr(torch.ops._rocm_C, "moe_gptq_gemm_gfx906")
         ):
             backends.append(WNA16MoEBackend.GFX906_HIP)
 
@@ -152,15 +154,23 @@ def _backend_incompatibility_reason(
     if backend == WNA16MoEBackend.FLASHINFER_TRTLLM and (may_have_zp or may_have_bias):
         return "zero points and bias are not supported"
 
-    if backend == WNA16MoEBackend.GFX906_HIP:
-        # Phase 1: AWQ-style stored zero points only; symmetric GPTQ (no zp)
-        # falls back to Triton.
-        if not may_have_zp:
-            return "zero points are required (AWQ-style checkpoints)"
+    # Phase 1: AWQ-style stored zero points only; symmetric GPTQ (no zp)
+    # falls back to Triton.
+    if backend == WNA16MoEBackend.GFX906_HIP and not may_have_zp:
+        return "zero points are required (AWQ-style checkpoints)"
 
     from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
     from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
     from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
+
+    # GPTQ-style checkpoints (AutoGPTQ / compressed-tensors) use a
+    # different zero-point convention (and may use activation ordering),
+    # which the gfx906 kernel and repack do not implement: only the
+    # AutoAWQ K-first and MoeWNA16 N-first layouts are supported.
+    if backend == WNA16MoEBackend.GFX906_HIP and isinstance(
+        quant_config, (AutoGPTQConfig, QuantizationArgs)
+    ):
+        return "GPTQ-style zero-point encoding is not supported"
 
     if backend == WNA16MoEBackend.TRITON:
         if may_have_bias:
@@ -416,9 +426,7 @@ def make_wna16_moe_kernel(
     if backend == WNA16MoEBackend.HUMMING:
         allowed_experts += tuple(backend_to_kernel_cls(WNA16MoEBackend.HUMMING))
     if backend == WNA16MoEBackend.GFX906_HIP:
-        allowed_experts += tuple(
-            backend_to_kernel_cls(WNA16MoEBackend.GFX906_HIP)
-        )
+        allowed_experts += tuple(backend_to_kernel_cls(WNA16MoEBackend.GFX906_HIP))
     assert experts_cls in allowed_experts
 
     is_monolithic = experts_cls.is_monolithic()
@@ -1484,37 +1492,51 @@ def _repack_w4a16_wna16_layout(
     lo = b & 0xF  # k = 2j
     hi = (b >> 4) & 0xF  # k = 2j + 1
     wq = (
-        lo[..., 0]
-        | (lo[..., 1] << 4)
-        | (lo[..., 2] << 8)
-        | (lo[..., 3] << 12)
-        | (hi[..., 0] << 16)
-        | (hi[..., 1] << 20)
-        | (hi[..., 2] << 24)
-        | (hi[..., 3] << 28)
-    ).permute(0, 2, 1).contiguous()
+        (
+            lo[..., 0]
+            | (lo[..., 1] << 4)
+            | (lo[..., 2] << 8)
+            | (lo[..., 3] << 12)
+            | (hi[..., 0] << 16)
+            | (hi[..., 1] << 20)
+            | (hi[..., 2] << 24)
+            | (hi[..., 3] << 28)
+        )
+        .permute(0, 2, 1)
+        .contiguous()
+    )
 
     sc = scales.to(torch.float16).permute(0, 2, 1).contiguous()
 
     if qzeros is None:
-        # Symmetric quant: zero point = 8 (midpoint of uint4)
+        # Symmetric quant: zero point = 8 (midpoint of uint4) in every nibble.
+        # The zp tensor is packed (8 nibbles per int32 word, read back as
+        # uint32 by the kernel), so the fill value must be 0x88888888 —
+        # via uint32 because it overflows signed int32.
         zp = torch.full(
-            (E, scales.shape[2], N // 8), 8, dtype=torch.int32, device=w.device
-        )
+            (E, scales.shape[2], N // 8),
+            0x88888888,
+            dtype=torch.uint32,
+            device=w.device,
+        ).view(torch.int32)
     else:
         z = qzeros.to(torch.int32)
         zf = torch.stack([z & 0xF, (z >> 4) & 0xF], dim=2).reshape(E, N, -1)
-    zr = zf.view(E, N // 8, 8, -1)
-    zp = (
-        zr[..., 0, :]
-        | (zr[..., 1, :] << 4)
-        | (zr[..., 2, :] << 8)
-        | (zr[..., 3, :] << 12)
-        | (zr[..., 4, :] << 16)
-        | (zr[..., 5, :] << 20)
-        | (zr[..., 6, :] << 24)
-        | (zr[..., 7, :] << 28)
-    ).permute(0, 2, 1).contiguous()
+        zr = zf.view(E, N // 8, 8, -1)
+        zp = (
+            (
+                zr[..., 0, :]
+                | (zr[..., 1, :] << 4)
+                | (zr[..., 2, :] << 8)
+                | (zr[..., 3, :] << 12)
+                | (zr[..., 4, :] << 16)
+                | (zr[..., 5, :] << 20)
+                | (zr[..., 6, :] << 24)
+                | (zr[..., 7, :] << 28)
+            )
+            .permute(0, 2, 1)
+            .contiguous()
+        )
 
     return wq, sc, zp
 
@@ -1536,21 +1558,28 @@ def _repack_w4a16_awq_kfirst_layout(
     shifts_out = torch.tensor(
         [0, 16, 4, 20, 8, 24, 12, 28], device=w.device, dtype=torch.int32
     )
-    nib_shifts = (4 * torch.arange(8, device=w.device, dtype=torch.int32))
+    nib_shifts = 4 * torch.arange(8, device=w.device, dtype=torch.int32)
 
     wq = torch.empty(E, K // 8, N, dtype=torch.int32, device=w.device)
     # Process one expert at a time to keep the temporary [K, N] unpack small.
     for e in range(E):
         q = ((w[e].unsqueeze(-1) >> nib_shifts) & 0xF).reshape(K, N)
-        wq[e] = (q.view(K // 8, 8, N) << shifts_out.view(1, 8, 1)).sum(
-            dim=1
-        ).to(torch.int32)
+        wq[e] = (
+            (q.view(K // 8, 8, N) << shifts_out.view(1, 8, 1))
+            .sum(dim=1)
+            .to(torch.int32)
+        )
 
     sc = scales.to(torch.float16).contiguous()
     if qzeros is None:
-        # Symmetric quant: zero point = 8 (midpoint of uint4)
-        zp = torch.full((E, scales.shape[1], N // 8), 8, dtype=torch.int32,
-                        device=w.device)
+        # Symmetric quant: zero point = 8 (midpoint of uint4) in every nibble
+        # of each packed int32 word (see _repack_w4a16_wna16_layout).
+        zp = torch.full(
+            (E, scales.shape[1], N // 8),
+            0x88888888,
+            dtype=torch.uint32,
+            device=w.device,
+        ).view(torch.int32)
     else:
         zp = qzeros.to(torch.int32).contiguous()
 
@@ -1568,9 +1597,7 @@ def _process_weights_gfx906(
     w13_qweight, w13_scales, w13_zp = _repack_w4a16_gfx906_expert(
         w13, w13_scale, w13_qzeros
     )
-    w2_qweight, w2_scales, w2_zp = _repack_w4a16_gfx906_expert(
-        w2, w2_scale, w2_qzeros
-    )
+    w2_qweight, w2_scales, w2_zp = _repack_w4a16_gfx906_expert(w2, w2_scale, w2_qzeros)
     return (
         w13_qweight,
         w2_qweight,

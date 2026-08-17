@@ -251,7 +251,26 @@ mismatched metadata and get OOB. The vLLM-side caller is correct
 - **Docs match code** on every spot-checked claim (knob table, records,
   test counts, known limitations, roadmap N1–N3).
 
-## 5. Suggested pre-merge actions (ordered)
+## 5. Resolution status (2026-08-17, after the combined review)
+
+The combined review (`gfx906_qwen_impr_code_rev_claude.md`, repo root)
+added four findings of its own; together with this document's list, the
+following were fixed in the follow-up commit(s) right after this review
+landed:
+
+| finding | source | fix |
+|---|---|---|
+| repack `UnboundLocalError` on symmetric W4A16 (`zf` fall-through) + wrong symmetric zp fill (`8` vs `0x88888888` per nibble) | combined #1 | `int_wna16.py` both repack layouts; 12 new kernel-test cases (`*_sym`) |
+| GDN zero-fill skip not platform-gated | combined #2 | `on_gfx906()` added to the condition |
+| `GFX906_HIP` accepted GPTQ-style zp configs | combined #3, this doc P2-1 | oracle excludes `AutoGPTQConfig`/`QuantizationArgs`; new rejection + acceptance oracle tests |
+| `top_k > 0` guard missing in MoE GEMM | combined #4, this doc P3-7 | `TORCH_CHECK` in `moe_q_gemm_gfx906.cu`; probe-verified |
+| MoE oracle shape gates (N%4/K%8/groups) | this doc P2-1 | deferred — repack layout detection rejects unknown shapes loudly; revisit if a new layout is added |
+
+Still open from this document: P2-2 (direct-paged fp16-Q), P2-3 (plugin
+traceback), P2-4 (setup.py/CMake gate), P3-1…P3-6, P4 nits, and the
+three new lint errors (I001 ×2, SIM102).
+
+## 6. Suggested pre-merge actions (ordered)
 
 1. P2-1 oracle shape gates (+ C++ K%8/groups checks if cheap).
 2. P2-2 direct-paged fp32 buffer fix.

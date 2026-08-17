@@ -486,6 +486,9 @@ void moe_gptq_gemm_gfx906(torch::Tensor a, torch::Tensor c,
   TORCH_CHECK(b_q_weight.size(2) % 4 == 0,
               "moe_gptq_gemm_gfx906: size_n (", b_q_weight.size(2),
               ") must be a multiple of 4 for CAS alignment");
+  // Used as a divisor inside the kernels (token_id / top_k): a zero would
+  // be on-device UB, so fail on the host instead.
+  TORCH_CHECK(top_k > 0, "moe_gptq_gemm_gfx906: top_k must be positive");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   auto stream = at::cuda::getCurrentCUDAStream();

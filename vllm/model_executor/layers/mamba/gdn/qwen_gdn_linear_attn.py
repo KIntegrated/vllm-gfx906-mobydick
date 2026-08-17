@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
-from typing import Literal
-
 import os
+from typing import Literal
 
 import torch
 from einops import rearrange
@@ -47,6 +46,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.third_party.flash_linear_attention.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
 )
@@ -886,6 +886,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # on the MoE 35B, 48 on the dense 27B; DEVLOG "fill/copy pile" and
         # the dense handover section). This fork's serving deployments do
         # not use spec decode; the spec path below keeps the fill.
+        # Measured and exercised only on gfx906: keep the upstream zero
+        # fill everywhere else.
         core_attn_out = torch.zeros
         if _GDN_EMPTY_CORE_OUT:
             _fc = get_forward_context()
@@ -893,7 +895,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if isinstance(_fc.attn_metadata, dict):
                 _am = _fc.attn_metadata.get(self.prefix)
             if (
-                _am is not None
+                on_gfx906()
+                and _am is not None
                 and self.enable_packed_recurrent_decode
                 and _am.spec_sequence_masks is None
                 and _am.num_prefills == 0

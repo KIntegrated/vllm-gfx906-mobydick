@@ -2137,3 +2137,60 @@ Gates on the final per-file build: PPL dense 6.7122 ✓ / MoE 6.6832 ✓;
 serving dense 25.14/25.60 (record; was 23.70), MoE 67.33/67.39 (record;
 was 67.08). Build mechanics (local setup.py recipe, CMAKE_HIP_FLAGS
 cache gotcha) are documented in docs/gfx906/running.md.
+
+## 2026-08-17 — Pre-merge review fixes (combined review, 4 findings)
+
+`gfx906_qwen_impr_code_rev_claude.md` (root; combined review of the
+`moe-opt` branch) carried four verified correctness findings. All fixed:
+
+1. **`_repack_w4a16_wna16_layout` UnboundLocalError on symmetric
+   checkpoints** (`qzeros is None`): the `zr = zf.view(...)` / `zp = ...`
+   recompute ran unconditionally after the `if/else`, referencing `zf`
+   which only exists in the `else` branch; the symmetric `zp` fill was
+   dead code. Fixed by moving the recompute under `else:`.
+   **Second latent bug found while fixing**: the symmetric fill was
+   `torch.full(..., 8, dtype=int32)` — a packed zp word needs 8 in
+   *every nibble* (`0x88888888`); the value `8` only set nibble 0, so
+   columns 1-7 would have used zero point 0 (verified by probe: column 0
+   matched the `(q-8)*s` reference, the rest did not). Now filled as
+   uint32 `0x88888888` viewed as int32 (overflows signed). Same fix in
+   `_repack_w4a16_awq_kfirst_layout` (it never crashed there because the
+   branch had no fall-through, but it would have produced the same
+   wrong-zp output).
+2. **GDN `core_attn_out` zero-fill skip was not platform-gated**:
+   `_GDN_EMPTY_CORE_OUT` (default on) applied the `torch.empty` swap on
+   every platform; the row-rewrite proof only holds for the gfx906
+   deployment path. Added `on_gfx906()` to the condition (module-level
+   constant lookup, negligible in forward).
+3. **Oracle accepted GPTQ-style zero-point checkpoints for `GFX906_HIP`**:
+   only `may_have_zp` was checked; the kernel/repack implement
+   AWQ-encoded zps only (`zero_offset=0`). Note from verification: this
+   vLLM's `AutoGPTQConfig` only constructs *symmetric* configs (TYPE_MAP
+   is (4,True)/(8,True)), so those were already excluded by the
+   `may_have_zp` check; the reachable asymmetric-zp path is
+   `QuantizationArgs` (compressed-tensors) — today that hit a loud
+   `ValueError` in the repack's layout detection, not the silent
+   mis-encoding the review hypothesized, but the oracle now excludes
+   both `(AutoGPTQConfig, QuantizationArgs)` explicitly.
+4. **`moe_gptq_gemm_gfx906` missing `top_k > 0` guard**: on-device
+   integer divide by zero is UB on gfx906. Added `TORCH_CHECK(top_k > 0)`
+   to the host-side checks; verified the guard fires with a clean error.
+
+Tests added:
+- `tests/kernels/moe/test_gfx906_moe_gemm.py`: `awq_kfirst_sym` /
+  `wna16_sym` layouts (qzeros=None, implicit zp 8) across all six
+  shapes — 12 new cases; the `wna16_sym` case crashed with
+  UnboundLocalError pre-fix and produced wrong output with the
+  first-draft `8` fill.
+- `tests/quantization/test_moe_wna16.py`: GFX906_HIP rejection cases
+  (symmetric GPTQ no-zp; compressed-tensors asymmetric-zp) + acceptance
+  cases (AutoAWQ, MoeWNA16 with zp).
+- M=1 cases in the MoE GEMM test use tol 1e-1 (denominator over only
+  TOPK rows makes fp16 accumulation noise ~2x noisier; a 5e-2 threshold
+  flaked once in ~50 runs at worst-measured 3.9e-2).
+
+Gates: full suite 72 passed / 2 skipped (4 suites); PPL MoE **6.6827**
+in band (recent 6.6817-6.6832). Dense PPL/serving not re-run: on
+gfx906 all four fixes are inert for the dense model (the GDN gate
+evaluates to the same value it did before; the other three are
+MoE-load-path only).

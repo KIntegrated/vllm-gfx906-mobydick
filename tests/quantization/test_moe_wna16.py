@@ -86,6 +86,29 @@ def test_map_wna16_backend_supports_triton():
             False,
             "MoeWNA16 checkpoint layout",
         ),
+        (
+            WNA16MoEBackend.GFX906_HIP,
+            # Symmetric GPTQ has no stored zero points.
+            AutoGPTQConfig(4, 128, False, True, False, {}, {}),
+            False,
+            False,
+            "zero points are required",
+        ),
+        (
+            WNA16MoEBackend.GFX906_HIP,
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=False,
+                dynamic=False,
+                group_size=128,
+                actorder=None,
+            ),
+            True,
+            False,
+            "GPTQ-style zero-point",
+        ),
     ],
 )
 def test_wna16_oracle_rejects_incompatible_quant_structures(
@@ -106,6 +129,38 @@ def test_wna16_oracle_rejects_incompatible_quant_structures(
 
     assert reason is not None
     assert expected in reason
+
+
+@pytest.mark.parametrize(
+    "quant_config",
+    [
+        AutoAWQConfig(4, 128, True, False),
+        MoeWNA16Config(
+            linear_quant_method="awq",
+            weight_bits=4,
+            group_size=128,
+            has_zp=True,
+            lm_head_quantized=False,
+            modules_to_not_convert=None,
+            full_config={},
+        ),
+    ],
+)
+def test_gfx906_hip_oracle_accepts_awq_style_zero_points(quant_config):
+    from tests.kernels.moe.utils import make_dummy_moe_config
+
+    moe_config = make_dummy_moe_config()
+
+    reason = _backend_incompatibility_reason(
+        backend=WNA16MoEBackend.GFX906_HIP,
+        moe_config=moe_config,
+        quant_config=quant_config,
+        may_have_zp=True,
+        may_have_bias=False,
+        allow_tile_padding=True,
+    )
+
+    assert reason is None
 
 
 def test_compressed_tensors_weights_are_transposed_for_triton():

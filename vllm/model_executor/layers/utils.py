@@ -3,9 +3,8 @@
 # SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """Utility methods for model layers."""
 
-from collections.abc import Callable
-
 import os
+from collections.abc import Callable
 
 import torch
 
@@ -14,8 +13,7 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.triton_utils import tl
-from vllm.triton_utils import triton
+from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 
