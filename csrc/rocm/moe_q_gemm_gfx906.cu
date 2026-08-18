@@ -374,6 +374,214 @@ void launch_moe_gemm_q4(
           expert_zeros_stride, mul_topk_weight, output_topk, zero_offset);
 }
 
+// ---------------------------------------------------------------------------
+// M=1 (single-token decode) re-tile: one 512-thread CTA covers 64*NPT output
+// columns with cross-wave K parallelism (wave w owns K-slice w*size_k/8).
+// Columns are lane-based (all waves see the same column set), so the per-wave
+// fp32 partials are reduced through LDS and only wave 0 runs the epilogue --
+// direct store for gemm1, packed CAS into the pre-zeroed token row for gemm2
+// (all 8 slot x-blocks share the row and would otherwise add 8x).
+// Standalone A/B at M=1 (see docs/gfx906/DEVLOG-moe-m1-sprint.md):
+// gemm1 K=2048 32.0 -> 27.1 us, gemm2 K=512 21.4 -> 10.8 us per launch.
+// ---------------------------------------------------------------------------
+
+template <int THREADS, int NPT, int SLICE>
+__global__ void __launch_bounds__(THREADS)
+    moe_gemm_q4_v2_kernel_gfx906(const half* __restrict__ a,
+                                 half* __restrict__ c,
+                                 const uint32_t* __restrict__ b_q_weight,
+                                 const half* __restrict__ b_scales,
+                                 const uint32_t* __restrict__ b_qzeros,
+                                 const float* __restrict__ topk_weights,
+                                 const int32_t* __restrict__ sorted_token_ids,
+                                 const int32_t* __restrict__ expert_ids,
+                                 const int32_t* __restrict__ num_tokens_post_padded,
+                                 const int size_m, const int size_n,
+                                 const int size_k, const int groups,
+                                 const int top_k,
+                                 const int expert_weight_stride,
+                                 const int expert_scales_stride,
+                                 const int expert_zeros_stride,
+                                 const bool mul_topk_w, const int output_topk,
+                                 const int zero_offset) {
+  static_assert(NPT == 2 || NPT == 4);
+  static_assert(SLICE % 32 == 0 && SLICE >= 32);
+  constexpr int NWAVES = THREADS / 64;
+  constexpr int BLOCK_COLS = 64 * NPT;
+  constexpr int LDS_PAD = 8;
+  const int t = threadIdx.x;
+  const int w = t / 64;
+  const int tl = t % 64;
+  const int token_block = blockIdx.x;
+  const int offset_n = blockIdx.y * BLOCK_COLS;
+  const int n = offset_n + tl * NPT;
+  const int slice_k = size_k / NWAVES;
+  const int offset_k = w * slice_k;
+  const int end_k = min(offset_k + slice_k, size_k);
+
+  if (token_block >= num_tokens_post_padded[0]) return;
+  const int expert_id = expert_ids[token_block];
+  if (expert_id == -1) return;
+
+  const uint32_t* expert_weights =
+      b_q_weight + (int64_t)expert_id * expert_weight_stride;
+  const half* expert_scales =
+      b_scales + (int64_t)expert_id * expert_scales_stride;
+  const uint32_t* expert_qzeros =
+      b_qzeros + (int64_t)expert_id * expert_zeros_stride;
+
+  // per-wave activation slice (16B-padded rows)
+  __shared__ half block_a[NWAVES][SLICE + LDS_PAD];
+  // per-wave fp32 partials: [wave][lane][NPT]
+  __shared__ float partial[NWAVES][64][NPT];
+
+  int32_t token_id = sorted_token_ids[token_block];
+  int token_row = token_id / top_k;
+  // 64 lanes fill the full slice_k-wide LDS row for this wave (strided)
+  #pragma unroll
+  for (int i = 0; i < SLICE / 64; ++i) {
+    int pos = tl + i * 64;
+    if (offset_k + pos < end_k) {
+      half av = (token_row < size_m)
+                    ? a[(int64_t)token_row * size_k + offset_k + pos]
+                    : __float2half_rn(0.0f);
+      block_a[w][pos] = av;
+    }
+  }
+  __syncthreads();
+
+  const int groupsize = size_k / groups;
+  int group = offset_k / groupsize;
+  int nextgroup = (group + 1) * groupsize;
+  int qk = offset_k / 8;
+  const uint32_t* b_ptr = expert_weights + qk * size_n + n;
+
+  half2 z1z16_h[NPT][2], y1y16_h[NPT][2];
+  auto refresh_group = [&](int g) {
+    const uint32_t* qz_row = expert_qzeros + g * (size_n / 8);
+    const half* sc_row = expert_scales + g * size_n;
+    int zeros[NPT];
+    uint32_t d = qz_row[n / 8] >> ((n & 0x07) * 4);
+    #pragma unroll
+    for (int i = 0; i < NPT; ++i) zeros[i] = (int)((d >> (4 * i)) & 0xF);
+    #pragma unroll
+    for (int i = 0; i < NPT; ++i) {
+      half scale = sc_row[n + i];
+      prep_zero_scale_fp16((uint32_t)(zeros[i] + zero_offset), scale,
+                           z1z16_h[i], y1y16_h[i]);
+    }
+  };
+  refresh_group(group);
+
+  float acc[NPT];
+  #pragma unroll
+  for (int i = 0; i < NPT; ++i) acc[i] = 0.0f;
+  int k = offset_k;
+  uint32_t b_w[4][NPT];
+  while (k < end_k) {
+    if (k == nextgroup) {
+      group++;
+      nextgroup += groupsize;
+      refresh_group(group);
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      if (NPT == 4) {
+        uint4 v = *(const uint4*)(b_ptr + j * size_n);
+        b_w[j][0] = v.x;
+        b_w[j][1] = v.y;
+        b_w[j][2] = v.z;
+        b_w[j][3] = v.w;
+      } else {
+        uint2 v = *(const uint2*)(b_ptr + j * size_n);
+        b_w[j][0] = v.x;
+        b_w[j][1] = v.y;
+      }
+    }
+    b_ptr += 4 * size_n;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int a_off = (k - offset_k) + 8 * j;
+      half2 dq[NPT][4];
+      #pragma unroll
+      for (int i = 0; i < NPT; ++i)
+        dequant_4bit_8_fp16(b_w[j][i], dq[i], z1z16_h[i], y1y16_h[i]);
+      const half* a_ptr =
+          reinterpret_cast<const half*>(&block_a[w][a_off]);
+      #pragma unroll
+      for (int i = 0; i < NPT; ++i) acc[i] += dot22_8_f(dq[i], a_ptr);
+    }
+    k += 32;
+  }
+
+  // cross-wave reduce through LDS (lane-based: same lane across waves)
+  #pragma unroll
+  for (int i = 0; i < NPT; ++i) partial[w][tl][i] = acc[i];
+  __syncthreads();
+  float r[NPT];
+  #pragma unroll
+  for (int i = 0; i < NPT; ++i) r[i] = 0.0f;
+  #pragma unroll
+  for (int ww = 0; ww < NWAVES; ++ww)
+    #pragma unroll
+    for (int i = 0; i < NPT; ++i) r[i] += partial[ww][tl][i];
+
+  // All waves hold the same reduced value for the same columns: only wave 0
+  // runs the epilogue (direct stores are idempotent, but the gemm2 CAS must
+  // fire exactly once per cell).
+  if (w != 0) return;
+  if (token_id / top_k >= size_m) return;
+  if (mul_topk_w && topk_weights != nullptr) {
+    float tw = topk_weights[token_id];
+    #pragma unroll
+    for (int i = 0; i < NPT; ++i) r[i] *= tw;
+  }
+  int64_t out_row = (output_topk > 0) ? (int64_t)(token_id / output_topk)
+                                      : (int64_t)token_id;
+  half* out = c + out_row * size_n + offset_n + tl * NPT;
+  if (output_topk > 0) {
+    // gemm2: x-blocks (one per expert slot) share the token row
+    if (NPT == 4) {
+      atomic_add_pk4_f16(out, __halves2half2(__float2half_rn(r[0]),
+                                             __float2half_rn(r[1])),
+                         __halves2half2(__float2half_rn(r[2]),
+                                        __float2half_rn(r[3])));
+    } else {
+      atomic_add_pk2_f16(out, __halves2half2(__float2half_rn(r[0]),
+                                             __float2half_rn(r[1])));
+    }
+  } else {
+    if (NPT == 4) {
+      *(half2*)out = __halves2half2(__float2half_rn(r[0]),
+                                    __float2half_rn(r[1]));
+      *(half2*)(out + 2) = __halves2half2(__float2half_rn(r[2]),
+                                          __float2half_rn(r[3]));
+    } else {
+      *(half2*)out = __halves2half2(__float2half_rn(r[0]),
+                                    __float2half_rn(r[1]));
+    }
+  }
+}
+
+template <int THREADS, int NPT, int SLICE>
+void launch_moe_gemm_q4_v2(
+    const half* a, half* c, const uint32_t* b_q_weight, const half* b_scales,
+    const uint32_t* b_qzeros, const float* topk_weights,
+    const int32_t* sorted_token_ids, const int32_t* expert_ids,
+    const int32_t* num_tokens_post_padded, int num_token_blocks, int size_m,
+    int size_n, int size_k, int groups, int top_k, int expert_weight_stride,
+    int expert_scales_stride, int expert_zeros_stride, bool mul_topk_weight,
+    int output_topk, int zero_offset, cudaStream_t stream) {
+  dim3 block(THREADS);
+  dim3 grid(num_token_blocks, size_n / (64 * NPT));
+  moe_gemm_q4_v2_kernel_gfx906<THREADS, NPT, SLICE>
+      <<<grid, block, 0, stream>>>(
+          a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
+          expert_ids, num_tokens_post_padded, size_m, size_n, size_k, groups,
+          top_k, expert_weight_stride, expert_scales_stride,
+          expert_zeros_stride, mul_topk_weight, output_topk, zero_offset);
+}
+
 // N_PER_THREAD selection. BM < 8 keeps the original 4-column layout (decode
 // regime is latency-bound, not occupancy-bound). For BM >= 8 the default is
 // 2 columns/thread: ~half the accumulator/dequant register pressure,
@@ -406,6 +614,34 @@ void dispatch_moe_gemm_q4(
     int expert_weight_stride, int expert_scales_stride, int expert_zeros_stride,
     bool mul_topk_weight, int output_topk, int zero_offset, cudaStream_t stream) {
   const int npt = select_n_per_thread(block_size_m);
+  // M=1 decode fast path (VLLM_GFX906_MOE_M1=1, default off): the gemm2
+  // CAS path is re-tiled to the 512-thread lane-column kernel; the gemm1
+  // re-tile is neutral in-model and stays on the <1,4> kernel. size_m is M
+  // for gemm1 (a = hidden_states [M, K]) but EM = M*topk for gemm2 (a =
+  // act_out [EM, N2]), so the single-token condition differs per gemm.
+  const bool m1_decode = (output_topk == 0)
+                             ? (size_m == 1)
+                             : (size_m == output_topk);  // EM == topk <=> M == 1
+  if (block_size_m == 1 && m1_decode) {
+    // Read per call (80x/step) so the flag can be flipped at runtime in
+    // tests; the getenv cost is negligible next to the launch.
+    const char* m1_env = getenv("VLLM_GFX906_MOE_M1");
+    const bool use_m1_v2 = m1_env != nullptr && m1_env[0] != '0' && m1_env[0] != '\0';
+    if (use_m1_v2 && output_topk > 0) {
+      // gemm1 re-tile is neutral in-model (27.5 vs 26.8 us/call): only the
+      // gemm2 CAS path is re-tiled (26.8 -> 22.3 us/call in-model).
+      TORCH_CHECK(size_n % 256 == 0 && size_k % 64 == 0 && size_k <= 2048,
+                  "moe_gemm_q4 v2 M=1 tile requires size_n%%256==0, "
+                  "size_k%%64==0, size_k<=2048");
+      launch_moe_gemm_q4_v2<512, 4, 256>(
+          a, c, b_q_weight, b_scales, b_qzeros, topk_weights,
+          sorted_token_ids, expert_ids, num_tokens_post_padded,
+          num_token_blocks, size_m, size_n, size_k, groups, top_k,
+          expert_weight_stride, expert_scales_stride, expert_zeros_stride,
+          mul_topk_weight, output_topk, zero_offset, stream);
+      return;
+    }
+  }
   switch (block_size_m) {
     case 1:
       LAUNCH_MOE(1, 4);

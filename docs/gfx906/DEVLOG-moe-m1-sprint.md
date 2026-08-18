@@ -241,3 +241,102 @@ The 713 µs/step topk budget stays open: a real fix needs a design
 that is fast in the gapless regime (candidate: fuse topk into the
 router GEMV epilogue so there is no separate kernel at all — moved to
 the roadmap as S2').
+
+## S5 — M=1 expert kernel re-tile: gemm2 shipped default-OFF
+
+### Design (V2-B, lane-based columns)
+
+`moe_gemm_q4_v2_kernel_gfx906<THREADS,NPT,SLICE>` in
+`csrc/rocm/moe_q_gemm_gfx906.cu`: one 512-thread CTA (8 waves) covers
+`64*NPT` output columns; columns are **lane-based** (`n = offset_n +
+tl*NPT`, all waves see the same column set) so each wave can own a
+disjoint K-slice (`offset_k = w*size_k/8`); per-wave fp32 partials
+`[wave][64][NPT]` reduce through LDS (two `__syncthreads`), then
+**only wave 0 runs the epilogue** — direct store (gemm1) or packed
+CAS into the pre-zeroed token row (gemm2, all 8 slot x-blocks share
+the row).
+
+Design bug caught in harness: with lane-based columns all 8 waves hold
+the *same* reduced value for the *same* cells; if every wave runs the
+CAS epilogue the value is added 8× (measured exactly 8.02× in the
+single-slot case). Direct stores hide it (idempotent) — which is why
+the gemm1 path looked correct while gemm2 blew up. Wave-0-only
+epilogue fixes both.
+
+### Harness bugs found while validating (all in tmp_tp_probe/moe_m1_harness.cu)
+
+1. **Weight load**: `uint2 v = *(const uint2*)(b_ptr + j*size_n)` only
+   loads 2 of the 4 NPT=4 columns — `b_w[j][2..3]` were stale. Needs
+   `uint4`. Symptom: r[2]/r[3] (upper half2 of each 4-col group) off by
+   ~0.8–1.2 vs CPU ref in every mode.
+2. **Direct store dropped r[2..3]** for NPT=4 (only one half2 stored).
+   The "gemm1 512t4col direct-store: max err 0.2511" pass was a
+   **stale-buffer artifact**: col2/3 were left over from the
+   current-kernel run on the same buffer. Fixed the store, re-validated.
+3. Test bookkeeping: an npp sweep left `d_npp=8` for later
+   "single-slot" runs (compared 8-slot output to a 1-slot reference →
+   deterministic 14.6 "error"); one test block launched the current
+   kernel with a 2-D grid (missing grid.z → partial K sum → 12.1).
+
+### Machine fact: intra-wave CAS contention is pathological
+
+Standalone probes with ≥2 lanes of one wavefront CASing the *same*
+address show lost updates (deterministic saturation at 2^11 updates for
+32- and 64-bit CAS) and, with several cells,
+`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` queue aborts on ROCm 7.14
+gfx906. Hardware `atomicAdd`, plain stores, single-thread CAS loops,
+and the production regime (each lane a distinct cell; ≤16-CTA fan-in
+per cell) are all fine — the greedy probe matches baseline to the byte
+throughout. **Rule: never let multiple lanes of a wavefront CAS the
+same address; production/V2 kernels keep per-lane distinct cells.**
+(Also: `global atomic_cmpswap_x2` retry logic in the ISA updates
+`old := packed+old` rather than the CAS-returned value; harmless in the
+production contention regime, avoid relying on it under heavy
+same-address spin.)
+
+### Standalone A/B (harness, launch regime, M=1, 35B-A3B shapes)
+
+| K (gemm) | config | µs/launch | vs current |
+|---|---|---|---|
+| 2048 (gemm1) | current <1,4> | 32.00 | — |
+| 2048 | v2 <512,2,256> | 27.11 | 1.18× |
+| 2048 | v2 <512,4,256> | 28.14 | 1.14× |
+| 512 (gemm2) | current <1,4> | 21.36 | — |
+| 512 | **v2 <512,4,256>** | **10.80** | **1.98×** |
+| 512 | v2 <512,2,256> | 11.39 | 1.88× |
+
+Correctness: current vs cpu-ref 0.25 (dequant noise); v2 vs current
+0.02 (gemm1) / 0.65 (gemm2, fp16 CAS-chain noise); single-slot npp=1
+0.21/0.10; **production gemm2 convention** (top_k=1, per-slot a-rows,
+8× CAS into token row) all three kernels agree within 0.29/0.73 abs.
+
+### Production integration + in-model results
+
+Dispatch in `dispatch_moe_gemm_q4`: `block_size_m == 1` and
+`size_m == 1` (gemm1, a=[M,K]) or `size_m == output_topk` (gemm2,
+a=[EM,N2], EM==topk ⟺ M==1), behind `VLLM_GFX906_MOE_M1` (default
+**OFF**). Caller zeroing unchanged (gemm1 zeroing now redundant but
+harmless; gemm2 zeroing still required for CAS).
+
+In-model (kernel_prof_probe, 256 decode steps, µs/call rows —
+direction only): gemm2 26.8 → 22.3 (−17%); gemm1 v2 <512,2,256>
+27.5 vs 26.8 (neutral, standalone 1.18× did not transfer — kept the
+established <1,4> for gemm1).
+
+Wall-clock A/B (pp=2048 tg=256, 4 samples, same day, this build):
+
+| regime | OFF | ON (gemm2 v2) | Δ |
+|---|---|---|---|
+| CUDA-graph serving | 66.43 t/s | **67.03 t/s** | **+0.60 (+0.9%)** |
+| eager serving | 23.50 t/s | **23.96 t/s** | **+0.46 (+2.0%)** |
+| greedy (12×128 tokens) | `868ad09e…` | `868ad09e…` | identical |
+
+Both-V2 (gemm1+gemm2) variant: graph 66.81 / eager 24.00 — worse or
+equal in both, confirming the gemm1 re-tile is not worth keeping.
+
+**Decision: ship gemm2-only M=1 re-tile, `VLLM_GFX906_MOE_M1` default
+OFF** (opt-in; positive and token-identical in both serving modes).
+The gemm1 budget (≈1070 µs/step in the re-anchor table) stays open:
+its re-tile premise (standalone 1.18×) does not transfer in-model;
+next idea is a 256-thread 4-col tile or folding gemm1 into the
+activation epilogue — roadmap C2 follow-up.

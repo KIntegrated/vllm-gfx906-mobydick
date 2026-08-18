@@ -136,6 +136,23 @@ the 14 µs/call is structure, not DRAM latency. (Superseded for the
 probe; this is the sprint's **S5** — the V2 in-block K-parallel GEMV
 re-tile is the design under construction.)
 
+**Result (shipped, `VLLM_GFX906_MOE_M1`, default OFF):** the V2
+lane-column re-tile (512t, wave-per-K-slice, LDS reduce, wave-0-only
+epilogue) was built and validated. It wins big for **gemm2 only**:
+standalone 21.4 → 10.8 µs (1.98×, <512,4,256>), in-model 26.8 → 22.3
+µs/call; serving +0.60 t/s graph (66.43 → 67.03), +0.46 eager
+(23.50 → 23.96), token-identical. The **gemm1 re-tile is neutral
+in-model** (27.5 vs 26.8 µs/call; standalone 1.18× did not transfer)
+and was dropped from the dispatch. Two design/ISA facts learned (see
+dev log): with lane-based columns every wave holds the same reduced
+value for the same cells, so the CAS epilogue must run in exactly one
+wave (direct stores hide the 8× duplication); and intra-wavefront
+same-address CAS contention is pathological on this stack (lost updates
+at 2^11, aperture-violation aborts with multi-cell patterns) — keep
+per-lane distinct CAS targets. gemm1 (≈1070 µs/step) stays open; the
+V1 full-K single-wave design and the activation-fusion idea are the
+next candidates.
+
 The BM=1/NPT=4 tiling launches 4096 blocks (gemm1: 8 slots × 8 n-tiles ×
 64 K-splits, 32 threads each) per layer; each (slot, n-column) cell is
 CAS'd by 64 blocks. Variants to micro-bench (isolated bench, per
