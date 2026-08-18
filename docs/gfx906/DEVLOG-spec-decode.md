@@ -118,13 +118,141 @@ credit taken):
 - `benchmarks/kernels/gfx906/spec_ngram_dense.py`: `--repeats` knob,
   mean/sd/95%-CI-lower summary.
 
+## Phase 0 results (2026-08-18, all arms run)
+
+`spec_ngram_dense.py --repeats 3` (repeats knob added this session),
+server port 8931, 3 agentic prompts, 512 tok, greedy:
+
+| arm | mean t/s | CI95 | drafts/step | acc/step | vs baseline 27.46 |
+|---|---|---|---|---|---|
+| ngram_gpu k3 min2/max5 | 18.29 | 17.9–18.6 | 0.40 | **0.428** | 0.67× — **rejected** |
+| ngram k3 min1/max5 | 19.40 | 18.9–19.8 | 0.84 | 0.71 | 0.71× — best spec arm |
+| suffix | — | — | — | — | deferred: `arctic-inference==0.1.1` is an sdist (built in `/tmp/arctic_check`, install pending); dynamic draft length → PIECEWISE-only; only remaining value is a draft-quality measurement |
+
+**ngram_gpu rejection detail:** same draft rate as CPU ngram (0.40) but
+0.428 accepted/draft-step vs the CPU proposer's 1.08, and output text
+SHAs diverge. The GPU proposer is a reimplementation (unfold/argmax)
+whose tie-breaking on repeated n-grams picks different, worse
+tokens. Not a config issue — a match-selection bug. Logged as L3
+sub-item in the roadmap (small targeted fix if a GPU proposer is
+ever wanted).
+
+**Gate:** no arm beats the baseline band (26.81–27.96) — structural,
+as predicted. Phase 1 proceeds.
+
+## Fork in the road: the B1 attribution was wrong for single-request
+
+Kernel-path spy (`/tmp/bench/gdn_step_probe.py`, promoted to
+`benchmarks/kernels/gfx906/gdn_step_spy.py`) wraps the four GDN kernel
+entry points + the conv op and prints per-step kernel routing. Three
+pitfalls found:
+
+1. **CUDA graphs hide steps from Python spies.** Replay executes the
+captured kernel list directly — the model forward (and any spy)
+runs only at capture time. First spy run (graph mode) saw 7 packed
+steps + prefill and *zero* draft steps. **Fix: `enforce_eager=True`**
+(same routing as capture, all steps visible).
+2. **The conv anchor double-counts on mixed-batch steps.** When a
+batch mixes spec and non-spec sequences, the spec branch calls
+`causal_conv1d_update` for the spec rows *and* the non-spec path
+calls it again → 96 convs on one step → step index `conv//48`
+shifts. Only valid for single-sequence runs (one conv per layer per
+step).
+3. **Exit-134 shutdown hang** on this probe (known vLLM teardown
+heap corruption): `os._exit(0)` after the report.
+
+Clean single-prompt spec run (128 tok, eager):
+
+```
+TOTALS: chunk: 48 (39-token prefill)   packed: 336 (7 no-draft steps)
+        fused_seq: 1968 (36 draft steps)
+draft step:  fused_sigmoid_gating_delta_rule_update
+             q=(1,4,16,128) ssm_state_indices=(1,4) num_accepted_tokens=set
+no-draft step: fused_recurrent_packed_decode B=1
+```
+
+**The spec-path GDN kernel already is what old-Phase-1 planned to
+build**: the sequential FLA kernel with 2D per-token state-slot
+indices and `num_accepted_tokens` — per the code, the align-slot
+rollback mechanism is already wired. Cost ~32 µs/layer ≈ 1.2
+ms/step. **GDN is not the single-request draft-step bottleneck.**
+
+Where the chunk kernel actually bites: the GDN metadata builder
+(`qwen_gdn_linear_attn.py`, `_build_...` metadata path):
+`if num_decodes > 0 and num_spec_decodes > 0:` reclassifies the
+non-spec 1-token sequences as **prefill** ("the prefill kernel
+correctly handles 1-token sequences with initial state") → they run
+the chunk kernel at ~415 µs/layer (~20× packed). A **multi-request
+mixed-batch pathology** (~20 ms/step of waste per no-draft sequence),
+irrelevant to the single-request production bench. → roadmap W1.
+
+## Revised cost model (replaces the B1/B2/B3 budget in §"Revised
+cost model")
+
+Per-step kernel breakdown, in-process single-prompt profiler pair
+(`/tmp/spec_prof3_{nospec,spec}.log`; spec = 36 draft + 7 no-draft):
+
+| family | nospec M=1 | draft M=4 | excess |
+|---|---|---|---|
+| AWQ gptq_gemm | 18.9 ms (234 calls, 80 µs) | 44.6 ms (263 calls, 153 µs) | **25.7** |
+| fp16 projections | ~5 ms (inductor fusions) | **35 ms raw `triton_matmul` (77×377 µs)** | **~30** |
+| GDN | 0.7 | 1.2 | 0.5 |
+| FA | 0.3 | 0.5 | 0.2 |
+| B3 (copy_/elementwise/copyBuffer) | 0.5 | ~2 | ~1.5 |
+| CPU proposer | — | ~5 | ~5 |
+| **wall** | **36.5** | **~95** | **~57** |
+
+- `bench_awq_m_scaling.py` (promoted): q_gemm M=1→M=4 = 1.4–1.9×
+  (75→141 µs on 17408×5120) at M where the kernel is weight-bound —
+  the M=1 per-file max-ilp tuning does not carry to M=4.
+- The fp16 excess is an **inductor shape-guard cliff**: the M=1
+  compiled fusions don't apply at M=4 → raw triton_matmul at a
+  config ~8× off rocBLAS Cijk (which already costs only ~6 ms/step
+  aggregate at M=4 in the same run).
+- B3 single-seq is ~2 ms, not 10 — the 10 ms came from the 2-seq
+  profiler run (state save/restore for two sequences).
+
+**Calibration:** T_d=95, T_n=64 (piecewise), min1 r=.84 a=.71 →
+predicted 18.7 t/s vs **measured 19.40** (4% — model trusted).
+
+**Prompt sensitivity (new finding):** on a maximally repetitive
+prompt ("repeat the sentence 30 times", 128 tok, LLM harness) spec
+already **wins**: 32.5 t/s vs 29.0 nospec (1.12×), zero kernel work.
+The agentic loss is entirely the low-repetition case — where L1/L2
+apply.
+
+## Levers and revised plan (roadmap restructured accordingly)
+
+- **L1** fp16 M≤4 routing off raw triton_matmul (~25–30 ms): measure
+  rocBLAS/Cijk first, dispatch change or skinny GEMM.
+- **L2** AWQ q_gemm M≤4 skinny path (~20–25 ms): re-tile the M=1
+  tuning to M=4 or a GEMV-family 4-row kernel.
+- **L3** CPU proposer (~5 ms) / GPU proposer match-selection bug.
+- **L4** q1 FULL graphs for no-draft steps (old Phase 2, unchanged
+  scoping + review caveats).
+- **L5** B3 (~2 ms, small).
+- **Old Phase 1 (GDN small-M kernel): CLOSED — already exists**
+  (W3 in roadmap). GDN needs no new kernel for single-request spec.
+- Stop rule re-anchored: measured post-Phase-1 draft step > 60 ms →
+  stop. Expected ~55–60 (L1+L2 on 95).
+- Revised ceiling: L1+L2+L4 (+L3) = 1.16–1.29× agentic (today's
+  a); 1.18× at min2. Draft quality `a` remains the swing variable.
+
+## Artifacts this session
+
+- Promoted into `benchmarks/kernels/gfx906/`: `gdn_step_spy.py`
+  (from /tmp/bench/gdn_step_probe.py), `bench_awq_m_scaling.py`.
+- `spec_ngram_dense.py`: `--repeats` knob + CI summary (committed
+  earlier this session).
+- Roadmap restructured around L1–L5 (Phase 1 = skinny-M GEMMs;
+  old Phase 1 closed as W3; W1 = multi-request chunk reclass;
+  W2 = MoE port). Dev log + roadmap + scripts committed.
+
 ## Next
 
-1. Phase 0 arms (each = server restart + 3-prompt bench, ~15 min):
-   ngram_gpu (k3 min2/max5) + draft-equivalence (text SHA vs CPU
-   ngram texts), then ngram min_n=1, then suffix (if
-   `arctic-inference` installs; pin `num_speculative_tokens=4`).
-2. Re-derive ceiling with measured r/a; record go/no-go for Phase 1.
-3. Phase 1 spec (kernel contract: grid/strides, align-slot output,
-   numerics bar) → implement → unit test (per-boundary state vs fp32
-   reference) → draft-step profiler → stop-rule check.
+1. Phase 1 L1 first (cheapest, largest): measure Cijk/
+   `rocm_unquantized_gemm` at M=4 on the GDN fp16 shapes; pick
+   routing vs kernel; implement; unit test; draft-step probe.
+2. Phase 1 L2: q_gemm M=4 re-tile vs GEMV-family 4-row kernel —
+   bench both, pick.
+3. Stop-rule check → Phase 2 (q1 FULL) → Phase 3 (gate).

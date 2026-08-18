@@ -6,7 +6,13 @@ Prints top CUDA ops by total device time. Diff spec-on vs spec-off to
 attribute the spec-step overhead.
 """
 import argparse
+import os
 import time
+
+# MUST be in-process: the EngineCore runs in a child process by
+# default (spawn) and the torch.profiler in this process then captures
+# nothing but hipDeviceSynchronize.
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 import torch
 from vllm import LLM, SamplingParams
@@ -34,12 +40,14 @@ def main():
         }
     llm = LLM(**common)
     tok = llm.get_tokenizer()
-    prompt = tok.apply_chat_template(
+    enc = tok.apply_chat_template(
         [{"role": "user", "content":
           ("Repeat the following sentence exactly 30 times, once per "
            "line, with no changes: the quick brown fox jumps over the "
            "lazy dog")}],
         add_generation_prompt=True, enable_thinking=False)
+    # this tokenizer's template is token-based: returns BatchEncoding
+    prompt = list(enc["input_ids"]) if not isinstance(enc, str) else enc
 
     # Warmup (capture etc.)
     llm.generate(prompt, SamplingParams(max_tokens=16, temperature=0))
