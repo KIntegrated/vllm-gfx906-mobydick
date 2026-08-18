@@ -402,8 +402,23 @@ ideal, serving numbers directional only):**
   runs positive; expect a clean re-measure when thermals cooperate
   (predicted ≈ +0.3 t/s from the −40 us/step micro-bench delta).
 
-**Decision: default ON** (kill switch VLLM_GFX906_DOWN_GEMV=0).
-Expected in-model gain ~40 us/step (≈0.25% of the 17.5 ms GPU-busy
-step) — the smallest lever remaining in the re-anchored table; the
-big open buckets are now the expert gemm1 (≈1070 us/step, C2 follow-up)
-and the topkGating 713 us/step (S2' router-GEMV fusion).
+**Decision: default ON — PROVISIONAL** (kill switch
+VLLM_GFX906_DOWN_GEMV=0). Expected in-model gain ~40 us/step (≈0.25%
+of the 17.5 ms GPU-busy step) — the smallest lever remaining in the
+re-anchored table; the big open buckets are now the expert gemm1
+(≈1070 us/step, C2 follow-up) and the topkGating 713 us/step (S2'
+router-GEMV fusion).
+
+Provisional because (post-sprint code review, R4): this is the
+branch's only default-ON numerics change, it is not bit-equal to
+LLMM1, and the decision rests on a serving A/B the same section flags
+as thermally noisy. The uncontaminated evidence is: micro-bench
+−15..25% on the shape, in-model GPU-busy −70 us/step, greedy
+token-identical, PPL −0.16%, and four thermally-noisy serving samples
+that are all positive. Reopen conditions: a clean serving A/B (fans
+confirmed, both directions, 2 runs each) that goes negative, or a
+greedy-margin analysis showing the 0.031 standalone maxdiff is not
+comfortably below the smallest in-model winning-logit margin. The
+uniform rule going forward (also applied retroactively here): a
+default-ON numerics change requires a clean wall-clock A/B — a
+per-kernel number may motivate, but not justify, flipping a default.
