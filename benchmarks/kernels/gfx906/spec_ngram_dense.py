@@ -303,7 +303,14 @@ def main():
     ap.add_argument("--outdir", default="/tmp/spec_texts",
                     help="dir for per-prompt completion text dumps "
                          "(token-identity check vs another arm)")
+    ap.add_argument("--repeats", type=int, default=1,
+                    help="repeat the whole prompt sweep N times so the "
+                         "summary has enough samples for a real CI "
+                         "(roadmap Phase 0 gate: mean + 95%% CI lower "
+                         "bound vs the baseline band, not a flat t/s "
+                         "threshold — the baseline band is ~4%% wide)")
     args = ap.parse_args()
+    assert args.repeats >= 1
     os.makedirs(args.outdir, exist_ok=True)
     BASE = f"http://127.0.0.1:{args.port}"
 
@@ -313,41 +320,59 @@ def main():
         "max_tokens": 8, "temperature": 0})
 
     results = []
-    for i, msgs in enumerate(PROMPTS):
-        before = spec_counters(args.port)
-        t0 = time.perf_counter()
-        resp = get_json(BASE + "/v1/chat/completions", {
-            "model": "qwen27", "messages": msgs,
-            "max_tokens": OUT_TOKENS, "temperature": 0})
-        dt = time.perf_counter() - t0
-        after = spec_counters(args.port)
-        n_out = resp["usage"]["completion_tokens"]
-        text = resp["choices"][0]["message"]["content"]
-        text_sha = hashlib.sha256(text.encode()).hexdigest()[:16]
-        with open(f"{args.outdir}/spec_texts_{args.arm}_{i}.txt", "w") as fh:
-            fh.write(text)
-        drafts = after.get("vllm:spec_decode_num_drafts_total", 0) \
-            - before.get("vllm:spec_decode_num_drafts_total", 0)
-        draft_tok = after.get("vllm:spec_decode_num_draft_tokens_total", 0) \
-            - before.get("vllm:spec_decode_num_draft_tokens_total", 0)
-        acc = after.get("vllm:spec_decode_num_accepted_tokens_total", 0) \
-            - before.get("vllm:spec_decode_num_accepted_tokens_total", 0)
-        rec = {
-            "prompt": i, "arm": args.arm, "out_tokens": n_out,
-            "elapsed_s": round(dt, 3),
-            "tokens_per_s": round(n_out / dt, 3),
-            "drafts": drafts, "draft_tokens": draft_tok,
-            "accepted_tokens": acc, "text_sha": text_sha,
-            "accept_rate_pct": round(100.0 * acc / draft_tok, 2)
-            if draft_tok else None,
-            "accepted_per_step": round(acc / drafts, 3) if drafts else None,
-        }
-        results.append(rec)
-        print(json.dumps(rec), flush=True)
+    for rep in range(args.repeats):
+        for i, msgs in enumerate(PROMPTS):
+            before = spec_counters(args.port)
+            t0 = time.perf_counter()
+            resp = get_json(BASE + "/v1/chat/completions", {
+                "model": "qwen27", "messages": msgs,
+                "max_tokens": OUT_TOKENS, "temperature": 0})
+            dt = time.perf_counter() - t0
+            after = spec_counters(args.port)
+            n_out = resp["usage"]["completion_tokens"]
+            text = resp["choices"][0]["message"]["content"]
+            text_sha = hashlib.sha256(text.encode()).hexdigest()[:16]
+            if rep == args.repeats - 1:
+                with open(f"{args.outdir}/spec_texts_{args.arm}_{i}.txt",
+                          "w") as fh:
+                    fh.write(text)
+            drafts = after.get("vllm:spec_decode_num_drafts_total", 0) \
+                - before.get("vllm:spec_decode_num_drafts_total", 0)
+            draft_tok = after.get("vllm:spec_decode_num_draft_tokens_total",
+                                  0) \
+                - before.get("vllm:spec_decode_num_draft_tokens_total", 0)
+            acc = after.get("vllm:spec_decode_num_accepted_tokens_total",
+                            0) \
+                - before.get("vllm:spec_decode_num_accepted_tokens_total",
+                             0)
+            rec = {
+                "rep": rep, "prompt": i, "arm": args.arm,
+                "out_tokens": n_out,
+                "elapsed_s": round(dt, 3),
+                "tokens_per_s": round(n_out / dt, 3),
+                "drafts": drafts, "draft_tokens": draft_tok,
+                "accepted_tokens": acc, "text_sha": text_sha,
+                "accept_rate_pct": round(100.0 * acc / draft_tok, 2)
+                if draft_tok else None,
+                "accepted_per_step": round(acc / drafts, 3)
+                if drafts else None,
+            }
+            results.append(rec)
+            print(json.dumps(rec), flush=True)
+
+    tps = [r["tokens_per_s"] for r in results]
+    n = len(tps)
+    mean = sum(tps) / n
+    sd = (sum((x - mean) ** 2 for x in tps) / max(1, n - 1)) ** 0.5
+    ci95_lo = mean - 1.96 * sd / (n ** 0.5) if n > 1 else mean
+    tot_tok = sum(r["out_tokens"] for r in results)
+    tot_t = sum(r["elapsed_s"] for r in results)
     print("SUMMARY " + args.arm + " "
           + json.dumps({
-              "mean_tps": round(sum(r["tokens_per_s"] for r in results)
-                                / len(results), 3),
+              "n": n, "mean_tps": round(mean, 3),
+              "sd_tps": round(sd, 3),
+              "ci95_lower_tps": round(ci95_lo, 3),
+              "aggregate_tps": round(tot_tok / tot_t, 3),
               "mean_accept_rate_pct": round(
                   sum(r["accepted_tokens"] for r in results)
                   / max(1, sum(r["draft_tokens"] for r in results)) * 100, 2),
