@@ -11,6 +11,10 @@ evidence state: **measured** (number from a trace/probe this repo has),
 micro-bench per shape before the model path, PPL/greedy gates, serving
 A/B, separate commits, positive AND negative results in the DEVLOG.
 
+Transferability of this work to other model families (AWQ MoE in
+general, Ling-3.0-tiny, DeepSeek-V4-Flash) is assessed in
+`roadmap-more-models.md` (same directory).
+
 Model facts (Qwen3.5-35B-A3B-AWQ, this deployment): 40 layers, all MoE
 (E=256, topk=8, hidden 2048, expert w13 N=1024×K=2048 fused gate+up,
 w2 N=2048×K=512, AWQ w4a16 128-group), shared expert N=512 (dense
