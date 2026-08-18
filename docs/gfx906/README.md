@@ -45,6 +45,7 @@ dense band 6.6993–6.7197. Kernel test suites: 15/15 FA, 12/12 MoE GEMM.
 | `README.md` | this hub: changes, numbers, recipes, knobs |
 | `DEVLOG-moe-opt.md` | full development record (history/archive) |
 | `moe-decode-roadmap.md` | future MoE-decode candidates (roadmap, not a committed plan) |
+| `spec-decode-roadmap.md` | speculative-decode on gfx906: n-gram probe results + phase plan (ngram/suffix/MTP rails) |
 | `running.md` | how to run/build/bench: local venv (canonical) + docker images |
 | `_bench_gfx906.py` | end-to-end pp/tg serving bench harness (BENCH_* env knobs) |
 | `_pp_bench.py` | prefill/decode split harness |
