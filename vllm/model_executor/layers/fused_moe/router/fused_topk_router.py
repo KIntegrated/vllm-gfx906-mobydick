@@ -51,11 +51,20 @@ def _gfx906_m1_topk_softmax(
     Default OFF: the kernel wins in isolation (12.5 vs 17.3 us GPU
     self-time) and in eager serving (+0.11 t/s) but loses in CUDA-graph
     replay (-0.95 t/s at 66 t/s) — see the DEVLOG-moe-m1-sprint S2
-    table. Opt in with VLLM_GFX906_TOPK_M1=1 for eager-only deployments."""
+    table. Opt in with VLLM_GFX906_TOPK_M1=1 for eager-only deployments.
+
+    Bit-equality assumptions: ops.topk_softmax must be called with the
+    same neutral configuration this dispatch checks — softmax scoring,
+    no bias, no padding, full expert range (no TP expert sharding) —
+    and the caller passes routed_scaling_factor=1 upstream. A caller
+    that adds correction-bias or expert-range routing must be excluded
+    here or the outputs silently diverge from the generic path.
+    """
     if (
         on_gfx906()
         and _has_gfx906_m1_topk()
         and os.environ.get("VLLM_GFX906_TOPK_M1", "0") == "1"
+        and gating_output.shape[0] == 1
         and topk_indices.shape[0] == 1
         and gating_output.shape[1] == 256
         and topk_indices.shape[1] == 8

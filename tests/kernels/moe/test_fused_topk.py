@@ -12,7 +12,10 @@ from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
-from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+    fused_topk,
+    vllm_topk_softmax,
+)
 from vllm.platforms import current_platform
 
 if current_platform.is_rocm():
@@ -324,3 +327,26 @@ def test_gfx906_m1_topk_bit_equal_to_generic(scale, renormalize):
         assert torch.equal(fast_w, ref_w), (
             f"weights diverge: {fast_w.tolist()} vs {ref_w.tolist()}")
         assert torch.equal(fast_tei, ref_tei)
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() and on_gfx906()),
+    reason="gfx906 M=1 topk dispatch test (S2)")
+@pytest.mark.parametrize("renormalize", [True, False])
+def test_gfx906_m1_topk_dispatch_path(renormalize, monkeypatch):
+    """The Python dispatch in fused_topk_router (VLLM_GFX906_TOPK_M1=1
+    via vllm_topk_softmax) must be bit-equal to the default path and
+    must not fire for M>1 (guard regression check for the shape gate)."""
+    monkeypatch.setenv("VLLM_GFX906_TOPK_M1", "1")
+    for m in (1, 4):
+        g = torch.randn(m, 256, device="cuda").half()
+        w = torch.empty(m, 8, dtype=torch.float32, device="cuda")
+        i = torch.empty(m, 8, dtype=torch.int32, device="cuda")
+        tei = torch.empty(m, 8, dtype=torch.int32, device="cuda")
+        fast = vllm_topk_softmax(w, i, tei, g, renormalize=renormalize)
+        w2 = torch.empty(m, 8, dtype=torch.float32, device="cuda")
+        i2 = torch.empty(m, 8, dtype=torch.int32, device="cuda")
+        tei2 = torch.empty(m, 8, dtype=torch.int32, device="cuda")
+        ops.topk_softmax(w2, i2, tei2, g, renormalize)
+        assert torch.equal(fast[0], w2), f"M={m}: weights diverge"
+        assert torch.equal(fast[1], i2), f"M={m}: ids diverge"
