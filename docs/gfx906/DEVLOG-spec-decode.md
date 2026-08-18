@@ -276,15 +276,56 @@ apply.
 - `spec_prof_probe.py`: in-process env fix (multiprocess EngineCore
   empties the profiler table).
 
+## GEMM census (eager, single prompt, exact per-step counts)
+
+`gemm_step_census.py` (promoted) wraps `ops.gptq_qgemm`,
+`triton_matmul` and the GDN path markers; enforce_eager single-prompt
+run, counts per decode step by (N, K):
+
+- **AWQ call structure is M-invariant**: nospec 236/step, spec draft
+  231/step — the *same four shapes*:
+  `5120×6144` ×63, `34816×5120` ×63 (fused gate+up),
+  `5120×17408` ×63 (down), `16384×5120` ×47 (GDN in_proj_qkvz).
+  The "263 vs 234" in-engine gap was profiler warmup/capture
+  contamination — **no launch inflation exists**. The AWQ M=4 delta
+  is pure per-call kernel time: **~17 ms/step** over the exact shape
+  set (34816 and 16384 dominate; microbench-scaled).
+- **fp16 is M-gated in the dispatcher, not M-invariant in the
+  engine**: at M=1 the unquantized projections take the GEMV op path
+  (`_llmm1_tiny_m`/`_gfx906_gemv_long_k`/`dense_gemv` — the
+  `triton_matmul` call count is **0** at M=1); at M=4 they take
+  `triton_matmul` (N=96 ×~43/step for GDN a/b, N=14336 ×~14/step
+  for FA qkv, one ~[248320, 5120] inductor-fused mega-GEMM per
+  step = layer 0). fp16 M=1 cost ~3.5 ms (GEMV) → M=4 ~16.5 ms
+  (triton): **delta ~13 ms** — the fp16 family IS an M=4 lever
+  after all (my "L1 dead" call was about triton_matmul's own
+  M-invariance, not the engine's M=1 baseline).
+- Layer 0 is entirely fp16 (`modules_to_not_convert`); inductor
+  fuses some of its GEMMs into a single N=248320 call at M=4.
+
+**Implementation consequence (Phase 1 final shape):** one kernel
+family, two weight formats —
+- **L1' (fp16)**: extend `dense_gemv_gfx906` (W16A16, ours,
+  M=1-by-construction, template `<RPT, KCHUNK>`) to M≤4 output rows
+  (same weight-read-once structure, 4 dots per weight element);
+  dispatch for 1 < M ≤ 4 in `rocm_unquantized_gemm_impl`. Kills ~13
+  ms/draft step. The same kernel at M=1..16 is W4 (general decode
+  opt: replaces both the current GEMV and the triton 174 µs floor).
+- **L2 (AWQ)**: 4-row GEMV for the packed-4bit weights (exllama
+  GEMV structure, x shared, 4 output rows per weight row) or
+  re-tile q_gemm for M=4. Kills ~17 ms/draft step.
+- Combined target: T_d 95 → ~64 (probe context); the ceiling table
+  is unchanged (the spec-specific delta is ~30 ms either way).
+
 ## Next
 
-1. Phase 1 (L2): q_gemm at M=4 — first instrument the in-engine
-   launch/K-split counts (263 vs 234/step) to size the inflation;
-   then bench (a) re-tile the M=1 tuning to M=4 vs (b) GEMV-family
-   4-row kernel; implement the winner; unit test; draft-step probe;
-   stop-rule check (≤ 60 ms).
+1. Phase 1: bench the two candidate shapes (dense_gemv M=4 extension
+   vs status-quo triton; AWQ 4-row GEMV vs re-tiled q_gemm) at the
+   census shapes; implement the winners; unit tests; draft-step
+   probe; stop-rule check (≤ 60 ms).
 2. Phase 2 (L4): q1 FULL graphs for no-draft steps (spike first per
    review caveats).
 3. Phase 3: L3 (proposer) + adoption gate (1.15×, PPL-neutral,
    M=1 token identity).
-4. W4 after the spec gate: skinny fp16 GEMM (lifts both arms ~40%).
+4. W4 = the dense_gemv M≤16 extension shipping past M=4 (lifts both
+   arms ~40%) — do after the spec gate.

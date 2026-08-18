@@ -82,37 +82,35 @@ packed — a **multi-request serving pathology** (~20 ms/step of waste
 per no-draft sequence in a mixed batch), not a single-request one.
 See §6 (work item W3).
 
-**The actual draft-step excess is in the AWQ GEMM family — not the
-GDN, and not the fp16 family.** Per-step kernel breakdown (structure
-from the in-process single-prompt profiler pair
-`/tmp/spec_prof3_{nospec,spec}.log`; absolute costs from kernel
-microbenches — the profiler totals include warmup/capture runs and
+**The actual draft-step excess is in both GEMM families — not the
+GDN.** Per-step kernel breakdown (call structure from the exact
+eager-mode census `gemm_step_census.py`; costs from kernel
+microbenches — profiler totals include warmup/capture runs and
 inflate ~3×):
 
 | family | nospec M=1 | draft step M=4 | M=4 excess |
 |---|---|---|---|
-| AWQ `gptq_gemm` (q_gemm kernel), ~240 GEMMs/step | ~18 ms (kernel 7.3 + launch/split ~11) | ~45 ms in-engine (kernel 12.5 per `bench_awq_m_scaling`; +~20 ms unexplained launch/K-split inflation, 263 vs 234 calls/step) | **~26 ms** |
-| fp16 projections (`triton_matmul`, ~90 GEMMs/step) | ~19 ms | **~19 ms (M-invariant: 174 µs fa_q at M=1..16 — weight-bound)** | **0** |
+| AWQ `gptq_gemm` — **same 4 shapes, same ~231–236 calls/step at M=1 and M=4** (`5120×6144`×63, `34816×5120`×63 fused gate+up, `5120×17408`×63, `16384×5120`×47) | ~21 ms | ~38 ms (pure per-call kernel time, 1.4–1.9× per `bench_awq_m_scaling`) | **~17 ms** |
+| fp16 projections — **dispatcher is M-gated**: M=1 takes the GEMV op, M=4 falls to `triton_matmul` (N=96 ×~43, N=14336 ×~14, one inductor-fused [248320, 5120] layer-0 mega-GEMM) | ~3.5 ms (GEMV) | ~16.5 ms (triton; itself M-invariant, 174 µs fa_q at M=1..16) | **~13 ms** |
 | GDN (packed / fused_seq) | 0.7 ms | 1.2 ms | 0.5 |
 | FA q1 / q4 | 0.3 ms | 0.5 ms | 0.2 |
 | B3 bookkeeping (copy_/elementwise/copyBuffer) | 0.5 ms | ~2 ms | ~1.5 |
-| CPU ngram proposer (off-GPU) | — | ~5 ms | ~5 |
-| **measured step wall** | **36.5 ms** | **~95 ms** | **~57 ms** |
+| CPU ngram proposer (off-GPU; grows with context length) | — | ~5 ms | ~5 |
+| **measured step wall** | **36.5 ms** | **~95 ms (agentic context; ~70 in the short-context probe)** | **~30–57 ms** |
 
-- The AWQ M-scaling: `bench_awq_m_scaling.py` shows `q_gemm` at M=4
-  costs 1.4–1.9× M=1 (75→141 µs on the 17408×5120 shape) even
-  though the kernel is weight-read-bound — the M=1 per-file max-ilp
-  tuning does not carry to M=4; the in-engine gap on top of the
-  kernel gap (the ~20 ms) is launch/K-split inflation and is what
-  Phase 1 (L2) must kill.
-- The fp16 family is **not** an M=4 problem: `triton_matmul` is
-  weight-bound and M-invariant, and on MI50 it already beats
-  rocBLAS (`fp16_skinny_m.py`: 174 vs 340 µs on fa_q 3072×5120;
-  838 vs 1751 µs on layer0_down 17408×5120). Its ~19 ms/step is a
-  **general decode-latency** issue (custom weight-row-parallel
-  skinny fp16 GEMM could cut it to ~4–6 ms) → work item W4, parked
-  behind Phase 1 because it moves the no-spec baseline underneath
-  the spec A/B.
+- The AWQ delta is **pure per-call kernel time** — the census
+disproved the "launch/K-split inflation" hypothesis (identical call
+structure at M=1/M=4; the earlier 263-vs-234 was profiler
+contamination). `q_gemm` at M=4 is 1.4–1.9× M=1 despite being
+weight-read-bound: the M=1 per-file max-ilp tuning does not carry.
+- The fp16 delta is a **dispatcher gate**, not an inductor cliff:
+`rocm_unquantized_gemm_impl` routes n==1 to the GEMV ops and
+0 < n ≤ 16 to `triton_matmul`. On MI50 triton already beats
+rocBLAS (`bench_fp16_skinny_m.py`: 174 vs 340 µs on fa_q) and is
+M-invariant — so the fix is an M≤4 GEMV-family kernel (extend
+dense_gemv), not a routing change. The M≤16 extension of the same
+kernel is W4 (replaces the triton 174 µs floor for all M — general
+decode opt, ratio-neutral).
 
 **Model calibration.** With T_draft = 95 ms, T_nodraft = 64 ms
 (piecewise, B2), min1 stats r=0.84, a=0.71:
@@ -124,11 +122,12 @@ bench). The model is calibrated to within ~4%.
 
 | # | lever | savings | scope |
 |---|---|---|---|
-| **L2** | AWQ `q_gemm` at M≤4: skinny-M variant (re-tile the M=1 tuning to M=4, or a GEMV-family 4-row kernel reading weights once for 4 rows) | **~10–26 ms** (kernel ~5, launch/split inflation ~20 — kill both) | gfx906-local kernel (`csrc/rocm/quantization/gptq/`) |
+| **L1'** | fp16 M≤4: extend `dense_gemv_gfx906` to ≤4 rows (census: M=1 takes the GEMV op, M=4 falls to `triton_matmul`) | **~13 ms** (3.5 → ~3–4 ms at M=4) | gfx906-local kernel + dispatch branch (exists) |
+| **L2** | AWQ M≤4: 4-row GEMV (exllama structure) or re-tiled `q_gemm` (census: same calls at M=1/M=4 — pure per-call delta) | **~17 ms** (exact census shape set) | gfx906-local kernel (`csrc/rocm/quantization/gptq/`) |
 | L3 | CPU ngram proposer D2H serialization | ~5 ms | in-tree (`ngram_proposer.py`); the GPU proposer exists but has a **draft-quality bug** (0.428 vs 1.08 acc/step — match selection/tie-break divergence, §2 item 1) |
 | L4 | q1 FULL graphs for no-draft spec steps (old B2) | 25–27 ms on no-draft steps (16% of steps at min1; 40% at min2) | core vLLM (§4) |
 | L5 | B3 bookkeeping | ~2 ms (small — the 10 ms figure came from a 2-seq run) | partly overlaps L2 kernel work |
-| **W4** | custom skinny fp16 GEMM (weight-row-parallel, GEMV structure) for the ~19 ms/step `triton_matmul` family — **all M, spec and no-spec** | ~15 ms per decode step (~40% baseline latency) | gfx906-local kernel; does NOT change the spec ratio — parked after Phase 1 |
+| **W4** | the same `dense_gemv` extension shipped at M≤16 (replaces the GEMV floor AND the 174 µs triton floor) — **all M, spec and no-spec** | ~15 ms per decode step (~40% baseline latency) | gfx906-local kernel; does NOT change the spec ratio — parked after Phase 1 |
 
 GDN needs **no new kernel** for single-request spec decode.
 
@@ -196,22 +195,36 @@ mean+CI gate per the review fix):
 gaps are structural (L2/L4). Phase 1 proceeds on the revised
 scope.
 
-## 3. Phase 1 — AWQ `q_gemm` at M≤4 (L2, the shared lever)
+## 3. Phase 1 — skinny-M (M≤4) GEMV-family kernels (L1' + L2)
 
-The draft step's M=4 excess is in the AWQ family (~26 ms in-engine:
-kernel ~5 + launch/K-split inflation ~20). Everything else
-measured is small (GDN 0.5, FA 0.2, B3 1.5, proposer 5) or
-M-invariant (fp16 → W4). The work is gfx906-local.
+The GEMM census (`gemm_step_census.py`, eager single-prompt, exact
+per-step counts) gives the final shape of the work:
 
-**Two candidate shapes (bench both, pick):**
-- (a) **Re-tile/tune the existing q_gemm kernel for M≤4**: extend
-  the M=1 per-file max-ilp tuning matrix to M=4; check the K-split
-  launch counts in-engine (263 vs 234 calls/step — the M=4 path
-  changes splitting; that inflation may be most of the gap).
-- (b) **GEMV-family 4-row kernel**: the exllama GEMV structure
-  (weight-row-parallel, x shared across the block) extended to
-  output 4 rows per weight row — same weight traffic as M=1, ~4×
-  the ALU, still weight-bound. Larger kernel effort, bigger ceiling.
+- **AWQ (L2)**: the M=4 draft step makes the *same* GEMM calls as
+  M=1 (231–236/step, four shapes: `5120×6144`, `34816×5120`
+  (fused gate+up), `5120×17408`, `16384×5120`) — the delta is pure
+  per-call kernel time, **~17 ms/step** over the exact shape set.
+- **fp16 (L1')**: the dispatcher is M-gated — M=1 takes the GEMV op
+  path (~3.5 ms/step), M=4 falls to `triton_matmul` (~16.5 ms/step:
+  N=96 ×~43, N=14336 ×~14, one inductor-fused [248320, 5120] layer-0
+  mega-GEMM). Delta **~13 ms/step**. (The earlier "fp16 is
+  M-invariant / L1 dead" finding was about triton_matmul's own
+  M-scaling, not the engine's M=1 baseline.)
+
+**Implementation — one kernel family, two weight formats:**
+- **L1'**: extend `dense_gemv_gfx906` (W16A16, gfx906-owned,
+  M=1-by-construction, `template<int RPT, int KCHUNK>`) to ≤4
+  output rows — same weight-read-once structure, 4 dots per weight
+  element, still weight-bound. Dispatch for 1 < M ≤ 4 in
+  `rocm_unquantized_gemm_impl` (gfx906-local branch already
+  exists). The same kernel extended to M≤16 is W4 (replaces the
+  current GEMV floor AND the triton 174 µs floor — general decode
+  opt, ratio-neutral).
+- **L2**: a 4-row GEMV for packed-4bit weights (exllama GEMV
+  structure: weight-row-parallel, x shared across the block, 4
+  output rows per weight row — same weight traffic as M=1), or
+  re-tile `q_gemm`'s M=1 tuning to M=4. Bench both at the census
+  shapes, pick.
 - Dispatch gate: uniform M≤4 (spec small-M steps); M=1 keeps
   today's path untouched (regression gate: nospec 27.46 t/s +
   greedy probe token identity). Env kill-switch per project
@@ -220,12 +233,15 @@ M-invariant (fp16 → W4). The work is gfx906-local.
   inputs; PPL A/B (S3-class: fp argmax flips allowed, PPL/
   coherence the bar); greedy probe.
 
-**Exit criteria (Phase 1 = L2):**
-- Draft-step wall measured (spec_step_probe + profiler): **≤ 60 ms**
-  (stop rule). Expect ~58.
+**Exit criteria:**
+- Draft-step wall measured (spec_step_probe): **≤ 60 ms** (stop
+  rule). Expect ~64 probe-context / ~60–70 agentic — the rule is
+  tight; the ~30 ms GEMM delta is well-evidenced, the residual
+  context-dependent part (FA KV growth, proposer on long context)
+  is what makes 60 borderline.
 - nospec regression: 27.46 t/s band + greedy probe token identity
   (M=1 paths untouched).
-- Unit tests for the new kernel path; A/B bench (agentic 3-prompt,
+- Unit tests for both new kernel paths; A/B bench (agentic 3-prompt,
   min1 and min2) with the §1 ceiling re-derived from measured r/a.
 
 ## 4. Phase 2 — q1 FULL graphs for no-draft steps (L4)
@@ -305,8 +321,10 @@ one-file fallback.)
   `spec_step_probe.py` (step-cost probes), `spec_prof_probe.py`
   (torch.profiler A/B — in-process only), `gdn_step_spy.py` (GDN
   kernel-routing spy — use `enforce_eager`, single prompt),
-  `bench_awq_m_scaling.py` (q_gemm M-scaling microbench),
-  `bench_fp16_skinny_m.py` (triton_matmul vs rocBLAS at M=1..16).
+  `gemm_step_census.py` (per-step GEMM call census by shape —
+  `enforce_eager`, single prompt), `bench_awq_m_scaling.py` (q_gemm
+  M-scaling microbench), `bench_fp16_skinny_m.py` (triton_matmul vs
+  rocBLAS at M=1..16).
 - Numbers: DEVLOG-moe-opt.md "n-gram spec decode probe";
   **DEVLOG-spec-decode.md** (this branch's log: Phase 0 results, B1
   reconciliation, kernel-path spy, revised cost model).
