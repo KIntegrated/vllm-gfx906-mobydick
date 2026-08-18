@@ -266,6 +266,42 @@ def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor:
     return out[:, :m]
 
 
+def _gfx906_spec_gemv_m4(
+    weight: torch.Tensor, x_view: torch.Tensor
+) -> torch.Tensor | None:
+    """M=2..4 W16A16 dense GEMM via the row-parallel GEMV-family kernel
+    (spec decode L1'; see csrc/rocm/dense_gemv_gfx906.cu).
+
+    The triton_matmul skinny fallback is weight-bound and M-invariant on
+    MI50 (bench_fp16_skinny_m.py: 174 us at M=1..16 for the 3072x5120
+    shape, ~7x off the HBM floor); the GEMV-family kernel keeps the M=1
+    weight-read speed at M=2..4 (bench_fp16_m4.py). Returns None when the
+    shape is unsupported so the caller falls back to the triton path.
+    """
+    from vllm.platforms.rocm import on_gfx906
+
+    if not (
+        on_gfx906()
+        and os.environ.get("VLLM_GFX906_SPEC_GEMM", "1") != "0"
+        and weight.dtype == torch.float16
+        and x_view.dtype == torch.float16
+        and weight.is_contiguous()
+    ):
+        return None
+    m, k = weight.shape  # m = output rows
+    n = x_view.shape[0]  # tokens
+    if not (2 <= n <= 4 and k % 8 == 0 and m % 2 == 0):
+        return None
+    # Keep the tuned hipBLAS special case (m==5120, 2048<=k<=2304, n=2..16)
+    # below untouched.
+    if m == 5120 and 2048 <= k <= 2304:
+        return None
+    if k % 1024 != 0 and k % 512 != 0:
+        return None
+    kchunk = 2048 if k % 2048 == 0 else (1024 if k % 1024 == 0 else 512)
+    return ops.dense_gemv_m4_gfx906(weight, x_view.contiguous(), kchunk)
+
+
 def _gfx906_gemv_long_k(
     weight: torch.Tensor, x_view: torch.Tensor
 ) -> torch.Tensor | None:
@@ -504,6 +540,10 @@ def rocm_unquantized_gemm_impl(
         return out.reshape(*x.shape[:-1], weight.shape[0])
     # low batch size, use triton matmul
     elif n <= 16 and bias is None:
+        # M=2..4 (spec decode draft steps): GEMV-family skinny kernel
+        out = _gfx906_spec_gemv_m4(weight, x_view)
+        if out is not None:
+            return out.reshape(*x.shape[:-1], weight.shape[0])
         # gfx906 / MI50:
         # For Qwen3.6 TP=8 MLP down projection, the shape is typically:
         #   x:      [n, 2176]

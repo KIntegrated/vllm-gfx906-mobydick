@@ -778,6 +778,22 @@ def dense_gemv_gfx906(
     return torch.ops._rocm_C.dense_gemv_gfx906(weight, x, kchunk)
 
 
+def dense_gemv_m4_gfx906(
+    weight: torch.Tensor,
+    x: torch.Tensor,
+    kchunk: int,
+) -> torch.Tensor:
+    """M<=4 W16A16 dense GEMM (GEMV-family) for gfx906 (spec decode L1').
+
+    ``weight`` [N, K] row-major fp16, ``x`` [M, K] fp16 with 1 <= M <= 4,
+    ``kchunk`` 512, 1024, 2048 or 4096 (must divide K). Returns ``out``
+    [M, N] fp16. Weight traffic is M-invariant (row-parallel, like the
+    M=1 GEMV); the K-split CAS epilogue requires N % RPT == 0. RPT is 2
+    or 4 (VLLM_GFX906_GEMVM_RPT for sweeps; default 2).
+    """
+    return torch.ops._rocm_C.dense_gemv_m4_gfx906(weight, x, kchunk)
+
+
 def moe_topk_softmax_m1_gfx906(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -807,6 +823,23 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
     ) -> torch.Tensor:
         return torch.empty(
             (1, weight.size(0)), dtype=weight.dtype, device=weight.device
+        )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "dense_gemv_m4_gfx906"
+):
+
+    @register_fake("_rocm_C::dense_gemv_m4_gfx906")
+    def _dense_gemv_m4_gfx906_fake(
+        weight: torch.Tensor,
+        x: torch.Tensor,
+        kchunk: int,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (x.size(0), weight.size(0)),
+            dtype=weight.dtype,
+            device=weight.device,
         )
 
 

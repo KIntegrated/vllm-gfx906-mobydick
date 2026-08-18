@@ -329,3 +329,89 @@ family, two weight formats —
    M=1 token identity).
 4. W4 = the dense_gemv M≤16 extension shipping past M=4 (lifts both
    arms ~40%) — do after the spec gate.
+
+## Phase 1 L1' implementation (dense_gemv M≤4 kernel) — built, awaiting GPU
+
+Kernel (`csrc/rocm/dense_gemv_gfx906.cu`, new `dense_gemv_m_kernel`
++ `dense_gemv_m4_gfx906` op, bound in `torch_bindings.cpp` /
+`_custom_ops.py`):
+- Row-parallel weight structure identical to the M=1 GEMV; per-M-row
+  x-slices in registers (x is M*K*2B ≤ 40 KB, L2-resident across
+  blocks); `acc[RPT][4]` fp32, RPT ∈ {2,4} (the packed-CAS epilogue
+  needs adjacent rows; per-M-row outputs are N apart so RPT=1 packing
+  is impossible).
+- ksplit==1: per-(m, row) direct stores. ksplit>1: per-M-row packed
+  CAS (32-bit RPT=2 / 64-bit RPT=4), lane-0 gather via shfl (single
+  warp) or LDS (multi-warp). Launcher requires N % RPT == 0 (kills
+  the ragged-tail OOB class the M=1 kernel only avoids in practice).
+- KCHUNK ∈ {512, 1024, 2048} (4096 bench-only as before); host op
+  takes kchunk, RPT via VLLM_GFX906_GEMVM_RPT (default 2).
+- M=1 path untouched (old kernel + op unchanged) → nospec regression
+  is structurally zero; dispatch gate is 2 ≤ M ≤ 4.
+
+Dispatch (`vllm/model_executor/layers/utils.py`, new
+`_gfx906_spec_gemv_m4`): gfx906 + fp16 + 2≤M≤4 + k%8==0 + N%2==0 +
+k%{512,1024}==0, kchunk = largest of 2048/1024/512 dividing K;
+excludes the tuned hipBLAS special case (m==5120, 2048≤k≤2304);
+kill switch `VLLM_GFX906_SPEC_GEMM=0` (default on — M=1 untouched).
+
+Tests (`test_rocm_unquantized_gemm.py`): numeric M∈{2,3,4} at
+K=5120 (ksplit=5 CAS chain), K=17408 M=4 (ksplit=17, the census
+down_proj shape), mock dispatch test (M=4 → op+kchunk, M=1 → not
+called, special-case shape → not called, kill switch → triton),
+never-off-gfx906 guard. Ruff-clean vs baseline.
+
+Microbench (`/tmp/bench/bench_fp16_m4.py`, not yet promoted): census
+shapes (96×5120 ×43, 14336×5120 ×14, 248320×5120 ×1 LM-head,
+16384×5120, 5120×6144, 34816×5120, 5120×17408) — M=1 ref vs
+triton M=4 vs m4 M=4 (kchunk 512/1024 sweep). Built (incremental,
+~5 min) into `_rocm_C`; **GPU held for RCCL bench + unit tests —
+microbench, pytest, and the in-engine A/B run when it frees.**
+
+Expected (weight-bound model): m4 M=4 ≈ M=1 cost per shape
+(248320×5120 ≈ 2.0 ms vs triton ~11.9; 14336×5120 ≈ 0.15 vs ~0.7);
+L1' step saving ≈ 13-20 ms if the weight-read speed holds at 4× the
+ALU work.
+
+## ROCm reinstall + clean rebuild (2026-08-18)
+
+ROCm moved: the old `/opt/rocm-7.14` custom build (7.13.60850 runtime)
+is now `/opt/rocm-7.14-gfx906-old`; the new install is `/opt/rocm`
+(7.14.60850, Debian-packaged, dev cmake packages via dpkg — the first
+clean build failed CMake configure on the missing `hip-lang` package,
+resolved by the dev-tools dpkg install landing them under
+`/opt/rocm/core-7.14/lib/cmake`, symlinked through
+`/etc/alternatives/rocm-lib`). `~/env-rocm-7.14-gfx906.sh` now points
+at `/opt/rocm` (top-level `lib` symlinks everything; gfx906 rocblas
+Tensile libs confirmed present). Full clean rebuild (`rm -rf build/`,
+stale .so's had `RUNPATH /opt/rocm-7.14/lib` baked in): configure OK
+(HIP 7.14.60850), ccache made it ~4 min. The new .so's carry **no
+RUNPATH** — runtime resolution is via the env script's
+LD_LIBRARY_PATH (system ld cache has no /opt/rocm entries). The
+optional `vllm-rs` Rust CLI cargo build fails (vllm-server crate
+build-script error) — tolerated, precompiled binary from Aug 16
+stays; Python extension build is unaffected. Import + gfx906_fa
+backend registration + m4 op smoke all pass on the new stack.
+
+## Phase 1 L1' — measured WIN (microbench + tests)
+
+`benchmarks/kernels/gfx906/bench_fp16_m4.py` (census shapes,
+kchunk 512/1024 sweep, RPT 2/4 sweep):
+
+| per draft step (all census fp16 shapes) | µs |
+|---|---|
+| M=1 ref (GEMV family) | 6.9 ms |
+| triton_matmul M=4 (status quo) | **25.6 ms** |
+| dense_gemv_m4 M=4 (kc1024, RPT=2) | **11.2 ms** |
+| dense_gemv_m4 M=4 (kc1024, RPT=4) | 11.0 ms |
+
+L1' saving at the M=4 worst case: **~14.5 ms/step**; at the typical
+draft-step M (1+accepted, a≈0.71 → M≈1.7–2) the saving is larger
+(~17–18 ms, cost scales ~linearly in M between 6.9 and 11). The M=4
+path runs 1.5–1.6× the M=1 cost (4× the dot work — ALU-bound, as
+modeled; the 5120×6144 shape is 1.08×). kc1024 beats kc512 on every
+shape; RPT=4 wins ~2% overall but RPT=2 wins at N=96 — default
+stays 2 (matches the M=1 GEMV rule; env sweep knob kept).
+
+pytest: 25 passed / 2 skipped (all 4 new tests green, incl. M=4
+K=17408 ksplit=17 CAS chain). M=1 paths untouched.

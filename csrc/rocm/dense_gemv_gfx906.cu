@@ -210,6 +210,162 @@ __global__ void __launch_bounds__(KCHUNK / 8)
   }
 }
 
+// ---------------------------------------------------------------------------
+// M<=4 variant (spec-decode draft steps, Phase 1 L1').
+//
+//   out[M, N] = x[M, K] @ W[N, K]^T
+//
+// Same row-parallel structure as the M=1 kernel, but each thread also
+// holds the 8-half x slice for every M row (registers; x re-reads hit
+// L2) and accumulates RPT*M fp32 partials. Weight traffic is
+// M-invariant — the whole point: at M=4 the triton_matmul fallback
+// costs ~7x the HBM floor (174 us for a 31.5 MB weight), while this
+// stays at the M=1 weight-read speed.
+//
+// K-split (kchunk < K) uses the same packed-fp16 CAS epilogue as the
+// M=1 kernel: per M row, one 32-bit CAS (RPT=2) or 64-bit CAS (RPT=4)
+// over the RPT adjacent output rows. RPT>=2 required (per-M-row output
+// addresses are N apart, so the RPT=1 packed CAS is impossible).
+// ---------------------------------------------------------------------------
+
+template <int RPT, int KCHUNK>
+__global__ void __launch_bounds__(KCHUNK / 8)
+    dense_gemv_m_kernel(const half* __restrict__ x,   // [M, K]
+                       const half* __restrict__ w,   // [N, K]
+                       half* __restrict__ out,       // [M, N], pre-zeroed
+                       // if KSPLIT>1
+                       const int M, const int N, const int K,
+                       const int ksplit) {
+  static_assert(KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 ||
+                    KCHUNK == 4096,
+                "KCHUNK must be 512, 1024, 2048 or 4096");
+  static_assert(RPT == 2 || RPT == 4, "RPT must be 2 or 4");
+  constexpr int THREADS = KCHUNK / 8;
+  constexpr int WARPS = THREADS / 64;
+  const int t = threadIdx.x;
+  const int row0 = blockIdx.x * RPT;
+  const int k0 = blockIdx.y * KCHUNK;
+
+  // x slices for all M rows (x is small: M*K*2B <= 40 KB, L2-resident;
+  // every block re-reads its k-chunk of it).
+  union {
+    uint4 u;
+    half2 h2[4];
+  } xa[4];
+  #pragma unroll
+  for (int m = 0; m < 4; ++m)
+    if (m < M) xa[m].u = *(const uint4*)(x + (int64_t)m * K + k0 + t * 8);
+
+  float acc[RPT][4];
+  #pragma unroll
+  for (int r = 0; r < RPT; ++r) {
+    const int row = row0 + r;
+    #pragma unroll
+    for (int m = 0; m < 4; ++m) acc[r][m] = 0.0f;
+    if (row >= N) continue;
+    union {
+      uint4 u;
+      half2 h2[4];
+    } wa;
+    wa.u = *(const uint4*)(w + (int64_t)row * K + k0 + t * 8);
+    #pragma unroll
+    for (int m = 0; m < 4; ++m)
+      if (m < M) acc[r][m] = dot8_f32(wa.h2, xa[m].h2);
+  }
+
+  // Flatten to acc_flat[r*4+m] for the reduction (lanes < RPT*4).
+  float acc_flat[RPT * 4];
+  #pragma unroll
+  for (int r = 0; r < RPT; ++r)
+    #pragma unroll
+    for (int m = 0; m < 4; ++m) acc_flat[r * 4 + m] = acc[r][m];
+
+  #pragma unroll
+  for (int mask = 32; mask >= 1; mask /= 2)
+    #pragma unroll
+    for (int i = 0; i < RPT * 4; ++i) acc_flat[i] += __shfl_xor(acc_flat[i], mask);
+
+  if constexpr (WARPS == 1) {
+    // Lane i < RPT*4 holds (r=i/4, m=i%4)'s full sum.
+    if (ksplit == 1) {
+      if (t < RPT * 4) {
+        const int r = t / 4, m = t % 4, row = row0 + r;
+        if (m < M && row < N)
+          out[(int64_t)m * N + row] = __float2half_rn(acc_flat[t]);
+      }
+    } else {
+      // CAS packs the RPT adjacent rows of each out[m]; lane 0 gathers
+      // every (r, m) sum via shfl and issues the M CAS ops.
+      if (t == 0) {
+        float s[RPT * 4];
+        #pragma unroll
+        for (int i = 0; i < RPT * 4; ++i) s[i] = __shfl(acc_flat[t], i);
+        #pragma unroll
+        for (int m = 0; m < 4; ++m) {
+          if (m >= M) continue;
+          if (row0 + RPT - 1 >= N) continue;  // ragged tail: RPT rows valid
+          if constexpr (RPT == 4)
+            atomic_add_pk4_f16(
+                out + (int64_t)m * N + row0,
+                __halves2half2(__float2half_rn(s[0 * 4 + m]),
+                               __float2half_rn(s[1 * 4 + m])),
+                __halves2half2(__float2half_rn(s[2 * 4 + m]),
+                               __float2half_rn(s[3 * 4 + m])));
+          else
+            atomic_add_pk2_f16(
+                out + (int64_t)m * N + row0,
+                __halves2half2(__float2half_rn(s[0 * 4 + m]),
+                               __float2half_rn(s[1 * 4 + m])));
+        }
+      }
+    }
+  } else {
+    __shared__ float red_smem[RPT * 4][8];  // WARPS <= 8 (KCHUNK <= 4096)
+    const int warp = t / 64;
+    const int lane = t % 64;
+    if (lane < RPT * 4) red_smem[lane][warp] = acc_flat[lane];
+    __syncthreads();
+    if (warp == 0) {
+      if (ksplit == 1) {
+        if (lane < RPT * 4) {
+          const int r = lane / 4, m = lane % 4, row = row0 + r;
+          float s = 0.0f;
+          #pragma unroll
+          for (int wp = 0; wp < WARPS; ++wp) s += red_smem[lane][wp];
+          if (m < M && row < N) out[(int64_t)m * N + row] = __float2half_rn(s);
+        }
+      } else {
+        if (lane == 0) {
+          float s[RPT * 4];
+          #pragma unroll
+          for (int i = 0; i < RPT * 4; ++i) {
+            s[i] = 0.0f;
+            #pragma unroll
+            for (int wp = 0; wp < WARPS; ++wp) s[i] += red_smem[i][wp];
+          }
+          #pragma unroll
+          for (int m = 0; m < 4; ++m) {
+            if (m >= M) continue;
+            if (row0 + RPT - 1 >= N) continue;  // ragged tail
+            if constexpr (RPT == 4)
+              atomic_add_pk4_f16(
+                  out + (int64_t)m * N + row0,
+                  __halves2half2(__float2half_rn(s[0 * 4 + m]),
+                                 __float2half_rn(s[1 * 4 + m])),
+                  __halves2half2(__float2half_rn(s[2 * 4 + m]),
+                                 __float2half_rn(s[3 * 4 + m])));
+            else
+              atomic_add_pk2_f16(
+                  out + (int64_t)m * N + row0,
+                  __halves2half2(__float2half_rn(s[0 * 4 + m]),
+                                 __float2half_rn(s[1 * 4 + m])));
+          }
+        }
+      }
+    }
+  }
+}
+
 }  // namespace dense_gemv_gfx906
 }  // namespace vllm
 
@@ -224,6 +380,74 @@ __global__ void __launch_bounds__(KCHUNK / 8)
 //
 // Returns out: [1, N] fp16. Pre-zeroed internally when K > kchunk.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// M<=4 entry point (spec decode; see dense_gemv_m_kernel above).
+//
+//   weight: [N, K] fp16 row-major; x: [M, K] fp16, 1 <= M <= 4
+//   Returns out: [M, N] fp16.
+// ---------------------------------------------------------------------------
+torch::Tensor dense_gemv_m4_gfx906(torch::Tensor weight, torch::Tensor x,
+                                   int64_t kchunk) {
+  TORCH_CHECK(weight.is_cuda() && x.is_cuda());
+  TORCH_CHECK(weight.dim() == 2 && x.dim() == 2);
+  TORCH_CHECK(weight.scalar_type() == torch::kHalf);
+  TORCH_CHECK(x.scalar_type() == torch::kHalf);
+  TORCH_CHECK(weight.is_contiguous() && x.is_contiguous());
+  const int64_t M = x.size(0);
+  const int64_t N = weight.size(0);
+  const int64_t K = weight.size(1);
+  TORCH_CHECK(M >= 1 && M <= 4, "M must be 1..4 (got ", M, ")");
+  TORCH_CHECK(x.size(1) == K, "x/weight K mismatch");
+  TORCH_CHECK(K % 8 == 0, "K must be a multiple of 8");
+  TORCH_CHECK(kchunk == 512 || kchunk == 1024 || kchunk == 2048 ||
+                  kchunk == 4096,
+              "kchunk must be 512, 1024, 2048 or 4096");
+  TORCH_CHECK(K % kchunk == 0, "K must be divisible by kchunk");
+
+  // RPT is 2 or 4 (the packed CAS epilogue needs adjacent rows); env
+  // override for micro-bench sweeps, default 2 (the M=1 K=17408 winner).
+  int rpt = 2;
+  if (const char* e = getenv("VLLM_GFX906_GEMVM_RPT")) {
+    const int v = atoi(e);
+    if (v == 2 || v == 4) rpt = v;
+  }
+  TORCH_CHECK(N % rpt == 0, "N (", N, ") not divisible by RPT (", rpt, ")");
+
+  const int ksplit = (int)(K / kchunk);
+  auto out = torch::empty({M, N}, weight.options());
+  if (ksplit > 1) out.zero_();
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(weight));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const half* wp = (const half*)weight.data_ptr();
+  const half* xp = (const half*)x.data_ptr();
+  half* op = (half*)out.data_ptr();
+
+  #define LAUNCHM(RPT, KC)                                                \
+    {                                                                     \
+      dim3 grid(N / RPT, ksplit);                                         \
+      vllm::dense_gemv_gfx906::dense_gemv_m_kernel<RPT, KC>               \
+          <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)M, (int)N,       \
+                                        (int)K, ksplit);                  \
+    }
+  #define LAUNCHM_BY_RPT(KCVAL)                                           \
+    do {                                                                  \
+      if (rpt == 4)                                                       \
+        LAUNCHM(4, KCVAL)                                                 \
+      else                                                                \
+        LAUNCHM(2, KCVAL)                                                 \
+    } while (0)
+  if (kchunk == 4096)
+    LAUNCHM_BY_RPT(4096);
+  else if (kchunk == 2048)
+    LAUNCHM_BY_RPT(2048);
+  else if (kchunk == 1024)
+    LAUNCHM_BY_RPT(1024);
+  else
+    LAUNCHM_BY_RPT(512);
+  return out;
+}
+
 torch::Tensor dense_gemv_gfx906(torch::Tensor weight, torch::Tensor x,
                                 int64_t kchunk) {
   TORCH_CHECK(weight.is_cuda() && x.is_cuda());

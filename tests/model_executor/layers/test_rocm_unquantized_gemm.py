@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 
 from unittest.mock import MagicMock
 
@@ -324,6 +325,133 @@ def test_rocm_unquantized_gemm_dense_gemv_ksplit_real_kernel(monkeypatch, m):
 
     assert out.shape == (1, m)
     torch.testing.assert_close(out.float(), ref.float(), atol=0.15, rtol=2e-2)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel test")
+@pytest.mark.parametrize("m", [2, 3, 4])
+def test_rocm_unquantized_gemm_spec_gemv_m4_real_kernel(monkeypatch, m):
+    # Numeric gate for the M<=4 GEMV-family kernel (spec decode L1') on its
+    # model path: K=5120 with kchunk=1024 (ksplit=5, packed-CAS epilogue).
+    # Catches row-mapping / M-row / CAS regressions. Tolerance matches the
+    # M=1 GEMV tests (fp16 output vs F.linear).
+    from vllm.platforms.rocm import on_gfx906
+
+    if not on_gfx906():
+        pytest.skip("dense_gemv_m4_gfx906 is measured only on gfx906")
+    monkeypatch.delenv("VLLM_GFX906_GEMVM_RPT", raising=False)
+    torch.manual_seed(2)
+    x = torch.randn(m, 5120, device="cuda", dtype=torch.float16)
+    weight = torch.randn(1024, 5120, device="cuda", dtype=torch.float16)
+
+    out = utils.ops.dense_gemv_m4_gfx906(weight, x, 1024)
+    ref = torch.nn.functional.linear(x, weight)
+
+    assert out.shape == (m, 1024)
+    torch.testing.assert_close(out.float(), ref.float(), atol=0.3, rtol=2e-2)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel test")
+def test_rocm_unquantized_gemm_spec_gemv_m4_long_k_real_kernel(monkeypatch):
+    # The K=17408 down_proj census shape (ksplit=17 at kchunk=1024) — the
+    # longest CAS-accumulation chain the dispatch can select.
+    from vllm.platforms.rocm import on_gfx906
+
+    if not on_gfx906():
+        pytest.skip("dense_gemv_m4_gfx906 is measured only on gfx906")
+    monkeypatch.delenv("VLLM_GFX906_GEMVM_RPT", raising=False)
+    torch.manual_seed(3)
+    x = torch.randn(4, 17408, device="cuda", dtype=torch.float16)
+    weight = torch.randn(5120, 17408, device="cuda", dtype=torch.float16)
+
+    out = utils.ops.dense_gemv_m4_gfx906(weight, x, 1024)
+    ref = torch.nn.functional.linear(x, weight)
+
+    assert out.shape == (4, 5120)
+    torch.testing.assert_close(out.float(), ref.float(), atol=0.5, rtol=2e-2)
+
+
+def test_rocm_unquantized_gemm_spec_gemv_m4_dispatch(monkeypatch):
+    # M=2..4 (spec decode draft steps) routes to the GEMV-family kernel on
+    # gfx906; M=1 stays on the GEMV/LLMM1 path; the tuned hipBLAS special
+    # case (m==5120, 2048<=k<=2304) and the kill switch stay on triton.
+    monkeypatch.delenv("VLLM_GFX906_SPEC_GEMM", raising=False)
+    monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
+    monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1250", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx906", lambda: True)
+    monkeypatch.setattr(utils, "num_compute_units", lambda: 64)
+    triton_mock = MagicMock(side_effect=lambda a, b: a @ b.t())
+    monkeypatch.setattr(utils, "triton_matmul", triton_mock)
+    m4_mock = MagicMock(side_effect=lambda w, xv, _: xv @ w.t())
+    llmm1_mock = MagicMock(side_effect=lambda w, xv, _: xv @ w.t())
+    monkeypatch.setattr(utils.ops, "dense_gemv_m4_gfx906", m4_mock)
+    monkeypatch.setattr(utils.ops, "LLMM1", llmm1_mock)
+
+    # M=4, K=5120 (the census fp16 shape): GEMV-family kernel
+    x = torch.randn(4, 5120, dtype=torch.float16)
+    weight = torch.randn(1024, 5120, dtype=torch.float16)
+    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
+    ref = torch.nn.functional.linear(x, weight)
+    m4_mock.assert_called_once()
+    assert m4_mock.call_args.args[2] == 1024  # kchunk
+    assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
+
+    # M=1: the GEMV/LLMM1 path, not the M<=4 kernel
+    m4_mock.reset_mock()
+    triton_mock.reset_mock()
+    x1 = torch.randn(1, 5120, dtype=torch.float16)
+    out = utils.rocm_unquantized_gemm_impl(x1, weight, None)
+    m4_mock.assert_not_called()
+    ref1 = torch.nn.functional.linear(x1, weight)
+    assert torch.allclose(out, ref1, atol=1e-3, rtol=1e-3)
+
+    # M=4 on the tuned hipBLAS special-case shape: untouched
+    m4_mock.reset_mock()
+    xs = torch.randn(4, 2048, dtype=torch.float16)
+    ws = torch.randn(5120, 2048, dtype=torch.float16)
+    out = utils.rocm_unquantized_gemm_impl(xs, ws, None)
+    m4_mock.assert_not_called()
+    assert torch.allclose(out, torch.nn.functional.linear(xs, ws), atol=1e-3, rtol=1e-3)
+
+    # Kill switch off: back to triton
+    m4_mock.reset_mock()
+    triton_mock.reset_mock()
+    monkeypatch.setenv("VLLM_GFX906_SPEC_GEMM", "0")
+    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
+    m4_mock.assert_not_called()
+    triton_mock.assert_called_once()
+    assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
+
+
+def test_rocm_unquantized_gemm_spec_gemv_m4_never_off_gfx906(monkeypatch):
+    # Regression guard: the M<=4 kernel is measured only on gfx906 and must
+    # never route onto other ROCm targets.
+    monkeypatch.delenv("VLLM_GFX906_SPEC_GEMM", raising=False)
+    monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
+    monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1250", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx906", lambda: False)
+    monkeypatch.setattr(utils, "num_compute_units", lambda: 64)
+    triton_mock = MagicMock(side_effect=lambda a, b: a @ b.t())
+    monkeypatch.setattr(utils, "triton_matmul", triton_mock)
+    m4_mock = MagicMock(side_effect=lambda w, xv, _: xv @ w.t())
+    monkeypatch.setattr(utils.ops, "dense_gemv_m4_gfx906", m4_mock)
+
+    x = torch.randn(4, 5120, dtype=torch.float16)
+    weight = torch.randn(1024, 5120, dtype=torch.float16)
+    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
+
+    m4_mock.assert_not_called()
+    triton_mock.assert_called_once()
+    assert torch.allclose(
+        out, torch.nn.functional.linear(x, weight), atol=1e-3, rtol=1e-3
+    )
 
 
 def test_rocm_unquantized_gemm_gfx950_wvsplitkrc_path(monkeypatch):
