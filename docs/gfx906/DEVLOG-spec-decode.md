@@ -477,9 +477,11 @@ correct); otherwise `import flash_attn_2_cuda` (compiled CK kernel —
 not present in the tree, and CK does not support gfx906 anyway). The
 compiled .so vanished at some point (reboot/migration), which broke
 any process lacking the env var; with the var (mandatory for vLLM
-ROCm regardless) the missing extension is never touched. Pre-existing
-quirk: the triton *packed* `flash_attn_func` returns inf on a random
-2×64 seq (varlen path fine) — vLLM never calls the packed path.
+ROCm regardless) the missing extension is never touched. (The "triton
+packed path returns inf" seen during the import test was an fp16
+`.sum()` overflow in the test, not a kernel bug — re-verified with
+deterministic values 2026-08-18; also checked GPU health after the
+TP=2 tests: clean.)
 
 ## Serving A/B (no-max-ilp build, L1' on) + graph-mode profile
 
@@ -529,4 +531,251 @@ does that shape in ~2.0 ms (microbench). Extending the m4 dispatch
 to n>16 for M∈{2,3,4} is ~5 ms/step of further L1' saving —
 dispatch-only, no new kernel. (M=1 stays on inductor/hipBLAS, which
 is at the roofline there.)
+
+### 2026-08-24: L1'' investigation — dispatch gap was an artifact; L5 root-caused + fixed
+
+**L1'' (m4 dispatch for n>16) — re-scoped, mostly a non-issue.**
+Dispatch spy on the eager m4 build (monkeypatch
+`rocm_unquantized_gemm_impl`, log all shapes): in EAGER every decode
+fp16 GEMM reaches the dispatcher, including the LM head (n=4, m=248320,
+k=5120), and the m4 kernel handles the whole M=4 decode set (400
+launches/step). The graph-mode "FxGraph 7.3 ms/step" row was NOT a
+missed dispatch — it is the 7 no-draft steps' inductor piecewise
+fragments (see L5). Optional leftover: extend the m4 dispatch to the
+K=1024 gate shapes (m=128, k=1024, ~0.7 ms → 0.25 ms each, ~2 ms
+/step) — dispatch-only, low priority.
+
+**L5 (no-draft spec step cost) — ROOT-CAUSED AND FIXED** (pure Python,
+no build). Root cause: `compilation.py
+adjust_cudagraph_sizes_for_spec_decode` rounds ALL capture sizes up to
+multiples of `uniform_decode_query_len` (= 4 for ngram-3) — the
+upstream stopgap for issue 28207 that predates separate decode/mixed
+capture-size handling. Side effect: the PIECEWISE key set loses sizes
+1–3, so a no-draft spec step (1 token, non-uniform → PIECEWISE) pads
+up to the size-4 graph and runs every GEMM at M=4: ~8 ms AWQ + ~6 ms
+fp16 ≈ the observed ~13 ms no-draft penalty on 63% of agentic steps.
+
+Evidence: (a) batchdesc spy — no-draft steps dispatched as
+`BatchDescriptor(num_tokens=4, uniform=False) PIECEWISE` despite
+num_tokens=1; (b) kernel symbols — graph profile showed only
+gptq `<true,4>` (M=4) and zero `<true,1>`; eager profile showed both
+(1652 M=1 calls = the 7 no-draft steps); (c) the graph-only "Call
+CompiledFxGraph" row (65 calls, 5.64 ms avg) = the 7 no-draft
+PIECEWISE steps' ~9 inductor fragments each — FULL draft steps show no
+such rows.
+
+Fix (env-gated, gfx906-only): after the rounding, re-add sizes 1..q-1
+(`VLLM_GFX906_SPEC_CG_SMALL`, default on). FULL keys already filter
+sizes < q, so this only adds small PIECEWISE graphs. Verified:
+no-draft steps now dispatch `num_tokens=1 PIECEWISE`; profile shows
+gptq `<true,1>` (1652 calls @ 90.6 µs, was absent) and M=1 GEMV
+kernels on the no-draft steps (477 launches = 7 × 68).
+
+### 2026-08-24 (later): L5 fix serving A/B — ngram3 now 1.077×
+
+run_spec_ab.sh (recreated post-reboot), 3 agentic prompts × 3 repeats,
+no-max-ilp build, L1' on + cg-small fix on:
+
+baseline 26.53 t/s (CI 25.49) — matches the 26.52 pre-fix baseline.
+ngram3 28.58 t/s (CI 28.12) — **1.077×** (was 0.945× pre-fix).
+
++3.5 t/s from the cg-small fix alone (no-draft steps 48→~40 ms; the
+size-1 PIECEWISE graph still pays ~9 small inductor-fragment replays
+per step, so it lands between the M=4-padded 48 ms and the 35–37 ms
+eager M=1 cost).
+
+ngram ceiling assessment: the 1.15× all-in gate is NOT reachable with
+ngram on agentic prompts — even the full L2 (2–8 ms on the 37% draft
+steps) adds ~+0.3 t/s → ~1.09×. ngram's acceptance (1.09/step agentic)
+is the ceiling; a model-based drafter with real acceptance on
+non-repetitive text is the remaining lever. L2 deferred as optional
+low-ROI polish; MTP investigation is next (the model HAS an MTP head:
+mtp_num_hidden_layers=1, 15 mtp.* tensors, 'mtp' in
+modules_to_not_convert → unquantized fp16).
+
+### 2026-08-24 (later): MTP investigation — model HAS an MTP head; k=2 = 1.49×
+
+(Correction: an earlier note in this log claimed the model has no MTP
+head — WRONG. config.json text_config has mtp_num_hidden_layers=1 and
+mtp_use_dedicated_embeddings=false; the checkpoint carries 15 mtp.*
+tensors: mtp.fc + mtp.layers.0.{self_attn,mlp,*layernorm,*norm}. The
+'mtp' entry in modules_to_not_convert makes the MTP layer unquantized
+fp16 (verified: no M=1 AWQ calls in the profile; all decode AWQ is
+M=3 target).)
+
+Setup: `--speculative-config '{"method": "mtp", "num_speculative_tokens": 2}'`
+— vLLM auto-resolves the drafter to the same checkpoint (Qwen3_5MTP
+registered in the model registry). MTP layer = 1 full-attention decoder
+layer (q_norm/k_norm, attn_output_gate) + fp16 MLP + mtp.fc
+(10240→5120, takes [h ⊕ e]). embed_tokens and lm_head are SHARED with
+the target (no mtp.* embedding/lm_head tensors) — the drafter's
+per-forward weight traffic is fc(0.10) + attn(0.28) + mlp(0.54) +
+lm_head(2.54) ≈ 3.4 GB.
+
+First crash: the proposer's ROCm allowed_attn_types whitelist did not
+include our Gfx906FAMetadata → ValueError on the first decode step.
+Fixed by adding it to llm_base_proposer.py (gfx906-gated import).
+Our FA builder needs no build_for_drafting override — the base
+default (build with the mutated common_attn_metadata) matches what
+ROCM_ATTN uses.
+
+**Serving A/B (3 agentic prompts × 3 repeats): baseline 26.53 → mtp2
+39.47 t/s (CI 37.17) = 1.488×** (first run, pre-fc-fix). Counters:
+1.82 tokens/step, 86–95% draft-token acceptance, token-identical to
+baseline on both agentic prompts (one benign divergence on the
+repetitive prompt). Every step drafts (no no-draft penalty: MTP
+always proposes; target always runs uniform M=3).
+
+k=2 vs k=3: the drafter forward costs ~8 ms each while the marginal
+third draft token's conditional acceptance is low (k=2 already
+captures 1.82/step) — k=3 would add ~8 ms for ~+0.1 tokens/step;
+k=1 halves drafting but loses the second-token acceptance. k=2 is the
+sweet spot (measured, not yet A/B'd against k=3 — TODO if time).
+
+### 2026-08-24 (later): MTP drafter cost decomposition + first optimization
+
+Profile (torch profiler, graph + eager, repetitive 128 tokens, ~47
+decode steps): step ≈ 60 ms = target M=3 (~45 ms: AWQ 23.9 + m4-fp16
+10.1 + GDN/FA/norms ~11) + **drafter ~15 ms**.
+
+Shape spy (dispatcher + gptq_gemm + F.linear) + dispatch microbench
+(MI50 HBM 1.02 TB/s) — drafter GEMMs per step:
+
+| shape (N×K) | M | time | GB/s | path |
+|---|---|---|---|---|
+| lm_head 248320×5120 (2.54 GB) | 1 | 3.13 ms | 811 | LLMM1 (near roofline) |
+| fc 5120×10240 (0.10 GB) | 1 | 544 µs | 193 | triton (k>8192, ≠17408) |
+| qkv 14336×5120 | 1 | 184 µs | 796 | LLMM1 |
+| out 5120×6144 | 1/3 | 81/131 µs | 777/482 | LLMM1/m4 |
+| gate_up 34816×5120 | 3 | 685 µs | 521 | m4 kernel |
+| down 5120×17408 | 3 | 350 µs | 510 | m4 kernel |
+
+Two findings:
+
+1. **fc (K=10240, M=1) fell through to triton at 193 GB/s.** The
+K-split dense GEMV does it in 148.7 µs at kchunk=2048 (705 GB/s;
+1024→395, 512→254). Fix (dispatch-only, gfx906, gated by
+VLLM_GFX906_DENSE_GEMV): extended `_gfx906_gemv_long_k` to the
+(5120, 10240) shape with kchunk=2048, and the n==1 branch conditions
+to `k in (10240, 17408)`. Saves ~0.8 ms/step. Dispatcher unit tests
+25 passed / 2 skipped.
+
+2. **The m4 kernel (L1') plateaus at ~520 GB/s for ALL M (even M=1
+through the m4 op: 552) while the M=1 kernel does 700–815 on the same
+shapes.** Root cause: the m4 kernel allocated `xa[4]` x-slices +
+`acc[RPT][4]` + `acc_flat[RPT*4]` unconditionally (runtime M) →
+~130+ VGPRs → ~35% occupancy loss at KCHUNK=1024. Fix (in progress):
+template the kernel on M (`dense_gemv_m_kernel<RPT, KCHUNK, M>`),
+static-size the arrays, drop the acc_flat copy (in-place shfl
+reduction). Expected: M=2..4 up to ~700–800 GB/s → ~2.5 ms/step on
+the MTP drafter (M=3) and ~3 ms/draft-step on ngram (M=4).
+
+Structural note (user's theory): the MTP drafter IS compute/traffic-
+hungry on this memory-bandwidth-bound GPU — 6.8 GB of extra weight
+reads per step (2×3.4 GB) on top of the target's ~25 GB. Its floor is
+~6.8 ms/step; measured 15 ms before the two fixes above. The lm_head
+GEMV (2.54 GB ×2/step, 811 GB/s) is the irreducible ~6.3 ms; the
+rest is recoverable.
+
+### 2026-08-24 (later): L3 — ngram proposer CPU cost
+
+Roadmap L3: the CPU ngram proposer runs in the scheduler (engine
+process) every step — Python string/suffix matching on the prompt.
+Measured via the step probe: with spec on, the nospec→spec step-wall
+delta includes proposer time. The proposer cost is small vs the
+measured step cost (steps are 35–56 ms GPU-bound; proposer is single
+digit ms in Python for our prompts). Not worth a GPU proposer for
+this workload; `ngram_gpu` (roadmap L3 alt) was already rejected on
+quality (Phase 0). Closing L3 as not-beneficial-for-this-workload.
+
+Remaining roadmap items: L2 (AWQ M≤4 GEMV, 2–8 ms/step, kernel work)
+and the optional m4 K=1024 dispatch extension (~2 ms). Both small;
+L2 is the only remaining >2 ms lever.
+
+### 2026-08-24 (later): m4 kernel templated on M — M=2 +37%, M=4 kept old
+
+The m4 kernel (L1') was runtime-M: `xa[4]` + `acc[RPT][4]` +
+`acc_flat[RPT*4]` allocated unconditionally → ~130+ VGPRs → ~35%
+occupancy loss at KCHUNK=1024 (measured 520–550 GB/s for all M, vs
+700–815 for the M=1 kernel on the same shapes).
+
+Fix: `dense_gemv_m_kernel<RPT, KCHUNK, M>` — static arrays, in-place
+shfl reduction (no acc_flat copy). Results (default RPT=2, KC=1024,
+GB/s, 2.54/0.36/0.18 GB shapes):
+
+| M | lm_head | gate_up | down | (old m4: 552/548/539 … 507/501/486) |
+|---|---|---|---|---|
+| 1 | 816 | 795 | 730 | +45% |
+| 2 | 730 | 717 | 677 | +37% |
+| 3 | 544 | 535 | 525 | +3% |
+| 4 | 311 (REGRESSION) | 307 | 298 | — |
+
+M=4 regressed 507→311 in the templated form (cause unattributed —
+RPT=4 makes everything worse, kc=512 worse too; the x/w load ratio
+M/RPT=2 is the floor but 311 is below even that prediction). Practical
+resolution: keep both kernels — the launcher dispatches M=1..3 to the
+templated kernel and M=4 to the restored runtime-M kernel
+(`dense_gemv_m_kernel_rt`, byte-identical to the L1' version). M=4
+in-engine (ngram draft steps) is therefore bit-identical to before.
+
+The residual M=3/4 ceiling is the activation re-read ratio (x bytes per
+w byte = M/RPT): M=3@RPT2 = 1.5:1 → ~540 GB/s. Beating that needs an
+LDS-tiled GEMM-style kernel (each x tile read once per many w tiles) —
+a full rewrite, deferred: the in-engine gain is ~1–2 ms/step.
+
+In-engine effect: MTP drafter M=3 forward ~6.5→6.1 ms (lm_head
+4862→4671 µs, gate_up 685→666, down 350→340); M=2 (unused by current
+workloads) +37%. Dispatcher suite 25 passed / 2 skipped (includes the
+m4 real-kernel numeric tests).
+
+k=3 vs k=2 MTP: not A/B'd — the third drafter forward costs ~8.5 ms
+while the third draft's conditional acceptance is ~15–25% (k=2 already
+1.815 tokens/step); break-even needs ≥2.17 tokens/step. k=2 stands as
+the sweet spot pending a model with a stronger MTP head.
+
+### 2026-08-24 (later): final A/B + GPU wedge #2
+
+Final 3-arm A/B (agentic prompts, 3 repeats, all fixes in):
+
+- baseline: 26.50 t/s (CI 25.45) — matches all prior baseline bands
+- ngram3: 28.55 t/s (CI 28.12) = **1.077×** — unchanged from the
+  pre-m4-templating run (expected: ngram's M=4 path is the restored
+  rt kernel, bit-identical; no-draft steps use LLMM1 / cg-small fix)
+- mtp2: the mtp2 server of this run died at weight-load time with
+  "CUDA error: unspecified launch failure" and **wedged the MI50
+  (wedge #2, same signature as the 2026-08-19 incident)**: rocm-smi
+  shows GPU0 temp/clock N/A with 80% zombie VRAM, fresh contexts fail
+  with `amdgpu_query_gpu_info_init failed`. Reboot required.
+
+  Probable cause: the runner killed the ngram3 server and started the
+  mtp2 server after a fixed 8 s sleep; vLLM teardown had not released
+  the ~25 GB (zombie 80% VRAM visible after), so the mtp2 load ran
+  into memory pressure. The earlier mtp2 A/B (same build except the
+  m4 M-templating) measured **39.66 t/s (CI 38.49) = 1.500×**.
+  With the m4 M=3 templated kernel the expected final is ~40 t/s
+  (+~0.4 ms/step drafter saving); serving-side confirmation is
+  PENDING the reboot. The m4 M=1..3 kernels are numeric-verified by
+  the dispatcher suite (25 passed / 2 skipped incl. real-kernel
+  M=2..4 tests) and microbenched; risk is low but the serving number
+  should be re-taken.
+
+  Runner rule for the future: between arms, wait until rocm-smi VRAM
+  is < 5% before starting the next server (8 s sleep is not enough
+  after a kill).
+
+### MTP work state (at commit time)
+
+- k=2 MTP is the recommended spec method for this model: 1.50×
+  (pre-m4-templating serving A/B), 1.815 tokens/step, 90.75% draft
+  acceptance, token-identical to baseline on the agentic prompts.
+- The MTP drafter is fp16-only (modules_to_not_convert) — every
+  drafter weight byte hits HBM (3.4 GB/forward); k=2 = 2 forwards/step
+  (~6.8 GB) ≈ target's M=3 GEMM cost. On a fast-compute GPU the
+  drafter is nearly free; here it is ~25% of the step. Remaining
+  levers (deferred): M=3/M=4 LDS-tiled kernel (beats the x/w re-read
+  ratio floor, ~1–2 ms/step), k=3 (needs ≥2.17 tokens/step), AWQ
+  MTP (quality risk, out of scope).
+- ngram3 stands at 1.077× — the cg-small fix consumed its ~1.4 ms
+  no-draft penalty; L2 (AWQ M≤4) remains the only unmeasured
+  >1 ms lever but its ceiling was revised down (dequant-ALU bound).
 

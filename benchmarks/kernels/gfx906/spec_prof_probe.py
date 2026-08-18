@@ -20,8 +20,10 @@ from vllm import LLM, SamplingParams
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--spec", action="store_true")
+    ap.add_argument("--spec", nargs="?", const="ngram3",
+                    help="spec method: ngram3 (default) or mtpK")
     ap.add_argument("--tokens", type=int, default=128)
+    ap.add_argument("--enforce-eager", action="store_true")
     args = ap.parse_args()
 
     common = dict(
@@ -31,13 +33,21 @@ def main():
         gpu_memory_utilization=0.95,
         dtype="float16",
     )
+    if args.enforce_eager:
+        common["enforce_eager"] = True
     if args.spec:
-        common["speculative_config"] = {
-            "method": "ngram",
-            "num_speculative_tokens": 3,
-            "prompt_lookup_min": 2,
-            "prompt_lookup_max": 5,
-        }
+        if args.spec.startswith("mtp"):
+            k = int(args.spec[3:])
+            common["speculative_config"] = {
+                "method": "mtp", "num_speculative_tokens": k,
+            }
+        else:
+            common["speculative_config"] = {
+                "method": "ngram",
+                "num_speculative_tokens": 3,
+                "prompt_lookup_min": 2,
+                "prompt_lookup_max": 5,
+            }
     llm = LLM(**common)
     tok = llm.get_tokenizer()
     enc = tok.apply_chat_template(
@@ -59,10 +69,10 @@ def main():
         out = llm.generate(prompt, sp)
         dt = time.perf_counter()
     n_out = len(out[0].outputs[0].token_ids)
-    print(f"OUT_TOKENS={n_out} ARM={'spec' if args.spec else 'nospec'}")
+    print(f"OUT_TOKENS={n_out} ARM={args.spec or 'nospec'}")
     print(prof.key_averages().table(
         sort_by="cuda_time_total", row_limit=25,
-        max_name_column_width=60))
+        max_name_column_width=170))
 
 
 if __name__ == "__main__":

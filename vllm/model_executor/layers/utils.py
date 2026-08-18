@@ -305,28 +305,32 @@ def _gfx906_spec_gemv_m4(
 def _gfx906_gemv_long_k(
     weight: torch.Tensor, x_view: torch.Tensor
 ) -> torch.Tensor | None:
-    """K=17408 MLP down_proj GEMV (gfx906 only).
+    """Long-K M=1 GEMVs the LLMM1 route does not cover (gfx906 only).
 
     The LLMM1 skinny-GEMV route is capped at K<=8192, so without this the
-    Qwen3.5-27B down_proj ([5120, 17408], n==1) falls to triton_matmul
-    (~794 us/step). The K-split GEMV (kchunk=1024, RPT=2, ksplit=17)
-    runs it in 223.8 us = 100.2% of the HBM floor (bench
-    benchmarks/kernels/gfx906/bench_dense_gemv_k5120.py). Returns None
-    for anything other than the measured shape so the caller can fall
-    back to the triton path.
+    Qwen3.5-27B down_proj ([5120, 17408], n==1) and the Qwen3.5 MTP drafter
+    fc ([5120, 10240], n==1) fall to triton_matmul (~794 us and ~544 us
+    respectively). The K-split GEMV runs down_proj in 223.8 us (kchunk=1024,
+    100.2% of the HBM floor, bench
+    benchmarks/kernels/gfx906/bench_dense_gemv_k5120.py) and fc in 148.7 us
+    (kchunk=2048, 705 GB/s). Returns None for unmeasured shapes so the
+    caller can fall back to the triton path.
     """
     from vllm.platforms.rocm import on_gfx906
 
-    if (
+    if not (
         on_gfx906()
         and os.environ.get("VLLM_GFX906_DENSE_GEMV", "1") != "0"
         and weight.dtype == torch.float16
         and x_view.dtype == torch.float16
         and weight.is_contiguous()
         and weight.shape[0] == 5120
-        and weight.shape[1] == 17408
     ):
+        return None
+    if weight.shape[1] == 17408:
         return ops.dense_gemv_gfx906(weight, x_view, 1024)
+    if weight.shape[1] == 10240:
+        return ops.dense_gemv_gfx906(weight, x_view, 2048)
     return None
 
 
@@ -508,7 +512,7 @@ def rocm_unquantized_gemm_impl(
             (m % 4 == 0 or m < 4)
             and n == 1
             and bias is None
-            and (k <= 8192 or (on_gfx906() and k == 17408))
+            and (k <= 8192 or (on_gfx906() and k in (10240, 17408)))
         ):
             if k <= 8192:
                 out = _llmm1_tiny_m(weight, x_view)
@@ -524,7 +528,7 @@ def rocm_unquantized_gemm_impl(
         (m % 4 == 0 or m < 4)
         and n == 1
         and bias is None
-        and (k <= 8192 or (on_gfx906() and k == 17408))
+        and (k <= 8192 or (on_gfx906() and k in (10240, 17408)))
     ):
         if k <= 8192:
             out = _llmm1_tiny_m(weight, x_view)

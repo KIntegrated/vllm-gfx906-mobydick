@@ -228,9 +228,150 @@ __global__ void __launch_bounds__(KCHUNK / 8)
 // addresses are N apart, so the RPT=1 packed CAS is impossible).
 // ---------------------------------------------------------------------------
 
-template <int RPT, int KCHUNK>
+template <int RPT, int KCHUNK, int M>
 __global__ void __launch_bounds__(KCHUNK / 8)
     dense_gemv_m_kernel(const half* __restrict__ x,   // [M, K]
+                       const half* __restrict__ w,   // [N, K]
+                       half* __restrict__ out,       // [M, N], pre-zeroed
+                       // if KSPLIT>1
+                       const int N, const int K, const int ksplit) {
+  static_assert(KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 ||
+                    KCHUNK == 4096,
+                "KCHUNK must be 512, 1024, 2048 or 4096");
+  static_assert(RPT == 2 || RPT == 4, "RPT must be 2 or 4");
+  static_assert(M >= 1 && M <= 4, "M must be 1..4");
+  constexpr int THREADS = KCHUNK / 8;
+  constexpr int WARPS = THREADS / 64;
+  constexpr int NV = RPT * M;  // values per thread (flattened r*M+m)
+  const int t = threadIdx.x;
+  const int row0 = blockIdx.x * RPT;
+  const int k0 = blockIdx.y * KCHUNK;
+
+  // x slices for all M rows (x is small: M*K*2B <= 40 KB, L2-resident;
+  // every block re-reads its k-chunk of it). M is a template parameter so
+  // the register arrays below size to the actual M (a runtime-M version
+  // allocated 4x x-slices + RPT*4 accumulators unconditionally, which cut
+  // occupancy ~35% on MI50 at KCHUNK=1024).
+  union {
+    uint4 u;
+    half2 h2[4];
+  } xa[M];
+  #pragma unroll
+  for (int m = 0; m < M; ++m)
+    xa[m].u = *(const uint4*)(x + (int64_t)m * K + k0 + t * 8);
+
+  float acc[RPT][M];
+  #pragma unroll
+  for (int r = 0; r < RPT; ++r) {
+    const int row = row0 + r;
+    #pragma unroll
+    for (int m = 0; m < M; ++m) acc[r][m] = 0.0f;
+    if (row >= N) continue;
+    union {
+      uint4 u;
+      half2 h2[4];
+    } wa;
+    wa.u = *(const uint4*)(w + (int64_t)row * K + k0 + t * 8);
+    #pragma unroll
+    for (int m = 0; m < M; ++m) acc[r][m] = dot8_f32(wa.h2, xa[m].h2);
+  }
+
+  // In-place shfl reduction of the RPT*M values (lanes < NV).
+  #pragma unroll
+  for (int mask = 32; mask >= 1; mask /= 2)
+    #pragma unroll
+    for (int r = 0; r < RPT; ++r)
+      #pragma unroll
+      for (int m = 0; m < M; ++m)
+        acc[r][m] += __shfl_xor(acc[r][m], mask);
+
+  if constexpr (WARPS == 1) {
+    // Lane i < RPT*M holds (r=i/M, m=i%M)'s full sum.
+    if (ksplit == 1) {
+      if (t < NV) {
+        const int r = t / M, m = t % M, row = row0 + r;
+        if (row < N)
+          out[(int64_t)m * N + row] = __float2half_rn(acc[r][m]);
+      }
+    } else {
+      // CAS packs the RPT adjacent rows of each out[m]; lane 0 gathers
+      // every (r, m) sum via shfl and issues the M CAS ops.
+      if (t == 0) {
+        float s[NV];
+        #pragma unroll
+        for (int i = 0; i < NV; ++i) s[i] = __shfl(acc[i / M][i % M], i);
+        #pragma unroll
+        for (int m = 0; m < M; ++m) {
+          if (row0 + RPT - 1 >= N) continue;  // ragged tail: RPT rows valid
+          if constexpr (RPT == 4)
+            atomic_add_pk4_f16(
+                out + (int64_t)m * N + row0,
+                __halves2half2(__float2half_rn(s[0 * M + m]),
+                               __float2half_rn(s[1 * M + m])),
+                __halves2half2(__float2half_rn(s[2 * M + m]),
+                               __float2half_rn(s[3 * M + m])));
+          else
+            atomic_add_pk2_f16(
+                out + (int64_t)m * N + row0,
+                __halves2half2(__float2half_rn(s[0 * M + m]),
+                               __float2half_rn(s[1 * M + m])));
+        }
+      }
+    }
+  } else {
+    __shared__ float red_smem[NV][8];  // WARPS <= 8 (KCHUNK <= 4096)
+    const int warp = t / 64;
+    const int lane = t % 64;
+    if (lane < NV) red_smem[lane][warp] = acc[lane / M][lane % M];
+    __syncthreads();
+    if (warp == 0) {
+      if (ksplit == 1) {
+        if (lane < NV) {
+          const int r = lane / M, m = lane % M, row = row0 + r;
+          float s = 0.0f;
+          #pragma unroll
+          for (int wp = 0; wp < WARPS; ++wp) s += red_smem[lane][wp];
+          if (row < N) out[(int64_t)m * N + row] = __float2half_rn(s);
+        }
+      } else {
+        if (lane == 0) {
+          float s[NV];
+          #pragma unroll
+          for (int i = 0; i < NV; ++i) {
+            s[i] = 0.0f;
+            #pragma unroll
+            for (int wp = 0; wp < WARPS; ++wp) s[i] += red_smem[i][wp];
+          }
+          #pragma unroll
+          for (int m = 0; m < M; ++m) {
+            if (row0 + RPT - 1 >= N) continue;  // ragged tail
+            if constexpr (RPT == 4)
+              atomic_add_pk4_f16(
+                  out + (int64_t)m * N + row0,
+                  __halves2half2(__float2half_rn(s[0 * M + m]),
+                                 __float2half_rn(s[1 * M + m])),
+                  __halves2half2(__float2half_rn(s[2 * M + m]),
+                                 __float2half_rn(s[3 * M + m])));
+            else
+              atomic_add_pk2_f16(
+                  out + (int64_t)m * N + row0,
+                  __halves2half2(__float2half_rn(s[0 * M + m]),
+                                 __float2half_rn(s[1 * M + m])));
+          }
+        }
+      }
+    }
+  }
+}
+
+// Runtime-M variant (kept for M=4): the M-templated kernel above is faster
+// for M=1..3 (static register arrays), but measured ~1.6x slower at M=4 on
+// MI50 (507 -> 311 GB/s on the 248320x5120 LM head; cause unattributed -
+// see docs/gfx906/DEVLOG-spec-decode.md). The launcher dispatches M=4 here.
+
+template <int RPT, int KCHUNK>
+__global__ void __launch_bounds__(KCHUNK / 8)
+    dense_gemv_m_kernel_rt(const half* __restrict__ x,   // [M, K]
                        const half* __restrict__ w,   // [N, K]
                        half* __restrict__ out,       // [M, N], pre-zeroed
                        // if KSPLIT>1
@@ -423,28 +564,63 @@ torch::Tensor dense_gemv_m4_gfx906(torch::Tensor weight, torch::Tensor x,
   const half* xp = (const half*)x.data_ptr();
   half* op = (half*)out.data_ptr();
 
-  #define LAUNCHM(RPT, KC)                                                \
+  #define LAUNCHM(MVAL, RPT, KC)                                          \
     {                                                                     \
       dim3 grid(N / RPT, ksplit);                                         \
-      vllm::dense_gemv_gfx906::dense_gemv_m_kernel<RPT, KC>               \
+      vllm::dense_gemv_gfx906::dense_gemv_m_kernel<RPT, KC, MVAL>         \
+          <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)N, (int)K,       \
+                                        ksplit);                          \
+    }
+  #define LAUNCHM_RT(RPT, KC)                                             \
+    {                                                                     \
+      dim3 grid(N / RPT, ksplit);                                         \
+      vllm::dense_gemv_gfx906::dense_gemv_m_kernel_rt<RPT, KC>            \
           <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)M, (int)N,       \
                                         (int)K, ksplit);                  \
     }
-  #define LAUNCHM_BY_RPT(KCVAL)                                           \
+  #define LAUNCHM_RT_BY_RPT(KCVAL)                                        \
     do {                                                                  \
       if (rpt == 4)                                                       \
-        LAUNCHM(4, KCVAL)                                                 \
+        LAUNCHM_RT(4, KCVAL)                                              \
       else                                                                \
-        LAUNCHM(2, KCVAL)                                                 \
+        LAUNCHM_RT(2, KCVAL)                                              \
     } while (0)
-  if (kchunk == 4096)
-    LAUNCHM_BY_RPT(4096);
-  else if (kchunk == 2048)
-    LAUNCHM_BY_RPT(2048);
-  else if (kchunk == 1024)
-    LAUNCHM_BY_RPT(1024);
+  #define LAUNCHM_BY_RPT(MVAL, KCVAL)                                     \
+    do {                                                                  \
+      if (rpt == 4)                                                       \
+        LAUNCHM(MVAL, 4, KCVAL)                                           \
+      else                                                                \
+        LAUNCHM(MVAL, 2, KCVAL)                                           \
+    } while (0)
+  #define LAUNCHM_BY_KC(MVAL)                                             \
+    do {                                                                  \
+      if (kchunk == 4096)                                                 \
+        LAUNCHM_BY_RPT(MVAL, 4096);                                       \
+      else if (kchunk == 2048)                                            \
+        LAUNCHM_BY_RPT(MVAL, 2048);                                       \
+      else if (kchunk == 1024)                                            \
+        LAUNCHM_BY_RPT(MVAL, 1024);                                       \
+      else                                                                \
+        LAUNCHM_BY_RPT(MVAL, 512);                                        \
+    } while (0)
+  if (M == 1)
+    LAUNCHM_BY_KC(1);
+  else if (M == 2)
+    LAUNCHM_BY_KC(2);
+  else if (M == 3)
+    LAUNCHM_BY_KC(3);
   else
-    LAUNCHM_BY_RPT(512);
+    // M=4: runtime-M kernel (the templated M=4 measured slower, see above).
+    do {
+      if (kchunk == 4096)
+        LAUNCHM_RT_BY_RPT(4096);
+      else if (kchunk == 2048)
+        LAUNCHM_RT_BY_RPT(2048);
+      else if (kchunk == 1024)
+        LAUNCHM_RT_BY_RPT(1024);
+      else
+        LAUNCHM_RT_BY_RPT(512);
+    } while (0);
   return out;
 }
 

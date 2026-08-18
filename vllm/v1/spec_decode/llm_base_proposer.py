@@ -290,6 +290,16 @@ class SpecDecodeBaseProposer:
                 DeepseekV32IndexerMetadata,
                 MiniMaxM3SparseMetadata,
             ]
+            # gfx906 custom FA backend: opt its metadata into the multi-step
+            # drafting allowlist (same shape contract as RocmAttentionMetadata
+            # for the draft loop: num_actual_tokens / max_query_len /
+            # query_start_loc / seq_lens).
+            from vllm.platforms.rocm import on_gfx906
+
+            if on_gfx906():
+                from vllm.gfx906_fa.gfx906_fa_backend import Gfx906FAMetadata
+
+                rocm_types.append(Gfx906FAMetadata)
             # ROCM_AITER_FA is an optional backend
             # We check is_enabled() here to avoid importing the backend module during
             # auto-discovery when VLLM_ROCM_USE_AITER=0, which would trigger aiter

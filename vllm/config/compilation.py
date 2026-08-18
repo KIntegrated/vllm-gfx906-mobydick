@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import os
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import field, fields
@@ -1488,6 +1489,27 @@ class CompilationConfig:
                 uniform_decode_query_len,
                 tensor_parallel_size,
             )
+            # gfx906 spec decode: restore the sub-query-len capture sizes
+            # (1..q-1) that the rounding above drops. FULL keys already
+            # filter sizes < q, so this only adds small PIECEWISE graphs.
+            # Without it, no-draft spec steps (1 token) pad up to the
+            # size-q graph and pay the M=q GEMM cost (~13 ms/step on the
+            # 27B agentic mix; docs/gfx906/DEVLOG-spec-decode.md).
+            # VLLM_GFX906_SPEC_CG_SMALL=0 restores upstream behavior.
+            if (
+                os.environ.get("VLLM_GFX906_SPEC_CG_SMALL", "1") != "0"
+                and current_platform.is_rocm()
+            ):
+                from vllm.platforms.rocm import on_gfx906
+
+                if on_gfx906():
+                    _q = uniform_decode_query_len
+                    _have = set(self.cudagraph_capture_sizes)
+                    _small = [s for s in range(1, _q) if s not in _have]
+                    if _small:
+                        self.cudagraph_capture_sizes = sorted(
+                            self.cudagraph_capture_sizes + _small
+                        )
 
         # For Mamba models with FULL decode cudagraphs, each decode
         # sequence needs one Mamba cache block. The decode cudagraph
