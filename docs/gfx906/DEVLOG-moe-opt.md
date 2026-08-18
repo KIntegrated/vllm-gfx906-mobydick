@@ -2387,3 +2387,71 @@ Single-stream 8205-token prompt, cold (2 different prompts) + warm:
   GPU, is the TTFT bottleneck") is superseded for single-stream TTFT.
 - Warm (prefix-cache) TTFT is config-invariant (~1.75 s for 8K).
 - The 1568/4-seq/4.5-GiB config is stable (4x2048 burst, 4/4 OK).
+
+---
+
+## 2026-08-18 — Upstream merge: vllm-project/main into gfx906/main
+
+Merged `upstream/main` (158 commits since merge-base `015660da91`) into
+`gfx906/main` (220 ahead). 661 files, +31783/−7248. Four content
+conflicts, all resolved by hand:
+
+1. **`vllm/config/attention.py`** — `IndexerKVDType` union: upstream's
+   `"auto"` + logger, kept alongside our fp16/fp32 spellings (Minimax M3
+   gfx906 work, `0ccc37a118`/`a0c1d17893`). Upstream's default change
+   (`"bf16"` → `"auto"`) and the `use_fp4_indexer_cache` deprecation
+   alias come along as-is.
+2. **`auto_awq.py`** — took upstream's deletion of
+   `is_awq_marlin_compatible` (dead at the merge-base; our gfx906 guard
+   on it was moot). The real gfx906 AWQ routing (MoeWNA16 fallback,
+   `get_supported_act_dtypes`, `get_min_capability`) is untouched and
+   verified present in the merged file.
+3. **`v1/attention/ops/rocm_aiter_mla_sparse.py`** — kept our
+   env-gated fp16 logits gate at the top of `rocm_mqa_logits` (gfx906
+   has no FP8); accepted upstream's removal of the stale `TODO(ganyi)`
+   workaround comment and the new gfx942 flydsl path (not taken on
+   gfx906 — `_ON_GFX942` guard).
+4. **`v1/attention/backends/mla/rocm_aiter_mla_sparse.py`** —
+   `get_supported_kernel_block_sizes`: base `[1, 64]` → we ran
+   `[1, 32, 64]`, upstream generalizes to `[1, MultipleOf(16)]` (a
+   superset of ours; our fp16 logits path is block-size agnostic).
+   Took upstream.
+
+Upstream content of note: XPU work, Rust frontend/gRPC, spec-decode MTP
+fusions, `[ROCm]` Triton W4A16 transpose bugfix (`1d3a8b9e22`, new
+tests), gfx942 FlyDSL fp8 MQA logits, DSV4 Triton sparse-MLA decode
+(gfx950), quant dead-code removal (`7d7b6f26f4`). Zero csrc/rocm
+changes from the merge (our whole kernel stack untouched);
+`libtorch_stable` changes → `_C_stable_libtorch` rebuild; `_rocm_C`
+recompiled for the changed `ops.h` header; `_C` unchanged (its source
+`csrc/torch_bindings.cpp` untouched by the merge).
+
+### Validation (post-merge, local venv, MI50)
+
+- Build: `setup.py build_ext --inplace` exit 0; all changed targets
+  rebuilt and reinstalled.
+- M3 config tests (`tests/models/minimax_m3/`): **byte-identical
+  pre/post** — `test_config.py` 3F/4P both sides (the 3 failures are
+  pre-existing: they assert an `fp16→float16` normalizer in
+  `AttentionConfig` that was never implemented; the commit that added
+  them says "test: partially ok"). `test_fp32_kv_config.py` has a
+  pre-existing collection error (imports
+  `_use_fp16_dot_for_fp32_inputs`, absent from our tree). No merge
+  regression.
+- `test_auto_awq.py`: identical 1F/8P both sides (the failure needs
+  Qwen2-1.5B-Instruct-AWQ weights, not in the offline cache).
+- gfx906 suites: `test_gfx906_moe_gemm.py` + `test_fused_topk.py` +
+  `test_moe_wna16.py` = 47 passed / 720 skipped; GEMV + FA + upstream
+  `test_triton_w4a16.py` = 52 passed / 2 skipped.
+- Greedy probe (35B, 12×128): **token-identical to baseline**
+  `ALL 868ad09ee35c493d83043655ffccecff4fd61f1379d9d6c6adde2dfa967aad2c`.
+- Serving graph bench (4 samples, 2048pp/256tg): **66.65 / 66.35 /
+  66.66 / 66.59 t/s** (mean 66.56) — mid-session band of the pre-merge
+  range 65.87–67.03 (S3 default-on, S2/S5 off).
+- Ruff on the 4 conflict files: 0 new findings; the 24 present
+  (20×E501, 2×F401, 1×I001, 1×SIM102) are pre-existing on the branch
+  (identical in the pre-merge worktree) and left untouched.
+
+Open (pre-existing, not merge-related): the M3 fp16/fp32 config
+normalizer gap and the `test_fp32_kv_config.py` import — the M3 gfx906
+support shipped as "partially ok" and was never finished.

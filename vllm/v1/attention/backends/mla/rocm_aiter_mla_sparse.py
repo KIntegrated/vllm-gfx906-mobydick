@@ -277,7 +277,10 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [1, 32, 64]
+        # gfx906 note: base was [1, 64], we ran [1, 32, 64]; upstream's
+        # MultipleOf(16) is a superset and the gfx906 fp16 logits path is
+        # block-size agnostic.
+        return [1, MultipleOf(16)]
 
     @staticmethod
     def get_name() -> str:
