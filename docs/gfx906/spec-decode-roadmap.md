@@ -1,7 +1,16 @@
 # gfx906 Speculative Decoding Roadmap
 
-> Status: **Phase 0 done, Phase 1 re-scoped after kernel-path
-> forensics (2026-08-18).** n-gram probe complete (0.68× on agentic
+> Status: **Phase 1 in progress — L1' DONE (committed
+> `751eacb37d`, 13.4 ms/step measured in-engine); serving A/B now
+> 0.945× (was 0.71×). Next: L1'' (m4 dispatch to n>16, ~5 ms,
+> dispatch-only), then L5 (no-draft graph padding, verify first),
+> then L2 (AWQ, re-scoped 2–8 ms).** Build note: this branch is
+> currently built `VLLM_NO_MAX_ILP=1` — the per-file max-ilp flag
+> under the new ROCm 7.14 LLVM is suspected of the weight-load GPU
+> faults (2× `hipErrorLaunchFailure` + BACO reset, then clean).
+>
+> Prior status (2026-08-18): Phase 0 done, Phase 1 re-scoped after
+> kernel-path forensics. n-gram probe complete (0.68× on agentic
 > prompts; **1.12× on highly repetitive prompts** — see §1); the two
 > prerequisite FA fixes are in-tree on this branch. Baseline refs:
 > dense 27B-AWQ **27.46 t/s** (server, 4 seqs, graph), MoE
@@ -120,44 +129,52 @@ bench). The model is calibrated to within ~4%.
 
 ### The levers (measured, single-request, per draft step)
 
-| # | lever | savings | scope |
-|---|---|---|---|
-| **L1'** | fp16 M≤4: extend `dense_gemv_gfx906` to ≤4 rows (census: M=1 takes the GEMV op, M=4 falls to `triton_matmul`) | **~13 ms** (3.5 → ~3–4 ms at M=4) | gfx906-local kernel + dispatch branch (exists) |
-| **L2** | AWQ M≤4: 4-row GEMV (exllama structure) or re-tiled `q_gemm` (census: same calls at M=1/M=4 — pure per-call delta) | **~17 ms** (exact census shape set) | gfx906-local kernel (`csrc/rocm/quantization/gptq/`) |
-| L3 | CPU ngram proposer D2H serialization | ~5 ms | in-tree (`ngram_proposer.py`); the GPU proposer exists but has a **draft-quality bug** (0.428 vs 1.08 acc/step — match selection/tie-break divergence, §2 item 1) |
-| L4 | q1 FULL graphs for no-draft spec steps (old B2) | 25–27 ms on no-draft steps (16% of steps at min1; 40% at min2) | core vLLM (§4) |
-| L5 | B3 bookkeeping | ~2 ms (small — the 10 ms figure came from a 2-seq run) | partly overlaps L2 kernel work |
-| **W4** | the same `dense_gemv` extension shipped at M≤16 (replaces the GEMV floor AND the 174 µs triton floor) — **all M, spec and no-spec** | ~15 ms per decode step (~40% baseline latency) | gfx906-local kernel; does NOT change the spec ratio — parked after Phase 1 |
+| # | lever | savings | scope | status |
+|---|---|---|---|---|
+| **L1'** | fp16 M≤4: extend `dense_gemv_gfx906` to ≤4 rows (census: M=1 takes the GEMV op, M=4 falls to `triton_matmul`) | **13.4 ms measured in-engine** (draft step 66.6 → 53.2 ms eager) | gfx906-local kernel + dispatch branch | **DONE** `751eacb37d` |
+| **L1''** | extend the m4 dispatch to **n>16** fp16 (LM head 248320×5120 + layer-0 FA projections currently run inductor at M=4: 5.6 ms/call; m4 does the shape in ~2.0 ms) | **~5 ms** | dispatch-only (no new kernel) | open — next |
+| **L2** | AWQ M≤4: 4-row GEMV (exllama structure) or re-tiled `q_gemm` | **2–8 ms** (re-scoped 2026-08-18: the family is dequant-ALU-bound — M=1 q_gemm runs 44 MB in 75 µs = 590 GB/s, ~2× off the HBM roofline — and the tiled M=4 kernel already shares the dequant across m-rows; GEMV structure removes only atomics/LDS/m-tiling overhead, not the 17 ms M=1→M=4 delta) | gfx906-local kernel (`csrc/libtorch_stable/quantization/gptq/`) | open — after L1'' |
+| L3 | CPU ngram proposer D2H serialization | ~5 ms | in-tree (`ngram_proposer.py`); the GPU proposer exists but has a **draft-quality bug** (0.428 vs 1.08 acc/step — match selection/tie-break divergence, §2 item 1) | open |
+| **L5** | no-draft spec step penalty: **measured ≈ 13 ms** (graph-mode no-draft ≈ 48 ms vs nospec 35–37, back-solved from the A/B counters; eager shows only +3–5, so ~10 ms is graph-mode — suspected cudagraph padding of spec steps to the draft capacity M=4, UNVERIFIED) | **~13 ms on 63% of agentic steps** — the dominant remaining loss | core vLLM (`cudagraph_dispatcher`/`gpu_model_runner`); verify padding first (§4 risk) | open — verify, then fix |
+| **W4** | the same `dense_gemv` extension shipped at M≤16 (replaces the GEMV floor AND the 174 µs triton floor) — **all M, spec and no-spec** | ~15 ms per decode step (~40% baseline latency) | gfx906-local kernel; does NOT change the spec ratio — parked after Phase 1 | parked |
 
 GDN needs **no new kernel** for single-request spec decode.
 
-### Revised ceiling (agentic prompts; T_n = 37 ms with L4)
+### Ceiling, re-anchored on measured values (min2 mix: r = 0.37,
+a = 1.09 — the config the serving A/B actually runs)
 
-| scenario | T_d | r, a (min1) | t/s | vs 1.15× gate |
+Anchor points: pre-L1' draft step 95 ms (profiler, contaminated
+era) / post-L1' **56 ms** (graph profile 54.7 + launch margin);
+no-draft **48 ms** (back-solved, L1' build); nospec 37 ms.
+
+| scenario | T_d | T_nd | t/s (decode) | all-in vs baseline 26.5 |
 |---|---|---|---|---|
-| today | 95 | .84, .71 | 19.4 (measured) | 0.71× |
-| +L2 (T_d ≈ 58) | 58 | .84, .71 | 26.5 | 0.97× |
-| +L2+L4 | 58 | .84, .71 | 29.2 | 1.06× |
-| +L2+L4, a = 1.0 | 58 | .84, 1.0 | 33.7 | **1.23×** |
-| +L2+L4+L3 (T_d ≈ 53) | 53 | .84, .71 | 31.8 | 1.16× |
+| **measured (L1')** | 56 | 48 | 28.6 | **25.06 = 0.945×** ✓ model fits |
+| +L1'' | 51 | 48 | 31.2 | ~1.03× |
+| +L1''+L2 (5 ms) | 46 | 48 | 33.7 | ~1.09× |
+| +L5 (T_nd → 35) | 46 | 35 | **35.9** | **~1.16×** |
 
-Same L2+L4 stack at min2 (r=0.40, a=1.08, T = 0.4·58+0.6·37 =
-45.4): 31.5 t/s = **1.15×**.
+(The old min1 table is superseded: min2's draft share is 37% vs
+84%, so the no-draft lever L5 — not the draft kernel — dominates
+the agentic mix. At min1 the draft-side levers dominate instead;
+the two configs are lever-dual.)
 
 W4 (skinny fp16 GEMM) lifts **both arms** ~40% (no-spec 36.5 → ~22
 ms ≈ 45 t/s; spec T_d 58 → ~43, T_n 37 → ~23) without changing the
 ratio.
 
-**Readout.** The stack **L2+L4(+L3)** lands at 1.06–1.16× at
-today's measured draft quality (a = 0.71) and **1.15–1.23× at
-a = 1.0–1.1** (min2 already reaches 1.15× at a = 1.08). **Draft
-quality `a` is the swing variable**: 0.71 → 1.0 flips 1.06× →
-1.23×. Note a = 1.0 is only 0.16 above the CPU ngram min2 average
-measured on this prompt set (1.08) — the gate pass is plausible
-without any drafter improvement, via min2 + L2 + L4. **Stop rule
-(kept from review, re-anchored):** if the measured post-Phase-1
-draft-step cost exceeds 60 ms, stop after Phase 1 and record the
-ceiling. (Expected ~58 — inside the rule, barely.)
+**Readout (updated 2026-08-18 post-L1').** At min2's measured
+quality (a = 1.09, r = 0.37), the stack **L1''+L2+L5** lands at
+~1.16× all-in (35.9 t/s decode); L1'' is dispatch-only, L2 is
+2–8 ms, L5 needs its padding hypothesis verified first (core-vLLM
+risk). **Order of attack: L1'' → verify L5 padding → L5 → L2.**
+L3 (proposer) stays available if the ceiling still falls short.
+**Draft quality `a` remains the swing variable** (a = 1.09 → 1.3
+would add ~1.3 t/s per 0.1 of a at the min2 mix). **Stop rule
+(kept from review, RE-ANCHORED 2026-08-18):** the draft-step cost
+is now 56 ms measured (≤ 60 rule met) — the rule is consumed; the
+gate going forward is the **all-in serving A/B ≥ 1.15×** after
+L1''+L2+L5. If that fails, stop and record the ceiling.
 
 ## 2. Phase 0 — config-only A/Bs (DONE 2026-08-18)
 
@@ -197,6 +214,13 @@ scope.
 
 ## 3. Phase 1 — skinny-M (M≤4) GEMV-family kernels (L1' + L2)
 
+**Status (2026-08-18):** L1' implemented, tested (25 passed / 2
+skipped), microbench-verified (25.6 → 11.0–11.2 ms/step fp16
+worst-case M=4) and **confirmed in-engine: draft step 66.6 →
+53.2 ms eager; serving A/B 0.71× → 0.945×** (dev log). L1''
+(m4 dispatch to n>16) and the L5 no-draft finding re-ordered the
+remainder — see the §1 levers table. L2 below is re-scoped.
+
 The GEMM census (`gemm_step_census.py`, eager single-prompt, exact
 per-step counts) gives the final shape of the work:
 
@@ -204,6 +228,10 @@ per-step counts) gives the final shape of the work:
   M=1 (231–236/step, four shapes: `5120×6144`, `34816×5120`
   (fused gate+up), `5120×17408`, `16384×5120`) — the delta is pure
   per-call kernel time, **~17 ms/step** over the exact shape set.
+  *(Re-scoped 2026-08-18: that 17 ms is the M=1→M=4 cost, but the
+  family is dequant-ALU-bound and the M=4 tiled kernel already
+  shares the dequant — a GEMV-structure M≤4 kernel saves only the
+  atomics/LDS/m-tiling overhead: 2–8 ms. See levers table.)*
 - **fp16 (L1')**: the dispatcher is M-gated — M=1 takes the GEMV op
   path (~3.5 ms/step), M=4 falls to `triton_matmul` (~16.5 ms/step:
   N=96 ×~43, N=14336 ×~14, one inductor-fused [248320, 5120] layer-0

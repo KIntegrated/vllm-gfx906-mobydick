@@ -415,3 +415,118 @@ stays 2 (matches the M=1 GEMV rule; env sweep knob kept).
 
 pytest: 25 passed / 2 skipped (all 4 new tests green, incl. M=4
 K=17408 ksplit=17 CAS chain). M=1 paths untouched.
+
+## ROCm 7.14 rebuild: GPU wedge incident + max-ilp disabled (2026-08-18)
+
+After the Debian-packaged ROCm switch and full clean rebuild
+(30 min, only the optional vllm-rs Rust CLI failed), weight loading of
+the dense 27B AWQ model faulted the GPU twice:
+`hipErrorLaunchFailure` mid-shard-copy (sticky error), CP
+"unrecoverable state due to unsuccessful queues preemption" in dmesg,
+queue eviction, BACO reset (self-recovered once; wedged the driver
+once, fixed by reboot). Intermittent (2 hits, then clean runs).
+
+Only compile difference in the load path: `q_gemm.hip` (contains
+gptq_shuffle / gptq_shuffle_awq_qweight) is the single file in
+csrc/libtorch_stable built with the per-file LLVM **max-ilp**
+scheduler flag. Under the new LLVM (ROCm 7.14.60850 toolchain) that
+flag is suspected of emitting a faulting schedule. Decision: rebuild
+with `VLLM_NO_MAX_ILP=1` (all 4 max-ilp files lose the flag). Since
+then: **4 full clean runs** (3× weight load + generate, plus the
+serialized-kernel probe). Cost carried: q_gemm +15..26%, FA decode
+−2..5% vs the max-ilp build — absolute serving numbers on this build
+are ~1–2 t/s below the max-ilp records; A/B ratios within one build
+stay valid. Revisit per-file max-ilp under the new LLVM later
+(candidates: flag only for the FA files, or a scheduler-variant).
+
+## In-engine step-wall probe (L1' confirmed in-engine)
+
+`/tmp/bench/step_wall_probe.py` (promote when settled): eager
+single-prompt (maximally repetitive), conv-anchor step segmentation,
+one CUDA event per step boundary (conv #48). `AMD_SERIALIZE_KERNEL=3`
+inflates walls ~2.2× (35→82 ms M=1) — use it only to identify
+faulting kernels, never for timing.
+
+| arm (eager) | wall | no-draft step | draft step min/mean |
+|---|---|---|---|
+| nospec M=1 | 24.9 t/s | 35.2 / 37.3 ms | — |
+| spec triton M≤4 | 36.2 t/s | 40.3 ms | 46.9 / 66.6 ms |
+| spec m4 GEMV (L1') | **43.7 t/s** | 39.8 ms | 41.9 / **53.2 ms** |
+
+L1' in-engine saving: **13.4 ms/draft step** — matches the
+microbench prediction (14.5 ms M=4 worst case). This
+maximally-repetitive prompt already wins 1.76× in eager (consistent
+with the graph-mode 1.12× finding). Draft-step floor ≈ 42 ms
+(min); the mean's excess is eager launch/CPU gaps (292 GEMMs) that
+CUDA graphs remove in serving.
+
+L2 re-scope: the AWQ family is dequant-ALU-bound, not
+weight-read-bound (M=1 q_gemm runs 44 MB in 75 µs = 590 GB/s, ~2× off
+the HBM roofline) and the tiled M=4 kernel already shares the
+dequant across m-rows. An M≤4 AWQ GEMV removes atomics/LDS/m-tiling
+overhead only — estimated **2–8 ms/step**, not the census's 17 ms
+M=1→M=4 delta. Deprioritized behind the serving A/B and the in-tree
+ngram GPU-proposer quality fix (~5 ms, no kernel work).
+
+## flash-attn: no rebuild needed
+
+`flash_attn` (editable, /local/git/flash-attention-gfx906) selects
+backend at import: `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` → pure
+Triton `flash_attn_triton_amd` (verified: varlen func finite and
+correct); otherwise `import flash_attn_2_cuda` (compiled CK kernel —
+not present in the tree, and CK does not support gfx906 anyway). The
+compiled .so vanished at some point (reboot/migration), which broke
+any process lacking the env var; with the var (mandatory for vLLM
+ROCm regardless) the missing extension is never touched. Pre-existing
+quirk: the triton *packed* `flash_attn_func` returns inf on a random
+2×64 seq (varlen path fine) — vLLM never calls the packed path.
+
+## Serving A/B (no-max-ilp build, L1' on) + graph-mode profile
+
+`run_spec_ab.sh` (3 agentic prompts × 3 repeats, 512 tok greedy,
+server per arm, `--served-model-name qwen27` — client 404s without
+it):
+
+| arm | mean t/s | CI95 lo |
+|---|---|---|
+| baseline | 26.52 | 25.48 |
+| ngram3 (L1') | 25.06 | 24.67 |
+
+L1' recovered most of the Phase 0 gap (0.71× → **0.945×**) but the
+agentic case still loses. Per-prompt: baseline 29.3/26.0/25.7,
+ngram3 24.3/25.3/25.6 — the spec arm is flatter (the repetitive
+bug-fix prompt p0, baseline's fastest, loses most).
+
+Counters (ngram3): a = 1.09 accepted/step, ~37% of steps are
+drafts (134/366 on p0), ~63% no-draft. Back-solving step walls from
+elapsed (incl. ~2–2.5 s TTFT): **no-draft spec step ≈ 48 ms vs
+nospec 35–37 ms** — a ~13 ms penalty on 63% of steps. The eager
+probe showed only +3–5 ms there (n=2), so the extra ~10 ms is
+graph-mode: suspected cudagraph padding of spec steps to the draft
+capacity (M=4) so no-draft steps pay M=4 GEMM costs (AWQ 29 vs 21
+ms, fp16 16.7 vs ~5). UNVERIFIED — needs a padded-size trace or the
+dispatcher's captured-size log. This, not the draft step, is the
+dominant agentic loss (B3-family lever, in-tree core-vLLM risk).
+
+`spec_prof_probe.py --spec` (repetitive prompt, graph mode, m4
+build): 128 tok, Self CUDA 2.736 s, ~50 steps → 54.7 ms/step,
+matching the eager probe (53 ms). Per step:
+
+| kernel | ms/step |
+|---|---|
+| gptq 4bit GEMM (AWQ M=4, 226 calls) | 29.1 |
+| dense_gemv_m_kernel (L1', 65 calls) | 9.4 |
+| inductor FxGraph (fp16 n>16 GEMMs) | 7.3 |
+| Cijk/hipBLAS (M=1 fp16) | 5.2 |
+| reconstruct_exllama_4bit (AWQ z/s) | 1.85 |
+| GDN fused_seq (1968 calls = 4/step… 48 layers × 2?) | 1.1 |
+| FA decode (q8 + gather) | 0.8 |
+
+**L1'' found**: the fp16 n>16 GEMMs (LM head 248320×5120, layer-0
+FA projections) bypass the m4 hook (dispatcher only hooks the
+n≤16 branch) and run inductor at M=4: 5.6 ms/call. The m4 kernel
+does that shape in ~2.0 ms (microbench). Extending the m4 dispatch
+to n>16 for M∈{2,3,4} is ~5 ms/step of further L1' saving —
+dispatch-only, no new kernel. (M=1 stays on inductor/hipBLAS, which
+is at the roofline there.)
+
