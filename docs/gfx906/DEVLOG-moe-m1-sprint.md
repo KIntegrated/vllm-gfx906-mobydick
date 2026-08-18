@@ -422,3 +422,44 @@ comfortably below the smallest in-model winning-logit margin. The
 uniform rule going forward (also applied retroactively here): a
 default-ON numerics change requires a clean wall-clock A/B — a
 per-kernel number may motivate, but not justify, flipping a default.
+
+## Post-sprint code review fixes (2026-08-19)
+
+Two independent reviews of the branch (moe-m1-sprint-code-rev-glm5.md,
+merged with moe-m1-sprint-code-rev-ds4.md) produced six findings; the
+actionable ones were fixed in five commits:
+
+- **R1+R2** (`979e72c925`): the v2 M=1 launcher guard admitted shapes
+  the kernel cannot tile (`size_k%64==0` allowed `slice_k<32` → reads
+  past `end_k`; no `groupsize%32==0` check → missed group refreshes).
+  Now `size_n%256==0 && size_k%256==0 && size_k<=2048 &&
+  groupsize%32==0`. Also dropped the dead gemm1 branch of the M=1
+  dispatch (computed for `output_topk==0` but the launch was gated on
+  `output_topk>0` only) and documented that the env flag does not
+  affect captured CUDA graphs.
+- **R5** (`b7ec0306ee`): this devlog's S2 section described an earlier
+  draft (-inf dummy lanes + LDS scans); rewritten to describe the
+  shipped width-32 shuffle kernel. The dispatch line wrongly claimed
+  the env default was ON.
+- **R4** (`e06f484c0e`): S3's default-ON decision marked provisional
+  with reopen conditions (its serving A/B was thermally flagged; see
+  the S3 section).
+- **R3/R6** (`b3e7139aaa`): `tmp_tp_probe/` harnesses moved to
+  `benchmarks/kernels/gfx906/harness/`, probe scripts to
+  `benchmarks/kernels/gfx906/`; path references updated.
+- **R5-hardening** (`8e7935edd4`): S2 dispatch docstring pins the
+  bit-equality assumptions (softmax/no-bias/no-padding/full-range/
+  rsf=1), Python gate now also checks `gating_output.shape[0]==1`,
+  and a new end-to-end dispatch test covers `vllm_topk_softmax` with
+  the env set (M=1 bit-equal, M>1 guarded off).
+
+Not done (deliberately): the S5 `diff < 0.3·max+0.05` test gate stays
+as-is — S5 is default-OFF and the review agreed the stronger
+higher-precision accumulation check should only be required before any
+future default-ON flip. The clean S3 serving re-A/B (fans confirmed)
+is deferred until thermals cooperate; the provisional flag in the S3
+section is the record of that.
+
+Verification: incremental rebuild + full
+`tests/kernels/moe/test_gfx906_moe_gemm.py` (25 passed) and
+`tests/kernels/moe/test_fused_topk.py -k gfx906` (6 passed).
