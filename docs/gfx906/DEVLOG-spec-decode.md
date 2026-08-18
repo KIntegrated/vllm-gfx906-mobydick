@@ -218,25 +218,46 @@ predicted 18.7 t/s vs **measured 19.40** (4% — model trusted).
 **Prompt sensitivity (new finding):** on a maximally repetitive
 prompt ("repeat the sentence 30 times", 128 tok, LLM harness) spec
 already **wins**: 32.5 t/s vs 29.0 nospec (1.12×), zero kernel work.
-The agentic loss is entirely the low-repetition case — where L1/L2
+The agentic loss is entirely the low-repetition case — where L2/L4
 apply.
 
 ## Levers and revised plan (roadmap restructured accordingly)
 
-- **L1** fp16 M≤4 routing off raw triton_matmul (~25–30 ms): measure
-  rocBLAS/Cijk first, dispatch change or skinny GEMM.
-- **L2** AWQ q_gemm M≤4 skinny path (~20–25 ms): re-tile the M=1
-  tuning to M=4 or a GEMV-family 4-row kernel.
+- **L2** AWQ q_gemm M≤4 skinny path: re-tile the M=1 tuning to M=4
+  or a GEMV-family 4-row kernel. In-engine M=1→M=4 delta ~26 ms
+  (19→45 ms/step); the kernel-only microbench delta is ~5 ms
+  (7.3→12.5 ms/step over the 27B's AWQ set) — the rest is
+  launch/K-split inflation (263 vs 234 calls/step). Target: bring
+  M=4 to M=1 cost.
 - **L3** CPU proposer (~5 ms) / GPU proposer match-selection bug.
 - **L4** q1 FULL graphs for no-draft steps (old Phase 2, unchanged
   scoping + review caveats).
 - **L5** B3 (~2 ms, small).
+- **W4 (new, general decode opt — not spec-specific)**: the fp16
+  family (self_attn.q/k/v + linear_attn.in_proj_a/b + layer 0,
+  ~90 GEMMs/step) runs `triton_matmul` at **~19 ms/step at EVERY M**
+  (weight-bound; M-invariant: 174 µs at M=1..16 on fa_q). Microbench
+  (`fp16_skinny_m.py`, promoted): Triton *beats* rocBLAS on MI50
+  (174 vs 340 µs on fa_q; 838 vs 1751 on layer0_down) — so the
+  original L1 "route to rocBLAS" is dead on arrival. The win is a
+  custom weight-row-parallel skinny fp16 GEMM (GEMV structure):
+  fa_q's 31.5 MB weight read is 31 µs at HBM speed vs Triton's 174.
+  ~15 ms off *every* decode step (spec and no-spec alike) — lifts
+  the baseline 36.5 ms → ~22 ms (~45 t/s no-spec) but does NOT
+  change the spec ratio. Parked as W4; do after Phase 1 (it makes
+  the A/B baselines move underneath the spec work).
+- **Old L1 (fp16 M≤4 routing): DEAD** — triton_matmul is M-invariant
+  and already the MI50-best of {triton, rocBLAS}; nothing to route.
 - **Old Phase 1 (GDN small-M kernel): CLOSED — already exists**
-  (W3 in roadmap). GDN needs no new kernel for single-request spec.
+  (W3). GDN needs no new kernel for single-request spec.
 - Stop rule re-anchored: measured post-Phase-1 draft step > 60 ms →
-  stop. Expected ~55–60 (L1+L2 on 95).
-- Revised ceiling: L1+L2+L4 (+L3) = 1.16–1.29× agentic (today's
-  a); 1.18× at min2. Draft quality `a` remains the swing variable.
+  stop. Expected ~58–65 (L2 on 95; the unexplained ~20 ms AWQ M=4
+  inflation is what L2 is supposed to kill).
+- Ceiling (microbench-verified costs; T_d ≈ 58 post-L2, T_n = 37
+  with L4): min1 (r=.84, a=.71) → **1.06×**; a=1.0 → **1.23×**;
+  min2 (r=.40, a=1.08) → **1.15×**. Draft quality `a` is *the*
+  swing variable (0.71→1.0 flips 1.06→1.23×). W4 lifts both arms
+  ~40% without moving the ratio.
 
 ## Artifacts this session
 
@@ -244,15 +265,26 @@ apply.
   (from /tmp/bench/gdn_step_probe.py), `bench_awq_m_scaling.py`.
 - `spec_ngram_dense.py`: `--repeats` knob + CI summary (committed
   earlier this session).
-- Roadmap restructured around L1–L5 (Phase 1 = skinny-M GEMMs;
-  old Phase 1 closed as W3; W1 = multi-request chunk reclass;
-  W2 = MoE port). Dev log + roadmap + scripts committed.
+- Roadmap restructured (Phase 1 = L2 AWQ skinny-M; old Phase 1
+  closed as W3; W1 = multi-request chunk reclass; W2 = MoE port;
+  W4 = skinny fp16 GEMM, general decode opt).
+- `bench_fp16_skinny_m.py` promoted (triton_matmul vs rocBLAS at
+  M=1..16): **triton wins on MI50, and is M-invariant** → old L1
+  (route fp16 to rocBLAS) is dead; the fp16 family becomes W4
+  (custom skinny fp16 GEMM, ~15 ms/step off ALL decode, ratio-
+  neutral).
+- `spec_prof_probe.py`: in-process env fix (multiprocess EngineCore
+  empties the profiler table).
 
 ## Next
 
-1. Phase 1 L1 first (cheapest, largest): measure Cijk/
-   `rocm_unquantized_gemm` at M=4 on the GDN fp16 shapes; pick
-   routing vs kernel; implement; unit test; draft-step probe.
-2. Phase 1 L2: q_gemm M=4 re-tile vs GEMV-family 4-row kernel —
-   bench both, pick.
-3. Stop-rule check → Phase 2 (q1 FULL) → Phase 3 (gate).
+1. Phase 1 (L2): q_gemm at M=4 — first instrument the in-engine
+   launch/K-split counts (263 vs 234/step) to size the inflation;
+   then bench (a) re-tile the M=1 tuning to M=4 vs (b) GEMV-family
+   4-row kernel; implement the winner; unit test; draft-step probe;
+   stop-rule check (≤ 60 ms).
+2. Phase 2 (L4): q1 FULL graphs for no-draft steps (spike first per
+   review caveats).
+3. Phase 3: L3 (proposer) + adoption gate (1.15×, PPL-neutral,
+   M=1 token identity).
+4. W4 after the spec gate: skinny fp16 GEMM (lifts both arms ~40%).
