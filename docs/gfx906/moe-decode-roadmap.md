@@ -67,6 +67,17 @@ Note for micro-kernel work below ~10 µs: per-kernel profiler rows are
 pipeline-state dependent (measured 1.8–20 µs for the SAME kernel in
 different contexts) — wall-clock serving A/B is the gate.
 
+**Sprint outcome (2026-08-18/19, DEVLOG-moe-m1-sprint):** of the
+fresh table's top MoE levers, S2 (M=1 topk) shipped default-OFF
+(graph-replay loss), S5 (gemm2 re-tile) shipped default-OFF behind
+`VLLM_GFX906_MOE_M1` (+0.60 t/s graph when on), and S3 (shared
+down_proj GEMV) shipped **default-ON, provisional** (−70 µs/step
+GPU-busy; clean serving re-A/B pending). The 64.08 t/s Phase-3 close
+was superseded within the sprint: 67.03 t/s with S5 on (record:
+67.39). Open MoE buckets are now gemm1 (≈1070 µs/step) and the
+topkGating launch itself (713 µs/step — only a fusion (C1b/c) can
+win it).
+
 ## 2. Structural facts (constraints for any design)
 
 1. **Atomic K-splits force two zeroings.** The gemm kernel tiles K via
@@ -138,7 +149,7 @@ the 14 µs/call is structure, not DRAM latency. (Superseded for the
 
 (2026-08-18 re-anchor: 2149 µs/step = 27.8 µs/call in the fresh eager
 probe; this is the sprint's **S5** — the V2 in-block K-parallel GEMV
-re-tile is the design under construction.)
+re-tile, built and shipped same week, see the result below.)
 
 **Result (shipped, `VLLM_GFX906_MOE_M1`, default OFF):** the V2
 lane-column re-tile (512t, wave-per-K-slice, LDS reduce, wave-0-only
@@ -155,7 +166,11 @@ same-address CAS contention is pathological on this stack (lost updates
 at 2^11, aperture-violation aborts with multi-cell patterns) — keep
 per-lane distinct CAS targets. gemm1 (≈1070 µs/step) stays open; the
 V1 full-K single-wave design and the activation-fusion idea are the
-next candidates.
+next candidates. Post-sprint review fix (2026-08-19): the v2 launcher
+guard was tightened (`size_k%256==0` + `groupsize%32==0` — the
+kernel consumes 32 k-elements per iteration per wave) and the dead
+gemm1 dispatch branch removed; the env flag does not affect captured
+CUDA graphs.
 
 The BM=1/NPT=4 tiling launches 4096 blocks (gemm1: 8 slots × 8 n-tiles ×
 64 K-splits, 32 threads each) per layer; each (slot, n-column) cell is
@@ -231,6 +246,17 @@ trivially shareable inside a block or via one barrier. Effort: high
 since there is no dequant); risk: medium; expected −150 to −250 µs
 after the §2.4 discount.
 
+**Sprint partial result (S3, 2026-08-18, shipped default-ON
+provisional):** the per-leg GEMV question is answered — the w2 leg
+[2048,512] moved to `dense_gemv_gfx906` (kc512/RPT=2, 5.6-5.7 vs
+6.7-7.7 µs LLMM1; −70 µs/step GPU-busy in-model; kill switch
+`VLLM_GFX906_DOWN_GEMV=0`), while the w13 gate_up leg [1024,2048] is
+a measured GEMV **loss** (8.0 vs 7.3 µs — no lever, stays LLMM1).
+The remaining C5 substance is therefore only the chain fusion (2
+launches/layer); its expected value shrank accordingly. The default-ON
+call is provisional pending a clean serving re-A/B (see the S3
+section of DEVLOG-moe-m1-sprint).
+
 ### C6 — Q8_1 activation quant (llama.cpp's decode mechanism) — likely NO on gfx906
 
 llama.cpp quantizes activations to Q8_1 and dots int8×int4 (mmq).
@@ -281,6 +307,10 @@ multi-batch project where the overlap window is larger.
 1. **Phase 0 — characterization (days, no model-path changes):** C8
    (TCC on the gemm) + C1 gate micro-bench (routing kernels at
    M=1/8/32/128) + C2 ablation bench (V1–V4 at gemm1/gemm2 shapes).
+   *(Partially done by the 2026-08-18 sprint re-anchor: the fresh
+   in-model table replaced the stale §1 premise; C2's V2 variant was
+   benched and shipped (default-OFF); C1's (a)-topk was tried and
+   rejected for the gapless regime. C8 remains open.)*
    (C4's identity question was resolved 2026-08-16 — layer 0's fp16
    routed experts; see §6.) Output: a DEVLOG table deciding which of
    C1/C2 is real.
@@ -424,12 +454,15 @@ AI-assistance disclosure), these are the items:
 ## 9. Code-review items (parked 2026-08-17, resolved 2026-08-18)
 
 The pre-merge code review of the branch (`gfx906_qwen_impr_code_rev_qwen.md`
-in `docs/gfx906/` plus the combined review at the repo root) resolved its
+in `docs/gfx906/`) resolved its
 four severity findings in `01499157a8` (symmetric W4A16 repack crash +
 wrong zp fill, GDN platform gate, oracle GPTQ exclusion, `top_k` guard).
 The remainder was parked here and is now fully resolved (see the
 2026-08-18 DEVLOG section for evidence and gates). IDs are R*,
-severities as P2/P3/P4 per the review.
+severities as P2/P3/P4 per the review. (The earlier combined review
+file that also lived at the repo root has been deleted; the resolved
+record is here and in the DEVLOG. A second review pass over the
+moe-m1-sprint commits is §9.4.)
 
 ### 9.1 Edge-path correctness (fix before enabling the affected mode)
 
@@ -530,27 +563,34 @@ or run on non-gfx906 hardware)
   `ZERO_KTAIL`); the individual knobs remain for finer control. The
   three ON-by-default functional switches (`FUSED`, `FUSED_QUANT`,
   `QPAD_EMPTY`) are NOT debug hooks and are untouched.
-- **R10 — stale docs/comments (P4).** The `kchunk 512|2048|4096`
-  docstrings in `csrc/rocm/ops.h` + `vllm/_custom_ops.py` omit 1024
-  (a supported and *used* value — K=17408 down_proj); the
-  `forward_paged_direct` pybind help says output `[B, Hq, Sq, D]`, it
-  is native BSHD `[B, Sq, Hq, D]`; the launcher header's "TODO: vLLM
-  block table" is implemented; the MoE kernel header's `grid = (…, 
-  N/1024, …)` is only true for NPT=4 (NPT=2 → N/512); `/tmp/bench/…`
-  references in code comments (volatile); the dead `mask_buf=None`
-  parameter on `forward_paged` (Level-3a leftover).
-- **R11 — lint debt in vendored/bench files (P4).** ~63 ruff errors in
-  `vllm/gfx906_fa/*.py`, `benchmarks/kernels/gfx906/*`, and the docs
-  bench scripts (B023/E501/F821 in the timeit-closure bench patterns;
-  the F821s are outer-scope names, verified harmless); pre-existing
-  E501s + ruff-format drift in `utils.py`. Pre-commit will flag these
-  if the files are restaged — a `per-file-ignores` entry or a cleanup
-  pass, bundled, not standalone.
-- **R12 — debug env knobs (P4).** 8 debug-only `GFX906_FA_*` switches
-  (`_DOUBLE_CHECK`, `_DUMP`, `_FUSED`, `_FWD_DEBUG`, `_NO_BUF_REUSE`,
-  `_QPAD_EMPTY`, `_TORCH_GATHER`, `_ZERO_KTAIL`) — candidates for a
-  single `GFX906_FA_DEBUG=1` master switch; all are read once at
-  import and documented in the README knob table.
+
+
+### 9.4 moe-m1-sprint review (2026-08-19) — RESOLVED
+
+Two independent code reviews of the four sprint commits produced six
+findings (review records deleted after fixing; the DEVLOG
+"post-sprint code review fixes" section holds the full account):
+
+- **Latent v2 tile-guard hole (P1-class)** — `size_k%64==0` admitted
+  shapes with `slice_k < 32` (reads past `end_k`) and there was no
+  `groupsize%32==0` check. Fixed in `979e72c925` (guard is now
+  `size_n%256==0 && size_k%256==0 && size_k<=2048 && groupsize%32==0`)
+  together with the dead gemm1 dispatch branch. Verified: 25/25
+  `test_gfx906_moe_gemm.py`.
+- **S3 default-ON evidence rigor** — decision rested on a
+  thermally-flagged serving A/B; marked provisional with reopen
+  conditions (`e06f484c0e`). The clean re-A/B is an open action.
+- **Stale S2 devlog description** — described a dropped draft variant;
+  rewritten to the shipped kernel (`b7ec0306ee`).
+- **S2 dispatch assumptions unpinned + missing M-gate** — docstring now
+  pins softmax/no-bias/no-padding/full-range/rsf=1; `gating_output.
+  shape[0]==1` added; end-to-end dispatch test added (`8e7935edd4`).
+- **Tooling placement** — `tmp_tp_probe/` harnesses →
+  `benchmarks/kernels/gfx906/harness/`; probe scripts →
+  `benchmarks/kernels/gfx906/` (`b3e7139aaa`).
+- Deliberately deferred: the stronger high-precision accumulation
+  check for S5 (required only before any default-ON flip) and the S5
+  test's wide `0.3·max+0.05` off-vs-on gate (same condition).
 
 ## Appendix A — `moe_gemm_q4_kernel_gfx906` facts (csrc/rocm/moe_q_gemm_gfx906.cu)
 
@@ -583,13 +623,19 @@ or run on non-gfx906 hardware)
   `README.md` §Bench recipes (`_b.py`, pp=2048/tg=256,
   util 0.95, fastsafetensors, FULL_DECODE_ONLY); check `uptime` first.
 - MoE kernel tests: `tests/kernels/moe/test_gfx906_moe_gemm.py`
-  (12 tests, covers both source layouts).
-- PPL probe: `/tmp/bench/ppl_probe.py` (prefill logprobs; the AWQ
+  (25 tests, covers both source layouts + the M=1 v2 flag path);
+  top-k router: `tests/kernels/moe/test_fused_topk.py` gfx906 tests
+  (bit-equality + dispatch path).
+- Standalone A/B harnesses (M=1 MoE gemm, topk): `benchmarks/kernels/
+  gfx906/harness/` — build/run standalone, outside the tree.
+- PPL probe: `benchmarks/kernels/gfx906/ppl_probe.py` (recreated
+  12-prompt set 2026-08-18 — absolute values not comparable to the
+  6.69-era set; prefill logprobs; the AWQ
   gemm2 atomics make it non-deterministic at the ~0.003-abs level across
   runs of identical code — compare against that band).
 - Isolated micro-benches live in `benchmarks/kernels/gfx906/`
-  (gemv, fa, gather, llmm1); a MoE-decode variant bench (em ∈ {8, 32},
-  tiling variants) does not exist yet — Phase 0 item.
+  (gemv, fa, gather, llmm1, moe gemm, moe topk) plus the greedy /
+  kernel-prof / PPL probes (moved from docs 2026-08-19).
 - Kernel trace: `rocprofv3 --kernel-trace` → SQLite (`agg_db.py`);
   remember the ~10–15% per-dispatch inflation under the tracer and the
   untrustworthy grid-axis columns (use timestamps/durations only).
@@ -600,7 +646,10 @@ or run on non-gfx906 hardware)
 
 ## Appendix C — file map
 
-- `csrc/rocm/moe_q_gemm_gfx906.cu` — the routed gemm (ours, Phase 1/2).
+- `csrc/rocm/moe_q_gemm_gfx906.cu` — the routed gemm (ours, Phase 1/2;
+  includes the M=1 v2 lane-column gemm2 re-tile, default-OFF).
+- `csrc/rocm/moe_topk_gfx906.cu` — the M=1 top-k router (S2,
+  default-OFF behind `VLLM_GFX906_TOPK_M1`).
 - `vllm/model_executor/layers/fused_moe/experts/gfx906_w4a16_moe.py` —
   the expert class (apply: zero_ → gemm1 → activation → gemm2;
   workspace lifecycle via `_resize_cache`).

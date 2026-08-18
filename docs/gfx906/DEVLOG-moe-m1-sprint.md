@@ -425,8 +425,8 @@ per-kernel number may motivate, but not justify, flipping a default.
 
 ## Post-sprint code review fixes (2026-08-19)
 
-Two independent reviews of the branch (moe-m1-sprint-code-rev-glm5.md,
-merged with moe-m1-sprint-code-rev-ds4.md) produced six findings; the
+Two independent code reviews of the branch (records deleted after
+fixing) produced six findings; the
 actionable ones were fixed in five commits:
 
 - **R1+R2** (`979e72c925`): the v2 M=1 launcher guard admitted shapes
