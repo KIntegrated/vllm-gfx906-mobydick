@@ -312,11 +312,19 @@ Correctness: current vs cpu-ref 0.25 (dequant noise); v2 vs current
 
 ### Production integration + in-model results
 
-Dispatch in `dispatch_moe_gemm_q4`: `block_size_m == 1` and
-`size_m == 1` (gemm1, a=[M,K]) or `size_m == output_topk` (gemm2,
+Dispatch in `dispatch_moe_gemm_q4`: `block_size_m == 1`,
+`output_topk > 0` (gemm2 only) and `size_m == output_topk` (gemm2
 a=[EM,N2], EM==topk ⟺ M==1), behind `VLLM_GFX906_MOE_M1` (default
-**OFF**). Caller zeroing unchanged (gemm1 zeroing now redundant but
-harmless; gemm2 zeroing still required for CAS).
+**OFF**). The launcher guard requires `size_n%256==0`, `size_k%256==0`,
+`size_k<=2048` and `groupsize%32==0`: the v2 kernel consumes 32
+k-elements per iteration per wave and refreshes scale/zeros only at
+32-aligned group boundaries, so a size_k not divisible by 256 would
+give slice_k<32 (reads past end_k) and a non-32-multiple groupsize
+would skip group refreshes (review R1; the earlier `size_k%64==0`
+guard admitted e.g. size_k=64). Note the env flag only affects
+launches dispatched after the flip — it has no effect on an
+already-captured CUDA graph. Caller zeroing unchanged (gemm1 zeroing
+now redundant but harmless; gemm2 zeroing still required for CAS).
 
 In-model (kernel_prof_probe, 256 decode steps, µs/call rows —
 direction only): gemm2 26.8 → 22.3 (−17%); gemm1 v2 <512,2,256>

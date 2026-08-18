@@ -614,25 +614,31 @@ void dispatch_moe_gemm_q4(
     int expert_weight_stride, int expert_scales_stride, int expert_zeros_stride,
     bool mul_topk_weight, int output_topk, int zero_offset, cudaStream_t stream) {
   const int npt = select_n_per_thread(block_size_m);
-  // M=1 decode fast path (VLLM_GFX906_MOE_M1=1, default off): the gemm2
-  // CAS path is re-tiled to the 512-thread lane-column kernel; the gemm1
-  // re-tile is neutral in-model and stays on the <1,4> kernel. size_m is M
-  // for gemm1 (a = hidden_states [M, K]) but EM = M*topk for gemm2 (a =
-  // act_out [EM, N2]), so the single-token condition differs per gemm.
-  const bool m1_decode = (output_topk == 0)
-                             ? (size_m == 1)
-                             : (size_m == output_topk);  // EM == topk <=> M == 1
-  if (block_size_m == 1 && m1_decode) {
+  // M=1 decode fast path (VLLM_GFX906_MOE_M1=1, default off): only the
+  // gemm2 fused topk-weight/CAS path is re-tiled to the 512-thread
+  // lane-column kernel (26.8 -> 22.3 us/call in-model). The gemm1
+  // re-tile measured neutral (27.5 vs 26.8 us/call) and stays on the
+  // <1,4> kernel, so this path requires output_topk > 0 (gemm2). For
+  // gemm2 a = act_out [EM, N2] with EM = M*topk, so size_m ==
+  // output_topk identifies the single-token case.
+  if (block_size_m == 1 && output_topk > 0 && size_m == output_topk) {
     // Read per call (80x/step) so the flag can be flipped at runtime in
-    // tests; the getenv cost is negligible next to the launch.
+    // tests. Note: the flag only affects launches dispatched after the
+    // flip — it has no effect on an already-captured CUDA graph (the
+    // replayed kernel was chosen at capture time). The getenv cost is
+    // negligible next to the launch.
     const char* m1_env = getenv("VLLM_GFX906_MOE_M1");
-    const bool use_m1_v2 = m1_env != nullptr && m1_env[0] != '0' && m1_env[0] != '\0';
-    if (use_m1_v2 && output_topk > 0) {
-      // gemm1 re-tile is neutral in-model (27.5 vs 26.8 us/call): only the
-      // gemm2 CAS path is re-tiled (26.8 -> 22.3 us/call in-model).
-      TORCH_CHECK(size_n % 256 == 0 && size_k % 64 == 0 && size_k <= 2048,
-                  "moe_gemm_q4 v2 M=1 tile requires size_n%%256==0, "
-                  "size_k%%64==0, size_k<=2048");
+    if (m1_env != nullptr && m1_env[0] != '0' && m1_env[0] != '\0') {
+      // The v2 kernel consumes 32 k-elements per iteration per wave and
+      // refreshes scale/zeros only at 32-aligned group boundaries, so it
+      // requires slice_k = size_k/8 to be a multiple of 32 (==>
+      // size_k % 256 == 0) and groupsize % 32 == 0; anything else would
+      // read past end_k or miss group refreshes.
+      TORCH_CHECK(
+          size_n % 256 == 0 && size_k % 256 == 0 && size_k <= 2048 &&
+              groups > 0 && (size_k / groups) % 32 == 0,
+          "moe_gemm_q4 v2 M=1 tile requires size_n%256==0, "
+          "size_k%256==0, size_k<=2048, groupsize%32==0");
       launch_moe_gemm_q4_v2<512, 4, 256>(
           a, c, b_q_weight, b_scales, b_qzeros, topk_weights,
           sorted_token_ids, expert_ids, num_tokens_post_padded,
