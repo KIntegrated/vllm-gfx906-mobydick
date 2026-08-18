@@ -10,7 +10,7 @@ files for the change to be considered output-safe.
 
 Usage:
   HF_HUB_OFFLINE=1 VLLM_ENABLE_V1_MULTIPROCESSING=0 HIP_VISIBLE_DEVICES=0 \
-  .venv/bin/python docs/gfx906/greedy_probe.py TAG
+  .venv/bin/python benchmarks/kernels/gfx906/greedy_probe.py TAG
 """
 import hashlib
 import sys

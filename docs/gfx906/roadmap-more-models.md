@@ -52,10 +52,10 @@ the layer's conditions — none of which are "model family" tests:
    standalone `clang++ -x hip` probes (pass buffers as kernel args).
 2. **Methodology** (the sprint's working process, model-independent):
    standalone A/B harness **before** touching the model path
-   (`tmp_tp_probe/moe_m1_harness.cu` takes K/N/E/topk as args — it is
+   (`benchmarks/kernels/gfx906/harness/moe_m1_harness.cu` takes K/N/E/topk as args — it is
    the re-validation tool for other shapes); per-kernel torch-profiler
    µs rows are unreliable (trust wall-clock); greedy-hash gate for
-   bit-equal work, **PPL gate** (`docs/gfx906/ppl_probe.py`) when
+   bit-equal work, **PPL gate** (`benchmarks/kernels/gfx906/ppl_probe.py`) when
    accumulation order changes; serving A/B (graph + eager) as the
    final gate; thermal-noise awareness (2026-08-18 serving numbers
    flagged directional for this reason).

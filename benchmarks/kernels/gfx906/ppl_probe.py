@@ -9,7 +9,7 @@ Protocol (per docs/gfx906/DEVLOG-moe-opt.md F3): prefill prompt logprobs
 with k=20 top-k, actual-token lookup, residual-mass fallback when the
 token misses top-k, PPL = exp(-sum(logprob)/n_tokens).
 
-Usage: VLLM_ENABLE_V1_MULTIPROCESSING=0 python docs/gfx906/ppl_probe.py
+Usage: VLLM_ENABLE_V1_MULTIPROCESSING=0 python benchmarks/kernels/gfx906/ppl_probe.py
 """
 import math
 

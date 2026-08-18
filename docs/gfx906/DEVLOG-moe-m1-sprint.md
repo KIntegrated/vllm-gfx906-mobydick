@@ -36,7 +36,7 @@ kernel:
   A2 needs a profiler check, not a kernel.
 
 So the first deliverable is a fresh in-model kernel table to re-rank the
-whole sprint. New probe: `docs/gfx906/kernel_prof_probe.py` (the old
+whole sprint. New probe: `benchmarks/kernels/gfx906/kernel_prof_probe.py` (the old
 `fillprof_probe.py` was deleted in the docs consolidation 0defa92551 and
 /tmp/bench was wiped by the reboot). Probe gotcha hit: the v1 engine runs
 in a separate process by default → torch profiler sees zero kernels;
@@ -192,7 +192,7 @@ self-time, M=1/E=256/k=8 fp16):
 
 So the shuffle path wins despite the ugly lowering — one wave with no
 row machinery is the real win over the generic. The LDS variant was
-verified correct (3000-trial stress harness `tmp_tp_probe/topk_harness.cu`,
+verified correct (3000-trial stress harness `benchmarks/kernels/gfx906/harness/topk_harness.cu`,
 bit-equal to a CPU reference incl. tie/sparse cases) but is dead weight;
 keep the harness for future top-k experiments. Side finding: the backend
 elides `__syncthreads()` for single-wave CTAs (per-wave LDS FIFO
@@ -268,7 +268,7 @@ single-slot case). Direct stores hide it (idempotent) — which is why
 the gemm1 path looked correct while gemm2 blew up. Wave-0-only
 epilogue fixes both.
 
-### Harness bugs found while validating (all in tmp_tp_probe/moe_m1_harness.cu)
+### Harness bugs found while validating (all in benchmarks/kernels/gfx906/harness/moe_m1_harness.cu)
 
 1. **Weight load**: `uint2 v = *(const uint2*)(b_ptr + j*size_n)` only
    loads 2 of the 4 NPT=4 columns — `b_w[j][2..3]` were stale. Needs
@@ -390,7 +390,7 @@ ideal, serving numbers directional only):**
 - in-model (kernel_prof_probe): dense_gemv_kernel<2,512> 39.7/step at
   8.4 us/call (L2-cold inflation vs 5.64 solo, same pattern as S5);
   GPU-busy 17593 → 17523 us/step (−70 us).
-- PPL (docs/gfx906/ppl_probe.py, recreated 12-prompt set, 359 tokens,
+- PPL (benchmarks/kernels/gfx906/ppl_probe.py, recreated 12-prompt set, 359 tokens,
   0 top-20 misses — absolute values NOT comparable to the 6.69-era
   probe whose prompt set was lost in the /tmp wipe): OFF 16.009±0.01
   vs ON 15.993±0.01 = −0.16%, well inside the 2% bar.
