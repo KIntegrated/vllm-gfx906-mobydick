@@ -60,8 +60,8 @@ def configs(N, K):
         cfgs += [(4096, "auto"), (4096, 2)]
     if K % 2048 == 0:
         cfgs += [(2048, "auto"), (2048, 2)]
-    if K % 512 == 0:
-        cfgs.append((512, 4))
+    if K == 512:
+        cfgs += [(512, "auto"), (512, 2), (512, 1)]
     return cfgs
 
 

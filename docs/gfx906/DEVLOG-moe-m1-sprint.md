@@ -340,3 +340,57 @@ The gemm1 budget (≈1070 µs/step in the re-anchor table) stays open:
 its re-tile premise (standalone 1.18×) does not transfer in-model;
 next idea is a 256-thread 4-col tile or folding gemm1 into the
 activation epilogue — roadmap C2 follow-up.
+
+## S3 — shared-expert down_proj GEMV (shipped default-ON)
+
+The re-anchor table flagged shared down [2048,512] x40/step at 2.5x the
+HBM floor (6.7 us LLMM1 rpb4 vs 2.6 us) and shared gate_up [1024,2048]
+at 1.4x. The dense GEMV kernel (csrc/rocm/dense_gemv_gfx906.cu) already
+supported both shapes (K%8==0, kchunk 512|1024|2048|4096); S3 was a
+dispatch extension plus one RPT rule entry.
+
+**Micro-bench (benchmarks/kernels/gfx906/bench_dense_gemv_gfx906.py):**
+
+| shape | LLMM1 rpb4 | best GEMV | verdict |
+|---|---|---|---|
+| shared down [2048,512] | 6.7-7.7 us | **kc512/r2 5.6-5.7 us** | ship (−15..25%) |
+| shared gate_up [1024,2048] | 7.3 us | kc2048/r4 8.0 us (r2: 46.4!) | **no lever — stays LLMM1** |
+
+The gate_up lever from the re-anchor table does not exist: the GEMV is
+8% slower at RPT=4 (default rule) and 6x slower at RPT=2. LLMM1 rpb4
+is the right kernel there. The down-shape win is real but the 2.5x-floor
+gap does not fully materialize: the winning GEMV is itself 2.2x floor.
+
+**Integration:**
+- `_llmm1_tiny_m` (vllm/model_executor/layers/utils.py): K=512, m=2048
+  → `dense_gemv_gfx906(w, x, 512)`, under the existing
+  VLLM_GFX906_DENSE_GEMV gate plus its own kill switch
+  `VLLM_GFX906_DOWN_GEMV=0`.
+- kernel default RPT rule: kchunk==512 && N==2048 → RPT=2 (measured;
+  RPT=4 is the old fallback at 8.0-8.2 us).
+
+**Gates (2026-08-18; NOTE: thermal noise today — fans reported not
+ideal, serving numbers directional only):**
+- standalone: GEMV kc512/auto(=r2) 5.64 us vs LLMM1 6.71-7.68 us
+  (the first-in-process "auto" sample reads ~6.1 us: GPU warmup bias,
+  not a config difference — re-run after warmup matches r2 exactly).
+- in-model (kernel_prof_probe): dense_gemv_kernel<2,512> 39.7/step at
+  8.4 us/call (L2-cold inflation vs 5.64 solo, same pattern as S5);
+  GPU-busy 17593 → 17523 us/step (−70 us).
+- PPL (docs/gfx906/ppl_probe.py, recreated 12-prompt set, 359 tokens,
+  0 top-20 misses — absolute values NOT comparable to the 6.69-era
+  probe whose prompt set was lost in the /tmp wipe): OFF 16.009±0.01
+  vs ON 15.993±0.01 = −0.16%, well inside the 2% bar.
+- greedy probe 12x128: **token-identical to baseline** (868ad09e...)
+  with the GEMV on — the standalone 0.031 maxdiff stays below the
+  argmax margin in-model.
+- serving graph (BENCH_EAGER=0, 2 runs x 4 samples each):
+  65.88/65.87 (OFF) vs 66.07/65.98 (ON) = +0.19/+0.11 t/s, all four
+  runs positive; expect a clean re-measure when thermals cooperate
+  (predicted ≈ +0.3 t/s from the −40 us/step micro-bench delta).
+
+**Decision: default ON** (kill switch VLLM_GFX906_DOWN_GEMV=0).
+Expected in-model gain ~40 us/step (≈0.25% of the 17.5 ms GPU-busy
+step) — the smallest lever remaining in the re-anchored table; the
+big open buckets are now the expert gemm1 (≈1070 us/step, C2 follow-up)
+and the topkGating 713 us/step (S2' router-GEMV fusion).

@@ -260,6 +260,11 @@ torch::Tensor dense_gemv_gfx906(torch::Tensor weight, torch::Tensor x,
   if (rpt < 0) {
     if (kchunk == 2048 && (N == 256 || N >= 2048))
       rpt = 2;
+    else if (kchunk == 512 && N == 2048)
+      // shared-expert down_proj [2048, 512] (M=1 decode): RPT=2 measured
+      // 5.6-5.7 us vs 6.7-7.7 us LLMM1 rpb4 and 8.0-8.2 us for RPT=4
+      // (bench benchmarks/kernels/gfx906/bench_dense_gemv_gfx906.py).
+      rpt = 2;
     else if (kchunk == 1024)
       // K=17408 down_proj (N=5120, ksplit=17): RPT=2 measured at 100.2%
       // of the HBM floor vs 116% for RPT=4 (bench /

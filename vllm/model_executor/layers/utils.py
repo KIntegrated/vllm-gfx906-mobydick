@@ -224,9 +224,12 @@ def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor:
     LLMM1 rpb=4 on K=2048 rows with N==256 (router, -17%) or N>=2048
     (in_proj/qkv/LM-head, -6..-23%); see
     benchmarks/kernels/gfx906/bench_dense_gemv_gfx906.py. Varying shapes
-    (o_proj K=4096, gate_up 1024, shared down K=512, N=64) stay on LLMM1.
-    The GEMV is measured only on gfx906 (MI50) and is gated to it; other
-    ROCm targets fall through to LLMM1.
+    (o_proj K=4096, gate_up 1024, N=64) stay on LLMM1; the shared-expert
+    down_proj [2048, 512] goes to the GEMV (kchunk=512, RPT=2; 5.6-5.7 us
+    vs 6.7-7.7 us LLMM1 rpb4, measured), while the shared gate_up
+    [1024, 2048] is a measured GEMV loss (8.0 vs 7.3 us) and stays on
+    LLMM1. The GEMV is measured only on gfx906 (MI50) and is gated to it;
+    other ROCm targets fall through to LLMM1.
 
     m==1 (the Qwen3-Next shared-expert gate [1, K]) also goes to the GEMV
     (RPT=1): the LLMM1 route zero-pads the *constant* weight to [4, K]
@@ -237,16 +240,26 @@ def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor:
     m = weight.shape[0]
     from vllm.platforms.rocm import on_gfx906
 
-    if (
+    gemv_ok = (
         on_gfx906()
         and os.environ.get("VLLM_GFX906_DENSE_GEMV", "1") != "0"
         and weight.dtype == torch.float16
         and x_view.dtype == torch.float16
         and weight.is_contiguous()
-        and weight.shape[1] == 2048
-        and (m == 1 or m == 256 or m >= 2048)
-    ):
-        return ops.dense_gemv_gfx906(weight, x_view, 2048)
+    )
+    if gemv_ok:
+        if weight.shape[1] == 2048 and (m == 1 or m == 256 or m >= 2048):
+            return ops.dense_gemv_gfx906(weight, x_view, 2048)
+        # Shared-expert down_proj (dense fp16): 5.6-5.7 us GEMV vs
+        # 6.7-7.7 us LLMM1 rpb4 at kchunk=512/RPT=2 (measured).
+        # Kill switch: VLLM_GFX906_DOWN_GEMV=0 (the outputs are not
+        # bit-equal to LLMM1 — different accumulation order).
+        if (
+            weight.shape[1] == 512
+            and m == 2048
+            and os.environ.get("VLLM_GFX906_DOWN_GEMV", "1") != "0"
+        ):
+            return ops.dense_gemv_gfx906(weight, x_view, 512)
     if m % 4 == 0:
         return ops.LLMM1(weight, x_view, 4)
     out = ops.LLMM1(torch.nn.functional.pad(weight, (0, 0, 0, 4 - m)), x_view, 4)
