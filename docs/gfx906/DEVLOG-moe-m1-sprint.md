@@ -155,16 +155,20 @@ strict `>` i-ascending, xor-butterfly argmax with lowest-expert-index
 tie-break, blank winner to -10000.f, `selected_sum += winner_p` in k
 order); renorm: `scale = 1.f/denom` (denom≤0→1.f), `out[k] *= scale`.
 
-**Kernel** (`csrc/rocm/moe_topk_gfx906.cu`): one 64-lane wave. Lanes
-0-31 own 8 consecutive experts (the generic's exact TPR=32/VPT=8
-partition, one 16B load each); lanes 32-63 hold 8×-inf so one code path
-runs on all 64 lanes (their p is exactly 0, their expert ids 256..1023
-can never win the tie-break).
+**Kernel** (`csrc/rocm/moe_topk_gfx906.cu`, as shipped): one 64-lane
+CTA; lanes 32-63 exit immediately (`if (t >= LANES) return;`) and the
+32 active lanes each own 8 consecutive experts (the generic's exact
+TPR=32/VPT=8 partition, one 16B load each), reduced with the generic's
+exact width-32 `VLLM_SHFL_XOR_SYNC_WIDTH` butterflies. (An earlier
+draft ran all 64 lanes with 32 holding 8×-inf dummy values and LDS
+scans for the cross-lane reductions; that variant was dropped — see
+the table below — and this description previously described it.)
 
 **Bit-equality argument** (finite inputs):
-- max: exact, tree-shape irrelevant → LDS scan ok.
-- sum: the generic's xor(16,8,4,2,1) tree reproduced round-for-round via
-  LDS (each round: write cur, barrier, cur += s_row[t^mask]).
+- max: exact; the width-32 xor(16,8,4,2,1) butterfly is the generic's
+  own reduction, reproduced instruction-for-instruction.
+- sum: the same xor(16,8,4,2,1) tree, round-for-round identical
+  operands and order.
 - argmax: strict total order (value desc, expert asc) → any
   reduction order gives the identical winner; blanking is local to the
   owner lane.
@@ -196,8 +200,9 @@ ordering); the stress harness passed with elision, which is why the
 forced-barrier cost was isolated as the suspect in the 35.5 µs number.
 
 **Dispatch** (fused_topk_router.py): `VLLM_GFX906_TOPK_M1` env (default
-on), gates = on_gfx906 + M==1 + E==256 + k==8 + fp16 gating + int32
-outputs + contiguous + softmax + no bias + no padding.
+OFF — see the S2 result section below), gates = on_gfx906 + M==1 +
+E==256 + k==8 + fp16 gating + int32 outputs + contiguous + softmax +
+no bias + no padding.
 
 **Build gotcha (this week)**: the in-tree `.deps/triton_kernels-subbuild`
 is root-owned (docker-era) and any CMake reconfigure dies writing its
