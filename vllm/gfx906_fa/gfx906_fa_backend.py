@@ -118,6 +118,17 @@ class Gfx906FAMetadataBuilder(
         if mode == "always":
             return AttentionCGSupport.ALWAYS
         if mode == "decode":
+            # With spec decode every decode step has query len
+            # 1 + num_speculative_tokens; declaring
+            # UNIFORM_SINGLE_TOKEN_DECODE makes vLLM demote the whole
+            # engine to PIECEWISE for spec runs (measured ~3x step cost
+            # on gfx906, 2026-08-18). The Q8 paged kernel is q_len-
+            # generic (seq_q + q_abs_offset inline causal) and the
+            # LEGACY=1 inline-quant path is FULL-capture safe (P3-3a M2),
+            # so UNIFORM_BATCH (the level that covers spec decodes) is
+            # the correct declaration when spec tokens are configured.
+            if vllm_config.num_speculative_tokens > 0:
+                return AttentionCGSupport.UNIFORM_BATCH
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
         return AttentionCGSupport.NEVER
 

@@ -560,6 +560,15 @@ def forward_paged(
     if max_seqlen_q == 1 and num_tokens == num_seqs:
         # query: [num_seqs, Hq, D] → [num_seqs, Hq, 1, D] → паддинг по Sq_pad
         q_padded[:, :, :1, :] = query.unsqueeze(2)
+    elif num_tokens == num_seqs * max_seqlen_q:
+        # Uniform multi-token batch (spec decode: n_q = 1 + num_spec).
+        # num_tokens == num_seqs * max_seqlen_q (host ints) implies every
+        # sequence has exactly max_seqlen_q queries, so no D2H sync into
+        # cu_seqlens_q is needed — the int(cu[...]) loop below is illegal
+        # during cudagraph capture.
+        n_q = max_seqlen_q
+        q_padded[:, :, :n_q, :] = (
+            query.view(num_seqs, n_q, Hq, D).permute(0, 2, 1, 3))
     else:
         cu = cu_seqlens_q.to(torch.long)
         for s in range(num_seqs):
@@ -635,6 +644,11 @@ def forward_paged(
     # строка Sq=0 ([:, 0, :, :]) — contiguous [B, Hq, D] view, без копий.
     if max_seqlen_q == 1 and num_tokens == num_seqs:
         return out_padded[:, 0, :, :].reshape(num_tokens, Hq * D)
+
+    if num_tokens == num_seqs * max_seqlen_q:
+        # Uniform multi-token batch (spec decode) — capture-safe gather.
+        n_q = max_seqlen_q
+        return out_padded[:, :n_q].reshape(num_tokens, Hq * D)
 
     cu = cu_seqlens_q.to(torch.long)
     out_flat = torch.empty(
