@@ -45,9 +45,11 @@ def main():
     if not eager:
         # Hybrid GDN model: cudagraph capture requires max_num_seqs <= number
         # of Mamba cache blocks. Single-request bench -> 32 is plenty.
+        # BENCH_MAX_SEQS overrides (dense 27B needs 4: the GDN state pool is
+        # ~72 MB/seq and 32 seqs OOMs the 1568-chunk prefill, 2026-08-18).
         # BENCH_CG_MODE overrides the cudagraph mode (P3-3a M0 needs
         # Triton in PIECEWISE for the mode-matched baseline).
-        extra["max_num_seqs"] = 32
+        extra["max_num_seqs"] = int(os.environ.get("BENCH_MAX_SEQS", "32"))
         extra["compilation_config"] = {
             "cudagraph_mode": os.environ.get("BENCH_CG_MODE", "FULL_DECODE_ONLY"),
             "max_cudagraph_capture_size": 8,

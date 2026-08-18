@@ -2452,6 +2452,32 @@ recompiled for the changed `ops.h` header; `_C` unchanged (its source
   (20×E501, 2×F401, 1×I001, 1×SIM102) are pre-existing on the branch
   (identical in the pre-merge worktree) and left untouched.
 
+### Serving benches post-merge (dense + MoE)
+
+| model | config | post-merge t/s | pre-merge reference |
+|---|---|---|---|
+| MoE 35B-A3B-AWQ | graph, 4 samples | 66.65 / 66.35 / 66.66 / 66.59 (mean **66.56**) | session band 65.87–67.03 (same day, pre-merge); record 67.39 (max-ilp build day) |
+| Dense 27B-AWQ | graph, 4 samples, **max_num_seqs=4** | 25.34 / 25.05 / 25.29 / 25.30 (mean **25.25**) | record 25.14 / 25.60 (2 samples) |
+
+**Verdict: no regression in either model at production configs.**
+
+**Finding — dense 27B graph mode OOMs at max_num_seqs=32 (post-merge):**
+first 1568-token prefill chunk, 340 MiB inductor static-buffer
+allocation, `free: 0` (the known 340/600 MiB signature from the 27B load
+test). At 32 seqs the GDN mamba-state pool ('align' mode, block size
+784 chosen for mamba-page alignment — logic pre-dates the merge) plus
+weights 19.77 GiB + KV 7.13 GiB leave no headroom for the compiled
+prefill buffers; at 4 seqs the pool shrinks by ~2 GiB and it runs clean
+(KV 7.39 GiB / 43,366 tok). The record-era harness state is ambiguous
+(the file was consolidated the same day as the 25.14/25.60 records), so
+it is not proven the merge changed 32-seq behavior — but the post-merge
+compile config registers many more `splitting_ops` (deepseek_v4,
+MLA kv-update, sparse indexer) which plausibly grows the inductor
+static footprint. **Production dense config is 4–8 seqs** (load-test
+section); 32-seq graph dense is not a deployment config on this
+32 GB card. `BENCH_MAX_SEQS` knob added to `_bench_gfx906.py` (default
+32 unchanged) with this documented in-line.
+
 Open (pre-existing, not merge-related): the M3 fp16/fp32 config
 normalizer gap and the `test_fp32_kv_config.py` import — the M3 gfx906
 support shipped as "partially ok" and was never finished.
