@@ -97,14 +97,16 @@ static hipError_t gfx906_fa_launch_impl(
     // by the caller via gfx906_fa_split_combine (O unscaled, meta=(m,l)).
     if (nc2 <= 1) {
         nc2 = 1;
-    } else if (heads_q % nc2 != 0 || (nc2 & (nc2 - 1)) != 0) {
-        fprintf(stderr, "[gfx906_fa] nc2=%d must be a power of two dividing heads_q=%d\n", nc2, heads_q);
-        return hipErrorInvalidValue;
     } else {
         // A packed tile shares ONE kv head (K/V base = head0 / gqa_ratio),
         // so a tile must not straddle GQA groups: gqa_ratio % nc2 == 0.
-        // E.g. Hq=24/Hkv=4 (ratio 6) with nc2=8 would read wrong KV heads
-        // for half the Q heads. Only NC2 in {1, 2, 8} are instantiated in
+        // heads_q % heads_kv == 0 is guaranteed above, so gqa_ratio is
+        // integral and gqa_ratio % nc2 == 0 already implies heads_q % nc2
+        // == 0 -- the old bare `heads_q % nc2` guard was redundant and
+        // aborted *before* the default downgrade could run, crashing any
+        // per-shard head count not divisible by 8 (e.g. heads_q=6 for a
+        // 12-head model at TP=2, or Qwen3.5-27B's 24 heads at TP=4).
+        // Only NC2 in {1, 2, 8} are instantiated in
         // the dispatch below; any other value is rejected loudly (clamping
         // to a non-instantiated value would still run the NC2=8 kernel and
         // silently mispack).

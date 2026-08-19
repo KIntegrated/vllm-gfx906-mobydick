@@ -426,7 +426,7 @@ kv_max = int(sys.argv[4])
 
 torch.manual_seed(0)
 dev = "cuda"
-HQ, HKV, D = 16, 2, 256
+HQ, HKV, D = int(sys.argv[5]), int(sys.argv[6]), 256
 
 from vllm import _gfx906_fa_C as fa
 
@@ -450,16 +450,22 @@ sys.exit(0 if rel < 5e-2 else 1)
 """
 
 
-@pytest.mark.parametrize("nc2, ys, sk, kv_max", [
-    (1, 1, 512, 512),    # legacy path, no split (sanity in-subprocess)
-    (1, 4, 512, 512),    # KV-split only
-    (1, 4, 512, 481),    # KV-split with empty trailing splits (kv_max<sk)
-    (8, 1, 512, 512),    # GQA head-packing only (no combine)
-    (8, 16, 512, 512),   # serving config: GQA pack + KV-split
-    (8, 16, 123, 123),   # short Sk: more splits than KV tiles
-    (8, 16, 512, 481),   # serving config + empty trailing splits
+@pytest.mark.parametrize("nc2, ys, sk, kv_max, hq, hkv", [
+    (1, 1, 512, 512, 16, 2),    # legacy path, no split (sanity in-subprocess)
+    (1, 4, 512, 512, 16, 2),    # KV-split only
+    (1, 4, 512, 481, 16, 2),    # KV-split with empty trailing splits (kv_max<sk)
+    (8, 1, 512, 512, 16, 2),    # GQA head-packing only (no combine)
+    (8, 16, 512, 512, 16, 2),   # serving config: GQA pack + KV-split
+    (8, 16, 123, 123, 16, 2),   # short Sk: more splits than KV tiles
+    (8, 16, 512, 481, 16, 2),   # serving config + empty trailing splits
+    # heads_q=6 under default nc2=8 (e.g. Qwen3.5-27B at TP=4): the bare
+    # heads_q%nc2 guard used to abort before the 8->2 downgrade; must now
+    # downgrade to nc2=2 (ratio 6 % 2 == 0) and produce correct output.
+    (8, 16, 512, 512, 6, 1),
+    # heads_q=6 per-shard ratio with actual GQA (Hq=6/Hkv=3, ratio 2).
+    (8, 16, 512, 512, 6, 3),
 ])
-def test_forward_kv_split_gqa_pack_vs_fp32_ref(nc2, ys, sk, kv_max):
+def test_forward_kv_split_gqa_pack_vs_fp32_ref(nc2, ys, sk, kv_max, hq, hkv):
     import os
     import subprocess
 
@@ -470,6 +476,6 @@ def test_forward_kv_split_gqa_pack_vs_fp32_ref(nc2, ys, sk, kv_max):
     }
     r = subprocess.run(
         [sys.executable, "-c", _SPLIT_CHECK_SRC, str(nc2), str(ys),
-         str(sk), str(kv_max)],
+         str(sk), str(kv_max), str(hq), str(hkv)],
         env=env, capture_output=True, text=True, timeout=300)
     assert r.returncode == 0, f"stdout: {r.stdout}\nstderr: {r.stderr[-2000:]}"
