@@ -2563,3 +2563,51 @@ prerequisite for *any* spec decode on this backend). If revisited:
 (2) q1 FULL graphs for no-draft spec steps, (3) re-bench with
 min_n=1. MTP/EAGLE would hit the same GDN spec-path wall, so the
 lever is shared.
+
+## 2026-08-19 — FA gather-buffer use-after-free (init Memory Fault) — found & fixed
+
+Symptom: Qwen3-0.6B init (MRV2, default `GFX906_FA_LEGACY=1`) faults 100%
+during post-capture warmup with `gather_paged_kv_quant_kernel` in the HW
+record; the record's grid `[16384,8,2048]` and name were garbage (proved by
+LEGACY-independent constancy, a no-FA control still naming the kernel, and a
+launch-API spy seeing no such dispatch).
+
+Root cause: `_ensure_gather_buffers` allocated one exact-shape K+V gather
+buffer pair per batch size; FULL-graph capture bakes 35 pairs' VAs (B sweep
+1..256), but the keep-alive list held only 4 generations. The descending
+capture sweep freed the first-captured (B=256) pair; warmup replayed
+`graph_256` -> writes through stale VAs into freed segments.
+
+Fix (`vllm/gfx906_fa/gfx906_fa_backend.py`): smaller-B requests slice the
+current buffer `[:B]` (same base VA, one generation for all sizes); real
+growth (Sk/Hkv/D) retires into an unbounded dict so captured VAs are never
+freed. Latch `_gather_captured` on the slice path too.
+
+**Review hardening (takeover):** the retire dict was keyed by
+`(shape, device)` — two generations of identical shape (reachable via
+post-capture eager decode + prefill Sk ping-pong) would collide and the
+latter entry would free the captured one (UAF recurs). Re-keyed by
+`data_ptr`, which is unique among live tensors and a retained tensor is
+never freed, so an entry can never be overwritten. New regression test
+`test_gather_buffers_capture_sweep_keepalive` drives the real
+`Gfx906FAImpl` through warmup -> capture (B=2, then B=1 slice, same base
+VA) -> post-capture Sk/B churn that recreates same-shape generations, and
+asserts every retired generation (incl. the captured one) stays referenced
+and both graphs replay numerically correct.
+
+Verified: repro 4/4 clean on the hardened build (was 10/10 fault);
+FA kernel suite 18/18 (17 + new lifecycle test); temp instrumentation
+reverted (gather debug prints, C++ dbg block, GFX906_FA_DISABLE gate)
+and the .so rebuilt clean. Also added a no-view fast path when
+`b.shape[0] == num_seqs` (the exact-size decode case was getting a fresh
+TensorImpl per FA layer per step).
+
+Serving re-validation (post-fix build): dense 27B 4-seq 25.33 t/s
+(25.26-25.36, record band 25.25-25.34 — no regression); MoE 35B
+65.98 / 65.81 t/s over two 4-sample runs vs 65.71 for the OLD backend in
+an in-session A/B (stashed fix) — the ~0.5% offset vs the historical
+66.3-66.5 band is day-to-day environment variance (old code reproduces
+it too), not the fix. Note: MoE 35B production (max_num_seqs=32 ->
+7+ captured sizes > old bound of 4) had been exposed to *silent*
+corruption under the old bound. Full investigation trail:
+/tmp/fa-analysis.md (§11).
