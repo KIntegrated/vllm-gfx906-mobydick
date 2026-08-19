@@ -392,6 +392,31 @@ def test_rocm_unquantized_gemm_spec_gemv_m4_ksplit1_real_kernel(monkeypatch, m):
     torch.testing.assert_close(out.float(), ref.float(), atol=0.15, rtol=2e-2)
 
 
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel test")
+@pytest.mark.parametrize("m", [2, 3, 4])
+def test_rocm_unquantized_gemm_spec_gemv_m4_kc512_ksplit2(monkeypatch, m):
+    # Regression: kchunk=512 (WARPS=1) with ksplit=2 is the single-warp
+    # CAS-gather path. The M=4 runtime-M kernel previously gathered with
+    # __shfl(acc_flat[t], i) at t==0 -- a uniform expression, so every
+    # (r, m) slot got index 0's sum (silent wrong numerics). The dispatch
+    # never selects kchunk=512 for the 27B (all Ks are 1024-multiples),
+    # so only a direct-kchunk test catches this.
+    from vllm.platforms.rocm import on_gfx906
+
+    if not on_gfx906():
+        pytest.skip("dense_gemv_m4_gfx906 is measured only on gfx906")
+    monkeypatch.delenv("VLLM_GFX906_GEMVM_RPT", raising=False)
+    torch.manual_seed(5)
+    x = torch.randn(m, 1024, device="cuda", dtype=torch.float16)
+    weight = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
+
+    out = utils.ops.dense_gemv_m4_gfx906(weight, x, 512)
+    ref = torch.nn.functional.linear(x, weight)
+
+    assert out.shape == (m, 1024)
+    torch.testing.assert_close(out.float(), ref.float(), atol=0.15, rtol=2e-2)
+
+
 def test_rocm_unquantized_gemm_spec_gemv_m4_dispatch(monkeypatch):
     # M=2..4 (spec decode draft steps) routes to the GEMV-family kernel on
     # gfx906; M=1 stays on the GEMV/LLMM1 path; the tuned hipBLAS special

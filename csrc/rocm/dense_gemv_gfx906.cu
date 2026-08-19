@@ -294,12 +294,18 @@ __global__ void __launch_bounds__(KCHUNK / 8)
           out[(int64_t)m * N + row] = __float2half_rn(acc[r][m]);
       }
     } else {
-      // CAS packs the RPT adjacent rows of each out[m]; lane 0 gathers
-      // every (r, m) sum via shfl and issues the M CAS ops.
+      // CAS packs the RPT adjacent rows of each out[m]; lane 0 issues the
+      // M CAS ops. The butterfly above is a full-wavefront broadcast, so
+      // lane 0 already holds every (r, m) sum in its own registers. Do NOT
+      // "fix" this back to __shfl(acc[...], i): on ROCm 7.14 clang the
+      // divergent cross-lane __shfl lowers to ds_bpermute with an
+      // offset-encoded 16-byte window read that lands on the wrong VGPRs
+      // when the data registers are not 16B-aligned (silent wrong results
+      // for M=2/3; see DEVLOG-spec-decode).
       if (t == 0) {
         float s[NV];
         #pragma unroll
-        for (int i = 0; i < NV; ++i) s[i] = __shfl(acc[i / M][i % M], i);
+        for (int i = 0; i < NV; ++i) s[i] = acc[i / M][i % M];
         #pragma unroll
         for (int m = 0; m < M; ++m) {
           if (row0 + RPT - 1 >= N) continue;  // ragged tail: RPT rows valid
@@ -435,12 +441,14 @@ __global__ void __launch_bounds__(KCHUNK / 8)
           out[(int64_t)m * N + row] = __float2half_rn(acc_flat[t]);
       }
     } else {
-      // CAS packs the RPT adjacent rows of each out[m]; lane 0 gathers
-      // every (r, m) sum via shfl and issues the M CAS ops.
+      // CAS packs the RPT adjacent rows of each out[m]. After the
+      // butterfly every lane holds every (r, m) sum, so lane 0 reads its
+      // own registers (shfl(acc_flat[0], i) -- the earlier form -- would
+      // have returned index 0's sum for all i).
       if (t == 0) {
         float s[RPT * 4];
         #pragma unroll
-        for (int i = 0; i < RPT * 4; ++i) s[i] = __shfl(acc_flat[t], i);
+        for (int i = 0; i < RPT * 4; ++i) s[i] = acc_flat[i];
         #pragma unroll
         for (int m = 0; m < 4; ++m) {
           if (m >= M) continue;

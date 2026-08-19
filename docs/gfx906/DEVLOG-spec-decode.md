@@ -1005,3 +1005,76 @@ split build (same unflagged `<true,4>` kernel binary as the no-max
 build; suspected module-level I-cache/constant-memory effect from the
 twin's presence, or environmental; serving-level impact <=3%, CIs
 overlap — revisit only if the spec arms regress further).
+
+## Final branch review: m4 WARPS==1 shfl-gather bug (fixed)
+
+Critical pre-merge review of the branch found a **silent wrong-numerics
+bug** in `dense_gemv_m_kernel`'s CAS epilogue (WARPS==1, ksplit>1 path),
+latent for Qwen3.5-27B (all K's are 1024-multiples → kchunk=1024 →
+WARPS=2 smem path; the kchunk=512 path only fires for K=1536/2560/3584
+models):
+
+- Templated kernel gathered the butterfly sums with
+  `s[i] = __shfl(acc[i/M][i%M], i)` inside `if (t == 0)`.
+- On ROCm 7.14 clang this lowers to
+  `ds_bpermute_b32 vdst, slane, vdata offset:4/8/12` — the offset
+  encoding reads `addr(vdata)+offset` from the source lane's file, which
+  is only correct for a specific consecutive-register layout the register
+  allocator does not guarantee. Result: s[0] (self-read, offset 0)
+  correct, s[1..NV-1] wrong. Test: M=2 → 74.5% mismatched elements,
+  even/odd column split matching the half2 CAS packing.
+- The rt kernel had the same path with the earlier uniform-expression
+  form (`__shfl(acc_flat[0], i)`) — fixed during review to read lane 0's
+  own registers; the templated kernel is now fixed the same way
+  (butterfly is a full-wavefront broadcast, verified by the ksplit==1
+  direct-store tests passing and by a standalone probe showing
+  post-butterfly "own acc" = full sum).
+- The divergent cross-lane `__shfl` gather is the only unsafe form;
+  offset-0 forms (butterfly, uniform broadcast, e.g. the FA gather
+  kernel's `__shfl(x, 0, 64)`) are unaffected and empirically verified
+  (FA suite 15/15, serving A/Bs).
+- Regression test: `test_rocm_unquantized_gemm_spec_gemv_m4_kc512_ksplit2`
+  (m=2,3,4; x m×1024, w 1024×1024 fp16, kchunk=512 → WARPS=1 ksplit=2),
+  compared to F.linear. Full file: 31 passed / 2 skipped.
+- A minimal standalone repro of the pattern misleads (plain clang -x hip
+  spills the accumulators to scratch and shuffles lower to flat loads —
+  a different artifact); the fix was validated through the in-tree test
+  against the actual CMake build.
+
+## Parallel 2-request serving A/B (dense 27B, split build)
+
+`benchmarks/kernels/gfx906/spec_parallel_dense.py` — staggered 2-request
+(A at t=0, B at t=2s), 512 output tokens, 3 repeats, streaming TTFT.
+Prompts: 797 / 621 tokens. Prefix cache does not help (both arms
+re-prefill ~1418 tok/window).
+
+| clean reps 1-2 | baseline | mtp2 |
+|---|---|---|
+| A decode (resident) | 22.6 t/s | **26.8 (+19%)** |
+| B decode | 25.2 t/s | **32.1 (+27%)** |
+| aggregate | 40.4 t/s | **42.7 (+5.7%)** |
+| B TTFT (prefill under load) | 2.51 s | **3.76 s (+1.24 s)** |
+| A TTFT (prefill alone) | 0.14 s | **3.15 s** |
+| token identity | — | identical across arms |
+
+Per-request decode uplift is real (+19-27%); aggregate nets only +5.7%
+(M=6 verify steps + drafter forwards). Prefill cost of enabling MTP
+under concurrent load: B's TTFT +50%.
+
+**Open item (not chased):** mtp2 A-TTFT is 3.15 s with sd 0.007 across
+reps — a deterministic ~3.0 s per-sequence first-token cost on top of
+the 797-token prefill, present even with warm cache and no JIT
+(warmup JIT of `precopy_mamba_align_fused_kernel` /
+`postprocess_mamba_fused_kernel` + 3 eagle metadata kernels only
+explains rep 0 per jit_monitor). Needs a dedicated per-chunk probe to
+root-cause (suspect mamba-state path on the prefill→decode boundary
+running non-graphed).
+
+## Environment note: standalone HIP programs fail on physical GPU #0
+
+2026-08-19: freshly built standalone HIP binaries (even an empty
+`<<<1,64>>>` kernel) fail on launch with hipErrorIllegalState (401) on
+physical GPU #0 (HIP_VISIBLE_DEVICES=0) but work on #1; torch/vLLM work
+on both. Both cards are identical 0x66a0 gfx906 32 GiB (the old
+"GPU #1 = RDNA2 12GB" note is stale). Not chased; use .venv python for
+GPU probes on this machine.
