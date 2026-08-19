@@ -74,9 +74,10 @@ fresh table's top MoE levers, S2 (M=1 topk) shipped default-OFF
 down_proj GEMV) shipped **default-ON, provisional** (−70 µs/step
 GPU-busy; clean serving re-A/B pending). The 64.08 t/s Phase-3 close
 was superseded within the sprint: 67.03 t/s with S5 on (record:
-67.39). Open MoE buckets are now gemm1 (≈1070 µs/step) and the
-topkGating launch itself (713 µs/step — only a fusion (C1b/c) can
-win it).
+67.39). Open MoE buckets are now the topkGating launch itself
+(713 µs/step — only a fusion (C1b/c) can win it) and the zeroing fold
+(C3, 234 µs/step); gemm1 (≈1070 µs/step) closed 2026-08-19 with no
+wall-clock lever found (DEVLOG-moe-gemm1-retiling.md).
 
 ## 2. Structural facts (constraints for any design)
 
@@ -171,6 +172,24 @@ guard was tightened (`size_k%256==0` + `groupsize%32==0` — the
 kernel consumes 32 k-elements per iteration per wave) and the dead
 gemm1 dispatch branch removed; the env flag does not affect captured
 CUDA graphs.
+
+**C2-gemm1 close (2026-08-19, `DEVLOG-moe-gemm1-retiling.md`): all decode-size
+gemm1 retiling is closed.** V1 (full-K direct store, 64 blocks) rejected in
+standalone: 2.2× (2-wave) / 4.3× (half-wave) slower than current 26.9
+µs/launch — 64 long 128 KB streams cannot keep enough HBM bytes in flight.
+Full (BLOCK_KN, NPT) surface swept: NPT=2 (128 blocks) is the best point,
+23.8 µs (−11.6%), but its in-model gain does **not** transfer to wall clock
+(eager census −186 µs/step; serving A/B neutral in graph +0.08 t/s and eager
+−0.03 t/s, 4 samples each) — the third consecutive gemm1 retiling (S5-V2,
+NPT sweep, V1) to fail transfer. V3 closed unbuilt (added cost on a
+non-transferring CAS design); V4 closed by sweep monotonicity (finer
+K-splits / more CAS is worse). Measurement finding: under CUDA-graph replay
+(FULL and FULL_AND_PIECEWISE) the torch profiler sees ~5 of 80 gemm
+calls/step — per-kernel A/B under graphs is infeasible on this stack,
+confirming wall-clock A/B as the gate. No dispatch change shipped; the
+harness keeps the sweep/v1 kernels as the Phase-0 tool. Remaining C2
+substance: activation fusion (transfer expectation now low) and C3 (zeroing
+fold, 234 µs/step measured, no numerics change) as the cheap lever.
 
 The BM=1/NPT=4 tiling launches 4096 blocks (gemm1: 8 slots × 8 n-tiles ×
 64 K-splits, 32 threads each) per layer; each (slot, n-column) cell is

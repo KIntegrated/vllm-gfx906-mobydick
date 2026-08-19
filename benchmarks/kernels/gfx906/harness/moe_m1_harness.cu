@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 //
-// Standalone A/B harness for the M=1 MoE expert GEMM (S5).
+// Standalone A/B harness for the M=1 MoE expert GEMM (S5 + C2-gemm1).
 //
-// Two kernels, same inputs:
+// Kernels under comparison (same inputs):
 //   current  — moe_gemm_q4_kernel_gfx906<1,4> as shipped: 256-thread
 //              blocks, grid.z = K/256 K-splits, fp16 CAS epilogue into a
 //              pre-zeroed output (copied verbatim from
@@ -11,6 +11,11 @@
 //   v2       — 512 threads (8 waves), NPT=2, BM=1; wave w owns K-slice
 //              w*(K/8); fp32 per-wave partials reduced through LDS;
 //              direct store (gemm1) or 8-way CAS (gemm2 output_topk).
+//   sweep    — the current kernel templated on (THREADS_X == BLOCK_KN,
+//              NPT): maps the z-split-granularity axis (C2, 2026-08-19).
+//   v1       — full-K per block, direct store, no CAS/zeroing (C2's V1
+//              design; REJECTED: 64 blocks x one long weight stream is
+//              bandwidth-starved, 2.2-4.3x slower than current).
 //
 // Checks: both vs an fp32 CPU reference (dequant + matmul, fp16-rounded
 // weights), and v2 vs current (must agree within fp16 accumulation noise —
@@ -461,6 +466,299 @@ __global__ void __launch_bounds__(THREADS)
 
 
 // ---------------------------------------------------------------------------
+// Sweep: the current kernel templated on (THREADS_X == BLOCK_KN, NPT), to
+// map the z-split granularity axis: finer K-splits -> more independent
+// weight streams (more in-flight bytes) but higher CAS fan-in per cell.
+// (256, 4) is the in-tree config; it must reproduce `current`'s numbers.
+// ---------------------------------------------------------------------------
+
+template <int THREADS_X, int NPT>
+__global__ void __launch_bounds__(THREADS_X)
+    moe_gemm_q4_sweep(const half* __restrict__ a, half* __restrict__ c,
+                      const uint32_t* __restrict__ b_q_weight,
+                      const half* __restrict__ b_scales,
+                      const uint32_t* __restrict__ b_qzeros,
+                      const float* __restrict__ topk_weights,
+                      const int32_t* __restrict__ sorted_token_ids,
+                      const int32_t* __restrict__ expert_ids,
+                      const int32_t* __restrict__ num_tokens_post_padded,
+                      const int size_m, const int size_n, const int size_k,
+                      const int groups, const int top_k,
+                      const int expert_weight_stride,
+                      const int expert_scales_stride,
+                      const int expert_zeros_stride, const bool mul_topk_w,
+                      const int output_topk, const int zero_offset) {
+  const int t = threadIdx.x;
+  const int token_block = blockIdx.x;
+  const int offset_n = blockIdx.y * THREADS_X * NPT;
+  const int offset_k = blockIdx.z * THREADS_X;
+  const int end_k = min(offset_k + THREADS_X, size_k);
+  const int n = offset_n + t * NPT;
+
+  if (token_block >= num_tokens_post_padded[0]) return;
+  const int expert_id = expert_ids[token_block];
+  if (expert_id == -1) return;
+
+  const uint32_t* expert_weights =
+      b_q_weight + (int64_t)expert_id * expert_weight_stride;
+  const half* expert_scales =
+      b_scales + (int64_t)expert_id * expert_scales_stride;
+  const uint32_t* expert_qzeros =
+      b_qzeros + (int64_t)expert_id * expert_zeros_stride;
+
+  constexpr int LDS_PAD = 8;
+  __shared__ half block_a[1][THREADS_X + LDS_PAD];
+
+  if (offset_k + t < end_k) {
+    int32_t token_id = sorted_token_ids[token_block];
+    int token_row = token_id / top_k;
+    half av = (token_row < size_m)
+                  ? a[(int64_t)token_row * size_k + offset_k + t]
+                  : __float2half_rn(0.0f);
+    block_a[0][t] = av;
+  }
+  __syncthreads();
+
+  if (n >= size_n) return;
+
+  const int groupsize = size_k / groups;
+  int group = offset_k / groupsize;
+  int nextgroup = (group + 1) * groupsize;
+  int qk = offset_k / 8;
+  const uint32_t* b_ptr = expert_weights + qk * size_n + n;
+
+  half2 z1z16_h[NPT][2], y1y16_h[NPT][2];
+  auto refresh_group = [&](int g) {
+    const uint32_t* qz_row = expert_qzeros + g * (size_n / 8);
+    const half* sc_row = expert_scales + g * size_n;
+    int zeros[4];
+    loadN_zeros(qz_row, n, zeros);
+    #pragma unroll
+    for (int i = 0; i < NPT; ++i) {
+      half scale = sc_row[n + i];
+      prep_zero_scale_fp16((uint32_t)(zeros[i] + zero_offset), scale,
+                           z1z16_h[i], y1y16_h[i]);
+    }
+  };
+  refresh_group(group);
+
+  float block_c[NPT];
+  #pragma unroll
+  for (int i = 0; i < NPT; ++i) block_c[i] = 0.0f;
+  int k = offset_k;
+  uint32_t b_w[4][NPT];
+  while (k < end_k) {
+    if (k == nextgroup) {
+      group++;
+      nextgroup += groupsize;
+      refresh_group(group);
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      if constexpr (NPT == 4) {
+        int4 v = *(const int4*)(b_ptr + j * size_n);
+        b_w[j][0] = v.x;
+        b_w[j][1] = v.y;
+        b_w[j][2] = v.z;
+        b_w[j][3] = v.w;
+      } else {
+        uint2 v = *(const uint2*)(b_ptr + j * size_n);
+        b_w[j][0] = v.x;
+        b_w[j][1] = v.y;
+      }
+    }
+    b_ptr += 4 * size_n;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int a_off = (k - offset_k) + 8 * j;
+      half2 dq[NPT][4];
+      #pragma unroll
+      for (int i = 0; i < NPT; ++i)
+        dequant_4bit_8_fp16(b_w[j][i], dq[i], z1z16_h[i], y1y16_h[i]);
+      const half* a_ptr =
+          reinterpret_cast<const half*>(&block_a[0][a_off]);
+      #pragma unroll
+      for (int i = 0; i < NPT; ++i) block_c[i] += dot22_8_f(dq[i], a_ptr);
+    }
+    k += 32;
+  }
+
+  int32_t token_id = sorted_token_ids[token_block];
+  if (token_id / top_k >= size_m) return;
+  if (mul_topk_w && topk_weights != nullptr) {
+    float tw = topk_weights[token_id];
+    #pragma unroll
+    for (int j = 0; j < NPT; ++j) block_c[j] *= tw;
+  }
+  int64_t out_row = (output_topk > 0) ? (int64_t)(token_id / output_topk)
+                                      : (int64_t)token_id;
+  half* out = c + out_row * size_n + n;
+  if constexpr (NPT == 4) {
+    half2 r01 = __halves2half2(__float2half_rn(block_c[0]),
+                               __float2half_rn(block_c[1]));
+    half2 r23 = __halves2half2(__float2half_rn(block_c[2]),
+                               __float2half_rn(block_c[3]));
+    unsigned long long* addr_u =
+        reinterpret_cast<unsigned long long*>(out);
+    unsigned long long old = *addr_u;
+    while (true) {
+      union {
+        unsigned long long u;
+        half2 h2[2];
+      } cur, sum;
+      cur.u = old;
+      sum.h2[0] = __hadd2(cur.h2[0], r01);
+      sum.h2[1] = __hadd2(cur.h2[1], r23);
+      unsigned long long prev = atomicCAS(addr_u, old, sum.u);
+      if (prev == old) break;
+      old = prev;
+    }
+  } else {
+    half2 r01 = __halves2half2(__float2half_rn(block_c[0]),
+                               __float2half_rn(block_c[1]));
+    atomic_add_pk2_f16(out, r01);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// V1 (C2): full-K per block, direct store. No CAS, no zeroing, no K-split.
+//   v1a: THREADS=32  (1 wavefront), NPT=4 — lane owns 4 columns, 128 cols/
+//         block; the roadmap's "64 blocks, each a 1-wavefront 2048-K loop".
+//   v1b: THREADS=128 (4 wavefronts), NPT=1 — wave w owns the disjoint 32-col
+//         strip [w*32, w*32+32); same total wavefront count as current,
+//         isolates the CAS/z-split structure cost.
+// gemm1-only (direct store; M=1: every slot reads activation row 0).
+// ---------------------------------------------------------------------------
+
+template <int THREADS, int NPT, int K_T>
+__global__ void __launch_bounds__(THREADS)
+    moe_gemm_q4_v1(const half* __restrict__ a, half* __restrict__ c,
+                   const uint32_t* __restrict__ b_q_weight,
+                   const half* __restrict__ b_scales,
+                   const uint32_t* __restrict__ b_qzeros,
+                   const int32_t* __restrict__ sorted_token_ids,
+                   const int32_t* __restrict__ expert_ids,
+                   const int32_t* __restrict__ num_tokens_post_padded,
+                   const int size_m, const int size_n, const int size_k,
+                   const int groups, const int top_k,
+                   const int expert_weight_stride,
+                   const int expert_scales_stride,
+                   const int expert_zeros_stride, const int zero_offset) {
+  static_assert(K_T % 32 == 0);
+  const int t = threadIdx.x;
+  const int w = t / 32;
+  const int tl = t % 32;
+  const int token_block = blockIdx.x;
+  const int offset_n = blockIdx.y * (THREADS * NPT);
+  const int n = offset_n + w * 32 + tl * NPT;
+
+  if (token_block >= num_tokens_post_padded[0]) return;
+  const int expert_id = expert_ids[token_block];
+  if (expert_id == -1) return;
+
+  const uint32_t* expert_weights =
+      b_q_weight + (int64_t)expert_id * expert_weight_stride;
+  const half* expert_scales =
+      b_scales + (int64_t)expert_id * expert_scales_stride;
+  const uint32_t* expert_qzeros =
+      b_qzeros + (int64_t)expert_id * expert_zeros_stride;
+
+  __shared__ half block_a[K_T + 8];
+
+  int32_t token_id = sorted_token_ids[token_block];
+  int token_row = token_id / top_k;
+  constexpr int FILL_ITERS = K_T / THREADS;
+  #pragma unroll
+  for (int i = 0; i < FILL_ITERS; ++i) {
+    int pos = i * THREADS + t;
+    block_a[pos] = (token_row < size_m)
+                       ? a[(int64_t)token_row * size_k + pos]
+                       : __float2half_rn(0.0f);
+  }
+  __syncthreads();
+
+  if (n >= size_n) return;
+
+  const int groupsize = size_k / groups;
+  int group = 0;
+  int nextgroup = groupsize;
+  const uint32_t* b_ptr = expert_weights + n;
+
+  half2 z1z16_h[NPT][2], y1y16_h[NPT][2];
+  auto refresh_group = [&](int g) {
+    const uint32_t* qz_row = expert_qzeros + g * (size_n / 8);
+    const half* sc_row = expert_scales + g * size_n;
+    int zeros[NPT];
+    uint32_t d = qz_row[n / 8] >> ((n & 0x07) * 4);
+    #pragma unroll
+    for (int i = 0; i < NPT; ++i) zeros[i] = (int)((d >> (4 * i)) & 0xF);
+    #pragma unroll
+    for (int i = 0; i < NPT; ++i) {
+      half scale = sc_row[n + i];
+      prep_zero_scale_fp16((uint32_t)(zeros[i] + zero_offset), scale,
+                           z1z16_h[i], y1y16_h[i]);
+    }
+  };
+  refresh_group(0);
+
+  float block_c[NPT];
+  #pragma unroll
+  for (int i = 0; i < NPT; ++i) block_c[i] = 0.0f;
+  int k = 0;
+  uint32_t b_w[4][NPT];
+  while (k < K_T) {
+    if (k == nextgroup) {
+      group++;
+      nextgroup += groupsize;
+      refresh_group(group);
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      if (NPT == 4) {
+        uint4 v = *(const uint4*)(b_ptr + j * size_n);
+        b_w[j][0] = v.x;
+        b_w[j][1] = v.y;
+        b_w[j][2] = v.z;
+        b_w[j][3] = v.w;
+      } else if (NPT == 2) {
+        uint2 v = *(const uint2*)(b_ptr + j * size_n);
+        b_w[j][0] = v.x;
+        b_w[j][1] = v.y;
+      } else {
+        b_w[j][0] = *(const uint32_t*)(b_ptr + j * size_n);
+      }
+    }
+    b_ptr += 4 * size_n;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int a_off = k + 8 * j;
+      half2 dq[NPT][4];
+      #pragma unroll
+      for (int i = 0; i < NPT; ++i)
+        dequant_4bit_8_fp16(b_w[j][i], dq[i], z1z16_h[i], y1y16_h[i]);
+      const half* a_ptr =
+          reinterpret_cast<const half*>(&block_a[a_off]);
+      #pragma unroll
+      for (int i = 0; i < NPT; ++i) block_c[i] += dot22_8_f(dq[i], a_ptr);
+    }
+    k += 32;
+  }
+
+  half* out = c + (int64_t)token_id * size_n + n;
+  if (NPT >= 4) {
+    *(half2*)out = __halves2half2(__float2half_rn(block_c[0]),
+                                  __float2half_rn(block_c[1]));
+    *(half2*)(out + 2) = __halves2half2(__float2half_rn(block_c[2]),
+                                        __float2half_rn(block_c[3]));
+  } else if (NPT == 2) {
+    *(half2*)out = __halves2half2(__float2half_rn(block_c[0]),
+                                  __float2half_rn(block_c[1]));
+  } else {
+    *out = __float2half_rn(block_c[0]);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Host
 // ---------------------------------------------------------------------------
 
@@ -746,7 +1044,10 @@ int main(int argc, char** argv) {
       launch(true);
       CHECK(hipDeviceSynchronize());
     };
-    auto report = [&](const char* name) {
+    float ref2max = 0;
+    for (int nn = 0; nn < N; ++nn)
+      ref2max = std::max(ref2max, fabsf(ref2[nn]));
+    auto report = [&](const char* name, bool expect_dirty = false) {
       std::vector<half> h(N);
       CHECK(hipMemcpy(h.data(), d_c3, M * N * sizeof(half),
                       hipMemcpyDeviceToHost));
@@ -757,12 +1058,23 @@ int main(int argc, char** argv) {
         if (__builtin_isinf(v) || __builtin_isnan(v)) ++ni;
         me = std::max(me, fabsf(v - ref2[nn]));
       }
+      // 8-slot fp16 CAS accumulation is ~0.6 abs err on ~20-magnitude
+      // random data: gate on relative error (the in-repo test suite's
+      // 5e-2 relative tolerance), not absolute.
+      float rel = me / (ref2max + 1e-6f);
       if (!strncmp(name, "v2-512t4col", 11))
         for (int j = 0; j < 16; ++j)
           printf("  [%2d] got %10.4f ref2 %10.4f\n", j, __half2float(h[j]),
                  ref2[j]);
-      printf("gemm2 %s: max abs err %.4f (%d inf/nan)\n", name, me, ni);
-      if (me > 0.35f || ni) bad = 1;
+      printf("gemm2 %s: max abs err %.4f (rel %.3e, %d inf/nan)\n", name, me,
+             rel, ni);
+      if (expect_dirty) {
+        // negative control: running on the pre-zeroed buffer must NOT
+        // happen; a clean result here means the control is stale
+        if (rel < 0.5f) bad = 1;
+      } else if (rel > 5e-2f || ni) {
+        bad = 1;
+      }
     };
 
     L2 l{d_c3, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp, d_a,
@@ -775,7 +1087,7 @@ int main(int argc, char** argv) {
     run2([&] (bool) { l.v2<512, 2, 256>(); }, true);
     report("v2-512t2col(8x CAS)");
     run2([&] (bool) { l.v2<512, 4, 256>(); }, false);
-    report("v2-nozero-dirty(8x CAS)");
+    report("v2-nozero-dirty(8x CAS)", /*expect_dirty=*/true);
   }
 
   // ---- gemm1 with 4col variant (direct store, no CAS at all)
@@ -793,6 +1105,126 @@ int main(int argc, char** argv) {
     printf("gemm1 v2 512t4col direct-store (vs cpu-ref): max err %.4f\n", me);
     if (me > 0.35f) bad = 1;
   }
+
+  // ---- V1 (C2): full-K direct-store variants, gemm1 (K=2048 only)
+  auto run_v1 = [&](auto launch, const char* name) {
+    launch();
+    CHECK(hipDeviceSynchronize());
+    std::vector<half> h(EM * N);
+    CHECK(hipMemcpy(h.data(), d_c1, EM * N * sizeof(half),
+                    hipMemcpyDeviceToHost));
+    float me = 0;
+    for (size_t i = 0; i < h.size(); ++i)
+      me = std::max(me, fabsf(__half2float(h[i]) - ref[i]));
+    printf("gemm1 %s (vs cpu-ref): max err %.4f\n", name, me);
+    if (me > 0.35f) bad = 1;
+  };
+  if (K == 2048) {
+    run_v1([&] {
+      dim3 blk(32);
+      dim3 grid(EM, N / 128);
+      moe_gemm_q4_v1<32, 4, 2048><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_sorted, d_eids, d_npp, M, N, K,
+          GROUPS, TOPK, wstride, sstride, zstride, 0);
+      CHECK(hipGetLastError());
+    }, "v1a 32t 4col full-K direct");
+    run_v1([&] {
+      dim3 blk(128);
+      dim3 grid(EM, N / 128);
+      moe_gemm_q4_v1<128, 1, 2048><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_sorted, d_eids, d_npp, M, N, K,
+          GROUPS, TOPK, wstride, sstride, zstride, 0);
+      CHECK(hipGetLastError());
+    }, "v1b 128t 1col full-K direct");
+  }
+
+  // ---- z-split sweep (gemm1 semantics: pre-zeroed, direct CAS fan-in)
+  auto run_sweep = [&](auto launch, const char* name) {
+    CHECK(hipMemset(d_c1, 0, EM * N * sizeof(half)));
+    launch();
+    CHECK(hipDeviceSynchronize());
+    std::vector<half> h(EM * N);
+    CHECK(hipMemcpy(h.data(), d_c1, EM * N * sizeof(half),
+                    hipMemcpyDeviceToHost));
+    float me = 0;
+    for (size_t i = 0; i < h.size(); ++i)
+      me = std::max(me, fabsf(__half2float(h[i]) - ref[i]));
+    printf("sweep %s (vs cpu-ref): max err %.4f\n", name, me);
+    if (me > 0.35f) bad = 1;
+  };
+  auto sweep_cfg = [&](int tx, int np_, auto launch) {
+    if (K % tx != 0) {
+      printf("sweep %dt NPT=%d skipped (K %% %d)\n", tx, np_, tx);
+      return;
+    }
+    char name[32];
+    snprintf(name, sizeof(name), "%dt NPT=%d", tx, np_);
+    run_sweep(launch, name);
+  };
+  sweep_cfg(256, 4, [&] {
+    dim3 blk(256);
+    dim3 grid(EM, (N + 256 * 4 - 1) / (256 * 4), (K + 255) / 256);
+    moe_gemm_q4_sweep<256, 4><<<grid, blk>>>(
+        d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+        M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+    CHECK(hipGetLastError());
+  });
+  sweep_cfg(256, 2, [&] {
+    dim3 blk(256);
+    dim3 grid(EM, (N + 256 * 2 - 1) / (256 * 2), (K + 255) / 256);
+    moe_gemm_q4_sweep<256, 2><<<grid, blk>>>(
+        d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+        M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+    CHECK(hipGetLastError());
+  });
+  sweep_cfg(128, 4, [&] {
+    dim3 blk(128);
+    dim3 grid(EM, (N + 128 * 4 - 1) / (128 * 4), (K + 127) / 128);
+    moe_gemm_q4_sweep<128, 4><<<grid, blk>>>(
+        d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+        M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+    CHECK(hipGetLastError());
+  });
+  sweep_cfg(128, 2, [&] {
+    dim3 blk(128);
+    dim3 grid(EM, (N + 128 * 2 - 1) / (128 * 2), (K + 127) / 128);
+    moe_gemm_q4_sweep<128, 2><<<grid, blk>>>(
+        d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+        M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+    CHECK(hipGetLastError());
+  });
+  sweep_cfg(64, 4, [&] {
+    dim3 blk(64);
+    dim3 grid(EM, (N + 64 * 4 - 1) / (64 * 4), (K + 63) / 64);
+    moe_gemm_q4_sweep<64, 4><<<grid, blk>>>(
+        d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+        M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+    CHECK(hipGetLastError());
+  });
+  sweep_cfg(64, 2, [&] {
+    dim3 blk(64);
+    dim3 grid(EM, (N + 64 * 2 - 1) / (64 * 2), (K + 63) / 64);
+    moe_gemm_q4_sweep<64, 2><<<grid, blk>>>(
+        d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+        M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+    CHECK(hipGetLastError());
+  });
+  sweep_cfg(512, 4, [&] {
+    dim3 blk(512);
+    dim3 grid(EM, (N + 512 * 4 - 1) / (512 * 4), (K + 511) / 512);
+    moe_gemm_q4_sweep<512, 4><<<grid, blk>>>(
+        d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+        M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+    CHECK(hipGetLastError());
+  });
+  sweep_cfg(512, 2, [&] {
+    dim3 blk(512);
+    dim3 grid(EM, (N + 512 * 2 - 1) / (512 * 2), (K + 511) / 512);
+    moe_gemm_q4_sweep<512, 2><<<grid, blk>>>(
+        d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+        M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+    CHECK(hipGetLastError());
+  });
 
   // ---- single-slot gemm2 (npp=1): only x-block 0 contributes
   {
@@ -870,6 +1302,124 @@ int main(int argc, char** argv) {
   time_v2([&] { v2.template operator()<512, 4, 256>(); }, "512t 4col s256");
   time_v2([&] { v2.template operator()<256, 2, 512>(); }, "256t 2col s512");
   time_v2([&] { v2.template operator()<128, 1, 1024>(); }, "128t 1col s1024");
+  if (K == 2048) {
+    // also time current kernel WITHOUT the zeroing memset (kernel only)
+    for (int i = 0; i < 50; ++i) {
+      dim3 blk(CURRENT_THREADS_X);
+      dim3 grid(EM, (N + CURRENT_BLOCK_KN * NPT - 1) / (CURRENT_BLOCK_KN * NPT),
+                (K + CURRENT_BLOCK_KN - 1) / CURRENT_BLOCK_KN);
+      moe_gemm_q4_current<<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp, M, N, K,
+          GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+      CHECK(hipGetLastError());
+    }
+    CHECK(hipStreamSynchronize(0));
+    hipEventRecord(e0, 0);
+    for (int i = 0; i < niter; ++i) {
+      dim3 blk(CURRENT_THREADS_X);
+      dim3 grid(EM, (N + CURRENT_BLOCK_KN * NPT - 1) / (CURRENT_BLOCK_KN * NPT),
+                (K + CURRENT_BLOCK_KN - 1) / CURRENT_BLOCK_KN);
+      moe_gemm_q4_current<<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp, M, N, K,
+          GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+      CHECK(hipGetLastError());
+    }
+    hipEventRecord(e1, 0);
+    CHECK(hipStreamSynchronize(0));
+    hipEventElapsedTime(&ms, e0, e1);
+    printf("current (no zero)  : %.2f us/launch\n", ms * 1000.f / niter);
+    time_v2([&] {
+      dim3 blk(32);
+      dim3 grid(EM, N / 128);
+      moe_gemm_q4_v1<32, 4, 2048><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_sorted, d_eids, d_npp, M, N, K,
+          GROUPS, TOPK, wstride, sstride, zstride, 0);
+      CHECK(hipGetLastError());
+    }, "v1a 32t 4col fullK");
+    time_v2([&] {
+      dim3 blk(128);
+      dim3 grid(EM, N / 128);
+      moe_gemm_q4_v1<128, 1, 2048><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_sorted, d_eids, d_npp, M, N, K,
+          GROUPS, TOPK, wstride, sstride, zstride, 0);
+      CHECK(hipGetLastError());
+    }, "v1b 128t 1col fullK");
+    auto time_sweep = [&](auto launch, const char* name) {
+      for (int i = 0; i < 50; ++i) launch();
+      CHECK(hipStreamSynchronize(0));
+      hipEventRecord(e0, 0);
+      for (int i = 0; i < niter; ++i) launch();
+      hipEventRecord(e1, 0);
+      CHECK(hipStreamSynchronize(0));
+      float m;
+      hipEventElapsedTime(&m, e0, e1);
+      printf("sweep %-12s: %.2f us/launch\n", name, m * 1000.f / niter);
+    };
+    time_sweep([&] {
+      dim3 blk(256);
+      dim3 grid(EM, (N + 256 * 4 - 1) / (256 * 4), (K + 255) / 256);
+      moe_gemm_q4_sweep<256, 4><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+          M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+      CHECK(hipGetLastError());
+    }, "256t NPT=4");
+    time_sweep([&] {
+      dim3 blk(256);
+      dim3 grid(EM, (N + 256 * 2 - 1) / (256 * 2), (K + 255) / 256);
+      moe_gemm_q4_sweep<256, 2><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+          M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+      CHECK(hipGetLastError());
+    }, "256t NPT=2");
+    time_sweep([&] {
+      dim3 blk(128);
+      dim3 grid(EM, (N + 128 * 4 - 1) / (128 * 4), (K + 127) / 128);
+      moe_gemm_q4_sweep<128, 4><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+          M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+      CHECK(hipGetLastError());
+    }, "128t NPT=4");
+    time_sweep([&] {
+      dim3 blk(128);
+      dim3 grid(EM, (N + 128 * 2 - 1) / (128 * 2), (K + 127) / 128);
+      moe_gemm_q4_sweep<128, 2><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+          M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+      CHECK(hipGetLastError());
+    }, "128t NPT=2");
+    time_sweep([&] {
+      dim3 blk(64);
+      dim3 grid(EM, (N + 64 * 4 - 1) / (64 * 4), (K + 63) / 64);
+      moe_gemm_q4_sweep<64, 4><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+          M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+      CHECK(hipGetLastError());
+    }, "64t NPT=4");
+    time_sweep([&] {
+      dim3 blk(64);
+      dim3 grid(EM, (N + 64 * 2 - 1) / (64 * 2), (K + 63) / 64);
+      moe_gemm_q4_sweep<64, 2><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+          M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+      CHECK(hipGetLastError());
+    }, "64t NPT=2");
+    time_sweep([&] {
+      dim3 blk(512);
+      dim3 grid(EM, (N + 512 * 4 - 1) / (512 * 4), (K + 511) / 512);
+      moe_gemm_q4_sweep<512, 4><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+          M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+      CHECK(hipGetLastError());
+    }, "512t NPT=4");
+    time_sweep([&] {
+      dim3 blk(512);
+      dim3 grid(EM, (N + 512 * 2 - 1) / (512 * 2), (K + 511) / 512);
+      moe_gemm_q4_sweep<512, 2><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_topkw, d_sorted, d_eids, d_npp,
+          M, N, K, GROUPS, TOPK, wstride, sstride, zstride, false, 0, 0);
+      CHECK(hipGetLastError());
+    }, "512t NPT=2");
+  }
 
   if (mode3 == 11) {
     // production gemm2 convention: a = [EM, K] per-slot rows, top_k=1,
