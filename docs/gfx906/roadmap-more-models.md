@@ -71,12 +71,15 @@ the layer's conditions — none of which are "model family" tests:
 
 ## 3. Ready-to-benefit: any AWQ W4A16 MoE (no new kernels)
 
-Any MoE checkpoint in AWQ int4 group-128 form served on gfx906 with
-fp16 activations is routed to the same expert kernel by layout, not by
-model class (`gfx906_w4a16_moe.py` / `oracle/int_wna16.py`). On this
-disk the only such model is the 35B itself (gemma-4-26B-A4B is
-GGUF-only → llama.cpp territory; Qwen3.5-27B-AWQ is dense and already
-gets the K=17408 GEMV). The nearest untested family member is
+Any MoE checkpoint in AWQ int4 group-128 form **with stored zero
+points** served on gfx906 with fp16 activations is routed to the same
+expert kernel by layout, not by model class
+(`gfx906_w4a16_moe.py` / `oracle/int_wna16.py`). The oracle gate is
+deliberately AWQ-only: symmetric no-zp (GPTQ-style) checkpoints are
+rejected ("zero points are required") — gemma-4-26B-A4B-AWQ proved
+that path in 2026-08-19 (it fell through to Triton WNA16; see §6).
+On this disk the only AWQ-with-zp MoE is the 35B itself (Qwen3.5-27B-AWQ
+is dense and already gets the K=17408 GEMV). The nearest untested family member is
 **Qwen3-30B-A3B-AWQ** (E=128, topk-8, hidden 2048, inter 768):
 
 - gemm1 N=1536×K=2048, gemm2 N=2048×K=768 — both satisfy the S5 V2
@@ -189,17 +192,55 @@ community int4 quant under 32 GB) appears, the onboarding checklist
 (§3) plus items 2–4 above is the plan; the design patterns (§2.1)
 transfer unchanged.
 
-## 6. Priorities
+## 6. Gemma-4-26B-A4B-AWQ (onboarded 2026-08-19, `DEVLOG-gemma4-onboarding.md`)
+
+`cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit` (17.2 GB, local, standard HF
+layout under `/local/cache/huggingface/hub/`). Supersedes the §3 note
+that gemma-4 was GGUF-only. Facts that broke the "reuse the existing
+kernel" premise of P1:
+
+- **All 30 layers are MoE** (E=128, topk=8, moe_inter 704) **plus a
+  per-layer shared expert** (unquantized bf16 in layers 0–26).
+- Quantization is compressed-tensors W4A16 **group-32, symmetric, no
+  zero points** (`weight_packed` + `weight_scale` only) → the WNA16
+  oracle's AWQ-only gate routes it to **Triton WNA16** (correct gate
+  behavior; our kernel needs stored zps).
+- Hybrid attention (25 sliding hd-256 + 5 full hd-512 layers with
+  `attention_k_eq_v` + proportional RoPE) → `Gemma4Config` forces the
+  **TRITON_ATTN** backend here (no FA4). Works; 20% of the decode step.
+- fp16 (forced by the auto-dtype gfx906 fallback — second model to
+  exercise `69f615b98a`) is numerically fine; bf16 is structurally
+  blocked (our fp16-only dense path asserts).
+- **Raw-prompt degeneration trap:** bare continuation prompts produce
+  confident repetition loops on this thinking-mode instruct model;
+  templated messages are coherent. Gates must use the chat template.
+
+Record: **37.6 t/s** (graph, pp=2048 tg=256, 4 samples, util 0.95,
+max-seqs 32); KV pool 53,434 tokens. Census: MoE Triton expert GEMMs
+**46% of the step** (232.8 µs/call × 59.8/step ≈ ~38 GB/s effective),
+attention 17%, shared-expert `LLGemm1` 12%.
+
+**Lever (new P1): no-zp / GPTQ-style W4A16 MoE expert kernel.**
+Extend `moe_gemm_q4` to symmetric dequant (`(q-8)*scale`, zero-point
+machinery collapses to a per-group bias) + compressed-tensors repack +
+oracle gate. Expected ~10 ms/step recoverable (30 layers) →
+~50–55 t/s class. House gate sequence: harness no-zp variant → unit
+tests → PPL → serving A/B.
+
+## 7. Priorities
 
 1. **P1 (cheap, high confidence):** onboard the next AWQ W4A16 MoE
    checkpoint as it arrives (Qwen3-30B-A3B-AWQ-shaped): checklist §3,
-   ~1 day per model, zero new kernels.
-2. **P2 (one machine, one model at a time):** Ling-3.0-tiny L1+L2
+   ~1 day per model, zero new kernels. (gemma-4-26B-A4B done 2026-08-19,
+   §6 — it did *not* qualify for zero-new-kernels: no-zp format.)
+2. **P1 (measured payoff, one machine):** the gemma-4 no-zp W4A16 MoE
+   expert kernel (§6) — 46% of that model's decode step today.
+3. **P2 (one machine, one model at a time):** Ling-3.0-tiny L1+L2
    (make it run, get the table) — only after the 35B roadmap's big
    open levers (gemm1 M=1 re-tile, S2' router-GEMV fusion,
    `moe-decode-roadmap.md`) are spent, or if the 35B work is declared
    done.
-3. **P3 (park):** DeepSeek-V4-Flash — capacity-blocked (§5.1); revisit
+4. **P3 (park):** DeepSeek-V4-Flash — capacity-blocked (§5.1); revisit
    only on a smaller variant or a 3rd+ card with a working TP/PP path.
 
 **House protocol applies to all of it**: micro-bench per shape before
