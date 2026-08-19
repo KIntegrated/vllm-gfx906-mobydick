@@ -2238,6 +2238,17 @@ def _resolve_auto_dtype(
         config_dtype = preferred_dtype
 
     if config_dtype in supported_dtypes:
+        if (
+            config_dtype == torch.bfloat16
+            and torch.float16 in supported_dtypes
+            and not current_platform.supports_native_bf16
+        ):
+            logger.warning(
+                "Checkpoint dtype is bfloat16, but this device has no "
+                "native bfloat16 support; auto-selecting float16 "
+                "instead. Pass --dtype explicitly to override."
+            )
+            return torch.float16
         return config_dtype
 
     # Ensure device compatibility
@@ -2291,6 +2302,13 @@ def _get_and_verify_dtype(
         torch_dtype = dtype
     else:
         raise ValueError(f"Unknown dtype: {dtype}")
+
+    if torch_dtype == torch.bfloat16 and not current_platform.supports_native_bf16:
+        logger.warning(
+            "bfloat16 has no native support on this device (it is "
+            "emulated via fp32 and custom kernels may be "
+            "incompatible); consider --dtype float16."
+        )
 
     _check_valid_dtype(model_type, torch_dtype)
 

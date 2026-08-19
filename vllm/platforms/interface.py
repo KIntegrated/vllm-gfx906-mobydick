@@ -186,6 +186,16 @@ class Platform:
         # when encountering unsupported dtypes in "auto" dtype.
         return [torch.bfloat16, torch.float16, torch.float32]
 
+    @property
+    def supports_native_bf16(self) -> bool:
+        """Whether the device has native bfloat16 arithmetic support.
+
+        Platforms without native bf16 emulate it (upcast to fp32), and
+        their kernel stacks may be fp16-only; "auto" dtype resolution
+        uses this to fall back to float16 for bf16 checkpoints.
+        """
+        return True
+
     def is_cuda(self) -> bool:
         return self._enum == PlatformEnum.CUDA
 

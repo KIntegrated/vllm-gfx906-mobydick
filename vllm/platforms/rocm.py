@@ -548,12 +548,19 @@ class RocmPlatform(Platform):
         "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
     ]
 
+    @property
+    def supports_native_bf16(self) -> bool:
+        # gfx906 (CDNA1/Vega20) has no native bfloat16 instructions;
+        # bf16 is emulated via fp32 and the gfx906 kernel stack is
+        # fp16-only, so bf16 models should run in float16 there.
+        return not _ON_GFX906
+
     supported_quantization: list[str] = [
         "awq",
         "auto_awq",
         "awq_marlin",  # will be overwritten with awq
         "gptq",
-        "auto_gptq",
+        "auto_gpt",
         "fp8",
         "deepseek_v4_fp8",
         "compressed-tensors",
