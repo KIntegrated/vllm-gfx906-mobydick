@@ -1,13 +1,24 @@
 # gfx906 Speculative Decoding Roadmap
 
-> Status: **Phase 1 in progress — L1' DONE (committed
-> `751eacb37d`, 13.4 ms/step measured in-engine); serving A/B now
-> 0.945× (was 0.71×). Next: L1'' (m4 dispatch to n>16, ~5 ms,
-> dispatch-only), then L5 (no-draft graph padding, verify first),
-> then L2 (AWQ, re-scoped 2–8 ms).** Build note: this branch is
-> currently built `VLLM_NO_MAX_ILP=1` — the per-file max-ilp flag
-> under the new ROCm 7.14 LLVM is suspected of the weight-load GPU
-> faults (2× `hipErrorLaunchFailure` + BACO reset, then clean).
+> Status: **CLOSED (2026-08-24).** Final serving A/B (agentic 3-prompt,
+> 3 repeats, `68243a61b2`): **mtp k=2 = 1.503×** (39.74 t/s, CI
+> 38.58; 1.819 tokens/step, 90.95% draft acceptance, token-identical
+> output) — the recommended spec method for this model. ngram3 =
+> **1.094×** (28.92 t/s) after the L5 cg-small fix; its ceiling is
+> prompt repetition (1.12× on repetitive prompts, ~1.1× agentic). L2 (AWQ
+> M≤4) deferred (dequant-ALU-bound ceiling 2–8 ms); L3 moot (MTP
+> supersedes the CPU ngram proposer); W4 (skinny fp16 M≤16) parked —
+> it lifts both arms ~40% and is now the bigger prize (a 40 t/s
+> baseline would make k=2 MTP ~2.1×). Build note: branch built
+> `VLLM_NO_MAX_ILP=1` — the per-file max-ilp flag under the new ROCm
+> 7.14 LLVM is suspected of the weight-load GPU faults (two
+> `hipErrorLaunchFailure` wedge incidents, 2026-08-19 and 2026-08-24;
+> both recovered via BACO/reboot).
+>
+> Prior status (2026-08-18): Phase 1 in progress — L1' DONE (committed
+> `751eacb37d`, 13.4 ms/step measured in-engine); serving A/B then
+> 0.945× (was 0.71×). L1''/L5/L2 were the remaining levers; see the
+> levers table for their final dispositions.
 >
 > Prior status (2026-08-18): Phase 0 done, Phase 1 re-scoped after
 > kernel-path forensics. n-gram probe complete (0.68× on agentic
@@ -54,8 +65,11 @@ backend runs all decode steps piecewise (~100 ms/step).**
 
 - 64 layers = **48 GDN linear_attention + 16 full_attention**
   (`full_attention_interval=4`).
-- **No MTP head** (no `num_nextn_predict_layers`) — `method="mtp"`,
-  EAGLE, draft models are unavailable for this checkpoint.
+- **MTP head present**: `mtp_num_hidden_layers=1`; `mtp.*` weights =
+  `mtp.fc` ([5120, 10240] fp16) + one full decoder layer (fp16 via
+  `modules_to_not_convert`), shared embed/lm_head with the target.
+  `method: "mtp"` resolves to `Qwen3_5MTP` on the same checkpoint.
+  (Earlier "no MTP head" note was wrong — corrected 2026-08-24.)
 
 ### The cost model (revised 2026-08-18 afternoon — supersedes the
 B1/B2/B3 table that preceded it)
@@ -131,11 +145,11 @@ bench). The model is calibrated to within ~4%.
 
 | # | lever | savings | scope | status |
 |---|---|---|---|---|
-| **L1'** | fp16 M≤4: extend `dense_gemv_gfx906` to ≤4 rows (census: M=1 takes the GEMV op, M=4 falls to `triton_matmul`) | **13.4 ms measured in-engine** (draft step 66.6 → 53.2 ms eager) | gfx906-local kernel + dispatch branch | **DONE** `751eacb37d` |
-| **L1''** | extend the m4 dispatch to **n>16** fp16 (LM head 248320×5120 + layer-0 FA projections currently run inductor at M=4: 5.6 ms/call; m4 does the shape in ~2.0 ms) | **~5 ms** | dispatch-only (no new kernel) | open — next |
-| **L2** | AWQ M≤4: 4-row GEMV (exllama structure) or re-tiled `q_gemm` | **2–8 ms** (re-scoped 2026-08-18: the family is dequant-ALU-bound — M=1 q_gemm runs 44 MB in 75 µs = 590 GB/s, ~2× off the HBM roofline — and the tiled M=4 kernel already shares the dequant across m-rows; GEMV structure removes only atomics/LDS/m-tiling overhead, not the 17 ms M=1→M=4 delta) | gfx906-local kernel (`csrc/libtorch_stable/quantization/gptq/`) | open — after L1'' |
-| L3 | CPU ngram proposer D2H serialization | ~5 ms | in-tree (`ngram_proposer.py`); the GPU proposer exists but has a **draft-quality bug** (0.428 vs 1.08 acc/step — match selection/tie-break divergence, §2 item 1) | open |
-| **L5** | no-draft spec step penalty: **measured ≈ 13 ms** (graph-mode no-draft ≈ 48 ms vs nospec 35–37, back-solved from the A/B counters; eager shows only +3–5, so ~10 ms is graph-mode — suspected cudagraph padding of spec steps to the draft capacity M=4, UNVERIFIED) | **~13 ms on 63% of agentic steps** — the dominant remaining loss | core vLLM (`cudagraph_dispatcher`/`gpu_model_runner`); verify padding first (§4 risk) | open — verify, then fix |
+| **L1'** | fp16 M≤4: extend `dense_gemv_gfx906` to ≤4 rows (census: M=1 takes the GEMV op, M=4 falls to `triton_matmul`) | **13.4 ms measured in-engine** (draft step 66.6 → 53.2 ms eager) | gfx906-local kernel + dispatch branch | **DONE** `751eacb37d`; M-templated follow-up `68243a61b2` (M=1..3 → 816/730/544 GB/s; templated M=4 regressed 507→311 unattributed, so M=4 keeps the original runtime-M kernel) |
+| **L1''** | extend the m4 dispatch to **n>16** fp16 | — | dispatch-only | **CLOSED as non-issue** (2026-08-24): the "inductor intercept" theory was wrong — an eager dispatch spy showed every decode fp16 GEMM (incl. the LM head) reaches the dispatcher and already routes to m4 when the shape qualifies (k%1024==0 covers K=1024 fc/gate shapes too); the residual ~7.3 ms/step inductor rows are piecewise-compiled fragments, not missed GEMM dispatches |
+| **L2** | AWQ M≤4: 4-row GEMV (exllama structure) or re-tiled `q_gemm` | **2–8 ms** (re-scoped 2026-08-18: the family is dequant-ALU-bound — M=1 q_gemm runs 44 MB in 75 µs = 590 GB/s, ~2× off the HBM roofline — and the tiled M=4 kernel already shares the dequant across m-rows; GEMV structure removes only atomics/LDS/m-tiling overhead, not the 17 ms M=1→M=4 delta) | gfx906-local kernel (`csrc/libtorch_stable/quantization/gptq/`) | **DEFERRED** — low ROI vs MTP (the drafter is fp16, not AWQ) |
+| L3 | CPU ngram proposer D2H serialization | ~5 ms | in-tree (`ngram_proposer.py`); the GPU proposer exists but has a **draft-quality bug** (0.428 vs 1.08 acc/step — match selection/tie-break divergence, §2 item 1) | **MOOT** — MTP supersedes ngram (1.50× vs 1.077×) |
+| **L5** | no-draft spec step penalty: **measured ≈ 13 ms** (graph-mode no-draft ≈ 48 ms vs nospec 35–37, back-solved from the A/B counters; eager shows only +3–5, so ~10 ms is graph-mode — suspected cudagraph padding of spec steps to the draft capacity M=4) | **~13 ms on 63% of agentic steps** — the dominant remaining loss | core vLLM (`vllm/config/compilation.py`) | **DONE** `68243a61b2` — confirmed at kernel level (graph-mode profile: zero M=1 AWQ calls; batchdesc_probe.py: no-draft steps pad to num_tokens=4). Root cause: `adjust_cudagraph_sizes_for_spec_decode` rounds capture sizes up to multiples of `uniform_decode_query_len`, dropping sizes 1..q-1 from the PIECEWISE key set, so 1-token no-draft steps replay the size-q graph. Fix re-adds them (gfx906-gated, `VLLM_GFX906_SPEC_CG_SMALL=0` off). A/B: ngram3 0.945× → 1.077× |
 | **W4** | the same `dense_gemv` extension shipped at M≤16 (replaces the GEMV floor AND the 174 µs triton floor) — **all M, spec and no-spec** | ~15 ms per decode step (~40% baseline latency) | gfx906-local kernel; does NOT change the spec ratio — parked after Phase 1 | parked |
 
 GDN needs **no new kernel** for single-request spec decode.
@@ -159,9 +173,28 @@ no-draft **48 ms** (back-solved, L1' build); nospec 37 ms.
 the agentic mix. At min1 the draft-side levers dominate instead;
 the two configs are lever-dual.)
 
-W4 (skinny fp16 GEMM) lifts **both arms** ~40% (no-spec 36.5 → ~22
-ms ≈ 45 t/s; spec T_d 58 → ~43, T_n 37 → ~23) without changing the
-ratio.
+**Final measured (2026-08-24, `68243a61b2`, post-reboot run)**: the
+ngram stack (L1' + L5) landed at **1.094×** (28.92 t/s vs 26.44
+baseline; pre-reboot run 28.55 = 1.077×, within noise) — between
+the "measured (L1')" and "+L5" rows above, i.e. L5's predicted ~13 ms
+no-draft saving materialized but the draft-step cost stayed ~56 ms
+(the L1'' row turned out to be a non-issue). The 1.15× gate failed
+for ngram by construction: at min2's mix the draft step is
+AWQ-dominated (~29 ms of the 56), and L2's ceiling is 2–8 ms. **MTP
+bypassed the whole ngram cost model** — r=1.0 (every step drafts),
+no no-draft steps, and its drafter is fp16 (L1' family already
+fast): **1.503×** (39.74 t/s) with no L2 dependency.
+
+W4 (skinny fp16 GEMM, M≤16) — the "19 ms/step at every M" figure in
+its work-item entry predates the M-gated-dispatcher finding: at M=1
+the fp16 projections already take the GEMV ops (~3.5 ms/step, near
+roofline), so W4 does **not** lift the single-request baseline. Its
+real value is **multi-request decode**: 5–16 concurrent sequences
+fall to `triton_matmul` (M-invariant 174 µs floor, ~5× off roofline),
+and the m4 kernel covers only M≤4. That is the highest-leverage
+parked item on this branch — it also directly benefits concurrent
+MTP serving (drafter batch = 3×seqs, which lands in the M=5..16
+triton gap at 2–5 seqs).
 
 **Readout (updated 2026-08-18 post-L1').** At min2's measured
 quality (a = 1.09, r = 0.37), the stack **L1''+L2+L5** lands at
@@ -306,10 +339,10 @@ one-file fallback.)
 
 | method | available on 27B? | expected | notes |
 |---|---|---|---|
-| ngram (CPU) | yes | 0.71× today (agentic) → ~1.15–1.23× post L2+L4 (a-dependent) | prompt-repetition-bound; already 1.12× on repetitive prompts |
+| ngram (CPU) | yes | **1.094× final** (agentic; L5 cg-small fix) | prompt-repetition-bound; 1.12× on repetitive prompts; ceiling ~1.1× agentic — see the L1''/L5 closure above |
 | ngram_gpu | yes | **rejected: draft-quality bug** (0.428 vs 1.08 acc/step) | fixable (match selection), small task |
 | suffix | yes (dep pending) | draft-quality probe only | PIECEWISE-only (dynamic draft length); §2 item 3 |
-| MTP | **no head in checkpoint** | r=1.0 (no L4 dependency) | re-evaluate if an MTP-capable checkpoint lands |
+| **MTP** | **yes — head in checkpoint** (1 layer, fp16, shared embed/lm_head) | **1.503× final** (k=2: 39.74 t/s, 1.819 tok/step, 90.95% acceptance, token-identical) | needs `Gfx906FAMetadata` in the proposer allowlist (gfx906-gated, `68243a61b2`); drafter is fp16-only → 3.4 GB HBM read/forward (~25% of the step); fc K=10240 GEMV dispatch + m4 M-templating applied; k=3 can't break even (needs ≥2.17 tok/step) |
 | EAGLE / draft model | no weights on disk | n/a | would ride the same rails |
 
 **Work items outside the single-request rail:**

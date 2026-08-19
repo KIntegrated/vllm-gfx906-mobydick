@@ -290,7 +290,13 @@ def _gfx906_spec_gemv_m4(
         return None
     m, k = weight.shape  # m = output rows
     n = x_view.shape[0]  # tokens
-    if not (2 <= n <= 4 and k % 8 == 0 and m % 2 == 0):
+    # Mirror the kernel's RPT env so a non-matching RPT falls back to
+    # triton instead of tripping the launcher's TORCH_CHECK mid-serving.
+    rpt = 2
+    v = os.environ.get("VLLM_GFX906_GEMVM_RPT")
+    if v in ("2", "4"):
+        rpt = int(v)
+    if not (2 <= n <= 4 and k % 8 == 0 and m % rpt == 0):
         return None
     # Keep the tuned hipBLAS special case (m==5120, 2048<=k<=2304, n=2..16)
     # below untouched.

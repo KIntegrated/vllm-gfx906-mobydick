@@ -752,22 +752,28 @@ Final 3-arm A/B (agentic prompts, 3 repeats, all fixes in):
   the ~25 GB (zombie 80% VRAM visible after), so the mtp2 load ran
   into memory pressure. The earlier mtp2 A/B (same build except the
   m4 M-templating) measured **39.66 t/s (CI 38.49) = 1.500×**.
-  With the m4 M=3 templated kernel the expected final is ~40 t/s
-  (+~0.4 ms/step drafter saving); serving-side confirmation is
-  PENDING the reboot. The m4 M=1..3 kernels are numeric-verified by
-  the dispatcher suite (25 passed / 2 skipped incl. real-kernel
-  M=2..4 tests) and microbenched; risk is low but the serving number
-  should be re-taken.
+  **RESOLVED post-reboot (final A/B, same build + m4 M-templating):**
+  baseline 26.44, ngram3 **28.92 (1.094×)**, mtp2 **39.74 t/s
+  (1.503×**, CI 38.58; 1.819 tokens/step, 90.95% draft acceptance).
+  The m4 M=3 templated kernel added no measurable delta over the
+  pre-templating 39.66 (the ~0.4 ms/step saving is within noise),
+  and no regression (ngram3 unchanged within noise). MoE 35B soak
+  on the same build: 66.30/66.31/66.27/66.27 t/s (record band
+  65.9–67.0) — no cross-path regression.
 
   Runner rule for the future: between arms, wait until rocm-smi VRAM
   is < 5% before starting the next server (8 s sleep is not enough
-  after a kill).
+  after a kill). Implemented in /tmp/bench/run_final_ab.sh (wait_vram
+  loop); the post-reboot run with the fix completed all three arms
+  cleanly. NOTE: the reboot also left the NFS /data mount down
+  (fstab `auto` entry) — first A/B attempt after reboot failed with
+  HFValidationError (model path missing), not a GPU fault.
 
-### MTP work state (at commit time)
+### MTP work state (final, 2026-08-24 post-reboot)
 
-- k=2 MTP is the recommended spec method for this model: 1.50×
-  (pre-m4-templating serving A/B), 1.815 tokens/step, 90.75% draft
-  acceptance, token-identical to baseline on the agentic prompts.
+- k=2 MTP is the recommended spec method for this model: **1.503×**
+  (39.74 t/s final A/B, CI 38.58; 1.819 tokens/step, 90.95% draft
+  acceptance), token-identical to baseline on the agentic prompts.
 - The MTP drafter is fp16-only (modules_to_not_convert) — every
   drafter weight byte hits HBM (3.4 GB/forward); k=2 = 2 forwards/step
   (~6.8 GB) ≈ target's M=3 GEMM cost. On a fast-compute GPU the
@@ -775,7 +781,110 @@ Final 3-arm A/B (agentic prompts, 3 repeats, all fixes in):
   levers (deferred): M=3/M=4 LDS-tiled kernel (beats the x/w re-read
   ratio floor, ~1–2 ms/step), k=3 (needs ≥2.17 tokens/step), AWQ
   MTP (quality risk, out of scope).
-- ngram3 stands at 1.077× — the cg-small fix consumed its ~1.4 ms
-  no-draft penalty; L2 (AWQ M≤4) remains the only unmeasured
-  >1 ms lever but its ceiling was revised down (dequant-ALU bound).
+- ngram3 stands at 1.094× (28.92 t/s final A/B; 1.077× pre-reboot
+  run — within noise) — the cg-small fix consumed its ~1.4 ms no-draft
+  penalty; L2 (AWQ M≤4) remains the only unmeasured >1 ms lever but
+  its ceiling was revised down (dequant-ALU bound).
 
+
+### 2026-08-24 (evening): external code reviews absorbed
+
+Two independent critical reviews of `38ceb5d957..68243a61b2` landed:
+`docs/gfx906/spec-dec-code-rev-glm.md` and
+`docs/gfx906/spec-dec-code-rev-ds4.md`. Disposition:
+
+**ds4 F1 (claimed BLOCKER: cg-small fix unreachable — MRV2) —
+REFUTED.** The serving runs use MRV1, not MRV2:
+- `VLLM_USE_V2_MODEL_RUNNER` unset; Qwen3.5 is not a default-V2
+  architecture (`use_v2_model_runner` property → False).
+- The serve logs' `gpu_model_runner.py:6821` line is an EXACT match for
+  `vllm/v1/worker/gpu_model_runner.py` (MRV1) — the MRV2 file
+  (`vllm/v1/worker/gpu/model_runner.py`) does not have 5424 lines.
+- The per-arm PIECEWISE graph counts in the serve logs (ngram3: 8,
+  mtp2: 7) equal the rounded sizes + the restored small sizes per
+  method (q=4 → 5+3=8; q=3 → 5+2=7) — the block executes.
+- Pre-fix kernel profile (only `<true, 4>` AWQ in graph mode) vs
+  post-fix (M=1 calls present on no-draft steps) is independent
+  confirmation.
+The fix did, however, **break an upstream test**:
+`test_resolve_cudagraph_mode_adjusts_spec_decode_sizes_only_for_v1`
+asserts the rounded-only sizes [4,8,12,16] and fails on gfx906 with
+the fix on. Resolved: that test now pins `VLLM_GFX906_SPEC_CG_SMALL=0`
+(upstream behavior) and a new
+`test_resolve_cudagraph_mode_gfx906_spec_cg_small_restores_sizes`
+asserts the gfx906 behavior ([1,2,3,4,8,12,16]). Both pass.
+
+**Fixed this session:**
+- glm 1.2: `VLLM_GFX906_GEMVM_RPT=4` + N≡2 mod 4 previously tripped
+  the launcher's TORCH_CHECK mid-serving; `_gfx906_spec_gemv_m4` now
+  mirrors the rpt env and returns None (triton fallback) when
+  `m % rpt != 0`.
+- glm 1.3: ksplit==1 (plain-store epilogue) numeric test added
+  (K=1024/kc=1024, M=2..3..4, 14336 rows). Suite now 28 passed /
+  2 skipped.
+- ds4 F8: cg-small unit tests (above).
+
+**Accepted / documented (no code change):**
+- glm 1.4 / ds4 F5: the ksplit>1 fp16-CAS epilogue is
+  run-to-run order-nondeterministic (atomic order), and "token-
+  identical to baseline" was measured once, not guaranteed. This is
+  the S3-class fp-drift bar (PPL/coherence, not token identity); the
+  MTP acceptance counter (90.95%) absorbs any draft-logit jitter
+  downstream. Stated here so it is not re-litigated.
+- glm 2.1: cg-small graph memory cost — ngram3 serve log:
+  "Estimated CUDA graph memory: 1.60 GiB total" (8 PIECEWISE incl.
+  the three small graphs + 3 FULL) at GPU_UTIL 0.95, max_num_seqs=4;
+  the A/B runs prove the 4-seq GDN budget still fits (the size-1..3
+  pools are small; largest graph unchanged).
+- ds4 F6: [5120, 10240] fp16 is unique to the MTP fc in this
+  checkpoint (tensor list checked); the long-k kernel itself is
+  shape-generic, K is the tuned dimension. RPT: the default RPT=2
+  beats RPT=4 on every measured m4 shape (today's mscan: RPT=4
+  lm_head M=1..4 = 792/453/324/320 vs 816/730/544/506), so no RPT
+  sweep is pending.
+- glm 1.7: Gfx906FAMetadata contract — the 90.95% acceptance +
+  token-identical MTP A/B is the contract test in action (wrong
+  draft-attention fields would collapse acceptance). A field-presence
+  test would only pin attribute names; deferred.
+- glm 1.5 / ds4 F4: the templated M=4 is NOT compiled — the launcher
+  never instantiates `dense_gemv_m_kernel<_,_,4>` (the M=4 branch
+  calls `_rt`); the kernel template's M parameter is generic (the
+  same source serves M=1..3). The 311 GB/s measurement was of a
+  transient build that did instantiate it. Root-causing remains an
+  open afternoon task (rocprof register/occupancy comparison).
+
+**Open items handed back (decisions, not quick fixes):**
+- ds4 F3 / glm §5: ALL branch numbers are from the `VLLM_NO_MAX_ILP=1`
+  build (the per-file max-ilp flag is the suspect in both GPU-wedge
+  incidents). To close: root-cause the launch failures, or re-run the
+  gate A/Bs (mtp2 + baseline) on a max-ilp build. ~1 hr build +
+  ~20 min A/B + wedge risk. **Needs user OK** (reboot risk).
+- ds4 F2: the m4 hook is intentionally NOT spec-gated — M=2..4 fp16
+  decode (2-4 concurrent seqs, the production config) also takes it,
+  replacing triton_matmul (strictly slower on this range). Empirical
+  gate for the non-spec path: the standard dense 27B 4-seq bench
+  (record band 25.14-25.60 t/s) re-run on this build; also the
+  uniform-prefill case (ds4 F7) since 4 uniform prompts fire the FA
+  uniform fast path in prefill. The F7 pad-row concern is
+  structurally void: `num_tokens == num_seqs * max_seqlen_q` implies
+  every sequence has exactly max_seqlen_q tokens (sum of lengths =
+  num_tokens, each ≤ max), so no padded rows exist when the fast
+  path fires.
+
+**ds4 F2/F7 empirical gates (run this session):**
+- Dense 27B 4-seq bench (4× uniform 2048-tok prompts → uniform
+  prefill fast path + M=4 non-spec decode), m4 ON: 23.70 t/s;
+  `VLLM_GFX906_SPEC_GEMM=0` (m4 OFF): 23.69 t/s — identical to
+  noise. The m4 kernel is neutral on the non-spec path (no
+  regression; the record band 25.14–25.60 was set on a max-ilp /
+  old-ROCm build, so 23.70 vs 25.25 is the build delta, not this
+  branch's code — see the max-ilp open item above).
+- Serial-vs-batch token probe (`benchmarks/kernels/gfx906/
+  uniform_batch_probe.py`): prompt 0 diverges at char 59 — a benign
+  fp argmax flip near a logit tie ("...using Python's standard
+  library and the `croniter` library (which is the industry
+  standard" vs "...using the `croniter` library, which is the
+  industry standard"), both continuations coherent; prompt 1
+  identical. No scatter/gather or row-mapping bug (those would show
+  incoherent text). S3-class bar met. The flip location varies
+  run-to-run (CAS-order nondeterminism, as documented above).

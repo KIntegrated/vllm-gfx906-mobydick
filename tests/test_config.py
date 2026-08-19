@@ -135,9 +135,12 @@ def test_rocm_defaults_deepseek_v4_to_mrv1(monkeypatch):
     ],
 )
 def test_resolve_cudagraph_mode_adjusts_spec_decode_sizes_only_for_v1(
-    use_v2_model_runner,
-    expected_capture_sizes,
+    monkeypatch, use_v2_model_runner, expected_capture_sizes
 ):
+    # Pin the upstream (non-gfx906) behavior: the gfx906 cg-small
+    # restoration (see next test) re-adds sizes 1..q-1 and must not leak
+    # into this assertion.
+    monkeypatch.setenv("VLLM_GFX906_SPEC_CG_SMALL", "0")
     compilation_config = CompilationConfig(
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
         cudagraph_capture_sizes=list(range(1, 17)),
@@ -155,6 +158,38 @@ def test_resolve_cudagraph_mode_adjusts_spec_decode_sizes_only_for_v1(
 
     assert cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
     assert compilation_config.cudagraph_capture_sizes == expected_capture_sizes
+
+
+def test_resolve_cudagraph_mode_gfx906_spec_cg_small_restores_sizes(monkeypatch):
+    # gfx906 spec decode: the spec-decode rounding drops capture sizes
+    # 1..q-1, so no-draft (1-token) spec steps would replay the size-q
+    # graph at M=q GEMM cost. The gfx906 cg-small fix re-adds them
+    # (small PIECEWISE graphs only). See docs/gfx906/DEVLOG-spec-decode.md
+    # (L5): serving A/B ngram3 0.945x -> 1.09x.
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx906", lambda: True)
+    monkeypatch.delenv("VLLM_GFX906_SPEC_CG_SMALL", raising=False)
+
+    compilation_config = CompilationConfig(
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        cudagraph_capture_sizes=list(range(1, 17)),
+    )
+    compilation_config.max_cudagraph_capture_size = 16
+    compilation_config.post_init_cudagraph_sizes()
+
+    cudagraph_mode = compilation_config.resolve_cudagraph_mode_and_sizes(
+        AttentionCGSupport.ALWAYS,
+        "FakeAttentionBackend",
+        uniform_decode_query_len=4,
+        use_v2_model_runner=False,
+        tensor_parallel_size=1,
+    )
+
+    assert cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+    # Rounded sizes [4, 8, 12, 16] plus restored small sizes [1, 2, 3].
+    assert compilation_config.cudagraph_capture_sizes == [1, 2, 3, 4, 8, 12, 16]
 
 
 @pytest.mark.parametrize(
