@@ -1078,3 +1078,78 @@ physical GPU #0 (HIP_VISIBLE_DEVICES=0) but work on #1; torch/vLLM work
 on both. Both cards are identical 0x66a0 gfx906 32 GiB (the old
 "GPU #1 = RDNA2 12GB" note is stale). Not chased; use .venv python for
 GPU probes on this machine.
+
+## 2026-08-19 — Prefill/TTFT A/B: MTP prefill cost, cache behavior, one OOM bug
+
+Question set: prefill tok/s with/without MTP drafting; MTP's impact on
+prefill; root-cause of the 3.15 s mtp2 A-TTFT open item above.
+
+**Design** (`benchmarks/kernels/gfx906/prefill_ttft_probe.py`, new):
+sequential max_tokens=1 requests, TTFT + derived prefill rate. Warmup
+phase on a distinct prompt (PROMPTS[2]) absorbs per-server one-time
+costs; measured prompts A=795 tok, B=619 tok (both < one attention
+block), L=1631 tok (two blocks; built from PROMPTS[0] + extra messages,
+so L shares A's prefix).
+
+**Block sizes** (engine log, `mamba_cache_mode=align` auto-selected for
+both arms): baseline attention block = 784, mtp2 = 800 (MTP lookahead
+shifts the page-size fit). Cacheable prefix = `round_down(len, block)`.
+
+**Results** (warm, split build, dense 27B, sequential):
+
+| req (tok)     | baseline            | mtp2                     |
+|---------------|---------------------|--------------------------|
+| A fresh (795) | 3.176 s (250 t/s)   | 3.141 s (253 t/s)        |
+| A rep1/2      | 0.142/0.141 s (784 hit) | 3.140/3.147 s (sub-block: 0 cacheable) |
+| B fresh (619) | 2.404 s (257 t/s)   | 2.484 s (249 t/s)        |
+| L fresh (1631)| 3.547 s (784 hit via A's prefix + 847 prefill) | 6.410 s (true fresh) |
+| L rep1        | 0.455 s (1568 hit)  | 6.415 s (2nd observation; state cached at completion) |
+| L rep2        | 0.454 s (1568 hit)  | 3.257 s (800-tok hit)    |
+
+**Findings**
+
+1. **MTP solo-prefill cost: negligible.** 249–254 (mtp2) vs 250–258
+   (baseline) tok/s, within run-to-run noise.
+2. **The 3.15 s mtp2 A-TTFT (open item) is RESOLVED: block alignment,
+   not a per-sequence MTP cost.** A (795) is sub-block under mtp2
+   (`round_down(795, 800) = 0`) → full re-prefill every rep,
+   795/253 = 3.14 s, sd 0.007. Under baseline (block 784) the same
+   prompt hits 784 tokens → 0.14 s. Not a bug.
+3. **MTP + align-mode prefix caching works.** Upstream #33705, #33726,
+   #37898 (Marconi), #47782 verified in-tree. Repeated 1631-tok prompt
+   under mtp2 shows the Marconi admission pattern exactly: 1st full
+   prefill, 2nd full prefill (shared prefix detected, mamba state
+   cached at completion), 3rd+ recurring hit.
+   **Subtlety for upstream:** only 800 of the 1600 aligned tokens hit
+   under MTP (baseline: 1568 of 1631, from rep1). Candidate:
+   `num_reprefillable_tokens` finalization in
+   `HybridKVCacheCoordinator.cache_blocks` interacting with Marconi's
+   single cached state. Not chased.
+4. **One-time effects, characterized:** first prefill after a rebuild
+   pays ~10 s Triton JIT (mamba-align + eagle kernels, per jit_monitor);
+   the on-disk cache shrinks that to ~1 s residual. Warmup phase makes
+   all measured requests one-time-free. B (619, sub-block both arms)
+   never caches in either arm — consistent.
+5. **BUG (ours + upstream): serving baseline OOM at 0.95 with a warm
+   inductor cache.** 2nd request (795 → 784-tok chunk) dies with
+   `aten::empty` 356 MiB (free: 0) inside the inductor piecewise graph
+   (`piecewise_backend.py:198 compiled_graph_wrapper`). 3/3
+   reproductions on a monitored-clean GPU (5 s VRAM+KFD sampler: only
+   our processes). Correlation: cold inductor cache → profiled KV
+   7.54 GiB → OK; warm cache → KV 7.70 GiB → OOM. Warm-cache init peak
+   is ~0.16 GiB lower (autotune/combo-benchmark workspaces cached
+   away), so the KV pool is sized too large for a runtime allocation.
+   mtp2 arm at 0.95 is immune (KV 6.39 GiB — MTP weights + spec pool
+   leave headroom). **Workaround: `--gpu-memory-utilization 0.93`**
+   (validated: full baseline arm clean). Upstream report candidate.
+6. **External docker-crash report (other agent):** "default config
+   crashes at engine init in `gather_paged_kv_quant_kernel`" — separate
+   issue from the OOM above (my OOMs are explained without GPU
+   collision; default config = `GFX906_FA_LEGACY=1` + prefix caching =
+   our production config, 6+ clean local inits same day). His
+   workaround (`GFX906_FA_LEGACY=0` + `--no-enable-prefix-caching`) is
+   our documented experimental path. Need his timestamps + full error
+   text to sort collision vs env-specific kernel bug.
+
+**Serving recipe update:** dense 27B serving servers need
+`--gpu-memory-utilization 0.93` (warm inductor cache) — see item 5.
