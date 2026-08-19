@@ -437,6 +437,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/libtorch_stable/quantization/w8a8/int8/per_token_group_quant.cu"
     "csrc/libtorch_stable/permute_cols.cu"
     "csrc/libtorch_stable/quantization/gptq/q_gemm.cu"
+    "csrc/libtorch_stable/quantization/gptq/q_gemm_m1_maxilp.cu"
     "csrc/libtorch_stable/pos_encoding_kernels.cu"
     "csrc/libtorch_stable/fused_qknorm_rope_kernel.cu"
     "csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu"
@@ -1629,13 +1630,21 @@ endif()
 # decode shapes (serving -2.2%), so the flag is applied per source file,
 # not via CMAKE_HIP_FLAGS. Set VLLM_NO_MAX_ILP=1 to disable.
 #
+# q_gemm split (docs/gfx906/DEVLOG-spec-decode.md, 2026-08-24): the flag
+# helps q_gemm M=1 (+19..24%) but REGRESSES M>=2 (-14..-23%) -- the
+# spec-decode shapes. So the flag moves off q_gemm.hip onto
+# q_gemm_m1_maxilp.hip, which carries only the renamed M=1 4-bit kernel;
+# q_gemm.cu routes M=1/4-bit there and keeps M>=2 on the unflagged
+# kernels. The two kernel copies MUST be kept in sync (see the file
+# headers). Set VLLM_GFX906_QGEMM_M1_MAXILP=0 to run M=1 unflagged.
+#
 if(VLLM_GPU_LANG STREQUAL "HIP"
    AND VLLM_GPU_ARCHES MATCHES "gfx906"
    AND NOT DEFINED ENV{VLLM_NO_MAX_ILP})
   set(_VLLM_MAX_ILP_SRCS)
   if(TARGET _C_stable_libtorch)
     list(APPEND _VLLM_MAX_ILP_SRCS
-      "${CMAKE_CURRENT_BINARY_DIR}/csrc/libtorch_stable/quantization/gptq/q_gemm.hip")
+      "${CMAKE_CURRENT_BINARY_DIR}/csrc/libtorch_stable/quantization/gptq/q_gemm_m1_maxilp.hip")
   endif()
   if(TARGET _gfx906_fa_C)
     list(APPEND _VLLM_MAX_ILP_SRCS

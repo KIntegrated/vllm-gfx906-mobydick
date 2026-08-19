@@ -55,6 +55,8 @@ __host__ __forceinline__ hipblasStatus_t __compat_hipblasHgemm(
   #define rocblas_hgemm __compat_hipblasHgemm
 #endif
 
+// SYNC-COPY source: also copied (renamed dot22_8_f_m1mi) into
+// q_gemm_m1_maxilp.cu -- keep in lockstep. See that file's header.
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
   float result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
@@ -91,6 +93,12 @@ typedef void (*fp_gemm_half_q_half_gptq_kernel)(const half*, const uint32_t*,
                                                 const int, const int,
                                                 const bool, const int*);
 
+// SYNC-COPY (2/2): the M=1 gfx906 max-ilp variant of this kernel lives
+// in q_gemm_m1_maxilp.cu (gemm_half_q_half_gptq_4bit_kernel_m1mi) and
+// must be kept in lockstep with this one (names aside); the same applies
+// to dot22_8_f above (copied as dot22_8_f_m1mi there). A one-sided edit
+// silently changes M=1 gfx906 numerics/perf. See the SYNCHRONIZATION
+// WARNING in the header of q_gemm_m1_maxilp.cu.
 template <bool first_block, int m_count>
 __launch_bounds__(BLOCK_KN_SIZE)
 __global__ void gemm_half_q_half_gptq_4bit_kernel(
@@ -648,12 +656,47 @@ fp_gemm_half_q_half_gptq_kernel pick_gemm_half_q_half_gptq_kernel(
   return NULL;
 }
 
+// Defined in q_gemm_m1_maxilp.cu (the max-ilp M=1 twin of this file's
+// 4-bit kernel; keep the two in sync -- see that file's header).
+void qgemm_m1_maxilp_launch(const half* a, const uint32_t* b_q_weight,
+                            const uint32_t* b_gptq_qzeros,
+                            const half* b_gptq_scales, const int* b_q_perm,
+                            half* c, int size_m, int size_n, int size_k,
+                            int groups, bool use_v2_format);
+
 void gemm_half_q_half_cuda_part(const half* a, const uint32_t* b_q_weight,
                                 const uint32_t* b_gptq_qzeros,
                                 const half* b_gptq_scales, const int* b_q_perm,
                                 half* c, int size_m, int size_n, int size_k,
                                 int m_count, int groups, bool use_v2_format,
                                 int bit) {
+  // gfx906: M=1 4-bit takes the max-ilp-scheduled kernel
+  // (q_gemm_m1_maxilp.cu -- SYNC-COPY twin of the 4-bit kernel above);
+  // M>=2 shapes regressed under max-ilp and keep the unflagged kernel.
+  // Runtime arch guard (this file and the twin TU are ROCm-only, and the
+  // flag is applied to the twin only for gfx906 builds).
+  // See docs/gfx906/DEVLOG-spec-decode.md.
+  {
+    // Runtime arch guard via the CUDA runtime API (stable-ABI builds
+    // cannot use at::cuda::getCurrentDeviceProperties).
+    static const bool gfx906 = [] {
+      int dev = 0;
+      cudaGetDevice(&dev);
+      cudaDeviceProp prop = {};
+      cudaGetDeviceProperties(&prop, dev);
+      // gcnArchName carries a suffix on this machine
+      // ("gfx906:sramecc+:xnack+"), so match the prefix, not equality.
+      return strncmp(prop.gcnArchName, "gfx906", 6) == 0;
+    }();
+    if (gfx906 && m_count == 1 && bit == 4 &&
+        (getenv("VLLM_GFX906_QGEMM_M1_MAXILP") == nullptr ||
+         strcmp(getenv("VLLM_GFX906_QGEMM_M1_MAXILP"), "0") != 0)) {
+      qgemm_m1_maxilp_launch(a, b_q_weight, b_gptq_qzeros, b_gptq_scales,
+                             b_q_perm, c, size_m, size_n, size_k, groups,
+                             use_v2_format);
+      return;
+    }
+  }
   dim3 blockDim, gridDim;
   blockDim.x = BLOCK_KN_SIZE;
   blockDim.y = 1;

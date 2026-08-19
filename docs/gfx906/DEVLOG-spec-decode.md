@@ -888,3 +888,120 @@ asserts the gfx906 behavior ([1,2,3,4,8,12,16]). Both pass.
   identical. No scatter/gather or row-mapping bug (those would show
   incoherent text). S3-class bar met. The flip location varies
   run-to-run (CAS-order nondeterminism, as documented above).
+
+## max-ilp split: per-M q_gemm scheduling (2026-08-19)
+
+The 2026-08-24 max-ilp open item is resolved by compiling q_gemm's
+4-bit kernel **twice** — M=1 with `-amdgpu-sched-strategy=max-ilp`,
+M>=2 without — and routing on m_count at the single choke point
+(`gemm_half_q_half_cuda_part`).
+
+**Why split (measured, this session):**
+
+Max-ilp 3-arm A/B (build with flag on q_gemm + FA + skinny):
+- baseline 28.56 t/s (+8.0% vs no-max 26.44 — M=1 wins)
+- ngram3 27.80 = 0.973x (vs no-max 1.094x)
+- mtp2 36.67 = 1.284x (vs no-max 1.503x)
+The spec steps are M=3/4-dominant, so the M=1 win is overwhelmed by
+the M=3/4 loss.
+
+AWQ M-scaling microbench (27B shapes, us, [max-ilp | no-max]):
+| shape            | M=1      | M=2      | M=4      | M=8      |
+|------------------|----------|----------|----------|----------|
+| down 17408x5120  | 80 \| 95 | 118\|97  | 138\|105 | 160\|160 |
+| gate 5120x17408  | 78 \| 103| 118\|115 | 134\|122 | 182\|183 |
+| gdn 8192x5120    | 46 \| 47 | 52 \| 52 | 60 \| 61 | 100\|100 |
+| fa_q 3072x5120   | 29 \| 36 | 42 \| 42 | 56 \| 53 | 63 \| 59 |
+
+M=1: max-ilp wins 19-24% (down/gate/fa_q); M>=2: no-max wins 14-23%
+(down/gate; gdn/fa_q 3072-row shapes ~neutral). The split is strictly
+better than either uniform choice.
+
+**Implementation:**
+- New TU `csrc/libtorch_stable/quantization/gptq/q_gemm_m1_maxilp.cu`:
+  renamed copy of the 4-bit kernel (`gemm_half_q_half_gptq_4bit_
+  kernel_m1mi`, m_count=1 only) + `dot22_8_f_m1mi` + host launcher
+  `qgemm_m1_maxilp_launch`. **~149 lines of duplication** (140-line
+  kernel + 9-line helper + ~20 launcher grid math); the zero-
+  duplication alternative (shared macro-renamed header) was
+  considered and rejected for this local branch — the copy can't
+  perturb the shared file, and both copies carry explicit
+  **SYNCHRONIZATION WARNING** headers + SYNC-COPY markers at both
+  kernel sites and both dot-helper sites (a one-sided edit silently
+  changes M=1 numerics/perf with no compile/test signal).
+- `q_gemm.cu`: forward declaration + branch at the top of
+  `gemm_half_q_half_cuda_part`: m_count==1 && bit==4 && arch guard &&
+  env not disabled -> `qgemm_m1_maxilp_launch` + return.
+- CMake: the max-ilp flag moves OFF `q_gemm.hip` ONTO
+  `q_gemm_m1_maxilp.hip` (verified per-object in build.ninja; FA x3 +
+  skinny x2 keep their flags; q_gemm.hip unflagged).
+- Kill-switch: `VLLM_GFX906_QGEMM_M1_MAXILP=0` (M=1 falls back to the
+  unflagged kernel).
+
+**Debug saga (all fixed, all gfx906/stable-ABI landmines worth
+knowing):**
+1. First build: `use of undeclared identifier 'qgemm_m1_maxilp_
+   launch'` — the extern forward declaration was missing (added).
+2. Second build compiled + linked, but the dispatch probe (torch
+   profiler kernel names) showed M=1 still on the ORIGINAL kernel:
+   `__gfx906__` is NOT defined in the stable-ABI host compile, so
+   both the branch and the whole twin TU compiled to nothing (0
+   m1mi symbols in the .so). Convert to a **runtime arch guard**.
+3. Runtime guard via `at::cuda::getCurrentDeviceProperties` failed:
+   stable-ABI builds (`TORCH_STABLE_ONLY`) #error on ATen/cuda
+   headers. Convert to the plain runtime API
+   (`cudaGetDeviceProperties`, hipified to `hipGetDeviceProperties`).
+4. Branch still dead: `gcnArchName` on this machine is
+   **`gfx906:sramecc+:xnack+`** (suffixed), so `== "gfx906"` failed.
+   Prefix match (`strncmp(..., "gfx906", 6)`) — same convention as
+   skinny_gemms.cu's `find()`.
+Verification after fixes: dispatch probe shows M=1 ->
+`..._4bit_kernel_m1mi<1>`, M=4 -> `..._4bit_kernel<true, 4>`;
+build.ninja per-object flag placement exactly
+{m1mi, skinny x2, fa x3} flagged / q_gemm unflagged.
+
+**Verification (this build):**
+- AWQ M-scaling microbench: M=1 = 80/78/47/29 (== max-ilp numbers
+  exactly); M=2 = 97/115/51/42 (== no-max); M=8 = 161/179/99/58
+  (== no-max). OUTLIER: down M=4 = 115/116 (stable across runs) vs
+  105 on the no-max build — same unflagged kernel binary, so
+  environmental (clock/thermal or I-cache residency of the twin);
+  the serving A/B is the arbiter.
+- PPL gate (MoE 35B probe): twin ON 15.9730 vs kill-switch OFF
+  16.0450 (0.07 delta, 0 top-20 misses, both coherent) — S3-class
+  pass (algorithm identical; delta is CAS-order nondeterminism).
+- Dense 27B 4-seq bench: 25.35/25.36/25.23/25.36 t/s (~25.32) —
+  recovers the full max-ilp dense number (25.31-25.34), +6.8% vs
+  no-max 23.70, as predicted (dense decode = M=1 = twin).
+- Unit tests: 12 passed / 1 failed (test_auto_awq Qwen2-1.5B —
+  pre-existing: the custom FA launcher supports head_dim 128/256
+  only, Qwen2-1.5B is head_dim=64; FA suite 15/15 on this build).
+- 3-arm serving A/B (3 repeats x 3 prompts, VRAM-safe runner):
+
+| arm      | no-max   | full max-ilp | split build |
+|----------|----------|--------------|-------------|
+| baseline | 26.44    | 28.56        | **27.99**   |
+| ngram3   | 28.92 (1.094x) | 27.80 (0.973x) | **28.03 (1.002x)** |
+| mtp2     | 39.74 (1.503x) | 36.67 (1.284x) | **39.37 (1.407x)** |
+
+  mtp2 acceptance 90.64% / 1.813 tok-step (no-max: 90.95% / 1.819).
+  CIs: split mtp2 [38.19, ...] overlaps no-max 39.74 (CI 38.58);
+  ngram3 no-max CI lower 28.34 vs split 28.03 (marginal no-max win).
+
+**Verdict: split build is the branch default.**
+- baseline (production, no spec): +5.9% vs no-max (27.99 vs 26.44),
+  2% below full max (28.56) — M=1 gets the max-ilp win.
+- mtp2 (recommended spec method): 39.37 ~= no-max 39.74 (CI overlap,
+  -0.9%), +7.3% vs full max. The spec workload stays at its best
+  level while the plain serving path gets the M=1 gain.
+- ngram3: 28.03, -3% vs no-max (28.92) — ngram is the weak spec
+  method anyway (1.002x); the delta tracks the down_proj M=4
+  microbench outlier (115 vs 105 us, ~1 ms/step), not a dispatch
+  problem (M=4 verified on the unflagged kernel).
+- full max-ilp remains the wrong default (mtp2 -7.8%).
+
+**Open (documented, not chased):** down_proj M=4 115 vs 105 us on the
+split build (same unflagged `<true,4>` kernel binary as the no-max
+build; suspected module-level I-cache/constant-memory effect from the
+twin's presence, or environmental; serving-level impact <=3%, CIs
+overlap — revisit only if the spec arms regress further).

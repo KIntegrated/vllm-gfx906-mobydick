@@ -1,19 +1,35 @@
 # gfx906 Speculative Decoding Roadmap
 
-> Status: **CLOSED (2026-08-24).** Final serving A/B (agentic 3-prompt,
-> 3 repeats, `68243a61b2`): **mtp k=2 = 1.503×** (39.74 t/s, CI
-> 38.58; 1.819 tokens/step, 90.95% draft acceptance, token-identical
-> output) — the recommended spec method for this model. ngram3 =
-> **1.094×** (28.92 t/s) after the L5 cg-small fix; its ceiling is
-> prompt repetition (1.12× on repetitive prompts, ~1.1× agentic). L2 (AWQ
-> M≤4) deferred (dequant-ALU-bound ceiling 2–8 ms); L3 moot (MTP
-> supersedes the CPU ngram proposer); W4 (skinny fp16 M≤16) parked —
-> it lifts both arms ~40% and is now the bigger prize (a 40 t/s
-> baseline would make k=2 MTP ~2.1×). Build note: branch built
-> `VLLM_NO_MAX_ILP=1` — the per-file max-ilp flag under the new ROCm
-> 7.14 LLVM is suspected of the weight-load GPU faults (two
-> `hipErrorLaunchFailure` wedge incidents, 2026-08-19 and 2026-08-24;
-> both recovered via BACO/reboot).
+> Status: **CLOSED (2026-08-24), build updated 2026-08-19 (q_gemm
+> max-ilp split).** Final serving A/B (agentic 3-prompt, 3 repeats,
+> `68243a61b2`): **mtp k=2 = 1.503×** (39.74 t/s, CI 38.58; 1.819
+> tokens/step, 90.95% draft acceptance, token-identical output) — the
+> recommended spec method for this model. ngram3 = **1.094×** (28.92
+> t/s) after the L5 cg-small fix; its ceiling is prompt repetition
+> (1.12× on repetitive prompts, ~1.1× agentic). L2 (AWQ M≤4) deferred
+> (dequant-ALU-bound ceiling 2–8 ms); L3 moot (MTP supersedes the CPU
+> ngram proposer); W4 (skinny fp16 M≤16) parked — it lifts both arms
+> ~40% and is now the bigger prize (a 40 t/s baseline would make k=2
+> MTP ~2.1×).
+>
+> **Build (2026-08-19, supersedes the VLLM_NO_MAX_ILP note below):**
+> the 2026-08-24 open item (revisit per-file max-ilp) is resolved by
+> **splitting q_gemm's 4-bit kernel on M** — M=1 compiles with
+> `-amdgpu-sched-strategy=max-ilp` (new TU `q_gemm_m1_maxilp.cu`),
+> M≥2 unflagged; FA/skinny keep the flag. Measured: baseline
+> 26.44→27.99 t/s (+5.9%), mtp2 39.74→39.37 (within CI), ngram3
+> 28.92→28.03 (marginal). Kill-switch
+> `VLLM_GFX906_QGEMM_M1_MAXILP=0`. See DEVLOG-spec-decode.md
+> "max-ilp split" section. Build env: **no `VLLM_NO_MAX_ILP`**
+> (flag on by default; the split makes it safe). The GPU-wedge
+> suspicion of the flag was NOT confirmed: 5+ clean 27B weight loads
+> and a full A/B on a max-ilp build, both wedge incidents traced to
+> zombie-VRAM/other causes.
+>
+> Build note (superseded): branch built `VLLM_NO_MAX_ILP=1` — the
+> per-file max-ilp flag under the new ROCm 7.14 LLVM was suspected of
+> the weight-load GPU faults (two `hipErrorLaunchFailure` wedge
+> incidents, 2026-08-19 and 2026-08-24; both recovered via BACO/reboot).
 >
 > Prior status (2026-08-18): Phase 1 in progress — L1' DONE (committed
 > `751eacb37d`, 13.4 ms/step measured in-engine); serving A/B then
