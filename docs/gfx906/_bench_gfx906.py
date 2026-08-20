@@ -7,7 +7,11 @@ Env: BENCH_PP (2048), BENCH_TG (256), BENCH_GPU_UTIL (0.85), BENCH_MAXLEN,
 Measures one pp-prefill + tg-decode request (after an untimed warmup).
 Prints "BENCH: {json}". Robust to cross-version SamplingParams differences.
 """
-import json, os, sys, time
+
+import json
+import os
+import sys
+import time
 
 WARMUP = os.environ.get("BENCH_WARMUP", "1") == "1"
 SAMPLES = int(os.environ.get("BENCH_SAMPLES", "1"))
@@ -42,6 +46,11 @@ def main():
     attn_backend = os.environ.get("BENCH_ATTN_BACKEND")
     if attn_backend:
         extra["attention_config"] = {"backend": attn_backend}
+    # BENCH_MOE_BACKEND (e.g. triton) overrides the MoE backend selection
+    # for A/B runs (default auto picks the gfx906 W4A16 kernel where gated).
+    moe_backend = os.environ.get("BENCH_MOE_BACKEND")
+    if moe_backend:
+        extra["moe_backend"] = moe_backend
     if not eager:
         # Hybrid GDN model: cudagraph capture requires max_num_seqs <= number
         # of Mamba cache blocks. Single-request bench -> 32 is plenty.
@@ -76,11 +85,16 @@ def main():
     def gen_params(max_tokens):
         # enable_thinking may not exist across versions; probe harmlessly.
         try:
-            return SamplingParams(max_tokens=max_tokens, temperature=0.0,
-                                  ignore_eos=True, enable_thinking=False)
+            return SamplingParams(
+                max_tokens=max_tokens,
+                temperature=0.0,
+                ignore_eos=True,
+                enable_thinking=False,
+            )
         except TypeError:
-            return SamplingParams(max_tokens=max_tokens, temperature=0.0,
-                                  ignore_eos=True)
+            return SamplingParams(
+                max_tokens=max_tokens, temperature=0.0, ignore_eos=True
+            )
 
     if WARMUP:
         llm.generate([prompt], gen_params(min(tg, 8)))
@@ -96,15 +110,28 @@ def main():
         # token_ids-based: text re-encoding collapses on degenerate/garbage
         # output (e.g. '!!!!...') and undercounts.
         elapsed = t1 - t0
-        results.append({
-            "sample": s, "out_tokens": n_out, "elapsed_s": round(elapsed, 3),
-            "tokens_per_s": round(n_out / elapsed, 3) if elapsed else 0.0,
-        })
+        results.append(
+            {
+                "sample": s,
+                "out_tokens": n_out,
+                "elapsed_s": round(elapsed, 3),
+                "tokens_per_s": round(n_out / elapsed, 3) if elapsed else 0.0,
+            }
+        )
 
-    print("BENCH: " + json.dumps({
-        "model": model, "pp": pp, "tg": tg, "maxlen": maxlen,
-        "samples": results,
-    }), flush=True)
+    print(
+        "BENCH: "
+        + json.dumps(
+            {
+                "model": model,
+                "pp": pp,
+                "tg": tg,
+                "maxlen": maxlen,
+                "samples": results,
+            }
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

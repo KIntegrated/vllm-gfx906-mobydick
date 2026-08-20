@@ -30,15 +30,16 @@ GS = 128
 DBLL = "gfx"  # (unused; kept for readability in parametrize ids)
 
 
-def _make_layer(N, K, layout):
+def _make_layer(N, K, layout, gs=GS):
     """Random W4A16 weights in the requested source layout.
 
     Returns (w, s, qzeros_packed, q, z_ref) where q is the per-element uint4
-    codes [E, K, N] and z_ref the per-element zero points [E, G, N] (AWQ)
-    or [E, N, G] (MoeWNA16) for the dequant reference. Symmetric layouts
-    pass qzeros_packed=None and use the implicit zero point 8.
+    codes [E, K, N] and z_ref the per-element zero points [E, G, N] (AWQ /
+    GPTQ K-first) or [E, N, G] (MoeWNA16) for the dequant reference.
+    Symmetric layouts pass qzeros_packed=None and use the implicit zero
+    point 8.
     """
-    G = K // GS
+    G = K // gs
     sh = 1 << (4 * torch.arange(8, device=torch.device("cuda")))
     q = torch.randint(0, 16, (E, K, N), device=torch.device("cuda"), dtype=torch.int32)
     z = torch.randint(0, 16, (E, G, N), device=torch.device("cuda"), dtype=torch.int32)
@@ -59,6 +60,17 @@ def _make_layer(N, K, layout):
             q,
             torch.full((E, G, N), 8, device=q.device, dtype=torch.int32),
         )
+    if layout == "gptq_kfirst_sym":
+        # compressed-tensors GPTQ-style K-first int32: word r holds
+        # k=8r..8r+7 (low nibble first); symmetric, no stored zero points.
+        w = (q.view(E, K // 8, 8, N) * sh.view(1, 1, 8, 1)).sum(2).to(torch.int32)
+        return (
+            w,
+            s,
+            None,
+            q,
+            torch.full((E, G, N), 8, device=q.device, dtype=torch.int32),
+        )
     # MoeWNA16 N-first uint8: byte j holds k=2j low / 2j+1 high;
     # zp byte i holds n=2i low / 2i+1 high
     qn = q.permute(0, 2, 1).reshape(E, N, K // 2, 2)
@@ -72,10 +84,10 @@ def _make_layer(N, K, layout):
     return w, sc, None, q, torch.full((E, N, G), 8, device=q.device, dtype=torch.int32)
 
 
-def _dequant_ref(w, s, z, q):
+def _dequant_ref(w, s, z, q, gs=GS):
     """[E,N,K] fp32 dequantized weights: (q - z[g(k), n]) * s[g(k), n]."""
     E_, K, N = q.shape
-    g = torch.arange(K, device=q.device) // GS  # [K]
+    g = torch.arange(K, device=q.device) // gs  # [K]
     if s.shape[1] == N:  # MoeWNA16 scales/zp: [E, N, G]
         st = s.transpose(1, 2)[:, g, :]  # [E, K, N]
         zt = z.transpose(1, 2)[:, g, :]  # [E, K, N]
@@ -83,11 +95,11 @@ def _dequant_ref(w, s, z, q):
     return ((q.long() - z[:, g].long()) * s[:, g].float()).permute(0, 2, 1)
 
 
-def _run_case(M, N13, K13, N2, K2, block_m, layout):
+def _run_case(M, N13, K13, N2, K2, block_m, gs=GS, layout=None):
     from vllm import _custom_ops as ops
 
-    w13, s13, z13, q13, zz13 = _make_layer(N13, K13, layout)
-    w2, s2, z2, q2, zz2 = _make_layer(N2, K2, layout)
+    w13, s13, z13, q13, zz13 = _make_layer(N13, K13, layout, gs)
+    w2, s2, z2, q2, zz2 = _make_layer(N2, K2, layout, gs)
     wq13, sc13, zp13 = _repack_w4a16_gfx906_expert(w13, s13, z13)
     wq2, sc2, zp2 = _repack_w4a16_gfx906_expert(w2, s2, z2)
 
@@ -128,7 +140,7 @@ def _run_case(M, N13, K13, N2, K2, block_m, layout):
             continue
         rows = sel.nonzero()
         tok = rows[:, 0]
-        wdeq = _dequant_ref(w13, s13, zz13, q13)[e]
+        wdeq = _dequant_ref(w13, s13, zz13, q13, gs)[e]
         ref_rows[tok * TOPK + rows[:, 1]] = x[tok].float() @ wdeq.t()
     err1 = (c1.float() - ref_rows).abs().max().item()
     rel1 = err1 / ref_rows.abs().max().item()
@@ -163,7 +175,7 @@ def _run_case(M, N13, K13, N2, K2, block_m, layout):
         0,
     )
 
-    wdeq2 = _dequant_ref(w2, s2, zz2, q2)
+    wdeq2 = _dequant_ref(w2, s2, zz2, q2, gs)
     ref_out = torch.zeros(M, N2, device=dev, dtype=torch.float32)
     for e in range(E):
         sel = topk_ids == e
@@ -188,27 +200,64 @@ def _run_case(M, N13, K13, N2, K2, block_m, layout):
     return rel1, rel2
 
 
-# (M, N13, K13, N2, K2, block_m): Qwen-like shapes scaled to E=16 experts
+# (M, N13, K13, N2, K2, block_m, gs): Qwen-like shapes scaled to E=16
+# experts, plus the Gemma-4-26B-A4B-AWQ shapes (group-32; N=1408 is not a
+# multiple of the 1024-wide N tile, exercising the partial gridY block).
 _CASES = [
-    (1, 1024, 2048, 1024, 512, 1),
-    (4, 1024, 2048, 1024, 512, 1),
-    (8, 1024, 2048, 1024, 512, 4),
-    (32, 1024, 2048, 1024, 512, 4),
-    (64, 1024, 2048, 1024, 512, 16),
-    (2, 1536, 768, 1536, 768, 1),  # K not mult of 256; N=1536 (gridY partial)
+    (1, 1024, 2048, 1024, 512, 1, 128),
+    (4, 1024, 2048, 1024, 512, 1, 128),
+    (8, 1024, 2048, 1024, 512, 4, 128),
+    (32, 1024, 2048, 1024, 512, 4, 128),
+    (64, 1024, 2048, 1024, 512, 16, 128),
+    (2, 1536, 768, 1536, 768, 1, 128),  # K not mult of 256; N=1536 (gridY partial)
+    (1, 1408, 2816, 2816, 704, 1, 32),  # Gemma-4 gemm1/gemm2, decode
+    (32, 1408, 2816, 2816, 704, 4, 32),  # Gemma-4 gemm1/gemm2, prefill
 ]
 
 
 def _ids(c):
-    return f"M{c[0]}-bm{c[5]}-N{c[1]}"
+    return f"M{c[0]}-bm{c[5]}-N{c[1]}-gs{c[6]}"
 
 
 @pytest.mark.parametrize(
-    "layout", ["awq_kfirst", "wna16", "awq_kfirst_sym", "wna16_sym"]
+    "layout",
+    ["awq_kfirst", "wna16", "awq_kfirst_sym", "wna16_sym", "gptq_kfirst_sym"],
 )
 @pytest.mark.parametrize("case", _CASES, ids=_ids)
 def test_gfx906_moe_gemm(case, layout):
     _run_case(*case, layout)
+
+
+def test_gfx906_repack_gptq_kfirst_sym():
+    """compressed-tensors symmetric (no-zp) GPTQ K-first repack: the
+    exllama shuffle is bit-exact, scales pass through, zero points are the
+    fabricated 0x88888888 fill, and asymmetric GPTQ fails closed.
+
+    Shape mirrors Gemma-4: K = 704 (gemm2 K, 88 words), N = 1408 (gemm1
+    N), group-32 (22 groups). CPU-only."""
+    E, K8, N, G = 2, 88, 1408, 22
+    torch.manual_seed(0)
+    w = torch.randint(0, 2**31, (E, K8, N), dtype=torch.int32)
+    s = torch.rand(E, G, N, dtype=torch.float16)
+    wq, sc, zp = _repack_w4a16_gfx906_expert(w, s, None)
+
+    assert wq.shape == (E, K8, N)
+    assert torch.equal(sc, s), "scales must pass through unchanged"
+    assert zp.shape == (E, G, N // 8)
+    assert (zp.view(torch.uint32) == 0x88888888).all(), "symmetric zp fill"
+
+    # Bit-exact shuffle: source nibble j (k = 8*qk + j) lands at bits
+    # [0,16,4,20,8,24,12,28][j].
+    shifts = torch.tensor([0, 16, 4, 20, 8, 24, 12, 28])
+    nib = (w.unsqueeze(-1) >> (4 * torch.arange(8))) & 0xF  # [E,K8,N,8]
+    got = (wq.unsqueeze(-1) >> (4 * torch.arange(8))) & 0xF
+    for j in range(8):
+        dest = shifts[j].item() // 4  # bit slot holding source nibble j
+        assert torch.equal(got[..., dest], nib[..., j]), f"nibble {j} misplaced"
+
+    # Asymmetric GPTQ (stored qzeros) is unsupported: fail closed.
+    with pytest.raises(ValueError, match="stored zero points"):
+        _repack_w4a16_gfx906_expert(w, s, torch.randint(0, 2**31, (E, G, N // 8)))
 
 
 def test_gfx906_moe_gemm_m1_v2_flag():
@@ -240,8 +289,20 @@ def test_gfx906_moe_gemm_m1_v2_flag():
     def gemm2():
         c1 = torch.zeros(TOPK, N13, device=dev, dtype=torch.float16)
         ops.moe_gptq_gemm_gfx906(
-            x, c1, wq13, sc13, zp13, empty_tw,
-            sorted_ids, expert_ids, ntp, TOPK, 1, False, 0, 0,
+            x,
+            c1,
+            wq13,
+            sc13,
+            zp13,
+            empty_tw,
+            sorted_ids,
+            expert_ids,
+            ntp,
+            TOPK,
+            1,
+            False,
+            0,
+            0,
         )
         inter = (
             (
@@ -253,8 +314,20 @@ def test_gfx906_moe_gemm_m1_v2_flag():
         )
         out = torch.zeros(1, N2, device=dev, dtype=torch.float16)
         ops.moe_gptq_gemm_gfx906(
-            inter, out, wq2, sc2, zp2, topk_w.view(-1).float(),
-            sorted_ids, expert_ids, ntp, 1, 1, True, TOPK, 0,
+            inter,
+            out,
+            wq2,
+            sc2,
+            zp2,
+            topk_w.view(-1).float(),
+            sorted_ids,
+            expert_ids,
+            ntp,
+            1,
+            1,
+            True,
+            TOPK,
+            0,
         )
         return out
 
@@ -280,8 +353,20 @@ def test_gfx906_moe_gemm_m1_v2_flag():
     ref_out = torch.zeros(1, N2, device=dev, dtype=torch.float32)
     c1 = torch.zeros(TOPK, N13, device=dev, dtype=torch.float16)
     ops.moe_gptq_gemm_gfx906(
-        x, c1, wq13, sc13, zp13, empty_tw,
-        sorted_ids, expert_ids, ntp, TOPK, 1, False, 0, 0,
+        x,
+        c1,
+        wq13,
+        sc13,
+        zp13,
+        empty_tw,
+        sorted_ids,
+        expert_ids,
+        ntp,
+        TOPK,
+        1,
+        False,
+        0,
+        0,
     )
     inter = (
         (
@@ -300,9 +385,7 @@ def test_gfx906_moe_gemm_m1_v2_flag():
             ref_out[0] += h * topk_w[0, i].float()
     rel = ((out_on.float() - ref_out).abs().max() / ref_out.abs().max()).item()
     assert rel < 1e-1, f"v2 gemm2 too far from reference: maxrel={rel:.2e}"
-    rel_off = (
-        (out_off.float() - ref_out).abs().max() / ref_out.abs().max()
-    ).item()
+    rel_off = ((out_off.float() - ref_out).abs().max() / ref_out.abs().max()).item()
     assert rel_off < 1e-1, f"default gemm2 too far: maxrel={rel_off:.2e}"
     diff = (out_off.float() - out_on.float()).abs().max().item()
     assert diff < 0.3 * ref_out.abs().max().item() + 0.05, (

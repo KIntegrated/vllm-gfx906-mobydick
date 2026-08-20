@@ -465,6 +465,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
             experts_cls=self.experts_cls,
+            backend=self.wna16_backend,
             routing_tables=layer._expert_routing_tables(),
             **marlin_args,
         )
@@ -513,8 +514,13 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         replace_parameter(layer, "w13_weight_scale", w13_scales)
         replace_parameter(layer, "w2_weight_scale", w2_scales)
 
-        # CPU fused_experts_cpu requires zero points even for symmetric quant
-        if not self.symmetric or self.wna16_backend == WNA16MoEBackend.CPU:
+        # CPU fused_experts_cpu and the gfx906 kernel require zero-point
+        # tensors even for symmetric quant (the gfx906 repack fabricates
+        # the 0x88888888 symmetric fill; the kernel loads it per group).
+        if not self.symmetric or self.wna16_backend in (
+            WNA16MoEBackend.CPU,
+            WNA16MoEBackend.GFX906_HIP,
+        ):
             assert w13_qzeros is not None and w2_qzeros is not None
             replace_parameter(layer, "w13_weight_zero_point", w13_qzeros)
             replace_parameter(layer, "w2_weight_zero_point", w2_qzeros)

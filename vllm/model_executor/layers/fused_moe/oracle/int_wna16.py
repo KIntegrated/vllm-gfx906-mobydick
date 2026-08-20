@@ -61,6 +61,15 @@ class WNA16MoEBackend(Enum):
     GFX906_HIP = "GFX906_HIP"
 
 
+def _is_symmetric_no_zp(
+    quant_config: QuantizationConfig | QuantizationArgs,
+) -> bool:
+    """Symmetric W4A16 with no stored zero points (compressed-tensors
+    pack-quantized): dequant is (q - 8) * scale, so the gfx906 kernel's
+    zero-point machinery is exercised with a fabricated 0x88888888 fill."""
+    return isinstance(quant_config, QuantizationArgs) and quant_config.symmetric
+
+
 def backend_to_kernel_cls(
     backend: WNA16MoEBackend,
 ) -> list[type[mk.FusedMoEExperts]]:
@@ -154,21 +163,29 @@ def _backend_incompatibility_reason(
     if backend == WNA16MoEBackend.FLASHINFER_TRTLLM and (may_have_zp or may_have_bias):
         return "zero points and bias are not supported"
 
-    # Phase 1: AWQ-style stored zero points only; symmetric GPTQ (no zp)
-    # falls back to Triton.
-    if backend == WNA16MoEBackend.GFX906_HIP and not may_have_zp:
+    # AWQ-style stored zero points, or symmetric no-zp (compressed-tensors;
+    # the repack fabricates the 0x88888888 symmetric fill). Asymmetric
+    # checkpoints without a zero-point source fall back to Triton.
+    if (
+        backend == WNA16MoEBackend.GFX906_HIP
+        and not may_have_zp
+        and not _is_symmetric_no_zp(quant_config)
+    ):
         return "zero points are required (AWQ-style checkpoints)"
 
     from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
     from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
     from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
-    # GPTQ-style checkpoints (AutoGPTQ / compressed-tensors) use a
-    # different zero-point convention (and may use activation ordering),
-    # which the gfx906 kernel and repack do not implement: only the
-    # AutoAWQ K-first and MoeWNA16 N-first layouts are supported.
-    if backend == WNA16MoEBackend.GFX906_HIP and isinstance(
-        quant_config, (AutoGPTQConfig, QuantizationArgs)
+    # GPTQ-style checkpoints (AutoGPTQ / compressed-tensors asymmetric) use a
+    # stored zero-point convention (and may use activation ordering) which the
+    # gfx906 kernel and repack do not implement: only the AutoAWQ K-first,
+    # MoeWNA16 N-first, and compressed-tensors symmetric K-first layouts are
+    # supported.
+    if (
+        backend == WNA16MoEBackend.GFX906_HIP
+        and isinstance(quant_config, (AutoGPTQConfig, QuantizationArgs))
+        and not _is_symmetric_no_zp(quant_config)
     ):
         return "GPTQ-style zero-point encoding is not supported"
 
@@ -1458,7 +1475,7 @@ def _repack_w4a16_gfx906_expert(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Repack one W4A16 MoE weight set into the gfx906 kernel layout.
 
-    Two source layouts are supported (detected by shape/dtype):
+    Three source layouts are supported (detected by shape/dtype):
 
     MoeWNA16 (N-first uint8; the AWQ-on-ROCm fallback path via
     MoeWNA16Method.create_weights):
@@ -1471,19 +1488,32 @@ def _repack_w4a16_gfx906_expert(
       scales: [E, G, N]   fp16
       qzeros: [E, G, N/8] int32 (word m holds n=8m..8m+7, low nibble first)
 
-    Outputs (both):
+    compressed-tensors (GPTQ-style K-first int32, symmetric, no qzeros;
+    e.g. Gemma-4-26B-A4B-AWQ). Raw on-disk tensors are N-first [N, K/8];
+    the MoE weight loader (is_transposed) presents them K-first:
+      w:      [E, K/8, N] int32 (word holds k=8q..8q+7, low nibble first)
+      scales: [E, G, N]   fp16
+
+    Detection is collision-free: the packed dim of the int32 layouts is
+    dim 2 (AWQ: N/8) or dim 1 (GPTQ: K/8), so w.shape[2] is N/8 (AWQ),
+    N (GPTQ), or matches scales only for uint8 MoeWNA16.
+
+    Outputs (all):
       wq:  [E, K/8, N] int32 exllama shuffle
             (even/odd interleaved: bits[3:0]=k0 [7:4]=k2 [11:8]=k4
              [15:12]=k6 [19:16]=k1 [23:20]=k3 [27:24]=k5 [31:28]=k7
              for k = 8*qk .. 8*qk+7)
       sc:  [E, G, N] fp16
-      zp:  [E, G, N/8] int32 (8 nibbles per word, ascending n order)
+      zp:  [E, G, N/8] int32 (8 nibbles per word, ascending n order;
+            symmetric inputs are fabricated as 0x88888888)
     """
     if w.dtype == torch.uint8 and w.shape[1] == scales.shape[1]:
         return _repack_w4a16_wna16_layout(w, scales, qzeros)
     N = scales.shape[2]
     if w.shape[2] * 8 == N:
         return _repack_w4a16_awq_kfirst_layout(w, scales, qzeros, N)
+    if w.shape[2] == N:
+        return _repack_w4a16_gptq_kfirst_layout(w, scales, qzeros, N)
     raise ValueError(
         f"unrecognized W4A16 MoE weight layout: w={tuple(w.shape)} "
         f"dtype={w.dtype}, scales={tuple(scales.shape)}"
@@ -1594,6 +1624,56 @@ def _repack_w4a16_awq_kfirst_layout(
         ).view(torch.int32)
     else:
         zp = qzeros.to(torch.int32).contiguous()
+
+    return wq, sc, zp
+
+
+def _repack_w4a16_gptq_kfirst_layout(
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor | None,
+    N: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """compressed-tensors GPTQ-style K-first int32 layout (see
+    _repack_w4a16_gfx906_expert). Symmetric only: the nibbles are already
+    packed 8-per-word along K exactly like the AutoAWQ K-first layout, so
+    the exllama shuffle is identical; scales pass through unchanged and the
+    zero points are the fabricated symmetric fill."""
+    if qzeros is not None:
+        raise ValueError(
+            "gfx906 W4A16 MoE repack does not support GPTQ-style stored "
+            "zero points (asymmetric compressed-tensors/AutoGPTQ)"
+        )
+    E, K8, _ = w.shape
+
+    shifts_out = torch.tensor(
+        [0, 16, 4, 20, 8, 24, 12, 28], device=w.device, dtype=torch.int32
+    )
+    nib_shifts = 4 * torch.arange(8, device=w.device, dtype=torch.int32)
+
+    wq = torch.empty(E, K8, N, dtype=torch.int32, device=w.device)
+    # Process one expert at a time to keep the temporary [K, N] unpack small.
+    for e in range(E):
+        # [K8, N, 8] -> [K8, 8, N]: the nibble dim (8, along K) must merge
+        # with K8, not with N (unlike the AWQ branch where dim 2 is N/8).
+        q = (
+            ((w[e].unsqueeze(-1) >> nib_shifts) & 0xF)
+            .permute(0, 2, 1)
+            .reshape(K8 * 8, N)
+        )
+        wq[e] = (
+            (q.view(K8, 8, N) << shifts_out.view(1, 8, 1)).sum(dim=1).to(torch.int32)
+        )
+
+    sc = scales.to(torch.float16).contiguous()
+    # Symmetric quant: zero point = 8 (midpoint of uint4) in every nibble
+    # of each packed int32 word (see _repack_w4a16_wna16_layout).
+    zp = torch.full(
+        (E, scales.shape[1], N // 8),
+        0x88888888,
+        dtype=torch.uint32,
+        device=w.device,
+    ).view(torch.int32)
 
     return wq, sc, zp
 

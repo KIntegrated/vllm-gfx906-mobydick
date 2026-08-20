@@ -74,10 +74,11 @@ the layer's conditions — none of which are "model family" tests:
 Any MoE checkpoint in AWQ int4 group-128 form **with stored zero
 points** served on gfx906 with fp16 activations is routed to the same
 expert kernel by layout, not by model class
-(`gfx906_w4a16_moe.py` / `oracle/int_wna16.py`). The oracle gate is
-deliberately AWQ-only: symmetric no-zp (GPTQ-style) checkpoints are
-rejected ("zero points are required") — gemma-4-26B-A4B-AWQ proved
-that path in 2026-08-19 (it fell through to Triton WNA16; see §6).
+(`gfx906_w4a16_moe.py` / `oracle/int_wna16.py`). The gate was
+AWQ-only until 2026-08-20: symmetric no-zp (GPTQ-style) checkpoints are
+now accepted too — the kernel already dequanted `(q-8)*scale` for missing
+zero points, and only the Python-side gates + one repack layout branch
+had to open (gemma-4-26B-A4B-AWQ, §6; `DEVLOG-gemma4-moe.md`).
 On this disk the only AWQ-with-zp MoE is the 35B itself (Qwen3.5-27B-AWQ
 is dense and already gets the K=17408 GEMV). The nearest untested family member is
 **Qwen3-30B-A3B-AWQ** (E=128, topk-8, hidden 2048, inter 768):
@@ -202,9 +203,10 @@ kernel" premise of P1:
 - **All 30 layers are MoE** (E=128, topk=8, moe_inter 704) **plus a
   per-layer shared expert** (unquantized bf16 in layers 0–26).
 - Quantization is compressed-tensors W4A16 **group-32, symmetric, no
-  zero points** (`weight_packed` + `weight_scale` only) → the WNA16
-  oracle's AWQ-only gate routes it to **Triton WNA16** (correct gate
-  behavior; our kernel needs stored zps).
+  zero points** (`weight_packed` + `weight_scale` only) → initially
+  routed to **Triton WNA16** by the then-AWQ-only oracle gate (correct
+  at the time; our kernel path needed the gates opened, 2026-08-20,
+  below).
 - Hybrid attention (25 sliding hd-256 + 5 full hd-512 layers with
   `attention_k_eq_v` + proportional RoPE) → `Gemma4Config` forces the
   **TRITON_ATTN** backend here (no FA4). Works; 20% of the decode step.
@@ -220,21 +222,30 @@ max-seqs 32); KV pool 53,434 tokens. Census: MoE Triton expert GEMMs
 **46% of the step** (232.8 µs/call × 59.8/step ≈ ~38 GB/s effective),
 attention 17%, shared-expert `LLGemm1` 12%.
 
-**Lever (new P1): no-zp / GPTQ-style W4A16 MoE expert kernel.**
-Extend `moe_gemm_q4` to symmetric dequant (`(q-8)*scale`, zero-point
-machinery collapses to a per-group bias) + compressed-tensors repack +
-oracle gate. Expected ~10 ms/step recoverable (30 layers) →
-~50–55 t/s class. House gate sequence: harness no-zp variant → unit
-tests → PPL → serving A/B.
+**Lever — DONE 2026-08-20 (`DEVLOG-gemma4-moe.md`).** The no-zp path
+turned out to need **zero kernel changes**: `moe_gemm_q4` already
+dequants `(q-8)*scale` when zero points are missing (the repack
+fabricates `0x88888888`). The entire blocker was Python-side: two
+oracle gates (may-have-zp, GPTQ-style rejection), one missing
+GPTQ-K-first repack layout branch, and a latent upstream bug where
+`compressed_tensors_moe_wna16._setup_kernel` never forwarded
+`backend=` to `make_wna16_moe_kernel` (would have crashed any gfx906
+W4A16 MoE load). Serving A/B (same recipe): **37.81 → 67.79 t/s
+(1.793×)**, 26.4 → 14.75 ms/step; numerics at fp16-noise level vs
+Triton (|ΔLP| of sampled token, 491 matching steps: median 0.0017,
+p99 0.31); flagship Qwen3.5-35B unchanged (66.27, band 65.9–67.0);
+58/58 MoE tests. Note: PPL is invalid as a gate on this model
+(prefill-logprob anomaly in the hybrid sliding/`k_eq_v` attention,
+both arms equally — separate investigation).
 
 ## 7. Priorities
 
 1. **P1 (cheap, high confidence):** onboard the next AWQ W4A16 MoE
    checkpoint as it arrives (Qwen3-30B-A3B-AWQ-shaped): checklist §3,
-   ~1 day per model, zero new kernels. (gemma-4-26B-A4B done 2026-08-19,
-   §6 — it did *not* qualify for zero-new-kernels: no-zp format.)
-2. **P1 (measured payoff, one machine):** the gemma-4 no-zp W4A16 MoE
-   expert kernel (§6) — 46% of that model's decode step today.
+   ~1 day per model, zero new kernels. (gemma-4-26B-A4B done: onboarding
+   2026-08-19 + no-zp kernel gate 2026-08-20, §6 — now 67.79 t/s.)
+2. **DONE 2026-08-20:** the gemma-4 no-zp W4A16 MoE expert kernel (§6)
+   — 37.81 → 67.79 t/s (1.793×); Python-gate work, no kernel changes.
 3. **P2 (one machine, one model at a time):** Ling-3.0-tiny L1+L2
    (make it run, get the table) — only after the 35B roadmap's big
    open levers (gemm1 M=1 re-tile, S2' router-GEMV fusion,
