@@ -127,8 +127,6 @@ def main():
         .to(torch.int32)
     ).unsqueeze(0)  # [1, K/8, N]
     sc3 = sc.unsqueeze(0).to(torch.float16)  # [1, G, N]
-    zp3 = torch.full((1, sc.shape[0], N // 8), 0x88888888, dtype=torch.uint32)
-    zp3 = zp3.view(torch.int32)
 
     # Dequant one random row slice with the kernel's exact arithmetic:
     # dq = (q + 1024) * scale + scale * (-1024 - zero), zero = 8, zero_offset 0.

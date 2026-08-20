@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+// SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 //
 // Fused MoE W4A16 GEMM kernel for gfx906 (Vega 20, no MFMA).
 //
@@ -199,7 +200,7 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
   const half* expert_scales =
       b_scales + (int64_t)expert_id * expert_scales_stride;
   const uint32_t* expert_qzeros =
-      b_qzeros + (int64_t)expert_id * expert_zeros_stride;
+      b_qzeros ? b_qzeros + (int64_t)expert_id * expert_zeros_stride : nullptr;
 
   // LDS for activations; pad to 16-byte alignment so dot22_8_f can use uint4.
   constexpr int LDS_PAD = 8;
@@ -243,10 +244,17 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
   half2 z1z16_h[N_PER_THREAD][2], y1y16_h[N_PER_THREAD][2];
 
   auto refresh_group = [&](int g) {
-    const uint32_t* qz_row = expert_qzeros + g * (size_n / 8);
     const half* sc_row = expert_scales + g * size_n;
     int zeros[N_PER_THREAD];
-    loadN_zeros<N_PER_THREAD>(qz_row, n, zeros);
+    if (b_qzeros == nullptr) {
+      // Symmetric quantization: constant zero point 8 (uint4 midpoint),
+      // inlined so no zp tensor is materialized or streamed.
+      #pragma unroll
+      for (int i = 0; i < N_PER_THREAD; ++i) zeros[i] = 8;
+    } else {
+      const uint32_t* qz_row = expert_qzeros + g * (size_n / 8);
+      loadN_zeros<N_PER_THREAD>(qz_row, n, zeros);
+    }
     #pragma unroll
     for (int i = 0; i < N_PER_THREAD; ++i) {
       half scale = sc_row[n + i];
@@ -428,7 +436,7 @@ __global__ void __launch_bounds__(THREADS)
   const half* expert_scales =
       b_scales + (int64_t)expert_id * expert_scales_stride;
   const uint32_t* expert_qzeros =
-      b_qzeros + (int64_t)expert_id * expert_zeros_stride;
+      b_qzeros ? b_qzeros + (int64_t)expert_id * expert_zeros_stride : nullptr;
 
   // per-wave activation slice (16B-padded rows)
   __shared__ half block_a[NWAVES][SLICE + LDS_PAD];
@@ -458,12 +466,18 @@ __global__ void __launch_bounds__(THREADS)
 
   half2 z1z16_h[NPT][2], y1y16_h[NPT][2];
   auto refresh_group = [&](int g) {
-    const uint32_t* qz_row = expert_qzeros + g * (size_n / 8);
     const half* sc_row = expert_scales + g * size_n;
     int zeros[NPT];
-    uint32_t d = qz_row[n / 8] >> ((n & 0x07) * 4);
-    #pragma unroll
-    for (int i = 0; i < NPT; ++i) zeros[i] = (int)((d >> (4 * i)) & 0xF);
+    if (b_qzeros == nullptr) {
+      // Symmetric quantization: constant zero point 8, inlined.
+      #pragma unroll
+      for (int i = 0; i < NPT; ++i) zeros[i] = 8;
+    } else {
+      const uint32_t* qz_row = expert_qzeros + g * (size_n / 8);
+      uint32_t d = qz_row[n / 8] >> ((n & 0x07) * 4);
+      #pragma unroll
+      for (int i = 0; i < NPT; ++i) zeros[i] = (int)((d >> (4 * i)) & 0xF);
+    }
     #pragma unroll
     for (int i = 0; i < NPT; ++i) {
       half scale = sc_row[n + i];
@@ -692,7 +706,12 @@ void dispatch_moe_gemm_q4(
 //   c                      [M*top_k, N] or [M, N]  half (pre-zeroed!)
 //   b_q_weight             [E, K/8, N]              int32 (shuffled)
 //   b_scales               [E, groups, N]           half
-//   b_qzeros               [E, groups, N/8]         int32 (packed 4-bit)
+//   b_qzeros               [E, groups, N/8]         int32 (packed 4-bit), or
+//                                                                  empty
+//                                                                  (symmetric:
+//                                                                  kernel
+//                                                                  inlines the
+//                                                                  constant 8)
 //   topk_weights           [M*top_k] or empty       float32
 //   sorted_token_ids       [num_blocks * block_m]   int32
 //   expert_ids             [num_blocks]             int32
@@ -718,7 +737,13 @@ void moe_gptq_gemm_gfx906(torch::Tensor a, torch::Tensor c,
   TORCH_CHECK(c.dim() == 2, "c must be 2D");
   TORCH_CHECK(b_q_weight.dim() == 3, "b_q_weight must be 3D [E, K/8, N]");
   TORCH_CHECK(b_scales.dim() == 3, "b_scales must be 3D [E, groups, N]");
-  TORCH_CHECK(b_qzeros.dim() == 3, "b_qzeros must be 3D [E, groups, N/8]");
+  // An empty b_qzeros (numel()==0) selects the symmetric path: the kernels
+  // inline the constant zero point 8 instead of streaming a packed tensor.
+  const bool has_zp = b_qzeros.numel() > 0;
+  if (has_zp) {
+    TORCH_CHECK(b_qzeros.dim() == 3,
+                "b_qzeros must be 3D [E, groups, N/8] or empty");
+  }
   TORCH_CHECK(a.scalar_type() == torch::kHalf, "a must be half");
   TORCH_CHECK(c.scalar_type() == torch::kHalf, "c must be half");
   TORCH_CHECK(b_scales.scalar_type() == torch::kHalf,
@@ -756,14 +781,19 @@ void moe_gptq_gemm_gfx906(torch::Tensor a, torch::Tensor c,
   TORCH_CHECK(b_scales.size(2) == size_n,
               "moe_gptq_gemm_gfx906: scales N (", b_scales.size(2),
               ") != qweight N (", size_n, ")");
-  TORCH_CHECK(b_qzeros.size(2) * 8 == size_n,
-              "moe_gptq_gemm_gfx906: zeros N (", b_qzeros.size(2) * 8,
-              ") != qweight N (", size_n, ")");
+  if (has_zp) {
+    TORCH_CHECK(b_qzeros.size(2) * 8 == size_n,
+                "moe_gptq_gemm_gfx906: zeros N (", b_qzeros.size(2) * 8,
+                ") != qweight N (", size_n, ")");
+  }
 
   // Per-expert strides
   int expert_weight_stride = (int)(b_q_weight.size(1) * b_q_weight.size(2));
   int expert_scales_stride = (int)(b_scales.size(1) * b_scales.size(2));
-  int expert_zeros_stride = (int)(b_qzeros.size(1) * b_qzeros.size(2));
+  int expert_zeros_stride = has_zp ? (int)(b_qzeros.size(1) * b_qzeros.size(2))
+                                   : 0;
+  const uint32_t* qzeros_ptr =
+      has_zp ? (const uint32_t*)b_qzeros.data_ptr<int32_t>() : nullptr;
 
   int num_token_blocks = (int)(sorted_token_ids.size(0) / block_size_m);
 
@@ -774,7 +804,7 @@ void moe_gptq_gemm_gfx906(torch::Tensor a, torch::Tensor c,
       (const half*)a.data_ptr(), (half*)c.data_ptr(),
       (const uint32_t*)b_q_weight.data_ptr<int32_t>(),
       (const half*)b_scales.data_ptr(),
-      (const uint32_t*)b_qzeros.data_ptr<int32_t>(), topk_w_ptr,
+      qzeros_ptr, topk_w_ptr,
       sorted_token_ids.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(),
       num_tokens_post_padded.data_ptr<int32_t>(), num_token_blocks, size_m,
       size_n, size_k, groups, (int)top_k, (int)block_size_m,

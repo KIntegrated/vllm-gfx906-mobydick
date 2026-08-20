@@ -66,8 +66,8 @@ def _is_symmetric_no_zp(
     quant_config: QuantizationConfig | QuantizationArgs,
 ) -> bool:
     """Symmetric W4A16 with no stored zero points (compressed-tensors
-    pack-quantized): dequant is (q - 8) * scale, so the gfx906 kernel's
-    zero-point machinery is exercised with a fabricated 0x88888888 fill."""
+    pack-quantized): dequant is (q - 8) * scale; the gfx906 kernel inlines
+    the constant zero point 8 when the zp tensor is empty."""
     return isinstance(quant_config, QuantizationArgs) and quant_config.symmetric
 
 
@@ -206,8 +206,8 @@ def _backend_incompatibility_reason(
         return "zero points and bias are not supported"
 
     # AWQ-style stored zero points, or symmetric no-zp (compressed-tensors;
-    # the repack fabricates the 0x88888888 symmetric fill). Asymmetric
-    # checkpoints without a zero-point source fall back to Triton.
+    # the repack passes an empty zp and the kernel inlines the constant 8).
+    # Asymmetric checkpoints without a zero-point source fall back to Triton.
     if (
         backend == WNA16MoEBackend.GFX906_HIP
         and not may_have_zp
@@ -1554,8 +1554,9 @@ def _repack_w4a16_gfx906_expert(
              [15:12]=k6 [19:16]=k1 [23:20]=k3 [27:24]=k5 [31:28]=k7
              for k = 8*qk .. 8*qk+7)
       sc:  [E, G, N] fp16
-      zp:  [E, G, N/8] int32 (8 nibbles per word, ascending n order;
-            symmetric inputs are fabricated as 0x88888888)
+      zp:  [E, G, N/8] int32 (8 nibbles per word, ascending n order);
+            None for symmetric (no-zp) inputs — the kernel inlines the
+            constant zero point 8
     """
     if w.dtype == torch.uint8 and w.shape[1] == scales.shape[1]:
         return _repack_w4a16_wna16_layout(w, scales, qzeros)
@@ -1574,7 +1575,7 @@ def _repack_w4a16_wna16_layout(
     w: torch.Tensor,
     scales: torch.Tensor,
     qzeros: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """MoeWNA16 N-first uint8 layout (see _repack_w4a16_gfx906_expert)."""
     E, N, k_half = w.shape
     K = 2 * k_half
@@ -1601,16 +1602,9 @@ def _repack_w4a16_wna16_layout(
     sc = scales.to(torch.float16).permute(0, 2, 1).contiguous()
 
     if qzeros is None:
-        # Symmetric quant: zero point = 8 (midpoint of uint4) in every nibble.
-        # The zp tensor is packed (8 nibbles per int32 word, read back as
-        # uint32 by the kernel), so the fill value must be 0x88888888 —
-        # via uint32 because it overflows signed int32.
-        zp = torch.full(
-            (E, scales.shape[2], N // 8),
-            0x88888888,
-            dtype=torch.uint32,
-            device=w.device,
-        ).view(torch.int32)
+        # Symmetric quant: no zp tensor — the kernel inlines the constant
+        # zero point 8 (uint4 midpoint) when passed an empty tensor.
+        zp = None
     else:
         z = qzeros.to(torch.int32)
         zf = torch.stack([z & 0xF, (z >> 4) & 0xF], dim=2).reshape(E, N, -1)
@@ -1638,7 +1632,7 @@ def _repack_w4a16_awq_kfirst_layout(
     scales: torch.Tensor,
     qzeros: torch.Tensor | None,
     N: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """AutoAWQMoEMethod K-first int32 layout (see
     _repack_w4a16_gfx906_expert). Scales and zero points are already in the
     kernel's [E, G, N] / [E, G, N/8] layout and pass through unchanged."""
@@ -1663,17 +1657,9 @@ def _repack_w4a16_awq_kfirst_layout(
         )
 
     sc = scales.to(torch.float16).contiguous()
-    if qzeros is None:
-        # Symmetric quant: zero point = 8 (midpoint of uint4) in every nibble
-        # of each packed int32 word (see _repack_w4a16_wna16_layout).
-        zp = torch.full(
-            (E, scales.shape[1], N // 8),
-            0x88888888,
-            dtype=torch.uint32,
-            device=w.device,
-        ).view(torch.int32)
-    else:
-        zp = qzeros.to(torch.int32).contiguous()
+    # Symmetric quant: no zp tensor — the kernel inlines the constant zero
+    # point 8 when passed an empty tensor.
+    zp = None if qzeros is None else qzeros.to(torch.int32).contiguous()
 
     return wq, sc, zp
 
@@ -1683,12 +1669,12 @@ def _repack_w4a16_gptq_kfirst_layout(
     scales: torch.Tensor,
     qzeros: torch.Tensor | None,
     N: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, None]:
     """compressed-tensors GPTQ-style K-first int32 layout (see
     _repack_w4a16_gfx906_expert). Symmetric only: the nibbles are already
     packed 8-per-word along K exactly like the AutoAWQ K-first layout, so
-    the exllama shuffle is identical; scales pass through unchanged and the
-    zero points are the fabricated symmetric fill."""
+    the exllama shuffle is identical, scales pass through unchanged, and
+    there is no zp tensor (the kernel inlines the constant zero point 8)."""
     if qzeros is not None:
         raise ValueError(
             "gfx906 W4A16 MoE repack does not support GPTQ-style stored "
@@ -1716,16 +1702,7 @@ def _repack_w4a16_gptq_kfirst_layout(
         )
 
     sc = scales.to(torch.float16).contiguous()
-    # Symmetric quant: zero point = 8 (midpoint of uint4) in every nibble
-    # of each packed int32 word (see _repack_w4a16_wna16_layout).
-    zp = torch.full(
-        (E, scales.shape[1], N // 8),
-        0x88888888,
-        dtype=torch.uint32,
-        device=w.device,
-    ).view(torch.int32)
-
-    return wq, sc, zp
+    return wq, sc, None
 
 
 def _process_weights_gfx906(

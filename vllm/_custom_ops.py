@@ -700,12 +700,18 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "moe_gptq_gemm_r
         return
 
 
+# Cached empty tensor for the symmetric (no-zero-point) path of
+# moe_gptq_gemm_gfx906: numel()==0 tells the kernel to inline the constant
+# zero point 8. Never dereferenced, so a CPU tensor is fine.
+_GFX906_EMPTY_INT32: torch.Tensor = torch.empty(0, dtype=torch.int32)
+
+
 def moe_gptq_gemm_gfx906(
     a: torch.Tensor,
     c: torch.Tensor,
     b_q_weight: torch.Tensor,
     b_scales: torch.Tensor,
-    b_qzeros: torch.Tensor,
+    b_qzeros: torch.Tensor | None,
     topk_weights: torch.Tensor,
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
@@ -719,7 +725,13 @@ def moe_gptq_gemm_gfx906(
     """Fused MoE W4A16 GEMM for gfx906 (see csrc/rocm/moe_q_gemm_gfx906.cu).
 
     ``c`` must be pre-zeroed; the kernel atomic-adds partial K-splits into it.
+
+    ``b_qzeros`` may be ``None`` for symmetric (no-zero-point) weights: an
+    empty tensor is passed and the kernel inlines the constant zero point 8
+    instead of streaming a packed zp tensor.
     """
+    if b_qzeros is None:
+        b_qzeros = _GFX906_EMPTY_INT32
     torch.ops._rocm_C.moe_gptq_gemm_gfx906(
         a,
         c,

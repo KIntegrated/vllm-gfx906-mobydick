@@ -230,8 +230,9 @@ def test_gfx906_moe_gemm(case, layout):
 
 def test_gfx906_repack_gptq_kfirst_sym():
     """compressed-tensors symmetric (no-zp) GPTQ K-first repack: the
-    exllama shuffle is bit-exact, scales pass through, zero points are the
-    fabricated 0x88888888 fill, and asymmetric GPTQ fails closed.
+    exllama shuffle is bit-exact, scales pass through, no zp tensor is
+    returned (the kernel inlines the constant zero point 8 for an empty
+    zp), and asymmetric GPTQ fails closed.
 
     Shape mirrors Gemma-4: K = 704 (gemm2 K, 88 words), N = 1408 (gemm1
     N), group-32 (22 groups). CPU-only."""
@@ -243,8 +244,7 @@ def test_gfx906_repack_gptq_kfirst_sym():
 
     assert wq.shape == (E, K8, N)
     assert torch.equal(sc, s), "scales must pass through unchanged"
-    assert zp.shape == (E, G, N // 8)
-    assert (zp.view(torch.uint32) == 0x88888888).all(), "symmetric zp fill"
+    assert zp is None, "symmetric repack returns no zp tensor"
 
     # Bit-exact shuffle: source nibble j (k = 8*qk + j) lands at bits
     # [0,16,4,20,8,24,12,28][j].
@@ -260,19 +260,20 @@ def test_gfx906_repack_gptq_kfirst_sym():
         _repack_w4a16_gfx906_expert(w, s, torch.randint(0, 2**31, (E, G, N // 8)))
 
 
-def test_gfx906_moe_gemm_m1_v2_flag():
+@pytest.mark.parametrize("layout", ["awq_kfirst", "awq_kfirst_sym"])
+def test_gfx906_moe_gemm_m1_v2_flag(layout):
     """VLLM_GFX906_MOE_M1 re-tiles the M=1 gemm2 (fused weight/reduce)
     path to the 512-thread lane-column kernel. It is not bit-equal to
     the default path (fp32 in-block reduce + one CAS per cell vs the
     fp16 z-slice CAS chain), so the gates are: the flag changes the
     output (V2 actually runs), the difference is fp16-atomic noise
-    level, and the result stays within the normal reference tolerance."""
+    level, and the result stays within the normal reference tolerance.
+    awq_kfirst_sym covers the symmetric (empty zp / inlined zero 8) path."""
     import os
 
     from vllm import _custom_ops as ops
 
     N13, K13, N2, K2 = 1024, 2048, 1024, 512
-    layout = "awq_kfirst"
     w13, s13, z13, _, _ = _make_layer(N13, K13, layout)
     w2, s2, z2, q2, zz2 = _make_layer(N2, K2, layout)
     wq13, sc13, zp13 = _repack_w4a16_gfx906_expert(w13, s13, z13)

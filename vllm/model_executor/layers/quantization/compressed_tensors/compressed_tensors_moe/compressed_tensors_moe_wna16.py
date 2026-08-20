@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 
 from typing import Any
 
@@ -514,13 +515,12 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         replace_parameter(layer, "w13_weight_scale", w13_scales)
         replace_parameter(layer, "w2_weight_scale", w2_scales)
 
-        # CPU fused_experts_cpu and the gfx906 kernel require zero-point
-        # tensors even for symmetric quant (the gfx906 repack fabricates
-        # the 0x88888888 symmetric fill; the kernel loads it per group).
-        if not self.symmetric or self.wna16_backend in (
-            WNA16MoEBackend.CPU,
-            WNA16MoEBackend.GFX906_HIP,
-        ):
+        # CPU fused_experts_cpu requires a zero-point tensor even for
+        # symmetric quant. The gfx906 kernel does not: for symmetric
+        # (no-zp) weights the repack returns None, the op is called with an
+        # empty zp, and the kernel inlines the constant zero point 8 — so
+        # symmetric gfx906 layers carry no zero_point parameters.
+        if not self.symmetric or self.wna16_backend is WNA16MoEBackend.CPU:
             assert w13_qzeros is not None and w2_qzeros is not None
             replace_parameter(layer, "w13_weight_zero_point", w13_qzeros)
             replace_parameter(layer, "w2_weight_zero_point", w2_qzeros)
