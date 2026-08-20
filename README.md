@@ -29,6 +29,20 @@ gather-and-quantize, native BSHD output), making `CUSTOM` the default for
 of the MoE stack reaching 67 t/s. See [`docs/gfx906/`](docs/gfx906/) for
 the full change inventory, numbers, and bench recipes.
 
+### Model support and performance on gfx906 (single MI50/MI60)
+
+| model | status | decode t/s |
+|---|---|---|
+| Qwen3.5-35B-A3B-AWQ (MoE) | flagship, fully optimized | **67.4** (~2140 t/s prefill) |
+| Qwen3.5-27B-AWQ (dense) | optimized | **25.6** |
+| ↳ with MTP k=2 speculative decoding | recommended spec config | **39.4** (1.41×) |
+| Gemma-4-26B-A4B-it-AWQ-4bit | optimized | **67.8** |
+| Qwen3.8-27B-AWQ-INT4 | experimental (eager only, `--dtype float16`) | — |
+| Qwen3.6 fp16 checkpoints (52–67 GB) | do not fit 32 GB | — |
+
+Details, per-model caveats, and bench recipes:
+[`docs/gfx906/README.md`](docs/gfx906/README.md) §Model support status.
+
 ### Benchmarks
 
 **gfx906 fork — dense AWQ `QuantTrio/Qwen3.5-9B-AWQ` (few full attention

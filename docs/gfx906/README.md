@@ -38,6 +38,24 @@ Reference point: llama.cpp (Q4_K_XL GGUF, full offload) — **70.3 t/s decode,
 Correctness gates: PPL on a fixed 442-token probe — MoE band 6.6817–6.6942,
 dense band 6.6993–6.7197. Kernel test suites: 15/15 FA, 12/12 MoE GEMM.
 
+## Model support status (single MI50, MI60 numbers similar)
+
+All numbers: serving decode t/s, graph mode, pp=2048/tg=256, single
+request (4 samples) unless noted. Recipes: §Bench recipes +
+`DEVLOG-spec-decode.md` (spec-decode arms).
+
+| model | status | decode t/s | prefill t/s | notes |
+|---|---|---|---|---|
+| **Qwen3.5-35B-A3B-AWQ** (MoE) | **flagship, optimized** | **67.39** (band 65.9–67.0) | **~2140** | full custom stack (W4A16 MoE GEMM + Q8 FA); 19.3× over fork base; llama.cpp parity on decode, 2.7× ahead on prefill |
+| **Qwen3.5-27B-AWQ** (dense) | **well supported, optimized** | **25.60** (27.99 with MTP off / split build; `gfx906/spec-decode` branch) | ~257 (chunked) | GEMV + CUSTOM FA + max-ilp; serving needs `--gpu-memory-utilization 0.93` |
+| ↳ same, **MTP k=2 spec decode** | recommended spec config | **39.4** (1.41×; 1.50× no-max build) | ~250 (neutral) | 90.9% draft acceptance, 1.82 tok/step; `--speculative-config '{"method":"mtp","num_speculative_tokens":2}'` |
+| ↳ same, ngram-3 | works, weak | 28.0–28.9 (1.0–1.09×) | — | agentic prompts only break even; MTP preferred |
+| **Gemma-4-26B-A4B-it-AWQ-4bit** (MoE) | **well supported, optimized** | **67.79** | — | no-zero-point W4A16 expert kernel (`gfx906/gemma4-moe-nzp` work, 1.79× over Triton); chat template required (thinking model); PPL/prompt_logprobs unreliable on this model — gate on coherent text + logprob A/B |
+| **Qwen3.8-27B-AWQ-INT4** (dense) | **loads & serves (experimental)** | eager only — no graph-mode number yet | — | `--dtype float16` required (auto-bf16→fp16 fallback landed); D=256 FA + quantized qkv verified in eager; graph capture + bench pending |
+| **Qwen3.6-27B / 3.6-35B-A3B** (fp16) | **not supported** | — | — | 52/67 GB fp16 checkpoints do not fit a 32 GB card; 3.6 GGUF only used as a llama.cpp reference point |
+| small AWQ models (e.g. Qwen3.5-9B-AWQ, 0.8B) | supported | — | 590–1483 (9B, eager) | fine on ≤0.85 util; FA prefill benchmarks in top-level README |
+
+
 ## Contents of this directory
 
 | file | what it is |
