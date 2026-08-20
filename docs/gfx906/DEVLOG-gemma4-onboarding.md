@@ -36,9 +36,10 @@ GPTQ-style W4A16 expert kernel).
 ## 2. What routes where (measured, from the load log)
 
 - dtype: checkpoint bf16 → **our auto-dtype gfx906 fallback
-  (`69f615b98a`) fires** — "Checkpoint dtype is bfloat16, but this
-  device has no native bfloat16 support; auto-selecting float16" —
-  second model validated on this fix.
+  (`69f615b98a`) fires** — the shared bf16→fp16 resolver whose detailed
+  record is `DEVLOG-qwen38.md` §Fix (this is the second model validated
+  on it); warning "Checkpoint dtype is bfloat16, but this device has no
+  native bfloat16 support; auto-selecting float16".
 - Attention: `Gemma4Config.verify_and_update_config` detects
   heterogeneous head dims (256/512); FA4 unavailable → forces
   **TRITON_ATTN** (the unified Triton attention). k_eq_v is handled in
