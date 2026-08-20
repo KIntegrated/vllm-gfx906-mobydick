@@ -243,19 +243,21 @@ both arms equally — separate investigation).
 Ordered by risk; **HIGH** items are fails-open paths that will bite
 when the next non-gemma-4 symmetric checkpoint arrives:
 
-- [ ] **HIGH — gate doesn't check bit-width / group size / strategy.**
-  `_is_symmetric_no_zp()` accepts *any* `QuantizationArgs` with
-  `.symmetric == True`. A symmetric W8A16, dynamic-scaled, or
-  odd-group-size checkpoint would pass the oracle and either crash
-  late in the repack or silently mis-dequant. Add asserts:
-  `num_bits == 4`, static (non-dynamic) scales, and a group size the
-  kernel supports (32/128). (`int_wna16.py`)
-- [ ] **HIGH — GPTQ activation ordering (`g_idx`) unguarded.** The old
-  GPTQ rejection explicitly cited activation ordering; the symmetric
-  exemption never checks it. A symmetric GPTQ-export with act-order
-  reordering passes every Python gate and repacks into a *silently
-  wrong* kernel layout. Add an explicit `g_idx` sequential/None
-  guard before the repack. (`int_wna16.py`)
+- [x] **HIGH — gate doesn't check bit-width / group size / strategy —
+  RESOLVED (`253942905c`).** New `_gfx906_no_zp_reason()` in the
+  GFX906_HIP branch of `_backend_incompatibility_reason` rejects
+  symmetric no-zp configs that are not 4-bit, static (non-dynamic)
+  scaled, group-strategy, and group size 32 or 128 (checkpoint-
+  validated; the kernel's per-32-K-slice group tracking would accept
+  any multiple of 32 — widen with a per-shape micro-bench). Rejected
+  configs fall through to the Triton backend. (`int_wna16.py`)
+- [x] **HIGH — GPTQ activation ordering (`g_idx`) unguarded —
+  RESOLVED (`5e3cf6d780`).** The same helper rejects `actorder in
+  (group, dynamic)`: those store weights in original column order and
+  need a runtime g_idx reordering the kernel and repack lack (a
+  silent mis-dequant). `weight`/`static` are format-identical to no
+  activation ordering and keep passing, matching the Marlin/Triton
+  treatment. (`int_wna16.py`)
 - [ ] **MED — fabricated-zp memory waste.** The constant
   `0x88888888` `[E, G, N/8]` int32 tensors are materialized per
   checkpoint and streamed so the kernel can subtract a known

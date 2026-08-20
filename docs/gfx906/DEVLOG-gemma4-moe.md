@@ -189,3 +189,46 @@ Follow-ups (not done here):
   prompt_logprobs quality gates; both MoE arms equally).
 - Triton `E=128,N=704` MoE config file for gfx906 (autotune warning) —
   now only relevant to non-gfx906-eligible models.
+
+## Post-review no-zp gate hardening (2026-08-20)
+
+The post-`180f030ee3` review (roadmap-more-models.md §6.1) flagged two
+fails-open paths in the symmetric no-zp exemption. Both fixed on
+`gfx906/no-zp-gate-hardening`:
+
+- **`253942905c`** — `_is_symmetric_no_zp()` accepted *any* symmetric
+  `QuantizationArgs`; a W8 / dynamic-scaled / odd-group-size /
+  non-group-strategy checkpoint would pass the oracle and either crash
+  late in the repack or mis-dequant silently. New
+  `_gfx906_no_zp_reason()` (GFX906_HIP branch of
+  `_backend_incompatibility_reason`) rejects symmetric no-zp configs
+  that are not 4-bit, static (non-dynamic) scaled, group-strategy,
+  and group size 32 or 128; they fall through to the Triton backend.
+  (The kernel's per-32-K-slice group tracking would in fact accept any
+  group size that is a multiple of 32; 32/128 are the checkpoint-
+  validated values — widen the gate with a per-shape micro-bench, not
+  by assumption.)
+- **`5e3cf6d780`** — the symmetric exemption skipped the act-order
+  check the GPTQ-style rejection carries. Per the compressed-tensors
+  `ActivationOrdering` contract, `group` (and its `dynamic` alias)
+  stores weights in original column order and requires a runtime g_idx
+  reordering — which the kernel and the gfx906 repack do not implement
+  (the repack drops g_idx), i.e. a silent mis-dequant. The helper now
+  rejects `actorder in (group, dynamic)`; `weight`/`static` are
+  format-identical to no activation ordering and keep passing, matching
+  how the Marlin/Triton paths treat them. (The loader's pre-existing
+  `assert actorder != "group"` in the non-Marlin branch would have
+  crashed such a load anyway; the oracle gate now fails closed to
+  Triton with a specific reason instead.)
+
+Evidence: oracle-gate unit tests in `tests/quantization/
+test_moe_wna16.py` — 25 passed (new: W8, dynamic, group-64, channel,
+actorder=group, actorder=dynamic all rejected with specific reasons;
+group-32/128 and actorder=weight accepted). The real gemma-4
+checkpoint weight args still pass the gate at the real model shapes
+(E=128, hidden 2816, moe_inter 704, group 32). Model path untouched
+(oracle-level only): MoE kernel suites 48 passed (`test_gfx906_moe_
+gemm.py` + `test_fused_topk.py`), WNA16 conversion suites 121 passed.
+No serving A/B: the gate only changes backend selection for configs
+that were previously unservable or silently wrong on gfx906; the
+accepted gemma-4 path is unchanged.
