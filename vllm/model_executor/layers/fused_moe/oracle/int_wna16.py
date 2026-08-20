@@ -103,6 +103,12 @@ def _gfx906_no_zp_reason(
             "symmetric no-zp MoE requires group size 32 or 128 "
             f"(got {quant_config.group_size})"
         )
+    # GROUP (and its DYNAMIC alias) stores weights in original column
+    # order and needs a runtime g_idx reordering the kernel lacks (a
+    # silent mis-dequant); WEIGHT/STATIC are format-identical to no
+    # activation ordering and are safe.
+    if quant_config.actorder in ("group", "dynamic"):
+        return "symmetric no-zp MoE does not support g_idx activation ordering"
     return None
 
 

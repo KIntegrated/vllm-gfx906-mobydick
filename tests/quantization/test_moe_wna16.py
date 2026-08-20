@@ -245,9 +245,51 @@ def test_gfx906_hip_oracle_shape_gate(hidden_dim, intermediate_size,
             ),
             "group strategy",
         ),
+        # g_idx activation ordering: weights are stored in original
+        # column order and need a runtime reordering the kernel lacks.
+        (
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=True,
+                dynamic=False,
+                group_size=128,
+                actorder=ActivationOrdering.GROUP,
+            ),
+            "g_idx activation ordering",
+        ),
+        # DYNAMIC is an alias of GROUP with the same runtime contract.
+        (
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=True,
+                dynamic=False,
+                group_size=128,
+                actorder=ActivationOrdering.DYNAMIC,
+            ),
+            "g_idx activation ordering",
+        ),
+        # WEIGHT is format-identical to no activation ordering: the
+        # repack consumes the stored weights in natural order, so the
+        # gate must not reject it.
+        (
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=True,
+                dynamic=False,
+                group_size=128,
+                actorder=ActivationOrdering.WEIGHT,
+            ),
+            None,
+        ),
     ],
 )
-def test_gfx906_hip_oracle_rejects_unsupported_symmetric_no_zp(quant_config, expected):
+def test_gfx906_hip_oracle_symmetric_no_zp_contract_gate(quant_config, expected):
     from tests.kernels.moe.utils import make_dummy_moe_config
 
     # Qwen3.5-A3B-shaped config so the shape gate passes and the no-zp
@@ -263,6 +305,9 @@ def test_gfx906_hip_oracle_rejects_unsupported_symmetric_no_zp(quant_config, exp
         allow_tile_padding=True,
     )
 
+    if expected is None:
+        assert reason is None
+        return
     assert reason is not None
     assert expected in reason
 
