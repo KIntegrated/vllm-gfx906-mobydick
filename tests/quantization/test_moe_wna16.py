@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 
 from types import SimpleNamespace
 
@@ -192,6 +193,106 @@ def test_gfx906_hip_oracle_shape_gate(hidden_dim, intermediate_size,
 
     assert reason is not None
     assert expected in reason
+
+
+@pytest.mark.parametrize(
+    ("quant_config", "expected"),
+    [
+        # W8A16: the kernel is W4A16 only.
+        (
+            QuantizationArgs(
+                num_bits=8,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=True,
+                dynamic=False,
+                group_size=128,
+            ),
+            "4-bit weights",
+        ),
+        # Dynamic scales: the kernel consumes static per-group scales.
+        (
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=True,
+                dynamic=True,
+                group_size=128,
+            ),
+            "static (non-dynamic) scales",
+        ),
+        # Group size outside the validated 32/128 set.
+        (
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=True,
+                dynamic=False,
+                group_size=64,
+            ),
+            "group size 32 or 128",
+        ),
+        # Channel strategy: no [E, G, N] group scales for the kernel.
+        (
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.CHANNEL,
+                symmetric=True,
+                dynamic=False,
+            ),
+            "group strategy",
+        ),
+    ],
+)
+def test_gfx906_hip_oracle_rejects_unsupported_symmetric_no_zp(quant_config, expected):
+    from tests.kernels.moe.utils import make_dummy_moe_config
+
+    # Qwen3.5-A3B-shaped config so the shape gate passes and the no-zp
+    # gate is what fires.
+    moe_config = make_dummy_moe_config(hidden_dim=2048, intermediate_size=1024)
+
+    reason = _backend_incompatibility_reason(
+        backend=WNA16MoEBackend.GFX906_HIP,
+        moe_config=moe_config,
+        quant_config=quant_config,
+        may_have_zp=False,
+        may_have_bias=False,
+        allow_tile_padding=True,
+    )
+
+    assert reason is not None
+    assert expected in reason
+
+
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_gfx906_hip_oracle_accepts_symmetric_no_zp(group_size):
+    from tests.kernels.moe.utils import make_dummy_moe_config
+
+    # Gemma-4-26B-A4B-shaped config (group-32 symmetric no-zp): the
+    # shipped no-zp path (180f030ee3) must keep passing the gate.
+    moe_config = make_dummy_moe_config(hidden_dim=2048, intermediate_size=704)
+    quant_config = QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.INT,
+        strategy=QuantizationStrategy.GROUP,
+        symmetric=True,
+        dynamic=False,
+        group_size=group_size,
+    )
+
+    reason = _backend_incompatibility_reason(
+        backend=WNA16MoEBackend.GFX906_HIP,
+        moe_config=moe_config,
+        quant_config=quant_config,
+        may_have_zp=False,
+        may_have_bias=False,
+        allow_tile_padding=True,
+    )
+
+    assert reason is None
 
 
 def test_compressed_tensors_weights_are_transposed_for_triton():

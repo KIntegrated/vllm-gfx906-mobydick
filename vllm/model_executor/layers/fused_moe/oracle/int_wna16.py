@@ -8,6 +8,7 @@ from typing import Any
 import torch
 from compressed_tensors.quantization import (
     QuantizationArgs,
+    QuantizationStrategy,
 )
 
 import vllm._custom_ops as ops
@@ -68,6 +69,41 @@ def _is_symmetric_no_zp(
     pack-quantized): dequant is (q - 8) * scale, so the gfx906 kernel's
     zero-point machinery is exercised with a fabricated 0x88888888 fill."""
     return isinstance(quant_config, QuantizationArgs) and quant_config.symmetric
+
+
+def _gfx906_no_zp_reason(
+    quant_config: QuantizationConfig | QuantizationArgs,
+) -> str | None:
+    """Why a symmetric no-zp checkpoint cannot use the gfx906 W4A16
+    kernel (None if it can).
+
+    The kernel dequants (q - 8) * scale with static per-group scales,
+    tracks group boundaries on 32-K slice boundaries, and has no g_idx
+    activation reordering. A symmetric checkpoint outside that contract
+    would pass the zero-point gates and either crash late in the repack
+    or mis-dequant silently, so reject it here; the oracle then falls
+    through to the Triton backend.
+    """
+    if not _is_symmetric_no_zp(quant_config):
+        return None
+    if quant_config.num_bits != 4:
+        return (
+            f"symmetric no-zp MoE requires 4-bit weights "
+            f"(got {quant_config.num_bits}-bit)"
+        )
+    if quant_config.dynamic:
+        return "symmetric no-zp MoE requires static (non-dynamic) scales"
+    # The kernel reads [E, G, N] group scales and 32/128 are the
+    # checkpoint-validated group sizes (its per-32-K-slice group tracking
+    # would accept any multiple of 32; widen with a per-shape micro-bench).
+    if quant_config.strategy != QuantizationStrategy.GROUP:
+        return "symmetric no-zp MoE requires the group strategy"
+    if quant_config.group_size not in (32, 128):
+        return (
+            "symmetric no-zp MoE requires group size 32 or 128 "
+            f"(got {quant_config.group_size})"
+        )
+    return None
 
 
 def backend_to_kernel_cls(
@@ -188,6 +224,14 @@ def _backend_incompatibility_reason(
         and not _is_symmetric_no_zp(quant_config)
     ):
         return "GPTQ-style zero-point encoding is not supported"
+
+    # Symmetric no-zp is the only zero-point-less path the gfx906 kernel
+    # supports; reject the symmetric variants it cannot dequant instead
+    # of letting them reach the repack.
+    if backend == WNA16MoEBackend.GFX906_HIP:
+        no_zp_reason = _gfx906_no_zp_reason(quant_config)
+        if no_zp_reason is not None:
+            return no_zp_reason
 
     # Shape contract of the gfx906 kernel (it derives group boundaries as
     # K / groups and packs 8 nibbles per int32 — violations are silent
