@@ -6,6 +6,9 @@ Getting `cyankiwi/Qwen3.8-27B-AWQ-INT4` to load and serve on the local
 vLLM build (gfx906/main), after two unrelated machine-killing NAS
 outages (see `qwen3.8_crash.md`).
 
+**VERDICT: PROVISIONAL — loads & serves in eager (experimental).** The
+bf16 crash is fixed (`--dtype float16` auto-fallback). No graph-mode / evalkit number yet; MTP on this model is open.
+
 ## Model facts
 
 - `Qwen3_5ForConditionalGeneration`, `qwen3_5_text`, 64 layers,

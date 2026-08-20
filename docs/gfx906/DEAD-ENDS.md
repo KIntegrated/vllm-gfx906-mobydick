@@ -1,0 +1,60 @@
+# gfx906 dead ends & open verdicts — index
+
+The one-pass answer to "did we try X and did it work?" Every row is backed
+by a source log (or, if not yet archived to the new format, the legacy
+DEVLOG). Pattern: **hypothesis → gate → verdict → commit/revert → comment**.
+
+- `VERDICT: DEAD-END` / `NEUTRAL` = tried, doesn't help (kept for the
+  negative evidence).
+- `VERDICT: SHIPPED` = landed, helps (indexed here only when the *cost*
+  or *reverse* matters — the positive record lives in its topic log).
+- Rows look like: `y/N hypthesis → gate → verdict → commit → refs` so one
+  line per line is grep-able and sortable.
+
+## DEAD-ENDS / REJECTED
+
+| Hyp | Gate | Verdict | Commit/revert | Comment | Refs |
+|-----|------|---------|---------------|---------|------|
+| gemm1 V1 full-K single-wave direct store | standalone harness | **REJECTED** (2.2× slower) | — | 64 blocks can't keep 128 KB streams in flight; kills atomics but loses all transfer | G1 |
+| gemm1 NPT=2 (z-split best point) | serving graph, +0.08 t/s | **DEAD-END** (neutral) | `reverted`, flag `VLLM_GFX906_MOE_G1NPT2` removed | census said −186 µs/step; wall-clock neutral in *both* eager & graph — 3rd consecutive transfer failure | G1 |
+| gemm1 V3 fp32-scratch K-split | — (closed w/o build) | **DEAD-END** | — | adds ~184 µs/step scratch+launch on top of a design whose best point doesn't transfer | G1 |
+| gemm1 V4 halve CAS fan-in (NPT=8/z=32) | launch sweep | **DEAD-END** | — | CAS fan-in axis is monotone-worse as count rises (27.8→33.4 z=16→32) | G1 |
+| S5 gemm2 V2 M=1 re-tile (lane-based cols) | standalone 1.18× | **NEUTRAL** in model | shipped default-OFF (`VLLM_GFX906_MOE_M2V2`) | standalone win, in-model transfer failed | M1 |
+| S2 dedicated M=1 topk kernel | in-model | **NEUTRAL** | shipped default-OFF (flag) | mode-dependent; standalone win, graph-replay loss | M1 |
+| P2-0b zero-fill launch elimination | design | **DESCOPED** (racy) | — | design is racy, not a kernel dead-end | M0 |
+| fused fp16·fp32 casts / h2d micro-copies | — | attributed as upstream (non-blocking) | — | — | M0 |
+| dense W4A16 purpose-built GEMV | serving | **REJECTED** | prototype in /tmp (not in-tree) | exllama gptq_gemm beats it 187–230% floor vs its 87–97%; no benefit | D |
+| dense K=5120 GEMV / lm_head GEMV | serving | **NEUTRAL** | — | LLMM1 already at HBM floor (3114 vs 3128 µs); the "lm_head GEMV lever" does not exist | D |
+| P3-2(b) K-split GEMV hypothesis (kc=512 splits) | micro-bench | **REJECTED** (wrong) | — | kc=512 2.4–4.2× slower than LLMM1; M=1 is latency/launch-bound, not occupancy | FA/D |
+| GEMV V2 (RPT=2+kc=4096) for skinny dense | micro-bench | **NEUTRAL** | kept per-shape | qkv/router win, N=1024 pathological (−533%), based on shape rule | D |
+| llama.cpp Q5_K_XL baseline | — | **IMPOSSIBLE** (36 GiB > 32 GB) | — | won't fit; used Q4_K_XL instead (70.3 t/s ref) | M0 |
+| FA V2 fused gather (416 WG, barriers) in serving | serving graph | **REJECTED** (V1 wins) | `GFX906_FA_GATHER_V=2` | V2 degrades 7× in serving (285 µs) vs V1 42 — wave-scheduling/low-WG effect | FA |
+
+**Sources:** `M0`=DEVLOG-moe-opt.md · `FA`=DEVLOG-fa-attention.md ·
+`D`=DEVLOG-dense-decode.md · `M1`=DEVLOG-moe-m1-sprint.md ·
+`G1`=DEVLOG-moe-gemm1-retiling.md · `S`=DEVLOG-spec-decode.md ·
+`Q`=DEVLOG-qwen38.md (incident, not a dead-end) ·
+`GA`=DEVLOG-gemma4-*.md.
+
+## OPEN / IN-FLIGHT (verdict not yet recorded)
+
+| Hyp | Gate | Status | Refs |
+|-----|------|--------|------|
+| gemm1 activation-fusion (fold SiLU·mul into epilogue) | serving wall-clock | low transfer expectation (see §interactions in G1) | G1, roadmap C2 |
+| C3 zeroing fold into neighbor kernels | serving wall-clock | ~234 µs/step measured, no numerics change — cheap lever | G1, roadmap C3 |
+| Spec-decode MTP k=2 | serving graph | **SHIPPED** 39.4 t/s (1.41×; 1.50× no-max build), 1.82 tok/step | S |
+| Dense W16A16 long-K GEMV (K=17408 down_proj) | serving | **SHIPPED**, at HBM floor (227.6 vs 795 µs, 101% floor) | D |
+
+## The recurring lessons (why the negative evidence is the point)
+
+1. **Standalone harness wins do NOT transfer to serving wall-clock.** The
+   profiler/launch-regime is pipeline-state dependent even in eager, not
+   only in graph contexts. `G1 §4` measured the graph-per-kernel census to
+   be impossible here (~7% visibility).
+2. **Serving `_bench_gfx906.py` graph A/B is THE gate** for µs-scale
+   verdicts; eager A/B can tie even when kernels differ (launch-bound).
+3. PPL/prompt_logprobs is an unreliable gate on Gemma-4 (hybrid attention);
+   gate on coherent text + logprob A/B (`GA`).
+
+---
+Copyright Kevin Read <me@kevin-read.com>

@@ -5,7 +5,7 @@ Branch `gfx906/moe-gemm1-v1` off `gfx906/main`. Model: Qwen3.5-35B-A3B-AWQ
 open; the V1 full-K single-wave design and the activation-fusion idea are the
 next candidates."
 
-**Verdict up front: all retiling of the decode-size gemm1 is closed.** V1 is
+**VERDICT: DEAD-END — all retiling of the decode-size gemm1 is closed.** V1 is
 rejected (2.2–4.3× slower standalone), the full (BLOCK_KN, NPT) tiling surface
 was mapped (best point 12% off current in the launch regime), and the best
 point's in-model gain **does not transfer to serving wall-clock in either

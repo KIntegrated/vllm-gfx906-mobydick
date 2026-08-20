@@ -113,7 +113,7 @@ Summary of the closure sequence (2026-08-20, agent handoff to Pi):
 
 ## Verdict
 
-**CLOSED — not a vLLM bug. The anomaly is a property of the model
+**VERDICT: CLOSED — not a vLLM bug. The anomaly is a property of the model
 weights** (the community cyankiwi W4A16 AWQ quantization of
 gemma-4-26B-A4B-it): from short/low-context prefixes the checkpoint
 genuinely produces flat degenerate distributions (top-1 `' own'`/`'-'`

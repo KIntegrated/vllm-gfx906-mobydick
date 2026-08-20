@@ -61,7 +61,11 @@ request (4 samples) unless noted. Recipes: §Bench recipes +
 | file | what it is |
 |---|---|
 | `README.md` | this hub: changes, numbers, recipes, knobs |
-| `DEVLOG-moe-opt.md` | full development record (history/archive) |
+| `DEAD-ENDS.md` | one-pass index: hypothesis → gate → verdict → commit for what was tried (grep-able) |
+| `_devlog-template.md` | the `VERDICT:`/`HYPOTHESIS:`/`GATE:` devlog convention + worked example |
+| `DEVLOG-moe-opt.md` | MoE kernel record (W4A16 GEMM, tuning, pile, merges) |
+| `DEVLOG-fa-attention.md` | custom Q8 FA / decode backend record |
+| `DEVLOG-dense-decode.md` | Qwen3.5-27B dense decode record |
 | `moe-decode-roadmap.md` | future MoE-decode candidates (roadmap, not a committed plan) |
 | `spec-decode-roadmap.md` | speculative-decode on gfx906: n-gram probe results + phase plan (ngram/suffix/MTP rails) |
 | `running.md` | how to run/build/bench: local venv (canonical) + docker images |

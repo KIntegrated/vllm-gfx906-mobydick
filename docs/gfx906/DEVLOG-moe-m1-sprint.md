@@ -210,7 +210,7 @@ CMakeLists there. Workaround already in running.md (`FETCHCONTENT_BASE_DIR=/tmp/
 added `TRITON_KERNELS_SRC_DIR=$PWD/.deps/triton_kernels-src/python/triton_kernels/triton_kernels`
 to skip the ROCm/triton git clone after reboots wipe /tmp.
 
-## S2 — result: mode-dependent, shipped default-OFF
+## S2 — result: mode-dependent, shipped default-OFF  (VERDICT: NEUTRAL)
 
 Bit-equality gates: pytest `test_gfx906_m1_topk_bit_equal_to_generic`
 4/4 (random×6 + all-equal + all-zero + 64-way tie, renorm on/off),
@@ -247,7 +247,7 @@ that is fast in the gapless regime (candidate: fuse topk into the
 router GEMV epilogue so there is no separate kernel at all — moved to
 the roadmap as S2').
 
-## S5 — M=1 expert kernel re-tile: gemm2 shipped default-OFF
+## S5 — M=1 expert kernel re-tile: gemm2 shipped default-OFF  (VERDICT: NEUTRAL)
 
 ### Design (V2-B, lane-based columns)
 
@@ -354,7 +354,7 @@ its re-tile premise (standalone 1.18×) does not transfer in-model;
 next idea is a 256-thread 4-col tile or folding gemm1 into the
 activation epilogue — roadmap C2 follow-up.
 
-## S3 — shared-expert down_proj GEMV (shipped default-ON)
+## S3 — shared-expert down_proj GEMV (shipped default-ON)  (VERDICT: SHIPPED, PROVISIONAL)
 
 The re-anchor table flagged shared down [2048,512] x40/step at 2.5x the
 HBM floor (6.7 us LLMM1 rpb4 vs 2.6 us) and shared gate_up [1024,2048]

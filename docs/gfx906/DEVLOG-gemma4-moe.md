@@ -177,7 +177,7 @@ Qwen3.5-35B-A3B-AWQ, same recipe: 66.322 / 66.308 / 66.249 / 66.211
 
 ## Verdict
 
-**SHIPPED.** No kernel changes were needed — the C++ side already
+**VERDICT: SHIPPED.** No kernel changes were needed — the C++ side already
 implemented `(q-8)` dequant for missing zero points; the entire blocker was
 Python-side (two oracle gates + one missing repack layout branch + one
 latent `_setup_kernel` bug that would have crashed any gfx906 W4A16 MoE

@@ -889,6 +889,92 @@ asserts the gfx906 behavior ([1,2,3,4,8,12,16]). Both pass.
   incoherent text). S3-class bar met. The flip location varies
   run-to-run (CAS-order nondeterminism, as documented above).
 
+## 2026-08-18 — n-gram spec decode probe (dense 27B)
+
+> Moved here from DEVLOG-moe-opt.md (topic consolidation, 2026-08).
+
+Question: does n-gram speculative decoding beat the no-spec baseline on
+dense Qwen3.5-27B-AWQ (compute/weight-bound decode)? Theory: the draft
+is free (no draft model), so it should fit this GPU better than MTP.
+
+**Setup.** OpenAI server, `--max-num-seqs 4 --max-model-len 2816
+--gpu-memory-utilization 0.95`, greedy, 3 multi-turn agentic-coding
+prompts (tool-call JSON + code context; outputs re-use context
+identifiers), 512 tokens each. Arms: baseline (no spec) and ngram
+k=3, `prompt_lookup_min=2, prompt_lookup_max=5`. Acceptance from
+`vllm:spec_decode_num_*_total` Prometheus deltas + engine
+"SpecDecoding metrics" log lines. Scripts: `/tmp/bench/
+spec_ngram_dense.py`, `spec_step_probe2.py`, `spec_prof_probe.py`
+(prompts + metric scrape; not yet in-tree).
+
+**VERDICT: no speed-up — 0.68×.**
+
+| arm | t/s (mean) | notes |
+|---|---|---|
+| baseline | **27.46** | 26.81 / 27.96 / 27.62 (server path; LLM-harness record 25.25) |
+| ngram k=3, first attempt | 22.99 | artifact: whole engine demoted to PIECEWISE (see below) |
+| ngram k=3, after FA fixes | **18.73** | 18.42 / 18.62 / 19.16 |
+
+Spec arm stats: drafts on ~40% of steps, ~36% draft-token acceptance
+(per-position ≈ 0.6 / 0.35 / 0.25), 1.08 accepted per draft step.
+Outputs differ from baseline at the first near-tie token (benign fp
+argmax flips — q4 vs q1 paths; texts coherent, S3-class, not
+corruption).
+
+**Blocker 1 (fixed in-tree): the engine was demoted to PIECEWISE.**
+`Gfx906FABackend` declared `UNIFORM_SINGLE_TOKEN_DECODE`; vLLM only
+FULL-graphs uniform decodes at support ≥ `UNIFORM_BATCH` (the level
+whose docstring says it covers spec decodes = 1 + num_spec queries).
+So every decode step ran piecewise (~100 ms/step). Fix (commit after
+the upstream merge): `UNIFORM_BATCH` when `num_speculative_tokens > 0`
++ capture-safe uniform fast paths in `forward_paged` (the Q-scatter /
+out-gather had `int(cu_seqlens_q[...])` D2H syncs, illegal under
+capture; gated on the host identity
+`num_tokens == num_seqs * max_seqlen_q`). Spec steps now FULL-graphed
+(capture 2 s vs 44 s). FA suite 15/15.
+
+**Blocker 2 (open): draft-step overhead.** Step-cost decomposition
+(controlled no-draft vs repeat-phrase probes + torch.profiler A/B):
+
+- no-draft step (1 tok, falls back to PIECEWISE — 1-token spec steps
+  are not uniform-4q): ~53–64 ms vs 36.5 ms baseline;
+- draft step (4 tok, FULL graph): ~80–110 ms vs ~45 ms ideal.
+
+Profiler diff (spec vs no-spec, same 128-token generation) attributes
+the draft-step excess to:
+
+1. **GDN spec path uses the chunk (prefill) kernel family**, not the
+   fused-recurrent decode kernel: `ChunkGatedDeltaRule*` calls 48 →
+   1536 at ~800 µs/layer/step (~18–25 ms/step) vs ~0.5 ms/step for the
+   packed-decode fast path. The fused-recurrent kernel is M=1-only;
+   upstream routes any multi-token GDN step through chunk kernels whose
+   O(chunk) preprocessing dominates at M=4.
+2. ~6× `aten::copy_` + ~300 ms `index_select/index_put/index`
+   spec bookkeeping (state save/restore, per-position scatters, 4× KV
+   writes).
+
+**Blocker 3 (open): no-draft steps.** With min2/max5 only ~40% of
+steps get a draft; the 60% without run at piecewise cost. Even at
+100% draft rate the current per-step costs give ~25.6 t/s < 27.5
+baseline, so draft-rate alone can't win; the two cost blocks must
+drop first.
+
+**Ceiling math** (T1=36.5 ms baseline step): with draft steps at ~55 ms
+(GDN chunk → recurrent fix) and no-draft steps at 36.5 ms (1-token
+spec steps routed to a q1 FULL graph — needs dual q1+q4 uniform FULL
+capture when spec is on), r=0.40, a=1.1 → ~32.8 t/s ≈ **1.19×**;
+r=0.60 (min_n=1), a=0.9 → ~1.18×. Real but modest.
+
+**Verdict.** n-gram spec decode as configured does not help dense 27B
+on gfx906 today (0.68×). The FA CG-support fix stays (required
+prerequisite for *any* spec decode on this backend). If revisited:
+(1) small-M fused-recurrent GDN spec path (biggest lever, ~27 ms/step),
+(2) q1 FULL graphs for no-draft spec steps, (3) re-bench with
+min_n=1. MTP/EAGLE would hit the same GDN spec-path wall, so the
+lever is shared.
+
+---
+
 ## max-ilp split: per-M q_gemm scheduling (2026-08-19)
 
 The 2026-08-24 max-ilp open item is resolved by compiling q_gemm's

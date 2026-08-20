@@ -155,9 +155,13 @@ vulnerability process.
 - **gfx906 kernel work**: [`docs/gfx906/`](docs/gfx906/) — the gfx906
   optimization hub: measured ISA facts, latency-hiding patterns, and the
   LDS layout standard for MI50, plus the change inventory, benchmark
-  record (`README.md`, `DEVLOG-moe-opt.md`), run/build recipes
+  record (`README.md`, the `DEVLOG-*.md` set), run/build recipes
   (`running.md`), and the MoE-decode roadmap. Read the kernel notes before
   writing or modifying gfx906 kernels or interpreting kernel benchmarks.
+  **Dev logs**: read
+  [`AGENTS.md`](docs/gfx906/AGENTS.md) before writing/updating any
+  `DEVLOG-*.md`/dev-log in `docs/gfx906/` (verdict-first entries, gate
+  rules, grouping, merge-train budget).
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.

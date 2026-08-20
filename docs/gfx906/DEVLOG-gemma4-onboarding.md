@@ -6,7 +6,7 @@ Branch: on `gfx906/main` (docs-only changes; no code). Checkpoint:
 `/local/cache/huggingface/hub/` (relative symlinks survived the move;
 offline resolution verified).
 
-**Verdict: ONBOARDED — loads, serves with quality, 37.6 t/s decode
+**VERDICT: ONBOARDED — loads, serves with quality, 37.6 t/s decode
 (graph mode).** Our custom gfx906 MoE kernel does NOT serve it (the
 checkpoint has no zero points — the oracle's AWQ-only gate is correct
 behavior); the MoE runs on the generic Triton WNA16 path, which is 46%
