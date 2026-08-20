@@ -258,17 +258,24 @@ when the next non-gemma-4 symmetric checkpoint arrives:
   silent mis-dequant). `weight`/`static` are format-identical to no
   activation ordering and keep passing, matching the Marlin/Triton
   treatment. (`int_wna16.py`)
-- [ ] **MED — fabricated-zp memory waste.** The constant
-  `0x88888888` `[E, G, N/8]` int32 tensors are materialized per
-  checkpoint and streamed so the kernel can subtract a known
-  constant. Fine at gemma-4 scale; if the no-zp family grows
-  (Qwen3-30B next), thread a `qzeros=None` flag to the repack/C++
-  side instead. (`int_wna16.py`, `csrc/rocm/moe_q_gemm_gfx906.cu`)
-- [ ] **MED — strengthen the numerics-gate record.** Token-match mean
-  0.64 (4/12 prompts identical) is on the soft side; note whether
-  first-diff positions correlate with the garbage-logprob prefill
-  regime vs pure decode. Not blocking — |ΔLP| p99 0.31 carries the
-  verdict. (`DEVLOG-gemma4-moe.md`)
+- [x] **MED — fabricated-zp memory waste — RESOLVED
+  (`20df23b80f`).** The repack returns `None` for symmetric input, the
+  op wrapper passes an empty tensor, and both gfx906 kernels inline
+  the constant zero point 8 when `b_qzeros` is null — no `[E, G, N/8]`
+  tensor is materialized (~16 MiB/layer at gemma-4) or streamed.
+  Symmetric layers no longer carry `zero_point` parameters; the CPU
+  path is unchanged. (`int_wna16.py`,
+  `csrc/rocm/moe_q_gemm_gfx906.cu`, `vllm/_custom_ops.py`)
+- [x] **MED — strengthen the numerics-gate record — RESOLVED
+  (2026-08-20, `DEVLOG-gemma4-moe.md` "Post-review MED items").**
+  Per-step re-run (probe at `benchmarks/kernels/gfx906/
+  gemma4_divergence_probe.py`): first-diff positions are spread
+  through the decode (median 20 of 64; 2/8 in the first two steps),
+  diff-position |ΔLP| sits inside the matching-step noise band, and
+  prefill flatness does not separate divergent from matching prompts —
+  the divergence is a near-tie argmax flip in pure decode, not
+  coupled to the garbage-prefill regime. Verdict unchanged: no
+  systematic dequant error.
 - [ ] **LOW — doc drift.** §7 item 3 still lists "gemm1 M=1 re-tile"
   among the 35B roadmap's open levers; it was closed 2026-08-19
   (`DEVLOG-moe-gemm1-retiling.md`). Update when next editing §7.

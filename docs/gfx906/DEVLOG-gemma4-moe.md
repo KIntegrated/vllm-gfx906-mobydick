@@ -232,3 +232,66 @@ gemm.py` + `test_fused_topk.py`), WNA16 conversion suites 121 passed.
 No serving A/B: the gate only changes backend selection for configs
 that were previously unservable or silently wrong on gfx906; the
 accepted gemma-4 path is unchanged.
+
+## Post-review MED items (2026-08-20)
+
+### MED-1 — fabricated zp tensor eliminated (`20df23b80f`)
+
+The symmetric repack no longer materializes a `[E, G, N/8]`
+`0x88888888` zp tensor (~16 MiB per gemma-4 MoE layer, ~0.45 GiB
+across the ~29 MoE layers), nor streams it per group: the repack
+returns `None`, the op wrapper passes an empty tensor, and both
+kernels (base and the M=1 v2 re-tile) inline the constant zero point 8
+(uint4 midpoint) when `b_qzeros` is null. `zero_offset` semantics are
+unchanged; symmetric gfx906 layers now carry no `zero_point`
+parameters (CPU still requires the tensor).
+
+No-numeric-change evidence: the MED-2 re-run below is post-MED-1 and
+agrees with the pre-MED-1 Numerical A/B record within run-to-run
+variance (median |ΔLP| 0.0012 vs 0.0017, p90 0.071 both, p99 0.286 vs
+0.307, first-diff spread 0–61 in both, same 4/12 fully-matching
+prompts), and the kernel e2e suite exercises the nullptr path against
+a torch reference with z = 8 (43 passed).
+
+### MED-2 — first-diff vs prefill regime (numerics record)
+
+Re-ran the 12-prompt × 64-token A/B with per-step logprobs and
+per-position prompt logprobs
+(`benchmarks/kernels/gfx906/gemma4_divergence_probe.py`; same
+protocol and prompt set as the Numerical A/B):
+
+- 8/12 divergent; 4/12 (indices 3, 7, 8, 9) 100% token-identical over
+  all 64 tokens; mean match 0.633 — reproduces the original record
+  (0.64, 4/12).
+- First-diff positions `[14, 10, 60, 1, 38, 0, 61, 26]`: spread
+  through the decode (median 20; only 2/8 in the first two steps) —
+  **not** concentrated at the prefill→decode boundary.
+- Prefill flatness per prompt (mean top-1 logprob over the model's own
+  prompt tokens): −0.26…−0.43 for the divergent prompts vs
+  −0.29…−0.56 for the non-divergent — overlapping ranges; the
+  garbage-prefill regime (PPL section) does **not** correlate with MoE
+  arm divergence.
+- |ΔLP| of the sampled token at first-diff steps (median 0.031, max
+  0.181) is inside the matching-step |ΔLP| band (median 0.0012, p99
+  0.286, n=486); the tie gap at the diff (median 0.219, min 0.172) is
+  a narrow but real top-1 lead.
+
+Record: the divergence is a near-tie argmax flip in pure decode
+(consistent with the softcap-30 + 262k-vocab hypersensitivity noted
+above); the anomalous prefill logprob regime is equally present in
+both arms and is not a driver of the divergence. Verdict unchanged: no
+systematic dequant error.
+
+Probe note: an early iteration of the probe ranked tokens by *most
+negative* logprob (the 10th of the top-10) and reported 12/12
+"divergences at position 0" — an artifact of comparing the arbitrary
+top-10 tails across arms (the top-10 sets themselves match with
+median overlap 1.00). The record above uses the true top-1, which is
+the greedy sample.
+
+### Serving (post-MED-1)
+
+auto arm: 68.245 / 68.239 / 68.240 / 68.221 → **68.24 t/s mean**
+(graph mode, util 0.95, pp 2048 / tg 256, max-seqs 32, 4 samples) vs
+the original 67.79 band — holds, with the ~16 MiB/layer zp stream
+gone. Triton arm unchanged by MED-1 (37.81 from the original A/B).
