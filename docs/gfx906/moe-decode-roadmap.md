@@ -191,6 +191,53 @@ harness keeps the sweep/v1 kernels as the Phase-0 tool. Remaining C2
 substance: activation fusion (transfer expectation now low) and C3 (zeroing
 fold, 234 µs/step measured, no numerics change) as the cheap lever.
 
+### C2-V — Validation experiments for the C2 close (proposed 2026-08-19, not run)
+
+Review of the C2 close identified regime and power gaps in the
+rejection evidence. Each is cheap to close before the close-out is
+treated as permanent:
+
+- **(v1) A/B power floor.** The serving gate ran 4 samples/arm with an
+  off-arm spread of 0.17 t/s; the expected eager effect (~186 µs of a
+  ~15 ms step, ~1.2%) sits *at* that resolution — "neutral" means
+  "below detection", not "no effect". Re-run the NPT=2 A/B (flag is
+  in the dev log, one-line dispatch change) with ≥16 samples/arm,
+  interleaved (off/on/off/on) to cancel build/date drift, and record
+  the resolved CI. Only a CI excluding ~0.3% closes the question.
+- **(v2) Parallel-request regime — the main untested axis.** The gate
+  is `_bench_gfx906.py`, i.e. a *single request* (batch 1, capture
+  size 8). All three "failed transfer" verdicts (S5-V2 gemm1, S2
+  topk, NPT sweep) were rendered in that regime only. Under concurrent
+  requests: (a) the step is busier, so per-kernel savings are far more
+  likely to hit wall-clock; (b) decode batch >1 moves MoE shapes
+  toward the grouped-GEMM (BM≥8) path, which the entire (BLOCK_KN,
+  NPT) sweep never measured. Experiment: a multi-request bench
+  (N=4/8/32 concurrent generations, e.g. `llm.generate` with a batch
+  of prompts; `BENCH_MAX_SEQS` already exists) re-run off/on for
+  `VLLM_GFX906_MOE_M1` and the NPT=2 trial flag, both regimes. Any
+  positive ≥0.5% reopens C2-gemm1 and the S5 gemm1 branch.
+- **(v3) V1 block-count axis was never swept.** V1 was rejected at
+  exactly 64 blocks (2 waves / half-wave variants only) — its loss
+  mechanism (too few long HBM streams) is also the axis it was never
+  varied on. A V1 derivative with N-split (e.g. 128–256 blocks each
+  streaming half/quarter of K, direct store retained, still no CAS,
+  still kills both zeroings — i.e. C3 subsumed) was not built.
+  Experiment: extend `moe_m1_harness.cu` with `moe_gemm_q4_v1n<N>`
+  (N ∈ {128, 256, 512}) — a day of harness work, standalone gate
+  only, before any model-path interest.
+- **(v4) S5-era standalone numbers were produced by a broken-check
+  harness.** The HARNESS-FAIL self-review fix means every harness run
+  since S5 "passed" with correctness checks that could not fail.
+  Timing rows are probably unaffected, but re-run the harness PASS
+  flow once on the current build to confirm the kept S5/S2 reference
+  numbers (21.4/10.8 µs gemm2 V2, 12.5 µs topk M=1) reproduce under
+  the fixed checks.
+
+State: proposal only — none of these has been run. (v1)+(v2) are
+prerequisites before the C2 close is cited as evidence in any future
+scope decision; (v3) is the remaining unbuilt design axis; (v4) is
+bookkeeping hygiene.
+
 The BM=1/NPT=4 tiling launches 4096 blocks (gemm1: 8 slots × 8 n-tiles ×
 64 K-splits, 32 threads each) per layer; each (slot, n-column) cell is
 CAS'd by 64 blocks. Variants to micro-bench (isolated bench, per

@@ -238,6 +238,43 @@ p99 0.31); flagship Qwen3.5-35B unchanged (66.27, band 65.9–67.0);
 (prefill-logprob anomaly in the hybrid sliding/`k_eq_v` attention,
 both arms equally — separate investigation).
 
+### 6.1 Review todos (post-`180f030ee3` review, 2026-08-20)
+
+Ordered by risk; **HIGH** items are fails-open paths that will bite
+when the next non-gemma-4 symmetric checkpoint arrives:
+
+- [ ] **HIGH — gate doesn't check bit-width / group size / strategy.**
+  `_is_symmetric_no_zp()` accepts *any* `QuantizationArgs` with
+  `.symmetric == True`. A symmetric W8A16, dynamic-scaled, or
+  odd-group-size checkpoint would pass the oracle and either crash
+  late in the repack or silently mis-dequant. Add asserts:
+  `num_bits == 4`, static (non-dynamic) scales, and a group size the
+  kernel supports (32/128). (`int_wna16.py`)
+- [ ] **HIGH — GPTQ activation ordering (`g_idx`) unguarded.** The old
+  GPTQ rejection explicitly cited activation ordering; the symmetric
+  exemption never checks it. A symmetric GPTQ-export with act-order
+  reordering passes every Python gate and repacks into a *silently
+  wrong* kernel layout. Add an explicit `g_idx` sequential/None
+  guard before the repack. (`int_wna16.py`)
+- [ ] **MED — fabricated-zp memory waste.** The constant
+  `0x88888888` `[E, G, N/8]` int32 tensors are materialized per
+  checkpoint and streamed so the kernel can subtract a known
+  constant. Fine at gemma-4 scale; if the no-zp family grows
+  (Qwen3-30B next), thread a `qzeros=None` flag to the repack/C++
+  side instead. (`int_wna16.py`, `csrc/rocm/moe_q_gemm_gfx906.cu`)
+- [ ] **MED — strengthen the numerics-gate record.** Token-match mean
+  0.64 (4/12 prompts identical) is on the soft side; note whether
+  first-diff positions correlate with the garbage-logprob prefill
+  regime vs pure decode. Not blocking — |ΔLP| p99 0.31 carries the
+  verdict. (`DEVLOG-gemma4-moe.md`)
+- [ ] **LOW — doc drift.** §7 item 3 still lists "gemm1 M=1 re-tile"
+  among the 35B roadmap's open levers; it was closed 2026-08-19
+  (`DEVLOG-moe-gemm1-retiling.md`). Update when next editing §7.
+- [ ] **LOW — quote the 1.793× carefully.** It is a single-request
+  (batch-1) figure; under parallel requests the Triton arm's MoE cost
+  grows superlinearly, so the true factor likely *widens* — never
+  quote 1.793× as a universal multiplier without the regime.
+
 ## 7. Priorities
 
 1. **P1 (cheap, high confidence):** onboard the next AWQ W4A16 MoE
