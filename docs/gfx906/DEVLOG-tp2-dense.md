@@ -172,3 +172,39 @@ upstream patch or platform quirk in vllm ROCm platform code).
    stock kernel boot — ACS irrelevant now).
 3. Candidate upstream fix: default NCCL_P2P_LEVEL for gfx906 PCIe-only
    topology in vllm ROCm platform init.
+
+### S4 — official amdgpu driver 6.19.14: P2P/IPC stall FIXED; perf ceiling remains (2026-08-21)
+
+**VERDICT:** SHIPPED (platform fix: official amdgpu driver) · **GATE:** offline
+repro, default env (no NCCL overrides), P2P/IPC transport.
+
+- Official AMD DKMS driver (6.19.14.31400100, on 6.8.12-acso) fixed the
+  27 s/step P2P/IPC stall entirely: default env now selects P2P/IPC and
+  runs clean — init 135-145 s (vs 505), both GPUs 100% concurrently
+  (serialized 99/0 pattern gone), zero copy-event stalls.
+- Root cause chain closed: stock Ubuntu amdgpu mishandled P2P/IPC on this
+  dual-root-port CPU-rooted topology (soft 27 s stall w/ RCCL 2.30.4,
+  hard GPU hang w/ ROCm 7.2.1 RCCL); official driver handles it.
+- Residual flakiness: ~1/3 inits wedge GPU1 mid-load (BACO recovers,
+  retry succeeds). Watch; may be warm-cache/profiling related.
+- **Decode throughput with working P2P: ~7.1 t/s** (256-tok: 36.15 s) —
+  same as SHM workaround (6.9), below PXB best (12.5). vs TP=1 record
+  25.3 t/s. TP=2 for dense decode is comm-bound and NOT a win on this
+  topology; 2× speedup target unreachable via TP.
+- Where TP=2 still pays: 131k-context capacity (463k-token KV pool across
+  two cards, max_model_len 262144 boots), at ~7-12 t/s decode.
+
+## HYPOTHESIS (S4)
+
+If the remaining ~7 t/s is per-step allreduce latency (128 ARs/step), then
+merging ARs (fuse_allreduce_rms) or MTP (fewer steps per token) recovers
+some t/s, but the PCIe topology caps TP=2 dense decode well below TP=1;
+expected ceiling ~12-15 t/s. VERDICT pending matrix.
+
+## Next (night-session deliverables, adjusted)
+
+1. Benchmark matrix on the fixed platform: pp 2048/8192 × tg 128/256 ± MTP
+   at default (P2P) — for the record and MTP ratio at TP=2.
+2. Recommendation: dense-27B serving stays TP=1+DP; TP=2 reserved for
+   ctx-capacity-constrained workloads.
+3. Flake watch on GPU1 init wedges; escalate to AMD if persistent.
