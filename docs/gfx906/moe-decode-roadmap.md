@@ -468,6 +468,31 @@ lands in this roadmap:
   batched decode (the production bench is single-request); B=1 is
   already copy-free. Evidence state: **derived** (per-call probe +
   stride analysis in the DEVLOG "FA decode per-layer copy pile").
+- **N4 — TP=2 dense decode: `max_model_len` decode tax — CONFIRMED
+  mechanism: FULL-cudagraph capture bakes `pad32(max_model_len)` Sk
+  into decode graphs (resolved 2026-08-21).** `--max-model-len 262144`
+  measured ~25% slower decode than 131072 on the same TP=2 dense-27B
+  server/flags. The earlier code-read ruling-out of the frozen-`max_seq_len`
+  theory was correct for live/piecewise steps but missed the FULL-graph
+  case: `gpu_model_runner.py:2390` (`for_cudagraph_capture` branch) sets
+  `max_seq_len = self.max_model_len` at capture, so `GFX906_FA`'s
+  gather-then-dense kernels get `Sk_pad = pad32(max_model_len)` baked
+  into replay launch dims — **every decode replay attends
+  max_model_len-wide regardless of live context**. Decisive gate (the
+  investigation's #4, now run): eager A/B at identical ~1.5k real
+  context shows NO gap (19.5 vs 19.9 t/s at 131k/256k) while graph
+  mode shows the full -25% (39.9 vs 29.9) — the tax is
+  capture-artifact, not live-Sk cost. Implication: even the 131k
+  config overpays (replays attend 131072-wide for short contexts).
+  Fix lever: capture-time Sk bound (env knob, e.g. capture at 32k with
+  piecewise/eager fallback for live contexts beyond the bound) — a
+  dense gather must cover worst-case at replay, so the knob trades
+  capture coverage for replay speed; a masked-early-exit in the dense
+  kernel is the deeper alternative (none exists today). Could speed
+  ALL decode (TP=1 and TP=2), not just recover the 256k tax.
+  Full writeup and numbers: `tp_decode_investigation.md` RESOLUTION
+  section, `DEVLOG-tp2-dense.md` S8. Evidence state: **measured**
+  (eager-vs-graph A/B at matched real context; gate run 2026-08-21).
 - **N3 — GDN [3,1,32] state-bookkeeping copies (measured 32/step,
   ~180 µs/step eager).** The timeline probe
   (`/tmp/bench/dense_ewp_timeline.py`) attributes the 32 [3,1,32]
