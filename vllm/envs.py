@@ -167,7 +167,6 @@ if TYPE_CHECKING:
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
-    VLLM_TP2_DEBUG: bool = False
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -1441,7 +1440,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB", None)
     ),
     # If set, enable multiprocessing in LLM for the V1 code path.
-    "VLLM_TP2_DEBUG": lambda: bool(int(os.getenv("VLLM_TP2_DEBUG", "0"))),
     "VLLM_ENABLE_V1_MULTIPROCESSING": lambda: bool(
         int(os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1"))
     ),

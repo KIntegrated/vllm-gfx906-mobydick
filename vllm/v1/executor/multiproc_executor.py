@@ -433,10 +433,6 @@ class MultiprocExecutor(Executor):
                     status, result = mq.dequeue(timeout=dequeue_timeout)
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
-                if envs.VLLM_TP2_DEBUG:
-                    logger.warning(
-                        "TP2DBG DEQ-RESP %.3f (%s)", time.time(), method
-                    )
                 if status != WorkerProc.ResponseStatus.SUCCESS:
                     raise RuntimeError(
                         f"Worker failed with error '{result}', please check the"
@@ -1010,12 +1006,6 @@ class WorkerProc:
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
-            if envs.VLLM_TP2_DEBUG:
-                logger.warning(
-                    "TP2DBG rank=%s ENQ-RESP %.3f",
-                    self.rank,
-                    time.time(),
-                )
             response_mq.enqueue(result)
 
     def handle_output(self, output: Any):
@@ -1059,24 +1049,7 @@ class WorkerProc:
                 elif isinstance(method, bytes):
                     func = partial(cloudpickle.loads(method), self.worker)
 
-                _t0 = time.perf_counter()
-                if os.environ.get("VLLM_TP2_DEBUG") and method in (
-                    "execute_model",
-                    "sample_tokens",
-                ):
-                    logger.warning(
-                        "TP2DBG rank=%s %s START", self.rank, method
-                    )
                 output = func(*args, **kwargs)
-                _dt = time.perf_counter() - _t0
-                if (
-                    method in ("execute_model", "sample_tokens")
-                    and _dt > 1.0
-                    and os.environ.get("VLLM_TP2_DEBUG")
-                ):
-                    logger.warning(
-                        "TP2DBG rank=%s execute_model took %.2f s", self.rank, _dt
-                    )
 
                 if output_rank is None or self.rank == output_rank:
                     self.handle_output(output)

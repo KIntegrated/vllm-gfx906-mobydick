@@ -591,14 +591,9 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        _tp2dbg = envs.VLLM_TP2_DEBUG
-        _t0 = time.perf_counter()
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-        _ts = time.perf_counter()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        _t1 = time.perf_counter()
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        _t2 = time.perf_counter()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -610,21 +605,9 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        _t3 = time.perf_counter()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-        _t4 = time.perf_counter()
-        if _tp2dbg and (_t4 - _t0) > 1.0:
-            logger.warning(
-                "TP2DBG3 step: sched=%.2fs rpc_launch=%.2fs grammar=%.2fs "
-                "result=%.2fs update_out=%.2fs",
-                _ts - _t0,
-                _t1 - _ts,
-                _t2 - _t1,
-                _t3 - _t2,
-                _t4 - _t3,
-            )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -710,7 +693,6 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
-        _tp2t0 = time.perf_counter()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -721,11 +703,6 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
-        _tp2t1 = time.perf_counter()
-        if envs.VLLM_TP2_DEBUG and (_tp2t1 - _tp2t0) > 1.0:
-            logger.warning(
-                "TP2DBG3 bq future.result()=%.2fs", _tp2t1 - _tp2t0
-            )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -1397,42 +1374,14 @@ class EngineCoreProc(EngineCore):
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
-        _tp2dbg = envs.VLLM_TP2_DEBUG
-        logger.warning("TP2DBG3 busy-loop entry, dbg=%s", _tp2dbg)
-        _last_step_end = None
-        _iter = 0
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
-            _tq0 = time.perf_counter()
             self._process_input_queue()
-            _tq1 = time.perf_counter()
             # Publish request counts before and after GPU step to ensure freshness.
             self._maybe_publish_request_counts()
             # 2) Step the engine core and return the outputs.
-            _ts0 = time.perf_counter()
             self._process_engine_step()
-            _ts1 = time.perf_counter()
             self._maybe_publish_request_counts()
-            _iter += 1
-            if _tp2dbg and _iter <= 200:
-                logger.warning(
-                    "TP2DBG3 iter=%d input=%.3f step=%.3f gap=%.3f",
-                    _iter,
-                    _tq1 - _tq0,
-                    _ts1 - _ts0,
-                    _ts0 - _last_step_end if _last_step_end else -1,
-                )
-            if _tp2dbg and _last_step_end is not None:
-                _gap = _ts0 - _last_step_end
-                if _gap > 2.0:
-                    logger.warning(
-                        "TP2DBG3 inter-step gap=%.2fs (input_queue=%.2fs "
-                        "step=%.2fs)",
-                        _gap,
-                        _tq1 - _tq0,
-                        _ts1 - _ts0,
-                    )
-            _last_step_end = _ts1
 
         raise SystemExit
 
