@@ -208,3 +208,54 @@ expected ceiling ~12-15 t/s. VERDICT pending matrix.
 2. Recommendation: dense-27B serving stays TP=1+DP; TP=2 reserved for
    ctx-capacity-constrained workloads.
 3. Flake watch on GPU1 init wedges; escalate to AMD if persistent.
+
+### S5 — final matrix: TP=2 beats TP=1 with graphs + MTP (2026-08-21 eve)
+
+**VERDICT:** SHIPPED · **GATE:** serving matrix on TP=2 server, graph mode,
+131072 ctx, official amdgpu driver, default NCCL (P2P/IPC), batch=1 greedy.
+Harness: `/tmp`→`/local/tmp/tp2-debug/tp2_serve_bench2.py` (streaming,
+per-phase rates); server flags: `-tp 2 --gpu-memory-utilization 0.93
+--max-num-seqs 4 --max-model-len 131072
+--compilation-config '{"cudagraph_capture_sizes":[1,2,3,4]}'`.
+
+## Results (tg decode tok/s, streaming-measured)
+
+| arm | pp2048 tg128 | pp2048 tg256 | pp8192 tg128 | pp8192 tg256 |
+|---|---|---|---|---|
+| baseline | ~31 | 38-39 | ~34 | 34-35 |
+| mtp2 | **39.7** | 38.2 | 34.0 | 34.4 |
+
+- Best: **39.7 t/s = 1.57× TP=1 record (25.3)**. Target ≥1.5× met.
+- MTP: mean accepted length 2.49, draft acceptance ~74% at TP=2 — parity
+  with TP=1 mtp2 acceptance. Gains concentrated at short prompts.
+- TTFT ~3.1 s at ~1.5k-token prompts (pp_rate ~492 tok/s cold;
+  higher when prefix cache warms).
+- Pure-decode single-stream offline (no server): 40.7 t/s steady
+  (3×256-tok, repeatably). First-gen warmup 26.6.
+- e2e (incl. TTFT) rates 14-20 t/s at these shapes.
+
+## Key facts learned this session (not obvious from the matrix)
+
+1. **Eager-mode TP=2 numbers (~7 t/s) were an artifact** — graph capture
+   is mandatory for TP=2 on this stack; the eager per-op launch overhead
+   × ~96 AR/token dominated. Claude UPDATE-11 arithmetic vindicated.
+2. **Debug logging costs real t/s**: instrumented run measured 29.8 t/s
+   where clean code does 40.7. Never benchmark with VLLM_TP2_DEBUG on
+   (reverted at `49c935332d`, kept in history for reuse).
+3. **Trimmed graph capture**: `[1,2,3,4]` (max_num_seqs=4) captures in
+   3 s/phase vs 2+ min, frees capture VRAM; KV pool 448-480k tokens,
+   3.4-3.7× concurrency at 131k ctx.
+4. Init flake (~1/3 GPU1 wedge during load, BACO recovers, retry works)
+   persists on official driver — watch; not blocking.
+5. Profiler left enabled in bench scripts skews numbers — the final
+   matrix ran clean (no profiler, no debug env).
+
+## Session verdict
+
+TP=2 dense 27B serving is viable and record-setting on this machine when:
+official amdgpu driver + graph capture + trimmed capture sizes. Dense
+decode record moves 25.3 → 39.7 t/s (mtp2, pp2048/tg128 shape). Context
+capacity doubles-plus (131k boots with 3.4x concurrency). Platform fix
+(official driver 6.19.14 DKMS) is a hard prerequisite — stock Ubuntu
+amdgpu both soft-stalls (RCCL 2.30.4) and hard-hangs (RCCL 7.2.1-era)
+TP=2 on this dual-root-port topology.
