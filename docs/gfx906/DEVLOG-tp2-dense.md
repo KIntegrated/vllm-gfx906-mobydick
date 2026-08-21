@@ -292,3 +292,22 @@ TP=2 on this dual-root-port topology.
 - decode: 39.7 t/s (mtp2, pp2048/tg128) = 1.57x TP=1 record
 - long-ctx decode: 37.8 t/s (mtp3, pp8192/tg256) = 1.49x
 - context: 131072 std (3.4x concurrency), 262144 available (1.8x, -25% t/s)
+
+### S7 — CORRECTION: baseline-comparison error in S5/S6 headlines (2026-08-21)
+
+**VERDICT:** correction — S5/S6 "1.57×/1.49× TP=1" compared TP=2 mtp2/mtp3
+against the TP=1 **baseline** (25.3 t/s), ignoring that the TP=1 mtp2
+record is 39.74 t/s (DEVLOG-spec-decode.md line ~756). Honest table:
+
+| arm | TP=1 | TP=2 (this session) | TP=2 gain |
+|---|---|---|---|
+| baseline | 25.14-25.60 | ~31-39 (streaming tg; server-path) | ~1.2-1.5x (needs clean A/B) |
+| mtp2 | 39.74 | 39.7 | **1.00x (parity)** |
+| mtp3 | (not measured TP=1) | 37.8 long-ctx | n/a |
+
+Real TP=2 value delivered: context capacity (445-480k-token KV pool,
+131k std / 262144 bootable), plus the mtp3 long-ctx profile TP=1 hasn't
+measured. Decode-speed parity at mtp2 — the TP=2 AR tax eats the spec
+headroom. Headline records in S5/S6 are SUPERSEDED by this table.
+TODO if TP=2 speed claim is needed: clean same-harness baseline TP=2
+vs TP=1 mtp2 A/B.
