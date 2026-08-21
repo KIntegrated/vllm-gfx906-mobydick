@@ -132,3 +132,43 @@ All pure logging; keep until the P2P question closes.
    discriminates our-tree vs platform.
 4. GPU-health caveat: SIGKILLing stalled runs wedges the GPUs
    (hipErrorLaunchFailure, drm_open hang) — always SIGTERM first.
+
+### S3 — cross-stack confirmation, ACS exonerated, PXB workaround (2026-08-21 pm)
+
+**VERDICT:** OPEN (platform/driver-level P2P/IPC pathology; workaround confirmed)
+**GATE:** offline repro, 128-tok greedy; docker A/B same model/flags.
+
+- **ACS override kernel (6.8.12-acso, pcie_acs_override=downstream,multifunction):
+  stall persists** (P2P/IPC selected, 26 s/step). ACS is NOT the mechanism.
+  All P2P primitives healthy on this kernel too (peer copy 10/14.2 GB/s,
+  cross-GPU flag poll 0 ms — note: earlier "flag poll hangs" was a harness
+  bug, setter on legacy default stream serialized against the spinner).
+- **Docker A/B** (`mixa3607/vllm-gfx906:0.20.1-rocm-7.2.1-aiinfos`): TP=2
+  with P2P/IPC **hard-hangs the GPU during weight load** (amdgpu "GPU Hang",
+  BACO reset); TP=1 in the same image loads/serves fine. Failure is
+  version-independent (old RCCL hangs, RCCL 2.30.4 stalls) → driver-level.
+- **Workaround (confirmed 3×): `NCCL_P2P_LEVEL=PXB`** → SHM/direct/direct
+  transport: init 105–198 s, no stalls, 128-tok generate 6.6–12.5 t/s
+  (run-to-run variance to investigate; transport pick may vary).
+  `NCCL_P2P_DISABLE=1` = 6.9 t/s. Matrix so far:
+  auto=27 s/step stall · Simple=stall · PHB=stall · PXB=OK · P2P_DISABLE=OK(slow).
+- Wedge hazard: TP=2 P2P failures can escalate to amdgpu reset storms
+  (BACO recovery works but colliding runs fail with hipErrorLaunchFailure).
+  Sequence attempts carefully; SIGTERM before SIGKILL.
+
+## HYPOTHESIS (S3)
+
+If the stock Ubuntu amdgpu driver mishandles P2P/IPC doorbell traffic on
+this dual-root-port topology, then the official AMD amdgpu driver build
+will either fix or change the failure mode; if it is RCCL-side, driver
+swap changes nothing and the fix lives in RCCL transport selection
+(default away from P2P/IPC on gfx906 PCIe-only topologies — candidate
+upstream patch or platform quirk in vllm ROCm platform code).
+
+## Next
+
+1. pp/tg ± MTP benchmark matrix on `NCCL_P2P_LEVEL=PXB` (131k ctx server).
+2. Official amdgpu driver test (user-gated; needs DKMS vs acso kernel or
+   stock kernel boot — ACS irrelevant now).
+3. Candidate upstream fix: default NCCL_P2P_LEVEL for gfx906 PCIe-only
+   topology in vllm ROCm platform init.
