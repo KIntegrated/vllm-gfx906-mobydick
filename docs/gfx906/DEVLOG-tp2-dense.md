@@ -311,3 +311,18 @@ measured. Decode-speed parity at mtp2 — the TP=2 AR tax eats the spec
 headroom. Headline records in S5/S6 are SUPERSEDED by this table.
 TODO if TP=2 speed claim is needed: clean same-harness baseline TP=2
 vs TP=1 mtp2 A/B.
+
+### S8 — S6 finding #1 root-caused: capture bakes max_model_len into decode graphs (2026-08-21 late)
+
+**VERDICT:** SHIPPED (diagnosis) / OPEN (fix) · **GATE:** eager A/B at
+matched real ctx (tp_decode_investigation.md #4).
+
+The 256k -25% decode tax is NOT live-context cost: eager 131k vs 256k at
+identical prompts are equal (19.5 vs 19.9 t/s). FULL-cudagraph capture
+freezes max_seq_len=max_model_len (gpu_model_runner.py:2390) → gather
+kernels' Sk_pad=pad32(max_model_len) baked into replay launch dims →
+every decode step attends max_model_len-wide. Implication: the 131k
+config ALSO overpays (attends 131072-wide for short contexts). Fix
+lever: capture-time Sk bound with piecewise fallback beyond; could
+speed all TP=2 (and TP=1?) decode, not just 256k. Details and numbers
+in tp_decode_investigation.md RESOLUTION section.
