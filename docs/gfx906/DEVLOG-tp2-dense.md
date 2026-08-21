@@ -259,3 +259,36 @@ capacity doubles-plus (131k boots with 3.4x concurrency). Platform fix
 (official driver 6.19.14 DKMS) is a hard prerequisite — stock Ubuntu
 amdgpu both soft-stalls (RCCL 2.30.4) and hard-hangs (RCCL 7.2.1-era)
 TP=2 on this dual-root-port topology.
+
+### S6 — ctx-length cost, MTP depth, prefill chunk A/B (2026-08-21 night)
+
+**VERDICT:** SHIPPED (mtp3 for long ctx) / DEAD-END (8k prefill chunks,
+256k for speed-sensitive serving) · **GATE:** same matrix harness
+(`tp2_serve_bench2.py`), 3 reps, 131k-ctx server unless noted.
+
+## Findings
+
+1. **max_model_len 262144 costs ~25% decode**: 29.9 t/s vs 39.9 at
+   131k (same mtp2, clean SIGTERM restarts both ways, acceptance
+   unchanged 2.48-2.57 — not noise). Suspect: capture-time FA gather
+   buffer / block-table sizing scales with max_model_len. 256k boots
+   fine (472k-token KV, 1.8x concurrency) — use only when needed.
+2. **mtp3 vs mtp2** (131k): pp2048/tg128 38.6 vs 39.7 (-3%); **pp8192/
+   tg256 37.8 vs 34.4 (+10%)**. 3rd position acceptance 0.511, mean
+   length 2.97. Choose by workload: mtp2 short-prompt, mtp3 long-ctx.
+   Long-ctx cell now 1.49x TP=1.
+3. **max-num-batched-tokens 8192: REJECTED** — worse everywhere (pp 423
+   vs 483; tg 35.9 vs 38.6) AND OOMs on 32k prefill (inductor 279 MB
+   chunk buffer, free:0 at gpu-util 0.93, engine died KeyError during
+   eviction). Default 2048 stands.
+4. Prefill cold ~480 tok/s at default chunks (8192-cell higher numbers
+   are prefix-cache warm hits, not throughput).
+5. Teardown protocol (SIGTERM+wait, no SIGKILL) adopted; clean
+   restarts since. AGENTS.md (workspace + local) updated: 2×gfx906
+   hardware note, trimmed-capture default, teardown rules.
+
+## Session records (dense 27B, TP=2)
+
+- decode: 39.7 t/s (mtp2, pp2048/tg128) = 1.57x TP=1 record
+- long-ctx decode: 37.8 t/s (mtp3, pp8192/tg256) = 1.49x
+- context: 131072 std (3.4x concurrency), 262144 available (1.8x, -25% t/s)
