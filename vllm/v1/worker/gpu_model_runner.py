@@ -344,6 +344,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.async_copy_ready_event.record()
+            if envs.VLLM_TP2_DEBUG:
+                logger.warning(
+                    "TP2DBG copy-event RECORD enqueued %.3f", time.time()
+                )
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
@@ -351,7 +355,13 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         This function blocks until the copy is finished.
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
+        if envs.VLLM_TP2_DEBUG:
+            _t0 = time.perf_counter()
         self.async_copy_ready_event.synchronize()
+        if envs.VLLM_TP2_DEBUG:
+            _dt = time.perf_counter() - _t0
+            if _dt > 1.0:
+                logger.warning("TP2DBG copy-event sync=%.2fs", _dt)
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -588,6 +598,10 @@ class GPUModelRunner(
 
         # Async scheduling
         self.use_async_scheduling = self.scheduler_config.async_scheduling
+        if envs.VLLM_TP2_DEBUG:
+            logger.warning(
+                "TP2DBG use_async_scheduling=%s", self.use_async_scheduling
+            )
 
         # Async PP broadcast of sampled token ids, waited on in _prepare_input_ids.
         self._pp_recv_work: torch.distributed.Work | None = None
@@ -4567,6 +4581,12 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            _tp2dbg = envs.VLLM_TP2_DEBUG
+            if _tp2dbg:
+                logger.warning(
+                    "TP2DBG2 rank=%s FORWARD-START",
+                    torch.distributed.get_rank(),
+                )
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4574,6 +4594,11 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if _tp2dbg:
+                logger.warning(
+                    "TP2DBG2 rank=%s FORWARD-DONE",
+                    torch.distributed.get_rank(),
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4602,7 +4627,17 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
+                if envs.VLLM_TP2_DEBUG:
+                    logger.warning(
+                        "TP2DBG2 rank=%s LOGITS-START",
+                        torch.distributed.get_rank(),
+                    )
                 logits = self.model.compute_logits(sample_hidden_states)
+                if envs.VLLM_TP2_DEBUG:
+                    logger.warning(
+                        "TP2DBG2 rank=%s LOGITS-DONE",
+                        torch.distributed.get_rank(),
+                    )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4706,7 +4741,15 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
+            if envs.VLLM_TP2_DEBUG:
+                logger.warning(
+                    "TP2DBG2 rank=%s SAMPLE-START", torch.distributed.get_rank()
+                )
             sampler_output = self._sample(logits, spec_decode_metadata)
+            if envs.VLLM_TP2_DEBUG:
+                logger.warning(
+                    "TP2DBG2 rank=%s SAMPLE-DONE", torch.distributed.get_rank()
+                )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
