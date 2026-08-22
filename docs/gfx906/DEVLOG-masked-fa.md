@@ -278,6 +278,14 @@ client tgs TTFT-excluded (same harness as the N4 plain-greedy gate):
   records on gfx906/main until it is root-caused.** Plain-greedy
   records are unaffected.
 
+  **Update 2026-08-22 (later, GPU session):** root cause characterized —
+  see DEVLOG-spec-decode.md "TP=2 mtp2 engine-cadence overhead" and
+  `fa-masked-mtp-regression-glm5.md` (folds the ds4/qwen reviews). GPU
+  work is healthy at both TP sizes; the ~95 ms/step is engine-level spec
+  bookkeeping (worker input-waits + propose/reject CPU chain);
+  `--async-scheduling` tested, no effect. TP=1 healthy. Clean-rebuild
+  A/B of the record binary remains the confirmation experiment.
+
 Refrigerated (updated): register-prefix widen to B=32 (kernel change,
 full gate protocol, needs a >16-concurrent-decode serving workload to
 A/B); `MARGIN=0` drop; grid sweep 512/2048.

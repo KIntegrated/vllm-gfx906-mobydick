@@ -1239,3 +1239,57 @@ shifts the page-size fit). Cacheable prefix = `round_down(len, block)`.
 
 **Serving recipe update:** dense 27B serving servers need
 `--gpu-memory-utilization 0.93` (warm inductor cache) — see item 5.
+
+## 2026-08-22 — TP=2 mtp2 engine-cadence overhead root-caused (the "regression" vs S5/S8 records)
+
+**VERDICT:** OPEN (mechanism characterized; no code fix yet) · **GATE:**
+TP=2 mtp2 chrome trace (`/tmp/mtp2_trace/`, `--profiler-config` +
+`/start_profile`) + same-harness TP=1 in-process matrix.
+
+Origin: the N4 re-baseline (DEVLOG-masked-fa post-commit 3) found mtp2
+TP=2 steady 24.9 t/s vs the S8 record 39.9 (same recipe). Read-only
+diagnosis in `fa-masked-mtp-regression-glm5.md` (folds the ds4 + qwen
+reviews; all claims adjudicated) + this session's GPU work:
+
+- **TP=1 is healthy:** record-config rerun (2816, agentic, in-process)
+  49.8 t/s @ 2.72 acc = 54.6 ms/step; fox matrix 62.6/62.9 ms/step at
+  maxlen 2816/32768 (maxlen exonerated; the earlier "+36 ms TP=1-common"
+  was acceptance-confounded). Plain TP=1 unchanged vs record era
+  (40.4 vs 39.5 ms). M=1-vs-M=3 kernel tables show the mtp2-only GPU
+  work is the drafter's two fp16 forwards + the 1.45× M=3 GEMM premium —
+  no pathology.
+- **TP=2 GPU side also healthy:** trace shows gptq-M3 17.6 ms/step
+  (TP=1's 33.6 halved ✓), rccl 8.5 (130 collective kernels/step), FA
+  2.7, gather 0.35; GPU busy 96% of the kernel window; the rocBLAS
+  MT-monsters are prefill chunks.
+- **The pathology is engine cadence:** client/engine 144 ms/step vs
+  ~45-50 ms of GPU work. Worker spends ~57 ms/step blocked in
+  `hipEventSynchronize` waiting for the next step's inputs (3813 ms /
+  272 calls / 71 steps, dedicated thread); visible spec CPU on the
+  worker ≈ 8.5 ms/step (`propose_draft_token_ids` 6.6 incl. ~1 ms Triton
+  re-specialization checks, spec metadata 1.1, rejection 0.8); the rest
+  (~30-40 ms) is EngineCore-side scheduler bookkeeping (untraced
+  process). Plain decode's lighter bookkeeping fits inside its 24.5 ms
+  cadence — that's why only mtp2×TP=2 suffers.
+- **`--async-scheduling` A/B: NO EFFECT** (24.93 vs 24.90 steady;
+  confirmed engaged) — the chain is a per-step GPU→CPU→GPU
+  **data dependency**, not schedulable idle.
+- **Record→now delta:** still unexplained by any diffable code (engine
+  code byte-identical; async default identical; capture topology
+  identical; drafter eager in both). H1 stands: all S5-S8 TP=2 numbers
+  came from one never-rebuilt dirty Aug-19 binary (state unrecoverable).
+  The S5-S8 mtp2/mtp3 records keep their asterisk; the clean-rebuild
+  A/B of `69f615b98` remains the confirmation experiment.
+- **Platform:** the mtp1 TP=2 arm could not boot (3×
+  `hipErrorLaunchFailure` at weight load — the S4-residual wedge; BACO
+  reset needs root). mtp1 scaling point unmeasured.
+
+Refrigerated: `--stream-interval` batched-output test for the
+EngineCore-side share; propose-path CPU trimming (the 6.6 ms/step);
+Triton specialization caching; EngineCore-side trace (untraced process
+needs its own profiler attach); the clean-rebuild confirmation.
+
+Cross-refs: `fa-masked-mtp-regression-glm5.md` (full evidence +
+three-review adjudication), `docs/gfx906/fa-masked-mtp-regression-qwen.md`,
+`fa-masked-mtp-regression-ds4.md`, DEVLOG-masked-fa post-commit 3,
+DEVLOG-tp2-dense S5-S8.
