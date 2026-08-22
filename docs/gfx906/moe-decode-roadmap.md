@@ -233,9 +233,18 @@ treated as permanent:
   numbers (21.4/10.8 µs gemm2 V2, 12.5 µs topk M=1) reproduce under
   the fixed checks.
 
-State: proposal only — none of these has been run. (v1)+(v2) are
-prerequisites before the C2 close is cited as evidence in any future
-scope decision; (v3) is the remaining unbuilt design axis; (v4) is
+State (2026-08-22): **(v2) running** on `gfx906/moe-c2v` (dev log
+`DEVLOG-moe-c2v.md`). Dispatch-gate audit corrected the scope: both
+existing re-tile candidates are M=1-only (`MOE_M1` gemm2 v2 tile
+gated on `size_m == output_topk`; the reverted NPT=2 trial was the
+BM=1 gemm1 path), so the batch axis is the *never-measured* BM=4
+grouped path (N=4/8/32 characterization; the NPT=2 arm can only fire
+at N=4) and **TP=2 M=1 is a first-class arm** (per-rank N halved —
+new tiling axis; first TP=2 35B-MoE run on this box, smoke-gated).
+TP=1-only scoping was overruled: a TP=2 win would reopen the branch
+regardless of TP=1. (v1) still unrun; (v1)+(v2) remain prerequisites
+before the C2 close is cited as evidence in any future scope
+decision; (v3) is the remaining unbuilt design axis; (v4) is
 bookkeeping hygiene.
 
 The BM=1/NPT=4 tiling launches 4096 blocks (gemm1: 8 slots × 8 n-tiles ×
