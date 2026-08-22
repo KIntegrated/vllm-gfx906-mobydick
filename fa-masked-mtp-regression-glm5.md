@@ -301,6 +301,47 @@ engine windowed metrics agree):
   processing) remains an untested cheap candidate for the
   EngineCore-side share.
 
+## REV 5 (2026-08-22 post-reboot) — THE REGRESSION WAS HOST-STATE DEGRADATION. CENTRAL CLAIM RETRACTED.
+
+A host reboot (12:39:47) changed nothing in the software stack but
+**restored mtp2 TP=2 serving to 74.9 t/s (40.1 ms/step, acceptance
+3.00, token-true usage-based client)** — 3× the degraded boot's 24.9.
+Consequences for everything above:
+
+1. **"mtp2 TP=2 regressed vs the S8 record" — RETRACTED.** The
+   current build BEATS the record era: 40.1 ms/step vs the record's
+   62.4 (which itself paid ~18 ms of N4 gather tax the record era
+   couldn't avoid). The whole record→now gap was host state.
+2. **The trace analysis (rev 4) described the DEGRADED host**, not the
+   code: the 57 ms/step `hipEventSynchronize` stalls were the
+   degradation signature. On the healthy host the same cadence costs
+   ~0. Keep the mechanism knowledge (spec decode is the canary for
+   sync-latency inflation), discard the "engine overhead exploded"
+   conclusion. `--async-scheduling`/`--stream-interval` no-ops were
+   no-ops because there was nothing code-side to fix.
+3. **The dirty-binary hypothesis (H1) is now UNNECESSARY** — no code
+   or binary difference was ever needed to explain anything. The
+   clean-rebuild A/B of `69f615b98` (worktree was staged at
+   `/local/git/vllm-s8-rebuild`) is CANCELLED as a diagnostic; run it
+   only if a fresh-boot mtp2 number ever disagrees with 74.9 again.
+4. **Client caveat that prolonged the confusion:** SSE-chunk counting
+   under-reports tokens ~3× when acceptance ≈ 3 (chunks ≈ steps). The
+   usage-based client (`stream_options.include_usage`) is mandatory
+   for spec-decode t/s from now on. Yesterday's "chunk-rate" numbers
+   (incl. mtp1 30.2 / mtp3 22.0) decode as healthy once multiplied by
+   acceptance: mtp1 ≈ 61.9 t/s @2.00 (33 ms/step), mtp3 ≈ 88.1 t/s
+   @4.00 (45.4 ms/step).
+5. **Healthy-host post-reboot serving matrix (131k, TP=2, PERSIST=1):**
+   plain 40.9 t/s · mtp1 61.9 · mtp2 74.9 · mtp3 88.1 — mtp2/mtp3 now
+   clearly BEAT plain greedy (1.83×/2.15×). MTP on TP=2 is the right
+   operating point again; S8 re-baselines should use these.
+6. Host-degradation mechanism, kernel signatures, canary probe, and the
+   recording protocol: `docs/gfx906/degradation.md` +
+   `degradation_details.md`. The final full-wedge (14:06, GPU0 PSP
+   −62) killed the 4-arm re-baseline mid-run; the P0/P1 tax arms need
+   one clean re-run for the devlog record (P1 numbers above stand from
+   the stream-interval A/B boots).
+
 ## Empirical results (GPU session, 2026-08-22 — after rev 3)
 
 Experiments 1 + 2 (partial) run; numbers are wall-clock t/s with engine

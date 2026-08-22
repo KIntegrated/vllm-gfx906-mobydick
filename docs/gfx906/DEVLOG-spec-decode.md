@@ -1293,3 +1293,29 @@ Cross-refs: `fa-masked-mtp-regression-glm5.md` (full evidence +
 three-review adjudication), `docs/gfx906/fa-masked-mtp-regression-qwen.md`,
 `fa-masked-mtp-regression-ds4.md`, DEVLOG-masked-fa post-commit 3,
 DEVLOG-tp2-dense S5-S8.
+
+### 2026-08-22 (post-reboot correction) — the "TP=2 mtp2 regression" was HOST-STATE DEGRADATION
+
+**VERDICT: RETRACTED (not a code regression).** A host reboot at 12:39
+restored mtp2 TP=2 serving to **74.9 t/s steady (40.1 ms/step,
+acceptance 3.00, usage-based client)** — 3× the same-boot-prior 24.9,
+on identical binary/config/harness. The build now beats the S8 record
+(62.4 ms/step, which paid the N4 gather tax): healthy-host matrix
+(131k, TP=2, P1): plain 40.9 · mtp1 61.9 (@2.00, 33 ms/step) ·
+mtp2 74.9 · mtp3 88.1 (@4.00, 45.4) t/s — spec decode beats plain
+1.83–2.15× on TP=2 again. The earlier entry's trace analysis described
+the degraded host (worker `hipEventSynchronize` stalls ~57 ms/step =
+the degradation signature, not engine overhead); async-scheduling /
+stream-interval no-ops were no-ops for that reason. The clean-rebuild
+confirmation of `69f615b98` is cancelled (unnecessary).
+
+Two operational lessons, now protocol: (a) SSE-chunk counting
+under-reports spec-decode t/s by ~acceptance (chunks ≈ steps) — use
+`stream_options.include_usage`; (b) **degradation canary**: after GPU
+wedge/reset bursts, run the 60-s TP=1 mtp2 probe in
+`docs/gfx906/degradation_details.md` before recording any spec number —
+slow canary ⇒ reboot. All wedges/degradation get timestamped rows in
+`docs/gfx906/degradation.md` (49 half-wedges + 3 full-wedges +
+1 degradation event logged 2026-08-21→22; the 14:06 full-wedge killed
+the 4-arm mtp2 re-baseline mid-run — P0/P1 tax arms need one clean
+re-run; the P1 74.9 stands from the stream-interval boots).
