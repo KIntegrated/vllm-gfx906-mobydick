@@ -468,31 +468,27 @@ lands in this roadmap:
   batched decode (the production bench is single-request); B=1 is
   already copy-free. Evidence state: **derived** (per-call probe +
   stride analysis in the DEVLOG "FA decode per-layer copy pile").
-- **N4 — TP=2 dense decode: `max_model_len` decode tax — CONFIRMED
-  mechanism: FULL-cudagraph capture bakes `pad32(max_model_len)` Sk
-  into decode graphs (resolved 2026-08-21).** `--max-model-len 262144`
-  measured ~25% slower decode than 131072 on the same TP=2 dense-27B
-  server/flags. The earlier code-read ruling-out of the frozen-`max_seq_len`
-  theory was correct for live/piecewise steps but missed the FULL-graph
-  case: `gpu_model_runner.py:2390` (`for_cudagraph_capture` branch) sets
-  `max_seq_len = self.max_model_len` at capture, so `GFX906_FA`'s
-  gather-then-dense kernels get `Sk_pad = pad32(max_model_len)` baked
-  into replay launch dims — **every decode replay attends
-  max_model_len-wide regardless of live context**. Decisive gate (the
-  investigation's #4, now run): eager A/B at identical ~1.5k real
-  context shows NO gap (19.5 vs 19.9 t/s at 131k/256k) while graph
-  mode shows the full -25% (39.9 vs 29.9) — the tax is
-  capture-artifact, not live-Sk cost. Implication: even the 131k
-  config overpays (replays attend 131072-wide for short contexts).
-  Fix lever: capture-time Sk bound (env knob, e.g. capture at 32k with
-  piecewise/eager fallback for live contexts beyond the bound) — a
-  dense gather must cover worst-case at replay, so the knob trades
-  capture coverage for replay speed; a masked-early-exit in the dense
-  kernel is the deeper alternative (none exists today). Could speed
-  ALL decode (TP=1 and TP=2), not just recover the 256k tax.
-  Full writeup and numbers: `tp_decode_investigation.md` RESOLUTION
-  section, `DEVLOG-tp2-dense.md` S8. Evidence state: **measured**
-  (eager-vs-graph A/B at matched real context; gate run 2026-08-21).
+- **N4 — TP=2 dense decode: `max_model_len` decode tax — RESOLVED
+  (2026-08-22, branch `gfx906/fa-masked-gather`; pending merge).**
+  Mechanism (confirmed 2026-08-21, S8): FULL-cudagraph capture bakes
+  `Sk_pad = pad32(max_model_len)` into `GFX906_FA`'s gather launch dims
+  (`gpu_model_runner.py:2390` `for_cudagraph_capture` branch), so the
+  two-kernel `> 65535` fallback gathered/quantized/zeroed
+  max_model_len-wide rows every replay regardless of live context
+  (eager A/B at matched ~1.5k context: no gap; graph A/B: −25% at
+  262k). **Fix**: `gather_paged_kv_quant_persistent` — one grid-stride
+  fused gather+quantize kernel with a fixed capture-time grid and work
+  bounded by the live `seq_lens` tensor (the masked-early-exit route,
+  `plan_masked_fa.md` §2.2); the capture-time Sk bound + fallback
+  design was superseded before implementation (its CORRECTION: a
+  single bound cliffs long-running conversations — the exact workload
+  262k exists for). Gates: NaN-tail, bit-exact capture/replay B=1..4,
+  PPL identical, TP=2 serving A/B: 131k 22.4→40.9 t/s (+83%),
+  262k 15.9→40.9 t/s (+157%), P1 tax 0.07% (noise) vs P0 −28.8%.
+  `GFX906_FA_PERSIST` default ON. Full record:
+  `DEVLOG-masked-fa.md`; diagnosis: `tp_decode_investigation.md`
+  RESOLUTION, `DEVLOG-tp2-dense.md` S8. Evidence state: **fixed and
+  gated** (serving A/B).
 - **N3 — GDN [3,1,32] state-bookkeeping copies (measured 32/step,
   ~180 µs/step eager).** The timeline probe
   (`/tmp/bench/dense_ewp_timeline.py`) attributes the 32 [3,1,32]
