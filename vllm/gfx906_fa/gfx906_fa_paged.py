@@ -100,6 +100,14 @@ _TORCH_GATHER = (_os.environ.get("GFX906_FA_TORCH_GATHER", "0") == "1"
 # (bit-equal to gather_paged_kv_fp16 + quantize_q8_0). GFX906_FA_FUSED_QUANT=0
 # reverts to the two-kernel path.
 _FUSED_QUANT = _os.environ.get("GFX906_FA_FUSED_QUANT", "1") != "0"
+# Persistent grid-stride fused gather+quantize (plan_masked_fa.md §2.2):
+# fixed capture-time grid, work bounded by the live seq_lens tensor —
+# valid at every Sk (replaces the two-kernel > 65535 fallback and the
+# per-token fused kernel). K output is bit-equal to the old paths;
+# gates in DEVLOG-masked-fa.md (NaN-tail, capture/replay B=1..4, PPL,
+# TP=2 serving A/B: 15.9->40.9 t/s at 262k). Default ON; GFX906_FA_PERSIST=0
+# is the kill switch.
+_PERSISTENT = _os.environ.get("GFX906_FA_PERSIST", "1") != "0"
 # P3-4: skip the LEGACY-path q_pad zero_ on the Sq=1 decode fast path
 # (pad rows are per-row-independent and discarded; the q8_0 quantization
 # clamps NaN/Inf garbage). GFX906_FA_QPAD_EMPTY=0 reverts to the zero_.
@@ -497,7 +505,16 @@ def forward_paged(
                       else block_table.to(torch.int32)).contiguous()
             sl_i32 = (seq_lens if seq_lens.dtype == torch.int32
                       else seq_lens.to(torch.int32)).contiguous()
-            if _FUSED_QUANT and Sk_pad <= 65535:
+            if _PERSISTENT:
+                # One kernel at every Sk: fixed grid, live-bounded work,
+                # in-kernel quantize (bit-equal K), V tail rows not written
+                # (FA cuts at kv_max; margin zeros per
+                # GFX906_FA_PERSIST_MARGIN).
+                K_q8, V_bhsd = gfx906_fa.gather_paged_kv_quant_persistent(
+                    key_cache, value_cache, bt_i32, sl_i32, Sk_pad,
+                    k_out=kbuf, v_out=vbuf,
+                )
+            elif _FUSED_QUANT and Sk_pad <= 65535:
                 K_q8, V_bhsd = gfx906_fa.gather_paged_kv_quantized(
                     key_cache, value_cache, bt_i32, sl_i32, Sk_pad,
                     k_out=kbuf, v_out=vbuf,
