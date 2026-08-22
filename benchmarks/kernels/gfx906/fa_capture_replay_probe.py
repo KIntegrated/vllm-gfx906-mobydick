@@ -29,7 +29,6 @@ BPR = (D // 32) * 34
 BLOCK = 16
 SK_PAD = 262144  # frozen graph launch dim (256k model)
 SCALE = 0.04419417382415922
-REPLAY_SLS = [32, 1536, 2177, 8192, SK_PAD - 32, SK_PAD]
 
 
 def eager_step(fa, q, kc, vc, bt, sl_t, sk, kbuf, vbuf):
@@ -53,12 +52,16 @@ def main():
     vc = torch.randn(nb, BLOCK, Hkv, D, dtype=torch.float16, device=dev)
     fails = 0
     for b in [1, 2, 3, 4]:
-        # per-seq block-table offset (seq s owns blocks [s*off, (s+1)*off))
+        # Full-coverage block table: every token of [0, SK_PAD) maps to
+        # its own physical block. (The pre-fix fill covered only off-16
+        # entries/seq, so the last 256 tokens per seq aliased phys block
+        # 0 through the zero-filled table tail — rows were written from
+        # real (aliased) data, but not the seq's own blocks.)
         off = (nb - 16 * max_b) // max_b
         bt = torch.zeros(b, off, dtype=torch.int32, device=dev)
         for s_ in range(b):
-            bt[s_, :off - 16] = torch.arange(
-                s_ * off, s_ * off + off - 16, dtype=torch.int32)
+            bt[s_, :] = torch.arange(
+                s_ * off, (s_ + 1) * off, dtype=torch.int32)
         q = torch.randn(b, Hq, 1, D, dtype=torch.float32, device=dev)
         sl_t = torch.zeros(b, dtype=torch.int32, device=dev)
 

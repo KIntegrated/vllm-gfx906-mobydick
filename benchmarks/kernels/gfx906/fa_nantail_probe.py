@@ -19,7 +19,11 @@ Poison = scale NaN (0x7E00 LE), qs 0. V poison = fp16 NaN (0x7E00).
 Cases: seq_len aligned / misaligned to the 32-row K tile (tail-tile
 oob_check path), seq_len 1 row before Sk (worst-case tail), seq_len == Sk
 (no tail), B=1 and B=2 ragged. Hkv in {2,4} exercises the GQA-packed
-(ncols2 > 1) decode path at Hq=24.
+(ncols2 > 1) decode path at Hq=24. sq > 1 exercises the multi-query
+paths the persistent gather also serves: mtp2 spec-decode verify
+(sq=3, ncols1=4) and prefill chunks (sq=64, ncols1=64) with inline
+causal (q_abs_offset = sl - sq, so the last query row sits on the last
+live token and rows [sl, sk) are dead in every query row's view).
 
 Run (local venv, GPU 0):
   cd /local/git/vllm-gfx906-mobydick
@@ -42,11 +46,11 @@ K_NAN = torch.zeros(BPR, dtype=torch.uint8, device=dev)
 K_NAN[1] = 0x7E  # fp16 NaN scale, little-endian byte 1
 
 
-def run_case(fa, hkv, b, sls, sk):
+def run_case(fa, hkv, b, sls, sk, sq=1):
     kb = torch.randn(b, hkv, sk, D, dtype=torch.float16, device=dev)
     vb = torch.randn(b, hkv, sk, D, dtype=torch.float16, device=dev)
     kq = fa.quantize_q8_0(kb)
-    q = torch.randn(b, Hq, 1, D, dtype=torch.float32, device=dev)
+    q = torch.randn(b, Hq, sq, D, dtype=torch.float32, device=dev)
 
     for i, sl in enumerate(sls):
         if sl < sk:
@@ -54,13 +58,17 @@ def run_case(fa, hkv, b, sls, sk):
             vb[i, :, sl:sk, :] = 0
     kv_max = torch.tensor(sls, dtype=torch.int32, device=dev)
 
-    o_clean = fa.forward(q, kq, vb, SCALE, kv_max)
+    # sq=1: decode, no causal. sq>1: inline causal (same as forward_paged
+    # prefill/spec-decode) — offset = sl - sq.
+    q_off = (kv_max - sq).to(torch.int32) if sq > 1 else None
+
+    o_clean = fa.forward(q, kq, vb, SCALE, kv_max, None, q_off)
 
     for i, sl in enumerate(sls):
         if sl < sk:
             kq[i, :, sl:sk, :] = K_NAN
             vb[i, :, sl:sk, :] = 0x7E00  # fp16 NaN
-    o_poison = fa.forward(q, kq, vb, SCALE, kv_max)
+    o_poison = fa.forward(q, kq, vb, SCALE, kv_max, None, q_off)
 
     ok = torch.equal(o_clean, o_poison)
     finite = bool(torch.isfinite(o_poison).all())
@@ -71,19 +79,23 @@ def main():
     from vllm import _gfx906_fa_C as fa
 
     cases = [
-        # (hkv, seq_lens, Sk_pad)
-        (2, [2176], 2560),         # aligned to 32 (no tail tile)
-        (2, [2177], 2560),         # tail tile oob path
-        (2, [2559], 2560),         # 1 row before Sk (worst-case tail)
-        (2, [2560], 2560),         # full (no tail)
-        (2, [32], 2560),           # tiny
-        (4, [2177], 2560),         # Hkv=4 packed path
-        (2, [1024, 2177], 2560),   # B=2 ragged
+        # (hkv, seq_lens, Sk_pad, sq)
+        (2, [2176], 2560, 1),         # aligned to 32 (no tail tile)
+        (2, [2177], 2560, 1),         # tail tile oob path
+        (2, [2559], 2560, 1),         # 1 row before Sk (worst-case tail)
+        (2, [2560], 2560, 1),         # full (no tail)
+        (2, [32], 2560, 1),           # tiny
+        (4, [2177], 2560, 1),         # Hkv=4 packed path
+        (2, [1024, 2177], 2560, 1),   # B=2 ragged
+        (2, [2177], 2560, 3),         # mtp2 verify (Sq=1+2), inline causal
+        (2, [2177], 2560, 64),        # prefill chunk (Sq=64, ncols1=64)
+        (2, [2559], 2560, 2),         # worst-case tail + Sq=2 (spec n=2)
+        (4, [1024, 2177], 2560, 3),   # GQA-packed + mtp2, B=2 ragged
     ]
     fails = 0
-    for hkv, sls, sk in cases:
-        ok, finite, o = run_case(fa, hkv, len(sls), sls, sk)
-        print(f"hkv={hkv} B={len(sls)} sls={sls} sk={sk}: "
+    for hkv, sls, sk, sq in cases:
+        ok, finite, o = run_case(fa, hkv, len(sls), sls, sk, sq)
+        print(f"hkv={hkv} B={len(sls)} sq={sq} sls={sls} sk={sk}: "
               f"{'PASS' if ok and finite else 'FAIL'} "
               f"(bit_equal={ok}, finite={finite})")
         if not (ok and finite):

@@ -216,7 +216,9 @@ kernel census.
 ---
 ## RESOLUTION (2026-08-21 late, pi agent) — experiment #4 decisive: capture-baking CONFIRMED
 
-**VERDICT:** CONFIRMED mechanism — FULL-cudagraph capture freezes
+**VERDICT:** CONFIRMED mechanism / FIXED — SUPERSEDED ANALYSIS BELOW
+(kept for history; the fix that shipped is the persistent live-bounded
+gather, `DEVLOG-masked-fa.md` — FULL-cudagraph capture freezes
 `max_seq_len = self.max_model_len` (`gpu_model_runner.py:2390`,
 `for_cudagraph_capture` branch), so the GFX906_FA gather-then-dense
 kernels get `Sk_pad = pad32(max_model_len)` baked into their launch
@@ -235,15 +237,330 @@ Evidence (identical prompts ~1.5k real tokens, same offline harness):
 Eager gap at matched real context: none (256k marginally faster = noise).
 Graph gap: -25%, tracking pad32(max_model_len) doubling.
 
-### Fix lever (open)
+### ⚠ CORRECTION (2026-08-21, later same day) — the bounded-capture proposal below is broken for its stated purpose
 
-Capture-time Sk bound: capture with `max_seq_len = min(max_model_len,
-GFX906_FA_CAPTURE_SK)` (env knob), accepting piecewise/eager fallback
-for live contexts beyond the bound. Since dense gather must cover the
-worst case at replay, a graph captured at 32k cannot serve 120k
-contexts directly — the knob trades capture coverage for replay speed.
-Even the 131k config overpays today (replays attend 131072-wide for
-typical short contexts): a 32k capture bound could speed ALL decode,
-not just recover the 256k tax. Needs the gather kernel's Sk handling
-reviewed for a masked-early-exit alternative (dense design has none
-today).
+**Gross oversight, caught in review before any code was written.** The
+bound-check in the mechanism below compares against
+`num_computed_tokens_cpu + num_scheduled_tokens`
+(`optimistic_seq_lens_cpu`'s definition, confirmed in
+`vllm/v1/core/sched/scheduler.py:881-884`: `num_computed_tokens =
+num_new_local_computed_tokens + num_external_computed_tokens`,
+asserted `<= request.num_tokens`) — this is **total accumulated
+sequence length including any prefix-cache hit**, not the size of the
+newly-added increment. A prefix-cache hit sets `num_computed_tokens`
+to a large value on the *first* scheduling of the request; it does not
+start at 0 and grow into the cached portion over time.
+
+Consequence: a long-running or deep multi-turn conversation crosses
+the bound **once** (e.g. at turn N where accumulated history passes
+32k tokens) and then **every subsequent decode step for that
+conversation falls back to PIECEWISE/eager permanently** — even though
+the actual new work per step is a completely ordinary single-token
+decode against a KV cache vLLM already has fully paged and resident.
+This is not a corner case; it is the **common case** for exactly the
+workload `--max-model-len 262144` was raised to serve. As designed,
+the single-bound version of this fix helps only short-lived/low-depth
+conversations on a server configured with a large `max_model_len` for
+headroom, and is neutral-to-useless for the long-context traffic that
+motivated raising `max_model_len` in the first place. It does **not**
+generalize to "all decode gets faster" as the original proposal
+implied — that claim is retracted.
+
+This isn't fixable by reading a different counter — the constraint is
+structural: decode attention legitimately attends over the *entire*
+accumulated KV cache every step, so `Sk` is inherently a total-length
+quantity, not an increment quantity, and any fix that keys off total
+`Sk` inherits this cliff. See the two alternatives below (multi-tier
+capture, masked early-exit) for how to actually serve long
+conversations at reasonable speed; the single-bound version is kept
+here only as the "cheap partial win for short-context-heavy traffic"
+option, not the primary recommendation.
+
+### Fix lever — bounded-capture Sk + dispatch fallback
+
+> **SUPERSEDED (2026-08-22):** none of the three proposals below was
+> built. `gather_paged_kv_quant_persistent` (branch
+> `gfx906/fa-masked-gather`, `DEVLOG-masked-fa.md`) implements the
+> masked-early-exit route — one live-bounded kernel at every `Sk`, all
+> gates passed, serving A/B 131k 22.4→40.9 / 262k 15.9→40.9 t/s — and
+> the devlog's Interactions section records why it supersedes the
+> bounded-capture and multi-tier designs. Retained as analysis only.
+
+**Status: design only, and per the correction above, only a partial
+fix (short-context traffic) — not a general one.** Nothing below has
+been implemented or gated; treat every number in the
+performance-impact section as an estimate from a two-point linear
+extrapolation, not a measurement. House protocol
+(`docs/gfx906/AGENTS.md`) applies before any of this ships:
+micro-bench, PPL/greedy gates, serving A/B, separate commit.
+
+#### Mechanism
+
+Two coordinated changes, both plain Python/config — no vendored HIP
+kernel touched:
+
+1. **Bound what capture bakes in.** In `_build_attention_metadata`
+   (`gpu_model_runner.py:2387-2391`), replace the unconditional
+   `max_seq_len = self.max_model_len` (used whenever
+   `for_cudagraph_capture=True` — confirmed this fires for *every*
+   FULL-mode capture call, not just the `i==0` buffer-sizing warmup
+   pass, which is a separate mechanism keyed off `profile_seq_lens`)
+   with `max_seq_len = min(self.max_model_len,
+   self.cudagraph_capture_max_seq_len)`, a new runner attribute set
+   once at init from an env knob (e.g. `VLLM_GFX906_FA_CAPTURE_SK`,
+   default something like 32768). Generic runner-level change, inert
+   for backends whose kernels are already live-`seq_len`-driven
+   (`ROCM_ATTN`'s `kernel_paged_attention_2d`, `TRITON_ATTN`'s unified
+   kernel) — only `GFX906_FA`'s gather-then-dense design is sensitive
+   to this value. Keep the existing sliding-window comment's intent:
+   bound should be `max(configured_bound, max sliding window across
+   layers)`.
+2. **Refuse the FULL graph once live context exceeds the bound.**
+   Before `_determine_batch_execution_and_padding` is called
+   (`execute_model`, ~line 4389), `self.input_batch.
+   num_computed_tokens_cpu[:num_reqs]` and `num_scheduled_tokens_np`
+   are already available (used one line earlier for cascade-attn
+   prefix lens) — compute `live_max_seq_len` from them the same way
+   `optimistic_seq_lens_cpu` does later, and set `exceeds_capture_bound
+   = live_max_seq_len > self.cudagraph_capture_max_seq_len`. Thread it
+   into the existing `disable_full` plumbing exactly like
+   `use_cascade_attn` already does: `disable_full=use_cascade_attn or
+   has_encoder_output or exceeds_capture_bound`. This reuses
+   `CudagraphDispatcher.dispatch`'s existing `invalid_modes=
+   {CUDAGraphMode.FULL}` parameter — no dispatcher change needed. The
+   step then runs PIECEWISE (if compiled that way) or eager, where
+   `Gfx906FAMetadataBuilder.build()` already computes `max_seq_len`
+   live and correctly (confirmed in "What was ruled out" above) — no
+   new correctness risk, since the fallback path never bakes launch
+   geometry, it just doesn't get the FULL-graph speedup for that step.
+
+Capture count/sizes (the batch-size buckets) are unaffected — only
+`Sk_pad` within each captured graph shrinks. The `i==0` profiling-run
+memory-sizing pass should stay tied to `self.max_model_len` (not the
+new bound) since it exists to budget the allocator for true worst
+case; conflating the two "worst case" uses would under-provision
+memory.
+
+Correctness note: there is nothing to guard against beyond "don't
+dispatch FULL when it doesn't apply" — a request over the bound simply
+never enters a FULL graph, so there is no truncated-context/garbage-
+output failure mode the way, e.g., R2's LEGACY=0+prefix-caching
+corruption was. The only real risk is a **batch-wide performance
+cliff**: dispatch is per-step batch-wide, not per-request, so one
+long-context request in a batch drops the *whole* batch to
+PIECEWISE/eager for that step, even if the other requests are
+well within bound. `logger.warning_once` when this fires, so it's
+visible in production, not silently absorbed.
+
+The masked-early-exit alternative (rewrite the HIP gather+attention
+kernel to skip padded tail rows within a fixed-shape graph) would let
+one captured graph serve any live `Sk` up to `max_model_len` at true
+cost — the ideal fix — but grid dims are still frozen at capture, so
+it needs the kernel body itself to branch/skip on a runtime tensor
+value: a real kernel-design project, not a knob. The bounded-capture
+approach is the cheap, low-risk first step; the kernel rewrite is the
+natural follow-up if the batch-wide-cliff fallback rate proves too
+high in practice.
+
+#### Performance impact (estimated, NOT measured — needs the gate)
+
+Using the `Sk`-linear coefficient from `DEVLOG-fa-attention.md` (327
+µs/layer @ Sk~2176, 72 µs/layer @ Sk~500 → ≈0.152 µs/layer per token of
+`Sk`) and the S8 evidence (131072-capture graph decode 39.9 t/s ≈ 25
+ms/step), assuming ~10 FA layers:
+
+| capture Sk bound | est. FA-kernel time (10 layers) | est. step time | est. decode t/s |
+|---|---|---|---|
+| 131072 (today) | ~19.7 ms | ~25 ms (measured) | 39.9 (measured) |
+| 32768 | ~4.9 ms | ~10.3 ms | ~97 (**~2.4×**) |
+| 4096 | ~0.6 ms | ~6.0 ms | ~166 (**~4×**, dubious — see caveat) |
+
+**Caveat:** this is a two-point linear fit extrapolated 40-60× below
+its calibration range (Sk~500-2176 → bound 4096-32768), and it ignores
+non-attention step time possibly having its own floor/overhead that
+doesn't shrink with Sk. Treat only the qualitative direction (large
+win for a well-chosen bound) as trustworthy; the specific multipliers
+need a real capture-bound sweep to confirm.
+
+**For requests that fall back (exceed the bound):** no worse than
+today in absolute terms — they already never benefited from the
+FULL-graph shape (capture always baked the worst case for everyone).
+Per S8, eager decode at matched short context runs ~19.5 t/s regardless
+of `max_model_len` — call this the fallback-path floor. Today, a
+long-context request already pays close to `max_model_len`-wide FULL
+attention cost every step; whether that is currently faster or slower
+than the eager floor at genuinely long real context is **not yet
+measured** (S8's eager numbers are at ~1.5k tokens only) — needed
+before claiming the fallback path is strictly non-regressive at long
+context, not just at short context.
+
+**Batch-wide cliff caveat:** dispatch is per-step, not per-request, so
+realized gains depend heavily on concurrency and context-length
+distribution. Single-request benchmarks (the existing
+`_bench_gfx906.py` harness, `max_num_seqs=4` in the S5 config) will
+read close to the ideal per-request numbers above; heterogeneous
+multi-tenant serving with even occasional long-context requests will
+see a smaller realized win, since one long request poisons FULL-graph
+eligibility for the whole batch that step.
+
+**Second-order effects not in the table:** capture time/VRAM should be
+roughly unchanged or slightly better (smaller gather buffers during
+capture); mode-switching overhead (FULL this step, PIECEWISE next) is
+unmeasured but likely small next to the attention-cost swing; smaller
+`Sk_pad` gather buffers free VRAM that could fund more KV-cache blocks
+(more concurrency) — a real secondary win not captured in the t/s
+table at all.
+
+#### What the gate needs to confirm before this ships
+
+1. Bounded-capture serving A/B (`_bench_gfx906.py`-style, per house
+   protocol) across a sweep of bounds (e.g. 4k/8k/16k/32k/64k) at
+   fixed real context below each bound — confirms/corrects the
+   `Sk`-linear extrapolation above.
+2. The same sweep at real context *above* each bound — confirms the
+   fallback path is non-regressive (not just non-improving) relative
+   to today's baseline at that context length.
+3. A concurrency/mixed-length A/B (`BENCH_MAX_SEQS`-style, per the
+   C2-V precedent in `moe-decode-roadmap.md`) — quantifies the
+   batch-wide-cliff discount versus the single-request numbers above.
+4. PPL/greedy correctness gate on the fallback path itself (should be
+   a no-op numerically since eager/piecewise `GFX906_FA` is already
+   the LEGACY=1 default path in non-FULL execution, but must be run,
+   not assumed).
+
+### Alternative — multi-tier capture (several Sk buckets)
+
+Prompted by the correction above: instead of one bound with a binary
+eager fallback, capture FULL graphs at several `Sk_pad` tiers (e.g.
+4k/32k/128k/262k) and dispatch to the smallest tier that covers the
+batch's live `max_seq_len`, the same way `cudagraph_capture_sizes`
+already buckets batch size today. This directly attacks the cliff:
+a 33k-token conversation lands in the 128k tier instead of falling
+all the way to eager.
+
+**Why this is a worse ceiling than masked early-exit, not just a
+cheaper stopgap:**
+
+- **Cost multiplies per tier, not just once.** Every additional Sk
+  tier is a full additional set of captured graphs (crossed with the
+  existing batch-size buckets), each with its own gather-buffer
+  generation. Per the capture-safety design in
+  `_ensure_gather_buffers` (a buffer baked into a graph is retired,
+  never freed, for the worker's lifetime), N Sk tiers means N
+  simultaneously-resident gather-buffer generations, each sized to
+  its tier's `Sk_pad`. On a 32 GB MI50 already fighting for KV-cache
+  headroom (the entire reason `--max-model-len` capacity work
+  happened), this directly competes with the KV cache the feature
+  exists to serve. Capture time also multiplies with tier count.
+- **Still a step function, not a fix.** Each tier still pays its
+  *bucket's* `Sk_pad` cost, not the request's real `seq_len` — a 33k
+  request in a 128k tier pays 128k-wide dense attention, ~4x its real
+  cost. Finer tiers shrink average waste but push VRAM/capture cost up
+  further; coarser tiers keep VRAM/capture cost down but leave more
+  waste per request. There is no tier count that removes the
+  structural `O(bucket_size)` tax — only ones that trade its size
+  against resource cost.
+- **The cliff shrinks but does not disappear.** Dispatch is still
+  batch-scalar: one long request in a batch still forces the whole
+  batch to that request's tier (or to eager, above the largest tier).
+  More tiers make the *average* cliff smaller but every tier boundary
+  is still a boundary.
+- **What it doesn't touch:** the underlying kernel is unchanged — this
+  is purely a capture/dispatch-side mitigation, same engineering
+  category (and similar risk/cost profile) as the single-bound
+  proposal above, just repeated N times.
+
+**Verdict:** viable as an incremental improvement over a single bound
+(fewer requests hit the eager cliff, at proportionally more VRAM/capture
+cost), but it is not a real fix for the long-context case — it only
+narrows the gap between "capture-time worst case" and "real cost,"
+never closes it. Not recommended as the target design; could be a
+pragmatic interim step if the masked-early-exit kernel rewrite (below)
+turns out to be infeasible or is deprioritized.
+
+### Alternative — masked early-exit in the kernel (the actual fix for long context)
+
+Instead of bucketing `Sk_pad` at all, make the attention kernel's
+per-request work data-driven at replay time, the same way
+`kernel_paged_attention_2d` (the `ROCM_ATTN`/Triton fallback backend,
+analyzed early in this investigation) already works: grid *shape*
+(batch dim, head dim) is fixed at capture — legal to bake into a
+graph — but the **inner K-loop trip count** is `cdiv(real_seq_len,
+tile_size)`, read from the live `seq_lens` tensor at replay time, not
+from a capture-time constant. Varying a data-dependent loop bound
+inside a captured kernel is ordinary, legal CUDA/HIP; what CUDA graphs
+freeze is launch *geometry* (grid/block dims), not data values a
+kernel reads and branches on.
+
+Applied to `GFX906_FA`: keep the gather buffer allocated at
+`Sk_pad = max_model_len` width as today (one-time VRAM cost, unchanged
+from the current design, paid once regardless of live traffic), but
+change the gather and attention kernels so the attention loop iterates
+`cdiv(real_seq_len, tile_size)` times instead of `cdiv(Sk_pad,
+tile_size)` — using the live `seq_lens` tensor already passed into the
+kernel today. This gets **true `O(real_seq_len)` cost at every context
+length, in a single capture, no tiers, no fallback, no batch-wide
+cliff** — because the grid no longer needs to depend on `Sk` at all
+once the K-loop is internal and data-driven. It also fully fixes "even
+131k configs overpay for short contexts," for every context length,
+not just below some bound — the qualitative win the original proposal
+claimed but, per the correction above, cannot actually deliver.
+
+**A closely related, possibly cheaper path already exists in this
+backend:** `forward_paged_direct`
+(`gfx906_fa_paged.py`/`gfx906_fa.cpp:845`, dispatched via
+`_should_use_direct_paged`) reads directly from the paged KV cache via
+`block_table`/`seq_lens` with **no dense gather buffer at all** —
+same category as `kernel_paged_attention_2d`, i.e. already
+`seq_len`-driven rather than capacity-driven. If its cost profile is
+confirmed flat/linear in real `seq_len` (not yet measured — needs the
+same `Sk`-sweep gate as everything else here), routing `GFX906_FA`'s
+FULL-graph decode through this path would sidestep writing a new
+kernel entirely. **It is not free to enable today**: it requires the
+Q8 K side-buffer (`key_cache_q8 is not None`, i.e. `GFX906_FA_LEGACY=0`),
+and `GFX906_FA_LEGACY=0` is currently flagged experimental and
+**fails closed** (`RuntimeError`) when combined with prefix caching
+(`get_cudagraph_support`, per R2 in `moe-decode-roadmap.md` §9.1) —
+because the Q8 side-buffer misses COW'd prefix-cache blocks and
+produces corrupt output. Since prefix caching is exactly what makes
+long multi-turn conversations affordable, that correctness gap would
+need closing first (making the Q8 side-buffer COW-aware) before this
+route is usable — real work, but likely less than a from-scratch
+kernel rewrite, since the direct-paged kernel and its causal/
+block-table addressing already exist and are validated for the
+non-prefix-caching case.
+
+**Cost:** real kernel-design work either way — either extending
+`forward_paged_direct`'s Q8 side-buffer to stay COW-consistent, or
+rewriting the dense gather-attention kernel's inner loop to be
+`seq_len`-driven. Both are correctness-critical changes to vendored
+HIP code (`csrc/gfx906_fa/`), not the cheap Python/config change the
+bounded-capture proposal is. Needs the same house-protocol rigor as
+any gfx906 kernel change: standalone kernel tests, PPL/greedy gates,
+serving A/B — likely a multi-session effort, not a quick follow-up.
+
+**Recommendation:** masked early-exit (via either route) is the
+correct target — it is the only option that actually serves long
+conversations fast, matching the reason `--max-model-len` capacity
+work happened at all. Multi-tier capture and the single-bound proposal
+are both capture/dispatch-side mitigations that cap the *worst* case
+tax without removing the structural `O(capacity)` cost; they may still
+be worth shipping first as a cheap, low-risk win for short-context
+traffic while the kernel work is scoped, but neither should be
+described as "fixing" the `max_model_len` decode tax — only as
+narrowing which traffic still pays it.
+
+## RESOLUTION UPDATE (2026-08-22) — fix shipped on branch `gfx906/fa-masked-gather`
+
+The "masked early-exit in the kernel" route (final section above) was
+implemented as the plan `plan_masked_fa.md` §2.2 design — a persistent
+grid-stride fused gather+quantize kernel (`gather_paged_kv_quant_persistent`)
+with a fixed capture-time grid and work bounded by the live `seq_lens`
+tensor. The single-bound bounded-capture design and the multi-tier
+alternative were NOT built (superseded; see the CORRECTION above).
+All house-protocol gates passed, including the serving A/B (THE gate):
+131k 22.4→40.9 t/s, 262k 15.9→40.9 t/s (plain-greedy harness; P0 tax
+−28.8% here vs the −25% of the mtp2 S8 numbers), residual tax at P1
+0.07% (noise). `GFX906_FA_PERSIST` default ON. Full record:
+`DEVLOG-masked-fa.md`. Status of this doc: diagnosis final; fix lever
+realized as the kernel route; roadmap N4 → RESOLVED (pending merge).

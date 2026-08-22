@@ -103,7 +103,8 @@ static int get_fa_persist_grid() {
 }
 // GFX906_FA_PERSIST_MARGIN: V-only zero rows written past seq_len as a
 // defensive headroom for the FA tail tile (max D=256 nbatch_fa is 128).
-// Set to 0 once the NaN-tail gate (plan step 2) passes.
+// The NaN-tail gate PASSED (DEVLOG-masked-fa.md) — 0 is safe; 128 stays
+// the conservative default (belt-and-braces, ~64 KB/head; droppable).
 static int get_fa_persist_margin() {
     static int v = [] {
         const char *e = std::getenv("GFX906_FA_PERSIST_MARGIN");

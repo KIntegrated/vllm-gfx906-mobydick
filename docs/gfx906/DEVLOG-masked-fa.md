@@ -166,3 +166,54 @@ path (bit-equal but unmaterialized) — now fully materialized, re-run
 PASS. Residuals (review P1/P2): mtp2 A/B before re-baselining S8,
 D=128 probe before widening default-ON, prefix-widen to B=32
 follow-up, B>16 configs still pay the Sk tax (old behavior).
+
+## 2026-08-22 (post-commit 2) — cross-review fold + gate hardening
+
+**VERDICT:** SHIPPED · **GATE:** probe/suite re-runs (no kernel-behavior
+change — C++ edit comment-only, Python debug-only — so no serving A/B
+required).
+
+Third review (`fa-masked-gather-code-rev-glm5.md`, folding the ds4 and
+qwen reviews; every claim validated or rejected against the tree at
+`ddd2adbdeb`):
+
+- **qwen P0-1 / ds4 F1 (B>16 throw at engine start): VALIDATED.**
+  Reproduced through `forward_paged` at B=17 pre-fix; default capture
+  sizes `[1,2,4]+range(8,256,8)+...≤512` (`vllm/config/compilation.py`)
+  and default `max_num_seqs=1024` (`arg_utils.py`) confirmed — engine
+  start would crash at default config. `ddd2adbdeb` fix validated
+  (B=17 dispatches to the fused path, no throw; suite 21/21).
+- **ds4 F5 (margin knob re-read per launch): REJECTED** — both
+  `GFX906_FA_PERSIST_{GRID,MARGIN}` are `static` read-once
+  (`get_fa_persist_*`), identical pattern; no asymmetry.
+- **qwen P2-5 residual ("now fully materialized"): PARTLY** — the
+  `ddd2adbdeb` width fix removed the skip-guard path, but the last 16
+  blocks/seq still aliased phys block 0 via the zero-filled table
+  tail. Fixed here (full-width fill).
+
+Hardening landed (this commit):
+
+- `fa_nantail_probe.py`: Sq>1 inline-causal cases — mtp2 verify (sq=3),
+  prefill chunk (sq=64, ncols1=64), worst-case tail sq=2, GQA-packed
+  mtp2 B=2 — closing the Sq=1-only coverage gap (tail-write removal
+  now gated on the spec-decode/prefill tile geometries too).
+  Re-run: **11/11 PASS**.
+- `fa_capture_replay_probe.py`: full-width block tables (no tail
+  aliasing); dead `REPLAY_SLS` constant removed. Re-run: **16/16
+  PASS** (B=1..4 × sl {128, 1536, 262112, 262144}).
+- `gfx906_fa_paged.py`: `GFX906_FA_DOUBLE_CHECK=1` now cross-checks the
+  persistent branch against the torch reference (per-seq in-range
+  rows; raises on mismatch) — smoke-run OK at B=3 ragged.
+  `GFX906_FA_FUSED_QUANT=0`-dead-under-PERSIST documented at the knob.
+- `csrc/gfx906_fa/gfx906_fa.cpp`: stale margin comment fixed (NaN gate
+  passed; 128 stays as the decided conservative default).
+- `tp_decode_investigation.md`: fix-lever/alternatives sections
+  bannered SUPERSEDED → this log (they read as still-open after the
+  2026-08-21 rewrite).
+
+Suite: 21/21. Refrigerated (unchanged): mtp2 in-model A/B before
+re-baselining S8; D=128 probe before widening default-ON past the
+D=256 model family; register-prefix widen to B=32 (house MoE
+`max_num_seqs=32` still pays the Sk tax above 16);
+small-`max_model_len` serving A/B (persistent replaced fused V1 at
+Sk≤65535 with kernel-level evidence only); `MARGIN=0` optional drop.
