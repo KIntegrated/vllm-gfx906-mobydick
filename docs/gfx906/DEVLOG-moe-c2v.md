@@ -6,13 +6,20 @@
 
 **VERDICT:** OPEN (in progress — Stage 0 running)
 
-**GATE:** serving A/B, decode-only t/s (Δ-wall method,
-`benchmarks/kernels/gfx906/moe_multireq_ab.py`), pp=2048/tg=256,
-graph mode (eager for Stage-1 A/B arms), N=1/4/8/32 concurrent,
-TP=1 and TP=2, flags off/on with interleaved engines, 3 repeats per
-engine. Reopen rule (roadmap C2-V(v2)): **any positive ≥0.5% reopens
-C2-gemm1 and the S5 gemm1 branch.** Single-request anchor: 67.39 t/s
-band (65.9–67.0).
+**GATE:** serving A/B, pp=2048/tg=256, graph mode (eager for Stage-1
+A/B arms), N=1/4/8/32 concurrent, TP=1 and TP=2, flags off/on with
+interleaved engines, 3 repeats per engine. Reopen rule (roadmap
+C2-V(v2)): **any positive ≥0.5% reopens C2-gemm1 and the S5 gemm1
+branch.** Metric: decode-only t/s via the Δ-wall method
+(`benchmarks/kernels/gfx906/moe_multireq_ab.py`: tg vs tg_short in
+the same engine — prefill/overlap cancels in the difference). NOTE:
+the 67.39 t/s record (band 65.9–67.0) is the *official harness*
+metric (`_bench_gfx906.py`: 256 / (prefill+decode wall)) — a
+different quantity, not comparable to Δ-method numbers (at equal
+step time the harness reads ~22% lower). The A/B delta is the gate
+(same metric on both arms); the absolute host/build anchor is the
+official harness run (queued after Stage 0, expect the 65.9–67.0
+band) + the mtp2 canary.
 
 ---
 
@@ -85,9 +92,23 @@ results TSV `/tmp/c2v/stage0_results.tsv`).
 - 2026-08-22: branch created; dispatch-gate audit (above); bench
   `benchmarks/kernels/gfx906/moe_multireq_ab.py` (Δ-wall decode-only
   t/s: prefill overlap cancels in the tg vs tg_short difference);
-  Stage-0 driver; roadmap C2-V state line updated.
-- (in progress) Stage-0 run sequence: canary → t1n1 off/on → t2n1
-  off/on (smoke) → t1n4 off/on → t1n8 off → t1n32 off.
+  Stage-0 driver; roadmap C2-V state line updated. (Commit
+  3824813bcf.)
+- (in progress) Stage-0 run sequence (driver PID-logged, logs
+  `/tmp/c2v/`): canary → t1n1 off/on → t2n1 off/on (smoke) → t1n4
+  off/on → t1n8 off → t1n32 off; official-harness 35B run queued
+  after the driver (metric anchor).
+
+### Results so far (2026-08-22, build fed585110)
+
+- **Canary (27B mtp2, 60 s): 38.8 t/s** — below the ~40–47 healthy
+  band but well above the <25 REBOOT line. Soft signal; the 35B
+  official-harness run is the tie-breaker (if it lands < 65.9 the
+  host is off-record and Stage-0 deltas are suspect).
+- **t1n1_off (TP=1, N=1, graph, flag off): 81.17 t/s Δ-metric**
+  (stdev 0.7, min 80.39 / max 81.72; prefill ≈ 0.9 s, step ≈ 12.3 ms).
+  Not comparable to the 67.39 record (different metric — see GATE); the
+  harness anchor run is pending.
 
 ## Evidence — FOR
 
