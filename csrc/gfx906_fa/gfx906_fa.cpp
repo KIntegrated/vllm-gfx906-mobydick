@@ -89,6 +89,31 @@ static int get_fa_kv_split() {
     return v;
 }
 
+// Persistent gather knobs (plan_masked_fa.md). The grid is a capture-time
+// constant (frozen per graph), so these are read once at process start.
+// GFX906_FA_PERSIST_GRID: fixed workgroup count (default 1024 = 17 per
+// CU on the 60-CU MI50; the micro-bench matrix tunes this).
+static int get_fa_persist_grid() {
+    static int v = [] {
+        const char *e = std::getenv("GFX906_FA_PERSIST_GRID");
+        int g = e ? std::atoi(e) : 1024;
+        return g > 0 ? g : 1024;
+    }();
+    return v;
+}
+// GFX906_FA_PERSIST_MARGIN: V-only zero rows written past seq_len as a
+// defensive headroom for the FA tail tile (max D=256 nbatch_fa is 128).
+// The NaN-tail gate PASSED (DEVLOG-masked-fa.md) — 0 is safe; 128 stays
+// the conservative default (belt-and-braces, ~64 KB/head; droppable).
+static int get_fa_persist_margin() {
+    static int v = [] {
+        const char *e = std::getenv("GFX906_FA_PERSIST_MARGIN");
+        int m = e ? std::atoi(e) : 128;
+        return m >= 0 ? m : 0;
+    }();
+    return v;
+}
+
 // Device-side quantize launchers (gfx906_fa_quant.cu)
 extern "C" hipError_t launch_quantize_q8_0_dense(
     const __half * x,
@@ -159,6 +184,33 @@ extern "C" hipError_t launch_gather_paged_kv_quant(
     int bytes_per_row,
     int block_size,
     int max_blocks_per_seq,
+    int64_t k_block_stride,
+    int64_t k_token_stride,
+    int64_t k_head_stride,
+    int64_t v_block_stride,
+    int64_t v_token_stride,
+    int64_t v_head_stride,
+    hipStream_t stream
+);
+
+// Persistent grid-stride fused gather + quantize (LEGACY decode path):
+// fixed grid, live seq_lens-bounded work, valid at every Sk.
+extern "C" hipError_t launch_gather_paged_kv_quant_persistent(
+    const __half  * key_cache,
+    const __half  * value_cache,
+    const int32_t * block_table,
+    const int32_t * seq_lens,
+    uint8_t       * k_q8_out,
+    __half        * v_out,
+    int num_seqs,
+    int num_kv_heads,
+    int Sk,
+    int D,
+    int bytes_per_row,
+    int block_size,
+    int max_blocks_per_seq,
+    int margin_zeros,
+    int grid,
     int64_t k_block_stride,
     int64_t k_token_stride,
     int64_t k_head_stride,
@@ -827,6 +879,111 @@ std::vector<torch::Tensor> gather_paged_kv_quantized(
 }
 
 // ============================================================================
+// Persistent grid-stride fused gather + quantize (LEGACY decode path).
+// One kernel with a fixed (capture-time-constant) grid whose work is
+// bounded by the live seq_lens tensor — replaces the two-kernel > 65535
+// fallback at every Sk. K output is bit-equal to
+// quantize_q8_0(gather_paged_kv_fp16(x)); V is a byte copy. Rows >=
+// seq_len are not written, except `margin_zeros` V-only zero rows past
+// seq_len (defensive FA tail-tile headroom, GFX906_FA_PERSIST_MARGIN).
+// ============================================================================
+std::vector<torch::Tensor> gather_paged_kv_quant_persistent(
+    torch::Tensor key_cache,     // fp16 [num_blocks, block_size, Hkv, D]
+    torch::Tensor value_cache,   // fp16 [num_blocks, block_size, Hkv, D]
+    torch::Tensor block_table,   // int32 [num_seqs, max_num_blocks]
+    torch::Tensor seq_lens,      // int32 [num_seqs]
+    int64_t Sk,
+    c10::optional<torch::Tensor> k_out_opt = c10::nullopt,  // uint8 [B,Hkv,Sk,bytes]
+    c10::optional<torch::Tensor> v_out_opt = c10::nullopt   // fp16  [B,Hkv,Sk,D]
+) {
+    TORCH_CHECK_CUDA(key_cache);
+    TORCH_CHECK_CUDA(value_cache);
+    TORCH_CHECK_CUDA(block_table);
+    TORCH_CHECK_CUDA(seq_lens);
+
+    TORCH_CHECK(key_cache.dtype() == torch::kFloat16, "key_cache must be fp16");
+    TORCH_CHECK(value_cache.dtype() == torch::kFloat16, "value_cache must be fp16");
+    TORCH_CHECK(seq_lens.dtype() == torch::kInt32, "seq_lens must be int32");
+    TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4, "caches must be 4D");
+
+    const int num_blocks     = key_cache.size(0);
+    const int block_size     = key_cache.size(1);
+    const int num_kv_heads   = key_cache.size(2);
+    const int D              = key_cache.size(3);
+
+    TORCH_CHECK(value_cache.size(0) == num_blocks, "value_cache blocks mismatch");
+    TORCH_CHECK(value_cache.size(1) == block_size, "value_cache block_size mismatch");
+    TORCH_CHECK(value_cache.size(2) == num_kv_heads, "value_cache Hkv mismatch");
+    TORCH_CHECK(value_cache.size(3) == D, "value_cache D mismatch");
+    TORCH_CHECK(D % 32 == 0, "D must be multiple of 32");
+
+    TORCH_CHECK(block_table.dtype() == torch::kInt32,
+                "block_table must be int32");
+    TORCH_CHECK(block_table.is_contiguous(), "block_table must be contiguous");
+    TORCH_CHECK(seq_lens.is_contiguous(), "seq_lens must be contiguous");
+
+    const int num_seqs           = block_table.size(0);
+    const int max_blocks_per_seq = block_table.size(1);
+    TORCH_CHECK(seq_lens.size(0) == num_seqs, "seq_lens vs block_table batch mismatch");
+    TORCH_CHECK(Sk > 0 && (Sk % 32) == 0, "Sk must be positive multiple of 32, got ", Sk);
+    TORCH_CHECK(num_seqs <= 16, "num_seqs must be <= 16, got ", num_seqs);
+
+    const int bytes_per_row = (D / 32) * 34;
+
+    auto use_or_alloc = [&](const c10::optional<torch::Tensor>& buf,
+                            at::TensorOptions opts,
+                            int64_t dim3) -> torch::Tensor {
+        if (buf.has_value()) {
+            const auto & t = buf.value();
+            if (t.dim() == 4
+                && t.size(0) == num_seqs
+                && t.size(1) == num_kv_heads
+                && t.size(2) == Sk
+                && t.size(3) == dim3
+                && t.dtype() == opts.dtype()
+                && t.device() == opts.device()
+                && t.is_contiguous()) {
+                return t;
+            }
+        }
+        return torch::empty({(int64_t)num_seqs, (int64_t)num_kv_heads, Sk, dim3}, opts);
+    };
+    auto k_out = use_or_alloc(k_out_opt, key_cache.options().dtype(torch::kUInt8),
+                              (int64_t)bytes_per_row);
+    auto v_out = use_or_alloc(v_out_opt, key_cache.options(), (int64_t)D);
+
+    const int64_t k_block_stride = key_cache.stride(0);
+    const int64_t k_token_stride = key_cache.stride(1);
+    const int64_t k_head_stride  = key_cache.stride(2);
+    const int64_t v_block_stride = value_cache.stride(0);
+    const int64_t v_token_stride = value_cache.stride(1);
+    const int64_t v_head_stride  = value_cache.stride(2);
+    TORCH_CHECK(key_cache.stride(3) == 1 && value_cache.stride(3) == 1,
+                "gather_paged_kv_quant_persistent: last dim must be contiguous");
+
+    auto stream = c10::hip::getCurrentHIPStream().stream();
+    hipError_t err = launch_gather_paged_kv_quant_persistent(
+        reinterpret_cast<const __half*>(key_cache.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(value_cache.data_ptr<at::Half>()),
+        block_table.data_ptr<int32_t>(),
+        seq_lens.data_ptr<int32_t>(),
+        k_out.data_ptr<uint8_t>(),
+        reinterpret_cast<__half*>(v_out.data_ptr<at::Half>()),
+        num_seqs, num_kv_heads, (int)Sk, D, bytes_per_row, block_size,
+        max_blocks_per_seq,
+        get_fa_persist_margin(), get_fa_persist_grid(),
+        k_block_stride, k_token_stride, k_head_stride,
+        v_block_stride, v_token_stride, v_head_stride,
+        stream
+    );
+    TORCH_CHECK(err == hipSuccess,
+                "launch_gather_paged_kv_quant_persistent failed: ",
+                hipGetErrorString(err));
+
+    return {k_out, v_out};
+}
+
+// ============================================================================
 // Level 3c: Direct-paged FlashAttention.
 //
 // НЕТ gather step: kernel читает K/V directly from paged cache через
@@ -1016,6 +1173,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "LEGACY-path fused gather: paged fp16 K + paged fp16 V -> contiguous "
           "BHSD outputs. Returns [k_out, v_out]. V tail zeroed per seq_lens; "
           "K tail unmasked (FA kernel cuts via kv_max).",
+          py::arg("key_cache"), py::arg("value_cache"),
+          py::arg("block_table"), py::arg("seq_lens"), py::arg("Sk"),
+          py::arg("k_out") = c10::nullopt,
+          py::arg("v_out") = c10::nullopt);
+    m.def("gather_paged_kv_quant_persistent", &gather_paged_kv_quant_persistent,
+          "Persistent grid-stride fused gather+quantize (LEGACY path): "
+          "fixed grid (GFX906_FA_PERSIST_GRID), work bounded by the live "
+          "seq_lens tensor, valid at every Sk. K bit-equal to "
+          "quantize_q8_0(gather_paged_kv_fp16(x)); rows >= seq_len are not "
+          "written except GFX906_FA_PERSIST_MARGIN V-zero rows.",
           py::arg("key_cache"), py::arg("value_cache"),
           py::arg("block_table"), py::arg("seq_lens"), py::arg("Sk"),
           py::arg("k_out") = c10::nullopt,

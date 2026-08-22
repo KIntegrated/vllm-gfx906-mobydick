@@ -224,6 +224,192 @@ def test_cudagraph_capture_replay_legacy_decode_path():
     assert ((out1 - ref200).norm() / ref200.norm()).item() < 2e-2
 
 
+def test_persistent_gather_capture_replay_large_sk():
+    """N4 fix gate: the persistent fused gather+quantize
+    (GFX906_FA_PERSIST) must be FULL-capture-safe at capacity Sk_pad
+    (262144, above the old 65535 two-kernel boundary) and its replayed
+    end-to-end FA output must match the two-kernel fallback at every
+    live seq_len in the sweep — the launch dim is frozen at Sk_pad while
+    seq_lens is re-read at replay, exactly like the serving FULL graph.
+    Buffer contents beyond seq_len may legitimately differ (tail-write
+    removal, gated by the NaN-tail test); end-to-end output must not.
+    """
+    dev = "cuda"
+    torch.manual_seed(5)
+    sk_pad = 262144
+    n_blocks = sk_pad // BLOCK + 4
+    _, value_cache, kv = _make_paged_cache(n_blocks, dev)
+    scale = 1.0 / math.sqrt(D)
+
+    k16 = torch.zeros(n_blocks, BLOCK, HKV, D, dtype=torch.float16,
+                      device=dev)
+    k16.normal_(0, 0.5)
+    kv[:, 1].normal_(0, 0.5)
+
+    from vllm.gfx906_fa import gfx906_fa_paged as fpp
+    from vllm.gfx906_fa.gfx906_fa_paged import forward_paged
+
+    q = torch.randn(1, HQ, D, device=dev, dtype=torch.float32) * 0.5
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, -1)
+    sl = torch.tensor([100], dtype=torch.int32, device=dev)
+    cu = torch.arange(2, dtype=torch.int32, device=dev)
+    q_pad = torch.zeros(1, HQ, 1, D, dtype=torch.float32, device=dev)
+
+    def fwd(persist, msk):
+        fpp._PERSISTENT = persist
+        return forward_paged(
+            q, k16, value_cache, bt, sl, cu,
+            max_seqlen_q=1, max_seqlen_k=msk, scale=scale,
+            key_cache_q8=None, q_pad_buf=q_pad,
+        )
+
+    orig = fpp._PERSISTENT
+    try:
+        # warmup the persistent path at small Sk, then capture at capacity
+        s = torch.cuda.Stream()
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                fwd(True, 128)
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = fwd(True, sk_pad)
+    finally:
+        fpp._PERSISTENT = orig
+
+    def rel_err(a, b):
+        return ((a - b).norm() / b.norm()).item()
+
+    sweep = [32, 100, 2048, 65504, 65536, 65600, 131072, sk_pad - 32,
+             sk_pad]
+    for v in sweep:
+        sl.fill_(v)
+        g.replay()
+        torch.cuda.synchronize()
+        ref_two = fwd(False, sk_pad)          # two-kernel fallback
+        ref_persist = fwd(True, sk_pad)       # eager persistent
+        e_two = rel_err(out, ref_two)
+        e_persist = rel_err(out, ref_persist)
+        assert e_persist == 0.0, (
+            f"replay vs eager persistent not bit-exact at sl={v}: "
+            f"rel={e_persist}")
+        assert e_two < 2e-2, (
+            f"replay vs two-kernel fallback diverges at sl={v}: rel={e_two}")
+
+
+def test_persistent_dispatch_fallback_large_batch():
+    """P0 regression guard (fa-masked-gather review): with PERSIST default
+    ON, a batch above the kernel's 16-seq bound must fall back to the
+    fused/two-kernel paths (old behavior) instead of hitting the C++
+    TORCH_CHECK(num_seqs <= 16) — which would crash engine start for any
+    default max_num_seqs (> 16)."""
+    dev = "cuda"
+    torch.manual_seed(7)
+    b = 17
+    max_len = 512
+    n_blocks = b * (max_len // BLOCK)
+    kv = torch.zeros(n_blocks, 2, BLOCK, HKV, D,
+                     dtype=torch.float16, device=dev)
+    key_cache, value_cache = kv.unbind(1)
+    kv[:, 0].normal_(0, 0.5)
+    kv[:, 1].normal_(0, 0.5)
+
+    from vllm.gfx906_fa import gfx906_fa_paged as fpp
+    from vllm.gfx906_fa.gfx906_fa_paged import forward_paged
+
+    scale = 1.0 / math.sqrt(D)
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev)
+    bt = bt.view(b, max_len // BLOCK).contiguous()
+    sl = torch.tensor([33, 100, 200, 333, 512] + [400] * (b - 5),
+                      dtype=torch.int32, device=dev)
+    cu = torch.arange(b + 1, dtype=torch.int32, device=dev)
+    q = torch.randn(b, HQ, D, device=dev, dtype=torch.float32) * 0.5
+    q_pad = torch.zeros(b, HQ, 1, D, device=dev, dtype=torch.float32)
+
+    def fwd(persist):
+        fpp._PERSISTENT = persist
+        return forward_paged(
+            q, key_cache, value_cache, bt, sl, cu,
+            max_seqlen_q=1, max_seqlen_k=max_len, scale=scale,
+            key_cache_q8=None, q_pad_buf=q_pad,
+        )
+
+    orig = fpp._PERSISTENT
+    try:
+        out_persist = fwd(True)   # must not raise (B=17 > 16)
+        out_ref = fwd(False)
+    finally:
+        fpp._PERSISTENT = orig
+    assert torch.equal(out_persist, out_ref)
+
+
+def test_persistent_gather_bit_equal_to_fused_at_batch_bound():
+    """B=16 (the kernel's register-prefix bound), ragged seq_lens, small
+    Sk: the persistent kernel must be bit-equal to the fused kernel
+    (gather_paged_kv_quantized) in-range. The capture probe covers
+    B=1..4 at full 262k live; this covers the prefix bound itself."""
+    dev = "cuda"
+    torch.manual_seed(11)
+    b, sk = 16, 1024
+    max_len = 1000
+    n_blocks = b * (sk // BLOCK)
+    kv = torch.zeros(n_blocks, 2, BLOCK, HKV, D,
+                     dtype=torch.float16, device=dev)
+    key_cache, value_cache = kv.unbind(1)
+    kv[:, 0].normal_(0, 0.5)
+    kv[:, 1].normal_(0, 0.5)
+
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev)
+    bt = bt.view(b, sk // BLOCK).contiguous()
+    sl = torch.tensor(
+        [1, 33, 100, 300, 512, 777, 1000] + [640] * (b - 7),
+        dtype=torch.int32, device=dev)
+
+    kb = torch.empty(b, HKV, sk, BYTES, dtype=torch.uint8, device=dev)
+    vb = torch.empty(b, HKV, sk, D, dtype=torch.float16, device=dev)
+    k_fused, v_fused = fa.gather_paged_kv_quantized(
+        key_cache, value_cache, bt, sl, sk)
+    k_p, v_p = fa.gather_paged_kv_quant_persistent(
+        key_cache, value_cache, bt, sl, sk, k_out=kb, v_out=vb)
+    for s_ in range(b):
+        L = int(sl[s_])
+        assert torch.equal(k_p[s_, :, :L], k_fused[s_, :, :L]), f"K s={s_}"
+        assert torch.equal(v_p[s_, :, :L], v_fused[s_, :, :L]), f"V s={s_}"
+
+
+def test_persistent_gather_d128_matches_fused():
+    """D=128 (other advertised head size; different FA tile config):
+    persistent kernel bit-equal to the fused kernel in-range. Kernel is
+    D-generic (V uint4 D/8 lanes, K blocks_per_row=D/32); this pins it
+    before default-ON widens past the D=256 model family
+    (fa-masked-gather-code-rev-qwen P1-2)."""
+    dev = "cuda"
+    torch.manual_seed(12)
+    d = 128
+    bpr = (d // 32) * 34
+    b, sk = 3, 1024
+    n_blocks = b * (sk // BLOCK)
+    kv = torch.zeros(n_blocks, 2, BLOCK, HKV, d,
+                     dtype=torch.float16, device=dev)
+    key_cache, value_cache = kv.unbind(1)
+    kv[:, 0].normal_(0, 0.5)
+    kv[:, 1].normal_(0, 0.5)
+
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev)
+    bt = bt.view(b, sk // BLOCK).contiguous()
+    sl = torch.tensor([1, 300, 1000], dtype=torch.int32, device=dev)
+
+    k_fused, v_fused = fa.gather_paged_kv_quantized(
+        key_cache, value_cache, bt, sl, sk)
+    k_p, v_p = fa.gather_paged_kv_quant_persistent(
+        key_cache, value_cache, bt, sl, sk)
+    assert k_p.shape == (b, HKV, sk, bpr)
+    for s_ in range(b):
+        L = int(sl[s_])
+        assert torch.equal(k_p[s_, :, :L], k_fused[s_, :, :L]), f"K s={s_}"
+        assert torch.equal(v_p[s_, :, :L], v_fused[s_, :, :L]), f"V s={s_}"
+
+
 def test_fused_fp16_gather_matches_torch_gather():
     """LEGACY-path fused gather (gather_paged_kv_fp16) must match the torch
     _gather_kv reference in the valid region; V tail zeroed; K tail

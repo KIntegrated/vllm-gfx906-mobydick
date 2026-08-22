@@ -97,9 +97,27 @@ _DOUBLE_CHECK = (_os.environ.get("GFX906_FA_DOUBLE_CHECK", "0") == "1"
 _TORCH_GATHER = (_os.environ.get("GFX906_FA_TORCH_GATHER", "0") == "1"
                  or _FA_DEBUG)
 # Stage 2: fuse the legacy-path gather + quantize into one kernel
-# (bit-equal to gather_paged_kv_fp16 + quantize_q8_0). GFX906_FA_FUSED_QUANT=0
-# reverts to the two-kernel path.
+# (bit-equal to gather_paged_kv_fp16 + quantize_q8_0). Dispatch
+# precedence in the legacy branch: PERSIST > FUSED_QUANT > two-kernel —
+# with _PERSISTENT on (default), GFX906_FA_FUSED_QUANT=0 is IGNORED and
+# the two-kernel path is only reached via GFX906_FA_PERSIST=0 or
+# num_seqs > _PERSIST_MAX_SEQS.
 _FUSED_QUANT = _os.environ.get("GFX906_FA_FUSED_QUANT", "1") != "0"
+# Persistent grid-stride fused gather+quantize (plan_masked_fa.md §2.2):
+# fixed capture-time grid, work bounded by the live seq_lens tensor —
+# valid at every Sk (replaces the two-kernel > 65535 fallback and the
+# per-token fused kernel). K output is bit-equal to the old paths;
+# gates in DEVLOG-masked-fa.md (NaN-tail, capture/replay B=1..4, PPL,
+# TP=2 serving A/B: 15.9->40.9 t/s at 262k). Default ON; GFX906_FA_PERSIST=0
+# is the kill switch.
+_PERSISTENT = _os.environ.get("GFX906_FA_PERSIST", "1") != "0"
+# Kernel bound: the persistent gather prefix-sums per-seq counts in a
+# fixed 16-entry register array (csrc launcher rejects num_seqs > 16 with
+# an error, which would crash engine start for any default max_num_seqs).
+# Batches above the bound fall back to the fused/two-kernel paths (old
+# behavior, still Sk-bounded) instead of dispatching to the persistent
+# kernel.
+_PERSIST_MAX_SEQS = 16
 # P3-4: skip the LEGACY-path q_pad zero_ on the Sq=1 decode fast path
 # (pad rows are per-row-independent and discarded; the q8_0 quantization
 # clamps NaN/Inf garbage). GFX906_FA_QPAD_EMPTY=0 reverts to the zero_.
@@ -497,7 +515,43 @@ def forward_paged(
                       else block_table.to(torch.int32)).contiguous()
             sl_i32 = (seq_lens if seq_lens.dtype == torch.int32
                       else seq_lens.to(torch.int32)).contiguous()
-            if _FUSED_QUANT and Sk_pad <= 65535:
+            if _PERSISTENT and num_seqs <= _PERSIST_MAX_SEQS:
+                # One kernel at every Sk: fixed grid, live-bounded work,
+                # in-kernel quantize (bit-equal K), V tail rows not written
+                # (FA cuts at kv_max; margin zeros per
+                # GFX906_FA_PERSIST_MARGIN). num_seqs > _PERSIST_MAX_SEQS
+                # falls through to the fused/two-kernel paths below.
+                K_q8, V_bhsd = gfx906_fa.gather_paged_kv_quant_persistent(
+                    key_cache, value_cache, bt_i32, sl_i32, Sk_pad,
+                    k_out=kbuf, v_out=vbuf,
+                )
+                if _DOUBLE_CHECK:
+                    # Torch reference, per-seq in-range rows only (the
+                    # persistent kernel does not write rows >= seq_len,
+                    # unlike the fused/two-kernel paths which zero the V
+                    # tail — that difference is gated separately by the
+                    # NaN-tail probe, not by this check).
+                    k_ref, v_ref = _gather_kv(
+                        key_cache, value_cache, block_table, seq_lens,
+                        max_seqlen_k)
+                    kq_ref = gfx906_fa.quantize_q8_0(k_ref)
+                    bad = [
+                        s for s in range(num_seqs)
+                        if not (torch.equal(
+                                    K_q8[s, :, :int(seq_lens[s])],
+                                    kq_ref[s, :, :int(seq_lens[s])])
+                                and torch.equal(
+                                    V_bhsd[s, :, :int(seq_lens[s])],
+                                    v_ref[s, :, :int(seq_lens[s])]))
+                    ]
+                    print(f"[FA-DC] persistent==torch (in-range): "
+                          f"{'OK' if not bad else f'MISMATCH seqs {bad}'} "
+                          f"B={num_seqs} Sk_pad={Sk_pad} "
+                          f"sl={seq_lens.tolist()[:4]}", flush=True)
+                    if bad:
+                        raise RuntimeError(
+                            f"persistent gather mismatch vs torch: {bad}")
+            elif _FUSED_QUANT and Sk_pad <= 65535:
                 K_q8, V_bhsd = gfx906_fa.gather_paged_kv_quantized(
                     key_cache, value_cache, bt_i32, sl_i32, Sk_pad,
                     k_out=kbuf, v_out=vbuf,

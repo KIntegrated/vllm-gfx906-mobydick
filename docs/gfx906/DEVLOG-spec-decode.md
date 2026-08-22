@@ -1239,3 +1239,87 @@ shifts the page-size fit). Cacheable prefix = `round_down(len, block)`.
 
 **Serving recipe update:** dense 27B serving servers need
 `--gpu-memory-utilization 0.93` (warm inductor cache) — see item 5.
+
+## 2026-08-22 — TP=2 mtp2 engine-cadence overhead root-caused (the "regression" vs S5/S8 records)
+
+**VERDICT:** OPEN (mechanism characterized; no code fix yet) · **GATE:**
+TP=2 mtp2 chrome trace (`/tmp/mtp2_trace/`, `--profiler-config` +
+`/start_profile`) + same-harness TP=1 in-process matrix.
+
+Origin: the N4 re-baseline (DEVLOG-masked-fa post-commit 3) found mtp2
+TP=2 steady 24.9 t/s vs the S8 record 39.9 (same recipe). Read-only
+diagnosis in `fa-masked-mtp-regression-glm5.md` (folds the ds4 + qwen
+reviews; all claims adjudicated) + this session's GPU work:
+
+- **TP=1 is healthy:** record-config rerun (2816, agentic, in-process)
+  49.8 t/s @ 2.72 acc = 54.6 ms/step; fox matrix 62.6/62.9 ms/step at
+  maxlen 2816/32768 (maxlen exonerated; the earlier "+36 ms TP=1-common"
+  was acceptance-confounded). Plain TP=1 unchanged vs record era
+  (40.4 vs 39.5 ms). M=1-vs-M=3 kernel tables show the mtp2-only GPU
+  work is the drafter's two fp16 forwards + the 1.45× M=3 GEMM premium —
+  no pathology.
+- **TP=2 GPU side also healthy:** trace shows gptq-M3 17.6 ms/step
+  (TP=1's 33.6 halved ✓), rccl 8.5 (130 collective kernels/step), FA
+  2.7, gather 0.35; GPU busy 96% of the kernel window; the rocBLAS
+  MT-monsters are prefill chunks.
+- **The pathology is engine cadence:** client/engine 144 ms/step vs
+  ~45-50 ms of GPU work. Worker spends ~57 ms/step blocked in
+  `hipEventSynchronize` waiting for the next step's inputs (3813 ms /
+  272 calls / 71 steps, dedicated thread); visible spec CPU on the
+  worker ≈ 8.5 ms/step (`propose_draft_token_ids` 6.6 incl. ~1 ms Triton
+  re-specialization checks, spec metadata 1.1, rejection 0.8); the rest
+  (~30-40 ms) is EngineCore-side scheduler bookkeeping (untraced
+  process). Plain decode's lighter bookkeeping fits inside its 24.5 ms
+  cadence — that's why only mtp2×TP=2 suffers.
+- **`--async-scheduling` A/B: NO EFFECT** (24.93 vs 24.90 steady;
+  confirmed engaged) — the chain is a per-step GPU→CPU→GPU
+  **data dependency**, not schedulable idle.
+- **Record→now delta:** still unexplained by any diffable code (engine
+  code byte-identical; async default identical; capture topology
+  identical; drafter eager in both). H1 stands: all S5-S8 TP=2 numbers
+  came from one never-rebuilt dirty Aug-19 binary (state unrecoverable).
+  The S5-S8 mtp2/mtp3 records keep their asterisk; the clean-rebuild
+  A/B of `69f615b98` remains the confirmation experiment.
+- **Platform:** the mtp1 TP=2 arm could not boot (3×
+  `hipErrorLaunchFailure` at weight load — the S4-residual wedge; BACO
+  reset needs root). mtp1 scaling point unmeasured.
+
+Refrigerated: `--stream-interval` batched-output test for the
+EngineCore-side share; propose-path CPU trimming (the 6.6 ms/step);
+Triton specialization caching; EngineCore-side trace (untraced process
+needs its own profiler attach); the clean-rebuild confirmation.
+
+Cross-refs: `fa-masked-mtp-regression-glm5.md` (full evidence +
+three-review adjudication), `docs/gfx906/fa-masked-mtp-regression-qwen.md`,
+`fa-masked-mtp-regression-ds4.md`, DEVLOG-masked-fa post-commit 3,
+DEVLOG-tp2-dense S5-S8.
+
+### 2026-08-22 (post-reboot correction) — the "TP=2 mtp2 regression" was HOST-STATE DEGRADATION
+
+**VERDICT: RETRACTED (not a code regression).** A host reboot at 12:39
+restored mtp2 TP=2 serving to **74.9 t/s steady (40.1 ms/step,
+acceptance 3.00, usage-based client)** — 3× the same-boot-prior 24.9,
+on identical binary/config/harness. The build now beats the S8 record
+(62.4 ms/step, which paid the N4 gather tax): healthy-host matrix
+(131k, TP=2, P1): plain 40.9 · mtp1 61.9 (@2.00, 33 ms/step) ·
+mtp2 74.9 · mtp3 88.1 (@4.00, 45.4) t/s — spec decode beats plain
+1.83–2.15× on TP=2 again. The earlier entry's trace analysis described
+the degraded host (worker `hipEventSynchronize` stalls ~57 ms/step =
+the degradation signature, not engine overhead); async-scheduling /
+stream-interval no-ops were no-ops for that reason. The clean-rebuild
+confirmation of `69f615b98` is cancelled (unnecessary).
+
+Two operational lessons, now protocol: (a) SSE-chunk counting
+under-reports spec-decode t/s by ~acceptance (chunks ≈ steps) — use
+`stream_options.include_usage`; (b) **degradation canary**: after GPU
+wedge/reset bursts, run the 60-s TP=1 mtp2 probe in
+`docs/gfx906/degradation_details.md` before recording any spec number —
+slow canary ⇒ reboot. All wedges/degradation get timestamped rows in
+`docs/gfx906/degradation.md` (49 half-wedges + 3 full-wedges +
+1 degradation event logged 2026-08-21→22; the 14:06 full-wedge killed
+the 4-arm mtp2 re-baseline mid-run). **Re-run CLEAN post-reboot
+(canary-passed): 131k P0 49.44 / 262k P0 37.69 / 131k P1 74.74 /
+262k P1 73.51 (steady 74.83) t/s — P0 tax −23.8 %, P1 residual 0.0 %,
+mtp2 = 1.83× plain, identical output hashes across all arms.** Three
+more GPU1 half-wedges during the run did not degrade it (onset data
+point, degradation.md).

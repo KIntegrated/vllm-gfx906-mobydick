@@ -12,6 +12,7 @@ token misses top-k, PPL = exp(-sum(logprob)/n_tokens).
 Usage: VLLM_ENABLE_V1_MULTIPROCESSING=0 python benchmarks/kernels/gfx906/ppl_probe.py
 """
 import math
+import os
 
 from vllm import LLM, SamplingParams
 
@@ -56,8 +57,10 @@ PROMPTS = [
 
 def main():
     llm = LLM(
-        model="/local/models/QuantTrio/Qwen3.5-35B-A3B-AWQ",
+        model=os.environ.get(
+            "BENCH_MODEL", "/local/models/QuantTrio/Qwen3.5-35B-A3B-AWQ"),
         max_num_seqs=8,
+        max_model_len=int(os.environ.get("BENCH_MAXLEN", "32768")),
         gpu_memory_utilization=0.95,
         enforce_eager=True,
         hf_overrides={},
