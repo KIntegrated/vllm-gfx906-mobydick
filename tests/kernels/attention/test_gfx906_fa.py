@@ -377,6 +377,39 @@ def test_persistent_gather_bit_equal_to_fused_at_batch_bound():
         assert torch.equal(v_p[s_, :, :L], v_fused[s_, :, :L]), f"V s={s_}"
 
 
+def test_persistent_gather_d128_matches_fused():
+    """D=128 (other advertised head size; different FA tile config):
+    persistent kernel bit-equal to the fused kernel in-range. Kernel is
+    D-generic (V uint4 D/8 lanes, K blocks_per_row=D/32); this pins it
+    before default-ON widens past the D=256 model family
+    (fa-masked-gather-code-rev-qwen P1-2)."""
+    dev = "cuda"
+    torch.manual_seed(12)
+    d = 128
+    bpr = (d // 32) * 34
+    b, sk = 3, 1024
+    n_blocks = b * (sk // BLOCK)
+    kv = torch.zeros(n_blocks, 2, BLOCK, HKV, d,
+                     dtype=torch.float16, device=dev)
+    key_cache, value_cache = kv.unbind(1)
+    kv[:, 0].normal_(0, 0.5)
+    kv[:, 1].normal_(0, 0.5)
+
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev)
+    bt = bt.view(b, sk // BLOCK).contiguous()
+    sl = torch.tensor([1, 300, 1000], dtype=torch.int32, device=dev)
+
+    k_fused, v_fused = fa.gather_paged_kv_quantized(
+        key_cache, value_cache, bt, sl, sk)
+    k_p, v_p = fa.gather_paged_kv_quant_persistent(
+        key_cache, value_cache, bt, sl, sk)
+    assert k_p.shape == (b, HKV, sk, bpr)
+    for s_ in range(b):
+        L = int(sl[s_])
+        assert torch.equal(k_p[s_, :, :L], k_fused[s_, :, :L]), f"K s={s_}"
+        assert torch.equal(v_p[s_, :, :L], v_fused[s_, :, :L]), f"V s={s_}"
+
+
 def test_fused_fp16_gather_matches_torch_gather():
     """LEGACY-path fused gather (gather_paged_kv_fp16) must match the torch
     _gather_kv reference in the valid region; V tail zeroed; K tail

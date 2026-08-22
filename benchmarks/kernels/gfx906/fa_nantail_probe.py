@@ -41,20 +41,35 @@ D = 256
 BPR = (D // 32) * 34  # 272 bytes per q8_0 row (D=256)
 SCALE = 0.04419417382415922  # 1/sqrt(D)
 
+# D=128 cases: the other advertised head size
+# (supports_head_size {64,128,256}) — different FA tile config; the
+# tail-read precondition must hold there too before default-ON widens
+# past the D=256 model family (fa-masked-gather-code-rev-qwen P1-2).
+D_ALT = 128
+BPR_ALT = (D_ALT // 32) * 34
+SCALE_ALT = 1.0 / (D_ALT ** 0.5)
+
 K_ZERO = torch.zeros(BPR, dtype=torch.uint8, device=dev)
 K_NAN = torch.zeros(BPR, dtype=torch.uint8, device=dev)
 K_NAN[1] = 0x7E  # fp16 NaN scale, little-endian byte 1
+K_ZERO_ALT = torch.zeros(BPR_ALT, dtype=torch.uint8, device=dev)
+K_NAN_ALT = torch.zeros(BPR_ALT, dtype=torch.uint8, device=dev)
+K_NAN_ALT[1] = 0x7E
 
 
-def run_case(fa, hkv, b, sls, sk, sq=1):
-    kb = torch.randn(b, hkv, sk, D, dtype=torch.float16, device=dev)
-    vb = torch.randn(b, hkv, sk, D, dtype=torch.float16, device=dev)
+def run_case(fa, hkv, b, sls, sk, sq=1, d=D):
+    if d == D:
+        bpr, scale, k_zero, k_nan = BPR, SCALE, K_ZERO, K_NAN
+    else:
+        bpr, scale, k_zero, k_nan = BPR_ALT, SCALE_ALT, K_ZERO_ALT, K_NAN_ALT
+    kb = torch.randn(b, hkv, sk, d, dtype=torch.float16, device=dev)
+    vb = torch.randn(b, hkv, sk, d, dtype=torch.float16, device=dev)
     kq = fa.quantize_q8_0(kb)
-    q = torch.randn(b, Hq, sq, D, dtype=torch.float32, device=dev)
+    q = torch.randn(b, Hq, sq, d, dtype=torch.float32, device=dev)
 
     for i, sl in enumerate(sls):
         if sl < sk:
-            kq[i, :, sl:sk, :] = K_ZERO
+            kq[i, :, sl:sk, :] = k_zero
             vb[i, :, sl:sk, :] = 0
     kv_max = torch.tensor(sls, dtype=torch.int32, device=dev)
 
@@ -62,13 +77,13 @@ def run_case(fa, hkv, b, sls, sk, sq=1):
     # prefill/spec-decode) — offset = sl - sq.
     q_off = (kv_max - sq).to(torch.int32) if sq > 1 else None
 
-    o_clean = fa.forward(q, kq, vb, SCALE, kv_max, None, q_off)
+    o_clean = fa.forward(q, kq, vb, scale, kv_max, None, q_off)
 
     for i, sl in enumerate(sls):
         if sl < sk:
-            kq[i, :, sl:sk, :] = K_NAN
+            kq[i, :, sl:sk, :] = k_nan
             vb[i, :, sl:sk, :] = 0x7E00  # fp16 NaN
-    o_poison = fa.forward(q, kq, vb, SCALE, kv_max, None, q_off)
+    o_poison = fa.forward(q, kq, vb, scale, kv_max, None, q_off)
 
     ok = torch.equal(o_clean, o_poison)
     finite = bool(torch.isfinite(o_poison).all())
@@ -91,11 +106,15 @@ def main():
         (2, [2177], 2560, 64),        # prefill chunk (Sq=64, ncols1=64)
         (2, [2559], 2560, 2),         # worst-case tail + Sq=2 (spec n=2)
         (4, [1024, 2177], 2560, 3),   # GQA-packed + mtp2, B=2 ragged
+        (2, [2177], 2560, 1, D_ALT),  # D=128: tail-tile oob, decode
+        (2, [2559], 2560, 1, D_ALT),  # D=128: worst-case tail
+        (2, [2177], 2560, 3, D_ALT),  # D=128: mtp2 inline causal
     ]
     fails = 0
-    for hkv, sls, sk, sq in cases:
-        ok, finite, o = run_case(fa, hkv, len(sls), sls, sk, sq)
-        print(f"hkv={hkv} B={len(sls)} sq={sq} sls={sls} sk={sk}: "
+    for hkv, sls, sk, sq, *drest in cases:
+        d = drest[0] if drest else D
+        ok, finite, o = run_case(fa, hkv, len(sls), sls, sk, sq, d)
+        print(f"D={d} hkv={hkv} B={len(sls)} sq={sq} sls={sls} sk={sk}: "
               f"{'PASS' if ok and finite else 'FAIL'} "
               f"(bit_equal={ok}, finite={finite})")
         if not (ok and finite):
