@@ -148,3 +148,21 @@ can still half-dead (shm-broadcast timeout) and serve empty
   `GFX906_FA_PERSIST_GRID` sweep (512/2048) — 1024 is fine at every
   probed shape; (c) LEGACY=0 direct-paged revisit (COW gap, N2) is
   unaffected and still blocked as before.
+
+## 2026-08-22 (post-commit) — code review found one P0, fixed on-branch
+
+Review: `fa-masked-gather-code-rev-qwen.md` (VERDICT: ship-worthy after
+the P0 fix). **P0**: the `_PERSISTENT` dispatch had no `num_seqs` guard
+while the C++ side throws at `num_seqs > 16` (fixed 16-entry register
+prefix) — with default ON, any `max_num_seqs > 16` (vLLM default 1024;
+house MoE 32) would crash at engine start (default capture sizes go up
+to 512). All gated runs used `--max-num-seqs 4`, which masked it. Fixed
+in `ddd2adbdeb`: dispatch clamped to B ≤ 16 with fallback to the
+fused/two-kernel paths above the bound (old behavior, no throw) + two
+regression tests (B=17 dispatch fallback; B=16 kernel bit-equal) —
+suite 21/21. Same commit: `fa_capture_replay_probe` block-table width
+was too small, so its sl=262144 point was skipping ~196k rows in every
+path (bit-equal but unmaterialized) — now fully materialized, re-run
+PASS. Residuals (review P1/P2): mtp2 A/B before re-baselining S8,
+D=128 probe before widening default-ON, prefix-widen to B=32
+follow-up, B>16 configs still pay the Sk tax (old behavior).
