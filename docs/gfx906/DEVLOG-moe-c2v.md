@@ -104,11 +104,45 @@ results TSV `/tmp/c2v/stage0_results.tsv`).
 - **Canary (27B mtp2, 60 s): 38.8 t/s** — below the ~40–47 healthy
   band but well above the <25 REBOOT line. Soft signal; the 35B
   official-harness run is the tie-breaker (if it lands < 65.9 the
-  host is off-record and Stage-0 deltas are suspect).
+  host is off-record and Stage-0 deltas are suspect). Harness run
+  in progress (queued after the first driver stop).
 - **t1n1_off (TP=1, N=1, graph, flag off): 81.17 t/s Δ-metric**
   (stdev 0.7, min 80.39 / max 81.72; prefill ≈ 0.9 s, step ≈ 12.3 ms).
   Not comparable to the 67.39 record (different metric — see GATE); the
   harness anchor run is pending.
+- **t1n1_m1on (TP=1, N=1, graph, `MOE_M1=1`): 82.46 t/s** (stdev
+  0.13, 82.38–82.61) → **+1.29 t/s = +1.59 % vs off.** This is the
+  KNOWN S5 gemm2-v2 single-request effect re-confirmed on this build
+  (S5 recorded +0.90 % on the harness metric — consistent once
+  prefill dilution is accounted for; 48 layers × ~4.5 µs ≈ 0.2 ms
+  ≈ 1.6 % of a 12.3 ms step). The anchor works as designed: the
+  flag's single-request gain is real and ≥0.5 % on this build. This
+  is NOT new evidence — it is the regime the C2 close already
+  measured; the (v2) verdict rests on the TP=2 and batch/N=4 arms.
+
+### TP=2 smoke failure + workaround (t2n1_off, 20:05Z)
+
+First TP=2 35B-MoE run crashed: rank-1 worker died in
+`RocmPlatform.get_device_name` (torch-compile-cache-dir query) during
+`profile_run` at `moe_forward_shared` — final exception
+`AMDSMI_STATUS_NOT_INIT` from the `with_amdsmi_context` wrapper's
+`finally: amdsmi_shut_down()`, masking the primary error. Rank 0 hung
+on the shm broadcast (GPU0 100 %) until SIGTERM. **No kernel reset**
+(software crash — recorded in `degradation.md` +
+`degradation_details.md` "2026-08-22 evening", incl. a transient
+44 %-VRAM-on-GPU1-with-no-owner observation that turned out to be
+the next config's in-flight allocation). Root fragility: **amdsmi is
+broken on this boot in every run** (TP=1 included — all runs log the
+protected `Failed to get total memory via amdsmi` fallback);
+`get_device_name` is the one unprotected caller. Workaround:
+sitecustomize shim (`/tmp/c2v/shim/sitecustomize.py`) — swallows
+amdsmi init/shutdown failures and gives `get_device_name` the same
+`AMD_<arch>` fallback the code already has for the 0-handles case.
+Upstream fix belongs in `vllm/platforms/rocm.py` (the wrapper's
+`finally` must not raise over the primary error). Stage-0b
+(`/tmp/c2v/run_stage0b.sh`, waiting on the harness job) re-runs:
+TP=1 batch (t1n4 off/on, t1n8, t1n32) then TP=2 N=1 off/on WITH the
+shim (`*_s` arms).
 
 ## Evidence — FOR
 
