@@ -23,6 +23,7 @@ clean engine-core shutdown before exiting (TP=2 teardown protocol:
 unclean kills can wedge GPU1 mid-P2P).
 """
 
+import hashlib
 import json
 import os
 import signal
@@ -133,12 +134,20 @@ def main():
         n_out = sum(len(o.outputs[0].token_ids) for o in outs)
         d = wall_long - wall_short
         decode_tps = n * (tg - tg_short) / d if d > 0 else 0.0
+        # Greedy output fingerprint: A/B arms must produce identical
+        # tokens (a re-tile that changes results is not a win).
+        fp = hashlib.sha1(
+            " ".join(
+                " ".join(map(str, o.outputs[0].token_ids)) for o in outs
+            ).encode()
+        ).hexdigest()[:16]
         rep = {
             "rep": r,
             "wall_short_s": round(wall_short, 2),
             "wall_long_s": round(wall_long, 2),
             "decode_tps": round(decode_tps, 2),
             "out_tokens": n_out,
+            "out_fp": fp,
         }
         reps.append(rep)
         print("C2V-REP: " + json.dumps(rep), flush=True)
@@ -167,6 +176,7 @@ def main():
         "decode_tps_min": round(min(dt), 2),
         "decode_tps_max": round(max(dt), 2),
         "wall_long_mean": round(sum(x["wall_long_s"] for x in reps) / len(reps), 2),
+        "out_fps": sorted(set(x["out_fp"] for x in reps)),
         "reps": reps,
     }
     print("C2V-SUMMARY: " + json.dumps(summary), flush=True)
