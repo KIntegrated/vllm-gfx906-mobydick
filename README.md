@@ -37,7 +37,9 @@ the full change inventory, numbers, and bench recipes.
 | Qwen3.5-27B-AWQ (dense) | optimized | **25.6** |
 | ↳ with MTP k=2 speculative decoding | recommended spec config | **39.4** (1.41×) |
 | Gemma-4-26B-A4B-it-AWQ-4bit | optimized | **67.8** |
-| Qwen3.8-27B-AWQ-INT4 | experimental (eager only, `--dtype float16`) | — |
+| Qwen3.8-27B-AWQ-INT4 (dense) | fully functional (TP=1 + TP=2) | **28.6** (TP=1, 4k ctx; holds at 131k) |
+| ↳ with MTP k=2 speculative decoding | recommended spec config | **41.4** (TP=1) / **42.6** (TP=2, record) |
+| ↳ TP=2 (2× MI50) | context: 445k-token KV pool, 256k bootable max_len | **28.8** @4k / **32.8** @131k ctx |
 | Qwen3.6 fp16 checkpoints (52–67 GB) | do not fit 32 GB | — |
 
 Details, per-model caveats, and bench recipes:
