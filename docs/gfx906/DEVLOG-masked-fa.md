@@ -271,8 +271,12 @@ client tgs TTFT-excluded (same harness as the N4 plain-greedy gate):
   max_seq_len 4096 per `tp2-bench-final.log`). Acceptance is healthy
   (metrics: mean acceptance length 3.00) → the pathology is step time:
   ~120 ms/verify step vs ~24 ms plain decode step, i.e. the mtp2
-  verify/draft path is ~5× the plain step on the post-upstream-merge
-  build (v0.28.0rc2.dev318+gfed58511). Suspect the spec-decode path
+  verify/draft path is ~5× the plain step on the current build
+  (v0.28.0rc2.dev318+gfed58511). [CORRECTED 2026-08-22: not
+  "post-upstream-merge" — the merge changed no step-path code; the
+  slowness was host-state degradation, see the CLOSED update below.
+  Also S5's 39.7 was TP=2 @131k, not maxlen 4096 — the
+  `tp2-bench-final.log` run had speculative_config=None.] Suspect the spec-decode path
   lost graph coverage in the merge; needs its own investigation
   (DEVLOG-spec-decode.md territory) — **do not re-baseline S8 mtp2
   records on gfx906/main until it is root-caused.** Plain-greedy
@@ -280,11 +284,30 @@ client tgs TTFT-excluded (same harness as the N4 plain-greedy gate):
 
   **Update 2026-08-22 (later, GPU session):** root cause characterized —
   see DEVLOG-spec-decode.md "TP=2 mtp2 engine-cadence overhead" and
-  `fa-masked-mtp-regression-glm5.md` (folds the ds4/qwen reviews). GPU
+  `fa-masked-mtp-regression-glm5.md` (repo docs/gfx906/) (folds the ds4/qwen reviews). GPU
   work is healthy at both TP sizes; the ~95 ms/step is engine-level spec
   bookkeeping (worker input-waits + propose/reject CPU chain);
   `--async-scheduling` tested, no effect. TP=1 healthy. Clean-rebuild
   A/B of the record binary remains the confirmation experiment.
+
+  **CLOSED 2026-08-22 (post-reboot, canary-passed clean re-run):** the
+  entire OPEN item was host-state degradation (see
+  `degradation_details.md`) — the characterization above described the
+  degraded host, not the code. Clean 4-arm re-baseline (token-true
+  usage-based client, identical output hashes `35c4e6794fa4` in all
+  arms):
+
+  | arm | t/s | ms/step |
+  |---|---|---|
+  | 131k P0 | 49.44 | 60.7 |
+  | 262k P0 | 37.69 | 79.6 |
+  | 131k P1 | **74.74** | 40.1 |
+  | 262k P1 | **73.51** (steady reps 74.83) | 40.1 |
+
+  Tax removal CONFIRMED under mtp2 on the healthy host: P0 tax −23.8 %
+  (S8's −25 %), P1 residual 0.0 % steady, +51 %/+95 %. mtp2 P1 =
+  **1.83× plain greedy** (40.86). S8 mtp2 re-baselines may proceed on
+  this branch; the 39.9-era record is superseded (it paid the N4 tax).
 
 Refrigerated (updated): register-prefix widen to B=32 (kernel change,
 full gate protocol, needs a >16-concurrent-decode serving workload to

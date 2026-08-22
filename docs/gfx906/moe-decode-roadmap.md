@@ -469,7 +469,7 @@ lands in this roadmap:
   already copy-free. Evidence state: **derived** (per-call probe +
   stride analysis in the DEVLOG "FA decode per-layer copy pile").
 - **N4 — TP=2 dense decode: `max_model_len` decode tax — RESOLVED
-  (2026-08-22, branch `gfx906/fa-masked-gather`; pending merge).**
+  (2026-08-22, merged to `gfx906/main`; see `DEVLOG-masked-fa.md`).**
   Mechanism (confirmed 2026-08-21, S8): FULL-cudagraph capture bakes
   `Sk_pad = pad32(max_model_len)` into `GFX906_FA`'s gather launch dims
   (`gpu_model_runner.py:2390` `for_cudagraph_capture` branch), so the

@@ -31,5 +31,7 @@ GPU dead until reboot/power-cycle), **DEG** = host-state degradation
 | 2026-08-22 13:44 (×2), 13:46 | 0, 1 | HW | during/after si8 serve window (qcm fence timeout, failed queue evict) | si8 bench still completed at 74.8 t/s |
 | 2026-08-22 13:55–14:04 (6×) | 1 | HW | si32 + mtp2-rebaseline boot failures (half-wedge cascade) | each "recovered" but next boot still failed |
 | 2026-08-22 14:06 | 0 | **FW** | mtp2_rb m131072_p1 boot attempt | reset → PSP resume failed ret −62; GPU0 dead (rocm-smi N/A, 31 % zombie VRAM) at 14:09; **needs reboot** |
+| — | | **BOOT** | 2026-08-22 ~14:50 reboot (GPU0 recovered, temps/clocks normal) | canary 38.6 t/s = healthy; **2 prior resets were insufficient to degrade; ≥14 were** (onset bracket) |
+| 2026-08-22 15:24, 15:40, 15:41 | 1 | HW | mtp2 re-baseline boot-attempt failures | recovered; all 4 arms then benched HEALTHY (49.4/37.7/74.7/73.5 t/s) — **3 resets did not degrade** (onset data point) |
 
 Maintained by: whoever hits the next one. Update BOTH files.

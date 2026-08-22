@@ -1317,5 +1317,9 @@ wedge/reset bursts, run the 60-s TP=1 mtp2 probe in
 slow canary ⇒ reboot. All wedges/degradation get timestamped rows in
 `docs/gfx906/degradation.md` (49 half-wedges + 3 full-wedges +
 1 degradation event logged 2026-08-21→22; the 14:06 full-wedge killed
-the 4-arm mtp2 re-baseline mid-run — P0/P1 tax arms need one clean
-re-run; the P1 74.9 stands from the stream-interval boots).
+the 4-arm mtp2 re-baseline mid-run). **Re-run CLEAN post-reboot
+(canary-passed): 131k P0 49.44 / 262k P0 37.69 / 131k P1 74.74 /
+262k P1 73.51 (steady 74.83) t/s — P0 tax −23.8 %, P1 residual 0.0 %,
+mtp2 = 1.83× plain, identical output hashes across all arms.** Three
+more GPU1 half-wedges during the run did not degrade it (onset data
+point, degradation.md).
