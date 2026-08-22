@@ -108,6 +108,13 @@ _FUSED_QUANT = _os.environ.get("GFX906_FA_FUSED_QUANT", "1") != "0"
 # TP=2 serving A/B: 15.9->40.9 t/s at 262k). Default ON; GFX906_FA_PERSIST=0
 # is the kill switch.
 _PERSISTENT = _os.environ.get("GFX906_FA_PERSIST", "1") != "0"
+# Kernel bound: the persistent gather prefix-sums per-seq counts in a
+# fixed 16-entry register array (csrc launcher rejects num_seqs > 16 with
+# an error, which would crash engine start for any default max_num_seqs).
+# Batches above the bound fall back to the fused/two-kernel paths (old
+# behavior, still Sk-bounded) instead of dispatching to the persistent
+# kernel.
+_PERSIST_MAX_SEQS = 16
 # P3-4: skip the LEGACY-path q_pad zero_ on the Sq=1 decode fast path
 # (pad rows are per-row-independent and discarded; the q8_0 quantization
 # clamps NaN/Inf garbage). GFX906_FA_QPAD_EMPTY=0 reverts to the zero_.
@@ -505,11 +512,12 @@ def forward_paged(
                       else block_table.to(torch.int32)).contiguous()
             sl_i32 = (seq_lens if seq_lens.dtype == torch.int32
                       else seq_lens.to(torch.int32)).contiguous()
-            if _PERSISTENT:
+            if _PERSISTENT and num_seqs <= _PERSIST_MAX_SEQS:
                 # One kernel at every Sk: fixed grid, live-bounded work,
                 # in-kernel quantize (bit-equal K), V tail rows not written
                 # (FA cuts at kv_max; margin zeros per
-                # GFX906_FA_PERSIST_MARGIN).
+                # GFX906_FA_PERSIST_MARGIN). num_seqs > _PERSIST_MAX_SEQS
+                # falls through to the fused/two-kernel paths below.
                 K_q8, V_bhsd = gfx906_fa.gather_paged_kv_quant_persistent(
                     key_cache, value_cache, bt_i32, sl_i32, Sk_pad,
                     k_out=kbuf, v_out=vbuf,

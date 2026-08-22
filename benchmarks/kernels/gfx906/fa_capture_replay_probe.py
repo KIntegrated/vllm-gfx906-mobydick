@@ -43,8 +43,12 @@ def main():
 
     # B=1..4: FULL capture sizes are [1,2,3,4] in the S5 serving config, so
     # the kernel's per-seq register prefix must hold for all of them.
+    # nb = SK_PAD//BLOCK per seq (+ headroom) so that the sl=SK_PAD replays
+    # materialize ALL rows: block_tab_idx must stay < max_blocks_per_seq,
+    # else the kernel's OOB guard skips the row in every path (bit-equal
+    # but unmaterialized) and the sweep is shallower than it looks.
     max_b = 4
-    nb = SK_PAD // BLOCK + 16 * max_b
+    nb = SK_PAD // BLOCK * max_b + 16 * max_b
     kc = torch.randn(nb, BLOCK, Hkv, D, dtype=torch.float16, device=dev)
     vc = torch.randn(nb, BLOCK, Hkv, D, dtype=torch.float16, device=dev)
     fails = 0
