@@ -4,7 +4,8 @@
 > Qwen3.5-35B-A3B-AWQ (`/local/models/QuantTrio/Qwen3.5-35B-A3B-AWQ`) ·
 > 2026-08-22 · roadmap item C2-V (`moe-decode-roadmap.md`).
 
-**VERDICT:** OPEN (in progress — Stage 0 running)
+**VERDICT:** OPEN (Stage 0 done: reopen gate TRIGGERED at TP=2, +1.47% ≥
+0.5%; Stage 1 NPT=2 gemm1 A/B in progress — build + matrix below)
 
 **GATE:** serving A/B, pp=2048/tg=256, graph mode (eager for Stage-1
 A/B arms), N=1/4/8/32 concurrent, TP=1 and TP=2, flags off/on with
@@ -150,6 +151,64 @@ Upstream fix belongs in `vllm/platforms/rocm.py` (the wrapper's
 (`/tmp/c2v/run_stage0b.sh`, waiting on the harness job) re-runs:
 TP=1 batch (t1n4 off/on, t1n8, t1n32) then TP=2 N=1 off/on WITH the
 shim (`*_s` arms).
+
+### Stage 0 complete — batch + TP=2-shim results (Δ-metric t/s, graph)
+
+| point | off | on (flag) | Δ | note |
+|---|---|---|---|---|
+| TP=1 N=1 | 81.17 (±0.7) | 82.46 (±0.13, MOE_M1) | +1.29 (+1.59 %) | known S5 effect re-confirmed (anchor) |
+| **TP=2 N=1 (shim)** | **80.32 (±0.03)** | **81.50 (±0.08, MOE_M1)** | **+1.18 (+1.47 %)** | **reopen gate triggered (≥0.5 %)** |
+| TP=1 N=4 | 184.59 (±2.1) | 183.76 (±1.3, MOE_M1) | −0.83 (−0.45 %) | inert as designed (M=1 gate) — proof |
+| TP=1 N=8 | 167.4 (rep1/2; rep0 cold) | — | — | BM=4 grouped-path characterization |
+| TP=1 N=32 | OOM (all configs) | — | — | single-card memory ceiling (below) |
+
+Findings:
+
+1. **TP=2 M=1 is a real, positive axis**: the gemm2-v2 tile transfers
+   to the per-rank-halved shapes (gemm2 N=1024, K=512) at +1.47 %, on
+   par with TP=1 (+1.59 %). Per the roadmap rule ("any positive ≥0.5 %
+   reopens C2-gemm1 and the S5 gemm1 branch") the branch **reopens** —
+   at minimum TP=2-scoped; combined with the re-confirmed TP=1 effect,
+   the natural follow-up question (for Kevin) is whether `MOE_M1` goes
+   default-on (it is env-gated, default off, since the C2 close).
+2. **Batch flag arms are structurally inert, as predicted**: MOE_M1 at
+   N=4 is within noise (−0.45 %, |Δ| < stdev) — the M=1 gate
+   (`size_m == output_topk`) excludes every N≥2 point. The batch
+   decode regime runs the BM=4 grouped path (N=8: em=64), which the
+   (BLOCK_KN, NPT) sweep never touched; both Stage-1 flags are BM=1
+   only, so the N=4 NPT=2 arm is the sole batch A/B point.
+3. **Step scaling**: N=1 12.3 ms → N=4 (BM=1) 21.7 ms → N=8 (BM=4)
+   47.8 ms. The BM=1→BM=4 transition costs +161 %/step for 2× the
+   tokens — the grouped path is the expensive one (per-slot cost
+   rises), consistent with the (v2)(b) premise. This is the real
+   batch-regime lever if batch decode ever becomes the target.
+4. **N=32 single-card memory ceiling (new finding)**: 32-concurrent
+   35B decode OOMs on one MI50 32 GB in this build at every config
+   tried (graph/eager × util 0.95/0.90 × maxlen 4096/2816/2048 ×
+   pp 2048/1024). Failure is the gfx906-FA `_q_pad_buf` [B, Hq,
+   Sq_pad, D] fp32 prefill Q buffer (544 MiB at B=32, maxlen-
+   independent — it grows to the batch size) on top of a ~28 GiB
+   non-KV footprint (17.6 GB weights + GDN state pool + inductor +
+   FA buffers); KV pool left with 41–57k tokens < the 74k needed.
+   32-seq 35B serving needs TP=2 (per-rank Hq/2 halves the q_pad) or
+   a larger card. Not a C2-V gate point (flag inert at BM=4 anyway).
+5. **Bench artifact noted**: the first repeat's tg_short run is cold
+   at N=8 (wall_short 11.7 vs 6.45 s steady) and inflates the Δ
+   metric (308 vs 167 t/s); steady-state = rep1/2 (agreed to 0.1 t/s).
+   Future A/B arms should report rep1/2.
+
+### Stage 1 (NPT=2 gemm1) — in progress
+
+`csrc/rocm/moe_q_gemm_gfx906.cu`: `VLLM_GFX906_MOE_NPT=2` now also
+selects the `<1,2>` kernel (64 cols/block vs `<1,4>`'s 128) for the
+BM=1 **gemm1** path (`output_topk == 0`) — the reverted trial, re-
+landed fresh (never committed), env-gated default off, per-call
+getenv like MOE_M1. gemm2 stays `<1,4>` (or the MOE_M1 v2 tile) so
+the two trial flags never touch the same kernel. Incremental
+`build_ext --inplace` (ccache) running; matrix: off/npt2 × {TP1 N1,
+TP2 N1 (shim), TP1 N4} graph + {TP1 N1, TP2 N1} eager — TP=2 N=1
+includes the first measurement of the gemm1 tile at the halved
+N=512 shape (the new tiling axis).
 
 ## Evidence — FOR
 

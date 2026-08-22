@@ -233,19 +233,28 @@ treated as permanent:
   numbers (21.4/10.8 µs gemm2 V2, 12.5 µs topk M=1) reproduce under
   the fixed checks.
 
-State (2026-08-22): **(v2) running** on `gfx906/moe-c2v` (dev log
-`DEVLOG-moe-c2v.md`). Dispatch-gate audit corrected the scope: both
-existing re-tile candidates are M=1-only (`MOE_M1` gemm2 v2 tile
-gated on `size_m == output_topk`; the reverted NPT=2 trial was the
-BM=1 gemm1 path), so the batch axis is the *never-measured* BM=4
-grouped path (N=4/8/32 characterization; the NPT=2 arm can only fire
-at N=4) and **TP=2 M=1 is a first-class arm** (per-rank N halved —
-new tiling axis; first TP=2 35B-MoE run on this box, smoke-gated).
-TP=1-only scoping was overruled: a TP=2 win would reopen the branch
-regardless of TP=1. (v1) still unrun; (v1)+(v2) remain prerequisites
-before the C2 close is cited as evidence in any future scope
-decision; (v3) is the remaining unbuilt design axis; (v4) is
-bookkeeping hygiene.
+State (2026-08-22): **(v2) Stage 0 done — reopen gate TRIGGERED**
+on `gfx906/moe-c2v` (dev log `DEVLOG-moe-c2v.md`). Results (Δ-metric
+serving A/B, graph): **TP=2 M=1 `MOE_M1` +1.47 % (80.32 → 81.50
+t/s)** — ≥0.5 %, so per the rule above the C2-gemm1/S5 branch
+reopens (TP=2-scoped; TP=1 M=1 re-confirmed at +1.59 %). Batch: the
+flag arms are structurally inert at N≥2 (M=1 dispatch gate —
+N=4 on/off within noise, as predicted); the batch regime runs the
+never-measured BM=4 grouped path (N=8: 167 t/s, 47.8 ms/step —
+expensive per step); N=32 does not fit one MI50 32 GB (FA q_pad
+buffer + ~28 GiB non-KV footprint — new memory-ceiling finding).
+Scope provenance: dispatch-gate audit showed both existing re-tile
+candidates are M=1-only (`MOE_M1` gated on `size_m == output_topk`;
+the reverted NPT=2 trial was the BM=1 gemm1 path), so the batch axis
+reduced to BM=4 characterization + the N=4 NPT=2 arm, and **TP=2 M=1
+is a first-class arm** (per-rank N halved — new tiling axis; first
+TP=2 35B-MoE run on this box). TP=1-only scoping was overruled:
+a TP=2 win would reopen the branch regardless of TP=1 — and it
+reopened. (v1) still unrun; (v1)+(v2) remain prerequisites before
+the C2 close is cited as evidence in any future scope decision; (v3)
+is the remaining unbuilt design axis; (v4) is bookkeeping hygiene.
+Open follow-up (Kevin): default-on for `MOE_M1` given +1.5 % at both
+TP=1 and TP=2 M=1 (currently env-gated off since the C2 close).
 
 The BM=1/NPT=4 tiling launches 4096 blocks (gemm1: 8 slots × 8 n-tiles ×
 64 K-splits, 32 threads each) per layer; each (slot, n-column) cell is
