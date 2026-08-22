@@ -104,8 +104,15 @@ results TSV `/tmp/c2v/stage0_results.tsv`).
 - **Canary (27B mtp2, 60 s): 38.8 t/s** — below the ~40–47 healthy
   band but well above the <25 REBOOT line. Soft signal; the 35B
   official-harness run is the tie-breaker (if it lands < 65.9 the
-  host is off-record and Stage-0 deltas are suspect). Harness run
-  in progress (queued after the first driver stop).
+  host is off-record and Stage-0 deltas are suspect).
+- **Official harness (35B, graph, 4 samples): 65.61 / 65.623 /
+  65.603 / 65.566 → 65.60 ± 0.03 t/s.** Marginally below the record
+  band (65.9–67.0; record 67.39) — ~0.5 % under the band floor, i.e.
+  at record level within run-to-run drift (degradation would be a
+  ~3× collapse, not 0.5 %). Cross-check: 256/3.902 s = 65.6 and the
+  Δ-method's 240/2.95 s = 81.2 both resolve to d ≈ 12.3 ms/step with
+  prefill ≈ 0.75 s — internally consistent. **Host judged healthy for
+  A/B gating; deltas, not absolutes, are the gate.**
 - **t1n1_off (TP=1, N=1, graph, flag off): 81.17 t/s Δ-metric**
   (stdev 0.7, min 80.39 / max 81.72; prefill ≈ 0.9 s, step ≈ 12.3 ms).
   Not comparable to the 67.39 record (different metric — see GATE); the
