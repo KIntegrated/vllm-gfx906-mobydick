@@ -224,6 +224,79 @@ def test_cudagraph_capture_replay_legacy_decode_path():
     assert ((out1 - ref200).norm() / ref200.norm()).item() < 2e-2
 
 
+def test_persistent_gather_capture_replay_large_sk():
+    """N4 fix gate: the persistent fused gather+quantize
+    (GFX906_FA_PERSIST) must be FULL-capture-safe at capacity Sk_pad
+    (262144, above the old 65535 two-kernel boundary) and its replayed
+    end-to-end FA output must match the two-kernel fallback at every
+    live seq_len in the sweep — the launch dim is frozen at Sk_pad while
+    seq_lens is re-read at replay, exactly like the serving FULL graph.
+    Buffer contents beyond seq_len may legitimately differ (tail-write
+    removal, gated by the NaN-tail test); end-to-end output must not.
+    """
+    dev = "cuda"
+    torch.manual_seed(5)
+    sk_pad = 262144
+    n_blocks = sk_pad // BLOCK + 4
+    _, value_cache, kv = _make_paged_cache(n_blocks, dev)
+    scale = 1.0 / math.sqrt(D)
+
+    k16 = torch.zeros(n_blocks, BLOCK, HKV, D, dtype=torch.float16,
+                      device=dev)
+    k16.normal_(0, 0.5)
+    kv[:, 1].normal_(0, 0.5)
+
+    from vllm.gfx906_fa import gfx906_fa_paged as fpp
+    from vllm.gfx906_fa.gfx906_fa_paged import forward_paged
+
+    q = torch.randn(1, HQ, D, device=dev, dtype=torch.float32) * 0.5
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, -1)
+    sl = torch.tensor([100], dtype=torch.int32, device=dev)
+    cu = torch.arange(2, dtype=torch.int32, device=dev)
+    q_pad = torch.zeros(1, HQ, 1, D, dtype=torch.float32, device=dev)
+
+    def fwd(persist, msk):
+        fpp._PERSISTENT = persist
+        return forward_paged(
+            q, k16, value_cache, bt, sl, cu,
+            max_seqlen_q=1, max_seqlen_k=msk, scale=scale,
+            key_cache_q8=None, q_pad_buf=q_pad,
+        )
+
+    orig = fpp._PERSISTENT
+    try:
+        # warmup the persistent path at small Sk, then capture at capacity
+        s = torch.cuda.Stream()
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                fwd(True, 128)
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = fwd(True, sk_pad)
+    finally:
+        fpp._PERSISTENT = orig
+
+    def rel_err(a, b):
+        return ((a - b).norm() / b.norm()).item()
+
+    sweep = [32, 100, 2048, 65504, 65536, 65600, 131072, sk_pad - 32,
+             sk_pad]
+    for v in sweep:
+        sl.fill_(v)
+        g.replay()
+        torch.cuda.synchronize()
+        ref_two = fwd(False, sk_pad)          # two-kernel fallback
+        ref_persist = fwd(True, sk_pad)       # eager persistent
+        e_two = rel_err(out, ref_two)
+        e_persist = rel_err(out, ref_persist)
+        assert e_persist == 0.0, (
+            f"replay vs eager persistent not bit-exact at sl={v}: "
+            f"rel={e_persist}")
+        assert e_two < 2e-2, (
+            f"replay vs two-kernel fallback diverges at sl={v}: rel={e_two}")
+
+
 def test_fused_fp16_gather_matches_torch_gather():
     """LEGACY-path fused gather (gather_paged_kv_fp16) must match the torch
     _gather_kv reference in the valid region; V tail zeroed; K tail
