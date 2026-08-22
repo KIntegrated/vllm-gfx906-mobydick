@@ -217,3 +217,67 @@ D=256 model family; register-prefix widen to B=32 (house MoE
 `max_num_seqs=32` still pays the Sk tax above 16);
 small-`max_model_len` serving A/B (persistent replaced fused V1 at
 Sk≤65535 with kernel-level evidence only); `MARGIN=0` optional drop.
+
+## 2026-08-22 (post-commit 3) — review follow-up gates: D=128, small-Sk serving A/B, mtp2 A/B
+
+Three review residuals run to ground (GPU session, branch at
+`3b40ad6349`).
+
+**1. D=128 kernel gates — SHIPPED · GATE: probe re-runs**
+(`fa_persist_probe` D∈{128,256}×Hkv∈{2,4}×Sk{3328..262144},
+`fa_nantail_probe` +3 D=128 cases, suite `test_persistent_gather_d128_matches_fused`).
+K/V bit-equal to the two-kernel path and margin-zero at every D=128
+combo; tail-read precondition holds at the D=128 FA tile config;
+launch-regime: D=128 persistent 16.7–18.3 µs flat vs two-kernel
+37.4 µs (3328) / 1224.6 µs (262144). Suite 22/22. Default-ON is now
+kernel-gated at both shipped head sizes.
+
+**2. Small-`max_model_len` serving A/B (F7) — SHIPPED, win not just
+parity · GATE:** TP=1 GPU0, dense Qwen3.8-27B (local),
+`_bench_gfx906.py` graph mode (FULL_DECODE_ONLY), util 0.93,
+pp2048/tg256, 4 samples, `BENCH_MAX_SEQS=4`, arms maxlen×PERSIST:
+
+| maxlen | P0 (fused V1) | P1 (persistent) | Δ |
+|---|---|---|---|
+| 8192 | 24.50 (24.61/24.60/24.24/24.55) | 24.76 (24.78/24.77/24.74/24.74) | +1.1% |
+| 32768 | 22.39 (22.40/22.40/22.38/22.38) | 24.75 (24.87/24.85/24.44/24.82) | **+10.5%** |
+
+No regression at small Sk; at 32k PERSIST removes V1's Sk-proportional
+tail-zero/dispatch cost entirely (P1 flat 24.75–24.76 across 8k→32k;
+P0 pays −8.6% at 32k vs its own 8k). Samples fully separated at 32k
+(p0 max 22.40 < p1 min 24.44). One arm aborted at weight-load (exit
+134, the known S4-residual flake) — clean rerun, numbers above.
+
+**3. mtp2 TP=2 A/B (re-baseline gate, qwen P1-1) — tax removal
+CONFIRMED under mtp2; absolute mtp2 regression discovered (OPEN) ·
+GATE:** TP=2, util 0.93, max_num_seqs 4, capture [1,2,3,4],
+`--speculative-config {mtp, n=2}`, 1091-token prompt, tg 256, 3 reps,
+client tgs TTFT-excluded (same harness as the N4 plain-greedy gate):
+
+| arm | mean | steady (reps 2-3) |
+|---|---|---|
+| 131k P0 | 15.70 | 16.50 |
+| 262k P0 | 12.09 | 12.54 |
+| 131k P1 | 24.64 | 24.90 |
+| 262k P1 | 24.61 | 24.91 |
+
+- **Tax removal transfers**: P0 tax 131k→262k −24.0% (reproduces S8's
+  −25% under mtp2); P1 residual 24.90 vs 24.91 = **0.0%**; P1 vs P0
+  +51% (131k) / +98% (262k) steady.
+- **NEW, pre-existing, NOT an N4 artifact (P0 shows it too): mtp2 on
+  this branch is absolutely regressed.** Steady 24.9 < plain-greedy
+  P1's 40.9 (same client/harness), and ≪ the pre-merge tp2-branch
+  mtp2 record 39.9 @131k (S8, v0.27.2 build; S5's 39.7 was at
+  max_seq_len 4096 per `tp2-bench-final.log`). Acceptance is healthy
+  (metrics: mean acceptance length 3.00) → the pathology is step time:
+  ~120 ms/verify step vs ~24 ms plain decode step, i.e. the mtp2
+  verify/draft path is ~5× the plain step on the post-upstream-merge
+  build (v0.28.0rc2.dev318+gfed58511). Suspect the spec-decode path
+  lost graph coverage in the merge; needs its own investigation
+  (DEVLOG-spec-decode.md territory) — **do not re-baseline S8 mtp2
+  records on gfx906/main until it is root-caused.** Plain-greedy
+  records are unaffected.
+
+Refrigerated (updated): register-prefix widen to B=32 (kernel change,
+full gate protocol, needs a >16-concurrent-decode serving workload to
+A/B); `MARGIN=0` drop; grid sweep 512/2048.
