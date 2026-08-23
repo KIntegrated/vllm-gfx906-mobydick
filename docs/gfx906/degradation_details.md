@@ -417,3 +417,19 @@ Arm B pending a clean boot window.
 Host state: 12 resets this boot (boot C, 19:20). Cadence accelerating
 (15 min → 23 min → 17 min between single-card wedges, then dual-card).
 If arm B cannot get a clean window, reboot is the next step (needs root).
+
+### 22:48–22:58 addendum — stop-retrying decision
+
+- 22:48:02 GPU0 (0b) — arm B attempt 1 (launched 22:47:09)
+- 22:57:38 window_watch confirmed a 5.5-min clean probe window (10×30s,
+  both cards) and auto-launched arm B; 22:58:30 GPU1 (0e) wedged at
+  SetDevice 52 s later.
+
+Cadence over the session: 21:46 → 22:02 → 22:25 → 22:42 (dual) →
+22:48 → 22:58 — 12 resets this boot. Good windows have shrunk below
+the ~6-min boot time, so every launch attempt now lands in (or creates)
+a bad window. **Retrying stopped.** This matches the AGENTS.md
+degraded-state signature (many half-wedges in one boot → only a reboot
+clears it). After a reboot: run `window_watch.sh` (it auto-launches
+arm B on a confirmed window) or launch arm B directly; arm A evidence
+is already on record (`/local/tmp/fa_fix/arm_A.log`, `oomhunt_A.log`).
