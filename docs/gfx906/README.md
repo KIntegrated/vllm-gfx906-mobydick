@@ -69,6 +69,7 @@ request (4 samples) unless noted. Recipes: §Bench recipes +
 | `DEVLOG-moe-opt.md` | MoE kernel record (W4A16 GEMM, tuning, pile, merges) |
 | `DEVLOG-fa-attention.md` | custom Q8 FA / decode backend record |
 | `DEVLOG-dense-decode.md` | Qwen3.5-27B dense decode record |
+| `DEVLOG-boot-failure.md` | 2026-08-23 weight-load `hipErrorLaunchFailure` hunt (OPEN: minimal torch repro, GTT-exhaustion theory) |
 | `moe-decode-roadmap.md` | future MoE-decode candidates (roadmap, not a committed plan) |
 | `spec-decode-roadmap.md` | speculative-decode on gfx906: n-gram probe results + phase plan (ngram/suffix/MTP rails) |
 | `running.md` | how to run/build/bench: local venv (canonical) + docker images |
@@ -253,6 +254,26 @@ targets matrix cores; gfx906 has none).
   needs a decode-specialized kernel store; only matters for batched decode).
 - **Eager decode is launch-bound**: eager A/B of kernel improvements can tie
   even when the kernels differ; always gate in graph/serving mode.
+- **256k-context prefill OOM on Qwen3.8-27B (2026-08-23, verified
+  across 7 OOMs — see `degradation_details.md` § 2026-08-23 OOM
+  cluster); full mechanism + verbatim evidence in
+  `oom-256k-prefill.md`).** A ~250k-token first prefill OOMs at `free: 0` on the
+  exllama AWQ **per-call dequant scratch** (`gptq_gemm` allocates
+  `temp_dq = [N×32/bit, K/8]` fp16 per call: 170 MB for the 17,408-wide
+  MLP, **2.37 GiB for the quantized lm_head** on every forward) — a
+  token-count-independent allocation, so chunk size, util, MTP and
+  prefix-caching/mamba-align changes do NOT fix it (all tested). The
+  post-capture headroom is `profiled_peak + graph_est − graph_actual`
+  ≈ 2.5 GiB/rank and is util-independent by construction; at 250k
+  context the unprofiled request-time consumers (lazy gfx906-FA Q8
+  side-buffer ~0.4 GB, FA buffer growth, inductor dynamic shapes, plus
+  an unidentified ~1-2 GB long-context transient) drain it. **131k
+  remains the validated ceiling on this model; 256k TP=2 works on dense
+  Qwen3.5-27B** (smaller footprint). Not a serving-time leak (W4 soak
+  flat at 98-99 %). Fix direction: identify the long-context transient
+  (worker memory snapshot at OOM) and/or pre-allocate the AWQ scratch
+  once. KV sizing facts: Qwen3.8-27B 64 KB/token (TP=1) / 32 KB/rank
+  (TP=2); Qwen3.5-27B 20 KB; Qwen3.5-35B 10 KB.
 - Dense GEMM dispatch (exllama gptq + LLMM1) is at its measured optimum —
   a purpose-built W4A16 dense GEMV is the top remaining dense lever
   (roadmap item).
