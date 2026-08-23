@@ -33,5 +33,6 @@ GPU dead until reboot/power-cycle), **DEG** = host-state degradation
 | 2026-08-22 14:06 | 0 | **FW** | mtp2_rb m131072_p1 boot attempt | reset → PSP resume failed ret −62; GPU0 dead (rocm-smi N/A, 31 % zombie VRAM) at 14:09; **needs reboot** |
 | — | | **BOOT** | 2026-08-22 ~14:50 reboot (GPU0 recovered, temps/clocks normal) | canary 38.6 t/s = healthy; **2 prior resets were insufficient to degrade; ≥14 were** (onset bracket) |
 | 2026-08-22 15:24, 15:40, 15:41 | 1 | HW | mtp2 re-baseline boot-attempt failures | recovered; all 4 arms then benched HEALTHY (49.4/37.7/74.7/73.5 t/s) — **3 resets did not degrade** (onset data point) |
+| 2026-08-22 20:05–20:12 | 1 | HW | C2-V t2n1_off (first TP=2 35B-MoE run): rank-1 worker crash in `get_device_name` (amdsmi `NOT_INIT`, masked by `with_amdsmi_context` finally); rank-0 hung on shm broadcast (GPU0 100 %) | **no kernel reset** in window (software crash); transient 44 % VRAM on GPU1 with no owning KFD process (later shown to be the next config's in-flight allocation — false alarm); VRAM 0/0 after SIGTERM; amdsmi broken on this boot in all runs (protected paths fell back); TP=2 arm retried with sitecustomize shim (stage0b); see `degradation_details.md` (2026-08-22 evening) and `DEVLOG-moe-c2v.md` |
 
 Maintained by: whoever hits the next one. Update BOTH files.

@@ -144,3 +144,41 @@ healthy host it reads ~40+.
   canary reads slow — they are host artifacts (this cost us a day of
   misattribution on 2026-08-22: the "mtp2 TP=2 regression"
   investigation, see `fa-masked-mtp-regression-glm5.md`).
+
+## 2026-08-22 evening: TP=2 35B-MoE amdsmi crash (C2-V t2n1_off) — no kernel reset
+
+First TP=2 run of the 35B MoE on this box (offline `LLM()`,
+`HIP_VISIBLE_DEVICES=0,1`). ~20:05:50Z the rank-1 worker died in
+`RocmPlatform.get_device_name` (the torch-compile-cache-dir query,
+`vllm/utils/platform_utils.py:72`) during `profile_run`, while the
+compiled region was executing `torch.ops.vllm.moe_forward_shared`:
+the final exception was `AMDSMI_STATUS_NOT_INIT` from
+`amdsmi_shut_down()` — i.e. the `with_amdsmi_context` wrapper's
+`finally` masked the primary error. Rank 0 then hung on the shm
+broadcast (GPU0 pinned 100 %) until SIGTERM at ~20:11Z.
+
+- **No kernel amdgpu events** in the 19:55–20:15 window
+  (`journalctl -k` / kern.log) — not a wedge in the HW/FW sense;
+  pure software crash.
+- **Transient VRAM observation**: 20:11–20:12Z `rocm-smi` showed
+  44 % VRAM on GPU1 with **no owning KFD process** (`rocm-smi
+  --showpids`). Attributed in the end to the next config's
+  in-flight weight-load allocation (the driver's VRAM-release check
+  had raced a 0 % reading and launched t2n1_m1on while I was
+  inspecting); both GPUs read 0 % after killing everything. Flagging
+  it here because it matches the zombie-VRAM symptom pattern and
+  cost a false-alarm.
+- **amdsmi is broken on this boot across ALL runs** (TP=1 included):
+  every run logs `Failed to get total memory via amdsmi, falling
+  back to torch.cuda` (rocm.py:913, protected path). Only
+  `get_device_name` is unprotected (no caller try/except), which is
+  why it was fatal in the rank-1 worker and harmless in TP=1.
+- **Workaround** (C2-V only): `sitecustomize.py` on PYTHONPATH
+  (`/tmp/c2v/shim/`) swallows `amdsmi_init/shut_down` failures and
+  gives `get_device_name` the same `AMD_<arch>` fallback the code
+  already has for the 0-handles case. TP=2 arm retried with the shim
+  (stage0b). A permanent fix belongs upstream in
+  `vllm/platforms/rocm.py` (the wrapper's `finally` must not mask).
+- Canary this boot: 38.8 t/s (band ~40–47) — see
+  `DEVLOG-moe-c2v.md`; the official 35B harness run is the
+  tie-breaker for host health.

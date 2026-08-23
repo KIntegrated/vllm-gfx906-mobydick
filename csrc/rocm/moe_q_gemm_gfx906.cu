@@ -662,9 +662,25 @@ void dispatch_moe_gemm_q4(
       return;
     }
   }
+  // M=1 gemm1 re-tile trial (C2-V, opt-in): VLLM_GFX906_MOE_NPT=2
+  // selects the <1,2> kernel (64 cols/block vs <1,4>'s 128) for gemm1
+  // (output_topk == 0). Standalone sweep: 25.13 vs ~26.9 us/call
+  // (N=1024, K=2048); the in-model A/B was under-powered at 4 samples
+  // (see docs/gfx906/DEVLOG-moe-c2v.md, Stage 1). gemm2 keeps <1,4>
+  // (or the VLLM_GFX906_MOE_M1 v2 tile when that flag is on), so the
+  // two trial flags never touch the same kernel. Read per call like
+  // MOE_M1 (80x/step, negligible next to the launch) so tests can flip
+  // it at runtime; captured graphs replay the kernel chosen at capture.
+  const char* npt_env = getenv("VLLM_GFX906_MOE_NPT");
+  const bool m1_npt2 = block_size_m == 1 && output_topk == 0 &&
+      npt_env != nullptr && npt_env[0] == '2';
   switch (block_size_m) {
     case 1:
-      LAUNCH_MOE(1, 4);
+      if (m1_npt2) {
+        LAUNCH_MOE(1, 2);
+      } else {
+        LAUNCH_MOE(1, 4);
+      }
       break;
     case 2:
       LAUNCH_MOE(2, 4);

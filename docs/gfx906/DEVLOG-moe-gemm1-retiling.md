@@ -110,6 +110,15 @@ graphs is retired as a method.
 
 ## 5. State and follow-ups
 
+- **Reopened (2026-08-23, C2-V `DEVLOG-moe-c2v.md`):** the §3 "failed
+  transfer" verdict was TP=1-only. The re-landed NPT=2 `<1,2>` tile
+  (commit `c03bc3349e`, env-gated `VLLM_GFX906_MOE_NPT=2`, default off)
+  measured **+1.23 % graph / +1.32 % eager at TP=2 M=1** (6 repeats,
+  identical outputs) — the per-rank-halved gemm1 shape (N=512) is a
+  tiling axis the sweep never covered. Powered TP=1 re-runs confirm
+  neutral there (+0.48 % graph ≈ 0, 0.00 % eager). The C2 close
+  stands for TP=1 M=1 and batch; the TP=2 M=1 scope reopens per the
+  roadmap C2-V rule. Flag still default off pending that decision.
 - **Reverted:** dispatch flag + unit tests (zero measured benefit; vLLM
   no-busywork rule); rebuilt, 25/25 suite. gemm1 stays on the established
   `<1,4>`; the in-tree M=1 gemm2 path (V2 tile) is untouched.
