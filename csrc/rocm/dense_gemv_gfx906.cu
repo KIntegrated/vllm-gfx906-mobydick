@@ -515,6 +515,80 @@ __global__ void __launch_bounds__(KCHUNK / 8)
   }
 }
 
+// W4 skinny M=5..16: RPT=1, exact-M-templated (the templated M=1..4 rail
+// structure with one weight row per block and M compile-time dots).
+// Measured (bench_fp16_skinny_m.py / /tmp/moespec/real27b): the kernel
+// is x-L2-re-read bound at ~M*B/1.6 TB/s (B = N*K*2 weight bytes -
+// every block re-reads all of x from L2), matching the M=4 rail at
+// M=4 (61 us on 5120x2048) and scaling linearly in M; triton is
+// ~B/0.2 TB/s plus a ~100 us floor on small shapes, so this wins at
+// M<=7 on all shapes and above only where triton hits its small-shape
+// floor (a_b 1.3 MB: 7.5x at M=8, 4.6x at M=16; fa_kv 5.2 MB: 3.7x/
+// 1.8x) - the python-side gate (VLLM_GFX906_SKINNY_M16, M-dependent
+// size thresholds) routes the rest to triton. ksplit>1 uses the
+// compiler-lowered fp16 atomicAdd (the pk2 CAS would be misaligned
+// for odd rows - RPT=1 rows are not pair-aligned; the HSA aperture
+// violation on an odd 32-bit CAS was observed, 2026-08-23).
+template <int KCHUNK, int M>
+__global__ void __launch_bounds__(KCHUNK / 8)
+    dense_gemv_m_kernel_m16(const half* __restrict__ x,   // [M, K]
+                            const half* __restrict__ w,   // [N, K]
+                            half* __restrict__ out,       // [M, N], pre-zeroed
+                                                            // if KSPLIT>1
+                            const int N, const int K,
+                            const int ksplit) {
+  static_assert(KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 ||
+                    KCHUNK == 4096,
+                "KCHUNK must be 512, 1024, 2048 or 4096");
+  static_assert(M >= 5 && M <= 16, "M must be 5..16");
+  constexpr int THREADS = KCHUNK / 8;
+  constexpr int WARPS = THREADS / 64;
+  const int t = threadIdx.x;
+  const int row = blockIdx.x;
+  const int k0 = blockIdx.y * KCHUNK;
+
+  union {
+    uint4 u;
+    half2 h2[4];
+  } xa[M];
+  #pragma unroll
+  for (int m = 0; m < M; ++m)
+    xa[m].u = *(const uint4*)(x + (int64_t)m * K + k0 + t * 8);
+
+  float acc[M];
+  union {
+    uint4 u;
+    half2 h2[4];
+  } wa;
+  wa.u = *(const uint4*)(w + (int64_t)row * K + k0 + t * 8);
+  #pragma unroll
+  for (int m = 0; m < M; ++m) acc[m] = dot8_f32(wa.h2, xa[m].h2);
+
+  // Full 64-lane wavefront butterfly (masks 32..1 - mask 32 is the
+  // cross-32-lane-half exchange on gfx906; house pattern, see
+  // dense_gemv_m_kernel), then cross-warp in shared memory.
+  #pragma unroll
+  for (int mask = 32; mask >= 1; mask /= 2)
+    #pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] += __shfl_xor(acc[m], mask);
+
+  __shared__ float red_smem[M][WARPS];  // WARPS <= 8 (KCHUNK <= 4096)
+  const int warp = t / 64;
+  const int lane = t % 64;
+  if (lane < M) red_smem[lane][warp] = acc[lane];
+  __syncthreads();
+  if (warp == 0 && lane < M) {
+    float s = 0.0f;
+    #pragma unroll
+    for (int wp = 0; wp < WARPS; ++wp) s += red_smem[lane][wp];
+    if (ksplit == 1) {
+      out[(int64_t)lane * N + row] = __float2half_rn(s);
+    } else {
+      atomicAdd(&out[(int64_t)lane * N + row], __float2half(s));
+    }
+  }
+}
+
 }  // namespace dense_gemv_gfx906
 }  // namespace vllm
 
@@ -530,9 +604,10 @@ __global__ void __launch_bounds__(KCHUNK / 8)
 // Returns out: [1, N] fp16. Pre-zeroed internally when K > kchunk.
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// M<=4 entry point (spec decode; see dense_gemv_m_kernel above).
+// M<=16 entry point (spec decode M<=4; W4 skinny M=5..16; see
+// dense_gemv_m_kernel above and dense_gemv_m_kernel_m16 below).
 //
-//   weight: [N, K] fp16 row-major; x: [M, K] fp16, 1 <= M <= 4
+//   weight: [N, K] fp16 row-major; x: [M, K] fp16, 1 <= M <= 16
 //   Returns out: [M, N] fp16.
 // ---------------------------------------------------------------------------
 torch::Tensor dense_gemv_m4_gfx906(torch::Tensor weight, torch::Tensor x,
@@ -545,7 +620,7 @@ torch::Tensor dense_gemv_m4_gfx906(torch::Tensor weight, torch::Tensor x,
   const int64_t M = x.size(0);
   const int64_t N = weight.size(0);
   const int64_t K = weight.size(1);
-  TORCH_CHECK(M >= 1 && M <= 4, "M must be 1..4 (got ", M, ")");
+  TORCH_CHECK(M >= 1 && M <= 16, "M must be 1..16 (got ", M, ")");
   TORCH_CHECK(x.size(1) == K, "x/weight K mismatch");
   TORCH_CHECK(K % 8 == 0, "K must be a multiple of 8");
   TORCH_CHECK(kchunk == 512 || kchunk == 1024 || kchunk == 2048 ||
@@ -611,13 +686,33 @@ torch::Tensor dense_gemv_m4_gfx906(torch::Tensor weight, torch::Tensor x,
       else                                                                \
         LAUNCHM_BY_RPT(MVAL, 512);                                        \
     } while (0)
+  // M=5..16: RPT=1 exact-M m16 kernel (W4; see the kernel above for the
+  // measured win/gate rationale).
+  #define LAUNCHM16(MVAL, KC)                                             \
+    {                                                                     \
+      dim3 grid(N, ksplit);                                               \
+      vllm::dense_gemv_gfx906::dense_gemv_m_kernel_m16<KC, MVAL>          \
+          <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)N, (int)K,       \
+                                        ksplit);                          \
+    }
+  #define LAUNCHM16_BY_KC(MAXM)                                           \
+    do {                                                                  \
+      if (kchunk == 4096)                                                 \
+        LAUNCHM16(MAXM, 4096)                                             \
+      else if (kchunk == 2048)                                            \
+        LAUNCHM16(MAXM, 2048)                                             \
+      else if (kchunk == 1024)                                            \
+        LAUNCHM16(MAXM, 1024)                                             \
+      else                                                                \
+        LAUNCHM16(MAXM, 512)                                              \
+    } while (0)
   if (M == 1)
     LAUNCHM_BY_KC(1);
   else if (M == 2)
     LAUNCHM_BY_KC(2);
   else if (M == 3)
     LAUNCHM_BY_KC(3);
-  else
+  else if (M == 4)
     // M=4: runtime-M kernel (the templated M=4 measured slower, see above).
     do {
       if (kchunk == 4096)
@@ -629,6 +724,30 @@ torch::Tensor dense_gemv_m4_gfx906(torch::Tensor weight, torch::Tensor x,
       else
         LAUNCHM_RT_BY_RPT(512);
     } while (0);
+  else if (M == 5)
+    LAUNCHM16_BY_KC(5);
+  else if (M == 6)
+    LAUNCHM16_BY_KC(6);
+  else if (M == 7)
+    LAUNCHM16_BY_KC(7);
+  else if (M == 8)
+    LAUNCHM16_BY_KC(8);
+  else if (M == 9)
+    LAUNCHM16_BY_KC(9);
+  else if (M == 10)
+    LAUNCHM16_BY_KC(10);
+  else if (M == 11)
+    LAUNCHM16_BY_KC(11);
+  else if (M == 12)
+    LAUNCHM16_BY_KC(12);
+  else if (M == 13)
+    LAUNCHM16_BY_KC(13);
+  else if (M == 14)
+    LAUNCHM16_BY_KC(14);
+  else if (M == 15)
+    LAUNCHM16_BY_KC(15);
+  else
+    LAUNCHM16_BY_KC(16);
   return out;
 }
 

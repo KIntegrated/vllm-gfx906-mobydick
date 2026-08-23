@@ -83,6 +83,20 @@ reboot: 74.9 t/s same wall-time), not `--async-scheduling` (no effect
 on the degraded host), not `--stream-interval` (no effect — it is a
 no-op on the healthy host).
 
+## 2026-08-23 OOM-teardown collateral (W4 A/B, not a wedge)
+
+W4 serving A/B on the 06:33 boot. 27B (Qwen3.8) N=8 off arm OOM'd at
+util 0.93 (356 MB inductor prefill buffer, free: 0 — Qwen3.8's FA KV
+is 655 KB/token; 64 layers) and aborted; the *next* arm (on) died
+`hipErrorLaunchFailure` rc=134 at boot (08:52). GPU0 read clean
+afterwards (0 % VRAM, 0 % busy, no zombies); re-run of both arms at
+util 0.90 / maxlen 1280 passed clean (off 98.2 / on 104.2 t/s, no
+launch failures, ksplit=5 atomicAdd path graph-safe). Verdict:
+one-off reset collateral of the aborted OOM arm, NOT a half-wedge
+(nothing was wedged afterwards; no PSP failure; the next two engines
+on the same GPU booted fine). Counts as a reset for the onset
+bracket (see the 08-22 15:41 row pattern).
+
 ## Open questions (record answers here as evidence lands)
 
 1. **Onset:** does degradation need N accumulated resets, long uptime,

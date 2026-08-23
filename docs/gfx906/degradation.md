@@ -33,5 +33,7 @@ GPU dead until reboot/power-cycle), **DEG** = host-state degradation
 | 2026-08-22 14:06 | 0 | **FW** | mtp2_rb m131072_p1 boot attempt | reset → PSP resume failed ret −62; GPU0 dead (rocm-smi N/A, 31 % zombie VRAM) at 14:09; **needs reboot** |
 | — | | **BOOT** | 2026-08-22 ~14:50 reboot (GPU0 recovered, temps/clocks normal) | canary 38.6 t/s = healthy; **2 prior resets were insufficient to degrade; ≥14 were** (onset bracket) |
 | 2026-08-22 15:24, 15:40, 15:41 | 1 | HW | mtp2 re-baseline boot-attempt failures | recovered; all 4 arms then benched HEALTHY (49.4/37.7/74.7/73.5 t/s) — **3 resets did not degrade** (onset data point) |
+| — | | **BOOT** | 2026-08-23 06:33 boot (canary 38.6 t/s, healthy) | W4 A/B on the fresh boot: 35B N=8 off/on 166.9/191.0 t/s (+14.5 %, off = C2-V record 167.4 → host clean) |
+| 2026-08-23 ~08:51, ~08:52 | 0 | HW | W4 27B (Qwen3.8) N=8 arms: off arm OOM'd at util 0.93 (356 MB inductor buf, free: 0) and aborted; next (on) arm `hipErrorLaunchFailure` rc=134 at boot | closed: clean re-run at util 0.90 passed (98.2/104.2 t/s, no recurrence, 2 engines booted fine after) — OOM-teardown collateral, NOT a wedge (details file § 2026-08-23) |
 
 Maintained by: whoever hits the next one. Update BOTH files.
