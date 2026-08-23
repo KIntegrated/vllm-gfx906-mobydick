@@ -387,7 +387,8 @@ one-file fallback.)
   not HBM-weight bound — the big shapes lose at M≥12 and are gated to
   triton). Measured serving: 35B MoE N=8 graph **+14.5 %** (191.0 vs
   166.9 t/s), 27B Qwen3.8 N=8 **+6.1 %** (104.2 vs 98.2), 27B N=4
-  control flat; kernel behind `VLLM_GFX906_SKINNY_M16` (default off).
+  control flat; kernel behind `VLLM_GFX906_SKINNY_M16` (default off);
+flag-on soak passed (30 reps × 2 models, drift < 0.2 %, rc=0).
 
 ## 7. Artifacts
 

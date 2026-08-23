@@ -43,6 +43,17 @@ measured evidence, not the original headline.**
   must be inert). Result pending at time of writing.
 - 27B token-identity gate usable (dense 27B is deterministic at
   temp=0); 35B FPs not usable (baseline non-deterministic, C2-V).
+  Correction (soak): the local 27B is Qwen3.8, which is ALSO
+  non-deterministic at temp=0 (the A/B off arm showed 3/3 distinct
+  FPs across 3 reps without the flag; the 30-rep on soak showed 30/30
+  distinct). Token-identity gates are unusable on both local models
+  at this build; perf + output completeness + no-crash is the gate.
+- Soak (flag ON, the ship precondition): 30 back-to-back N=8 reps
+  per model (driver /tmp/moespec/run_soak.sh, same harness/configs
+  as the A/B): rc=0 on both, t/s flat first-half vs second-half
+  (|drift| < 0.2 %), VRAM flat (35B pool 99 % throughout - fixed
+  pool rules out OOM creep), all reps complete-length. Numbers in
+  Results.
 
 ## Design iterations (2026-08-23)
 
@@ -157,6 +168,16 @@ triton-floor regime). Pre-existing exceptions unchanged (hipBLAS
     `hipErrorLaunchFailure` in the next arm (recorded in
     degradation.md); clean re-run passed — the ksplit=5 atomicAdd
     path (27B K=5120 shapes) is graph-safe.
+- **Soak (2026-08-23, flag ON, 30 reps each, steady = reps 1-30):**
+
+  | arm | steady t/s (stdev) | first vs second half | band | FPs | VRAM |
+  |---|---|---|---|---|---|
+  | 35B N=8 | 189.9 (0.4, 0.2 %) | −0.15 % | 188.47–190.54 | 2 known-good (incl. the A/B + C2-V FP) | 99 % flat (fixed pool) |
+  | 27B Qwen3.8 N=8 | 102.1 (0.14, 0.14 %) | −0.13 % | 101.87–102.46 | 30/30 distinct (model non-determinism, pre-existing - off arm 3/3 distinct) | 98 % flat (fixed pool) |
+
+  rc=0 both; all reps complete-length (2048 / 1280 tokens). Soak
+  steady matches the A/B steady (35B 191.0, 27B 102.4-106.0), so the
+  A/B deltas are not a short-run artifact. **Soak PASSED.**
 
 ## Refrigerated residue
 
@@ -170,10 +191,15 @@ triton-floor regime). Pre-existing exceptions unchanged (hipBLAS
 - M=8 big-shape tie (845 vs 863 on gate_up) leaves ~2 % uncollected;
   ksplit>1 CAS could be replaced by a warp-level fp32 accumulate if
   ever worth it.
-- **Default-on decision (Kevin):** the gate is shape-conservative and
-  the A/B arms are positive on both models, so `VLLM_GFX906_SKINNY_M16=1`
-  is safe to flip once this branch soaks; no serving soak has been
-  run with the flag on yet.
+- **Default-on decision (Kevin):** the A/B arms are positive on both
+  models and the flag-on soak passed (30 reps × 2 models, flat), so
+  `VLLM_GFX906_SKINNY_M16=1` is cleared to go default-on; flipping
+  it (or merging the branch with the flag on) is Kevin's call.
+  Note: the ksplit>1 epilogue is fp16 `atomicAdd` (value-
+deterministic up to fp16 rounding order) - on the non-deterministic
+  Qwen3.8 this is unobservable, but on a deterministic model the
+  last-bit values of ksplit>1 shapes could vary run-to-run (the M≤4
+  rail's pk2 CAS has the same property and has shipped since L1').
 - W4 + W2 interaction: a faster no-spec baseline changes the spec A/B
   denominator — re-measure spec arms if the flag goes default-on
   (W2's 35B mtp2 numbers were set on the pre-W4 build; the 35B
