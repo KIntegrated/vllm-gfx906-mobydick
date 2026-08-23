@@ -33,6 +33,10 @@ MAXLEN = int(os.environ.get("MAXLEN", "4096"))
 UTIL = float(os.environ.get("UTIL", "0.95"))
 MAX_SEQS = int(os.environ.get("MAX_SEQS", "4"))
 TAG = os.environ.get("TAG", "specab")
+# LLM() defaults disable_log_stats=True (llm.py) which suppresses the
+# scheduler's spec-decoding stats (and thus observe_draft); enable for
+# the acceptance counters.
+LOG_STATS = os.environ.get("LOG_STATS", "1") == "1"
 
 SYSTEM = (
     "You are an expert terminal assistant. Reply concisely; when a "
@@ -158,6 +162,7 @@ llm = LLM(
     speculative_config=json.loads(SPEC) if SPEC else None,
     compilation_config=comp,
     enable_prefix_caching=False,
+    disable_log_stats=not LOG_STATS,
 )
 t_boot = time.time() - t0
 print(f"SPECAB-BOOT: {t_boot:.1f}s spec={bool(SPEC)}", flush=True)
