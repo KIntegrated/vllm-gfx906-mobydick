@@ -191,7 +191,18 @@ harness keeps the sweep/v1 kernels as the Phase-0 tool. Remaining C2
 substance: activation fusion (transfer expectation now low) and C3 (zeroing
 fold, 234 µs/step measured, no numerics change) as the cheap lever.
 
-### C2-V — Validation experiments for the C2 close (proposed 2026-08-19, not run)
+**Reopen addendum (2026-08-23, C2-V `DEVLOG-moe-c2v.md`):** (v2)
+triggered the reopen rule — NPT=2 gemm1 `<1,2>` measured **+1.23 %
+graph / +1.32 % eager at TP=2 M=1** (6 repeats, identical outputs) and
+the gemm2-v2 tile **+1.47 %** there too. The neutral/"failed
+transfer" verdicts above were TP=1-only; powered TP=1 re-runs confirm
+neutral (+0.48 % ≈ 0, eager 0.00 %). The close stands for **TP=1 M=1
+and batch** (batch flags are structurally inert; the BM=4 grouped path
+was never retiled — separate lever); the **TP=2 M=1 scope reopens**.
+Both flags remain env-gated, default off, pending a default-on
+decision.
+
+### C2-V — Validation experiments for the C2 close (proposed 2026-08-19; (v2) run 2026-08-22/23, gate triggered)
 
 Review of the C2 close identified regime and power gaps in the
 rejection evidence. Each is cheap to close before the close-out is
@@ -233,28 +244,27 @@ treated as permanent:
   numbers (21.4/10.8 µs gemm2 V2, 12.5 µs topk M=1) reproduce under
   the fixed checks.
 
-State (2026-08-22): **(v2) Stage 0 done — reopen gate TRIGGERED**
-on `gfx906/moe-c2v` (dev log `DEVLOG-moe-c2v.md`). Results (Δ-metric
-serving A/B, graph): **TP=2 M=1 `MOE_M1` +1.47 % (80.32 → 81.50
-t/s)** — ≥0.5 %, so per the rule above the C2-gemm1/S5 branch
-reopens (TP=2-scoped; TP=1 M=1 re-confirmed at +1.59 %). Batch: the
-flag arms are structurally inert at N≥2 (M=1 dispatch gate —
-N=4 on/off within noise, as predicted); the batch regime runs the
-never-measured BM=4 grouped path (N=8: 167 t/s, 47.8 ms/step —
-expensive per step); N=32 does not fit one MI50 32 GB (FA q_pad
-buffer + ~28 GiB non-KV footprint — new memory-ceiling finding).
-Scope provenance: dispatch-gate audit showed both existing re-tile
-candidates are M=1-only (`MOE_M1` gated on `size_m == output_topk`;
-the reverted NPT=2 trial was the BM=1 gemm1 path), so the batch axis
-reduced to BM=4 characterization + the N=4 NPT=2 arm, and **TP=2 M=1
-is a first-class arm** (per-rank N halved — new tiling axis; first
-TP=2 35B-MoE run on this box). TP=1-only scoping was overruled:
-a TP=2 win would reopen the branch regardless of TP=1 — and it
-reopened. (v1) still unrun; (v1)+(v2) remain prerequisites before
-the C2 close is cited as evidence in any future scope decision; (v3)
-is the remaining unbuilt design axis; (v4) is bookkeeping hygiene.
-Open follow-up (Kevin): default-on for `MOE_M1` given +1.5 % at both
-TP=1 and TP=2 M=1 (currently env-gated off since the C2 close).
+State (2026-08-23): **(v2) COMPLETE — reopen gate TRIGGERED; branch
+reopens TP=2-scoped** (dev log `DEVLOG-moe-c2v.md`, `gfx906/moe-c2v`).
+Final results (Δ-metric serving A/B, 6 repeats, output-fingerprint
+checked): `MOE_M1` gemm2-v2 — TP=1 M=1 +1.59 % (known S5 effect),
+**TP=2 M=1 +1.47 % (80.32 → 81.50)**; NPT=2 gemm1 `<1,2>` — TP=1
+neutral (graph +0.48 % ≈ 0 at 6 samples, eager 0.00 %), **TP=2 M=1
++1.23 % graph (81.18 → 82.18) / +1.32 % eager (21.25 → 21.53)**,
+N=4 batch neutral (−0.42 %). Batch flags are structurally inert at
+N≥2 (M=1 dispatch gate); the batch regime runs the never-retiled BM=4
+grouped path (N=8: 167 t/s, 47.8 ms/step — the real batch lever, now
+known unmeasured not rejected); N=32 does not fit one MI50 32 GB (FA
+q_pad + ~28 GiB non-KV — new memory-ceiling finding). Scope
+provenance: dispatch-gate audit (both candidates M=1-only) + the
+TP=2 M=1 first-class arm (TP=1-only scoping overruled — a TP=2 win
+would reopen regardless, and it did). (v1) answered for free: the
+powered 6-sample TP=1 A/B resolves NPT=2 at ±~0.7 % (neutral there —
+the gain was TP=2-specific). (v3) remains the unbuilt V1 block-count
+axis; (v4) bookkeeping. Both flags env-gated, default off. Open
+follow-up (Kevin): default-on for `MOE_M1` (+~1.5 % at both TP=1 and
+TP=2 M=1) and/or `MOE_NPT=2` (+~1.3 % TP=2 M=1) — combined M=1
+decode would take both; neither helps N≥2.
 
 The BM=1/NPT=4 tiling launches 4096 blocks (gemm1: 8 slots × 8 n-tiles ×
 64 K-splits, 32 threads each) per layer; each (slot, n-column) cell is

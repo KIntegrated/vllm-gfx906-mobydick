@@ -4,8 +4,11 @@
 > Qwen3.5-35B-A3B-AWQ (`/local/models/QuantTrio/Qwen3.5-35B-A3B-AWQ`) ·
 > 2026-08-22 · roadmap item C2-V (`moe-decode-roadmap.md`).
 
-**VERDICT:** OPEN (Stage 0 done: reopen gate TRIGGERED at TP=2, +1.47% ≥
-0.5%; Stage 1 NPT=2 gemm1 A/B in progress — build + matrix below)
+**VERDICT:** SHIPPED (program complete 2026-08-23: reopen gate
+TRIGGERED — both re-tile candidates ≥0.5 % at **TP=2 M=1** (gemm2-v2
++1.47 % graph; gemm1 NPT=2 +1.23 % graph / +1.32 % eager, 6 repeats,
+identical outputs). The C2-gemm1/S5 branch reopens TP=2-scoped; the
+close stands for TP=1 M=1 and batch. Follow-ups in residue below.)
 
 **GATE:** serving A/B, pp=2048/tg=256, graph mode (eager for Stage-1
 A/B arms), N=1/4/8/32 concurrent, TP=1 and TP=2, flags off/on with
@@ -210,6 +213,61 @@ TP2 N1 (shim), TP1 N4} graph + {TP1 N1, TP2 N1} eager — TP=2 N=1
 includes the first measurement of the gemm1 tile at the halved
 N=512 shape (the new tiling axis).
 
+### Stage 1 results (complete 2026-08-23, 6 repeats, fingerprints match
+all 6 off/npt2 pairs — the `<1,2>` kernel is output-correct at every
+shape incl. 32-slot N=4 and the TP=2 halved shapes)
+
+| point | off | npt2 (`MOE_NPT=2`) | Δ |
+|---|---|---|---|
+| TP=1 N=1 graph | 81.19 (±1.06) | 81.58 (±1.09) | +0.39 (+0.48 %) — under the 0.5 % gate, ~0.3σ, i.e. neutral (confirms the original 4-sample neutral verdict, now powered) |
+| TP=1 N=1 eager | 25.90 (±0.06) | 25.90 (±0.06) | 0.00 % — neutral |
+| **TP=2 N=1 graph** | **81.18 (±0.22)** | **82.18 (±0.04)** | **+1.00 (+1.23 %) — above gate, ~4.5σ of off-stdev** |
+| **TP=2 N=1 eager** | **21.25 (±0.12)** | **21.53 (±0.07)** | **+0.28 (+1.32 %) — above gate, ~3σ; regime-consistent with graph** |
+| TP=1 N=4 graph | 184.33 (±1.91) | 183.55 (±0.71) | −0.78 (−0.42 %) — noise; no batch effect |
+
+Notes: TP=1 N=4's BM=1 gemm1 tile is neutral at 32 slots (the
+standalone −11.6 % was an M=1 launch-regime effect). Absolute levels
+drifted ~+1 % on TP=2 off-arm overnight (80.32 → 81.18) — the A/B
+deltas are intra-driver (adjacent engines) and unaffected; no wedge
+or reset overnight (VRAM 0/0 at completion, no degradation-table
+entries).
+
+## Verdict (final)
+
+- **Reopen gate TRIGGERED** (roadmap rule: any positive ≥0.5 %):
+  - gemm2-v2 tile (`MOE_M1`): TP=2 M=1 **+1.47 %** (Stage 0).
+  - gemm1 NPT=2 (`MOE_NPT=2`, `<1,2>`): TP=2 M=1 **+1.23 % graph /
+    +1.32 % eager** (Stage 1) — the C2 close's "failed transfer"
+    verdict was TP=1-only; at the halved per-rank gemm1 shape (N=512)
+    the tile's −11.6 % standalone gain DOES transfer.
+- The close **stands for TP=1 M=1** (now measured with power: +0.48 %
+  ≈ neutral, 6 samples) **and for batch** (both flags structurally
+  inert at N≥2; N=4 tile trial neutral — the batch lever is the
+  un-tilled BM=4 grouped path, a separate C2-scope item).
+- **C2-gemm1/S5 branch reopens, TP=2-scoped.** In-tree state: both
+  flags env-gated, default off (no dispatch default change without a
+  Kevin decision — see below).
+
+## Refrigerated residue (updated)
+
+- **Follow-up for Kevin:** default-on candidates now measured: `MOE_M1`
+  (gemm2-v2: +1.59 % TP=1 / +1.47 % TP=2 M=1) and `MOE_NPT=2` (gemm1:
+  +1.23/+1.32 % TP=2 M=1, neutral TP=1). Combined M=1 decode would take
+  both. Neither helps N≥2 (M=1 gates) — batch decode is untouched.
+- **BM=4/8 grouped-path tiling** — the real batch-decode lever
+  (N=8: 47.8 ms/step, per-slot cost rises at the BM=1→BM=4 jump);
+  now known to be *unmeasured, not measured-and-rejected*.
+- **N=32 single-card ceiling** (FA q_pad + ~28 GiB non-KV): 32-seq 35B
+  serving needs TP=2 or a bigger card — relevant to any batch-decode
+  target setting.
+- The `with_amdsmi_context` finally-masks-primary bug
+  (`vllm/platforms/rocm.py`) — upstream fix candidate; the shim
+  (`/tmp/c2v/shim/sitecustomize.py`, wiped on reboot) is C2-V-only.
+- The (v1) power question is answered for free: 6-sample TP=1 A/B
+  resolves the NPT=2 question at ±~0.7 % — the old 4-sample "neutral"
+  was indeed below detection, and the powered answer IS neutral at
+  TP=1 (the gain was TP=2-specific all along).
+
 ## Evidence — FOR
 
 (none yet)
@@ -224,20 +282,12 @@ N=512 shape (the new tiling axis).
 
 ## Interactions / superseded-by
 
-- `DEVLOG-moe-gemm1-retiling.md` (the C2 close this re-tests) and
-  `DEVLOG-moe-m1-sprint.md` (S5/S2 provenance).
-- If TP=2 N=1 shows ≥0.5%: the "failed transfer" verdicts stand for
-  TP=1 M=1 but the branch reopens **TP=2-scoped** — record both.
-
-## Refrigerated residue
-
-- The BM=4/8 grouped-GEMM tiling surface (BLOCK_KN, NPT at BM=4/8) is
-  now known to be *unmeasured, not measured-and-rejected* — if Stage 0
-  shows the MoE gemm is a large share of the busy batch step, that is
-  the real batch-decode lever (roadmap C2 territory).
-- NPT env override (`VLLM_GFX906_MOE_NPT`) is BM≥8-only in-tree; the
-  BM=4 path has no in-tree knob — any batch-regime A/B beyond N=4
-  needs a rebuild.
+- `DEVLOG-moe-gemm1-retiling.md` (the C2 close this re-tests — its §5
+  now carries the reopen pointer) and `DEVLOG-moe-m1-sprint.md` (S5/S2
+  provenance).
+- Outcome: both flags ≥0.5 % at TP=2 M=1 → the "failed transfer"
+  verdicts stand for TP=1 M=1 and batch, and the branch reopens
+  **TP=2-scoped** (Verdict above).
 
 ## Search keys
 
