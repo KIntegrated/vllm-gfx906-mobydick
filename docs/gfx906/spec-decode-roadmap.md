@@ -8,9 +8,11 @@
 > t/s) after the L5 cg-small fix; its ceiling is prompt repetition
 > (1.12× on repetitive prompts, ~1.1× agentic). L2 (AWQ M≤4) deferred
 > (dequant-ALU-bound ceiling 2–8 ms); L3 moot (MTP supersedes the CPU
-> ngram proposer); W4 (skinny fp16 M≤16) parked — it lifts both arms
-> ~40% and is now the bigger prize (a 40 t/s baseline would make k=2
-> MTP ~2.1×).
+> ngram proposer); W4 (skinny fp16 M≤16) **SHIPPED 2026-08-23**
+> (`DEVLOG-fp16-skinny.md`, `VLLM_GFX906_SKINNY_M16`): +14.5 % 35B
+> N=8 / +6.1 % 27B N=8 concurrent decode (the original ~40 % estimate
+> was falsified — the kernel is x-L2-re-read bound at M·B/1.6 TB/s;
+> big shapes stay on triton, see the dev log).
 >
 > **Build (2026-08-19, supersedes the VLLM_NO_MAX_ILP note below):**
 > the 2026-08-24 open item (revisit per-file max-ilp) is resolved by
@@ -166,7 +168,7 @@ bench). The model is calibrated to within ~4%.
 | **L2** | AWQ M≤4: 4-row GEMV (exllama structure) or re-tiled `q_gemm` | **2–8 ms** (re-scoped 2026-08-18: the family is dequant-ALU-bound — M=1 q_gemm runs 44 MB in 75 µs = 590 GB/s, ~2× off the HBM roofline — and the tiled M=4 kernel already shares the dequant across m-rows; GEMV structure removes only atomics/LDS/m-tiling overhead, not the 17 ms M=1→M=4 delta) | gfx906-local kernel (`csrc/libtorch_stable/quantization/gptq/`) | **DEFERRED** — low ROI vs MTP (the drafter is fp16, not AWQ) |
 | L3 | CPU ngram proposer D2H serialization | ~5 ms | in-tree (`ngram_proposer.py`); the GPU proposer exists but has a **draft-quality bug** (0.428 vs 1.08 acc/step — match selection/tie-break divergence, §2 item 1) | **MOOT** — MTP supersedes ngram (1.50× vs 1.077×) |
 | **L5** | no-draft spec step penalty: **measured ≈ 13 ms** (graph-mode no-draft ≈ 48 ms vs nospec 35–37, back-solved from the A/B counters; eager shows only +3–5, so ~10 ms is graph-mode — suspected cudagraph padding of spec steps to the draft capacity M=4) | **~13 ms on 63% of agentic steps** — the dominant remaining loss | core vLLM (`vllm/config/compilation.py`) | **DONE** `68243a61b2` — confirmed at kernel level (graph-mode profile: zero M=1 AWQ calls; batchdesc_probe.py: no-draft steps pad to num_tokens=4). Root cause: `adjust_cudagraph_sizes_for_spec_decode` rounds capture sizes up to multiples of `uniform_decode_query_len`, dropping sizes 1..q-1 from the PIECEWISE key set, so 1-token no-draft steps replay the size-q graph. Fix re-adds them (gfx906-gated, `VLLM_GFX906_SPEC_CG_SMALL=0` off). A/B: ngram3 0.945× → 1.077× |
-| **W4** | the same `dense_gemv` extension shipped at M≤16 (replaces the GEMV floor AND the 174 µs triton floor) — **all M, spec and no-spec** | ~15 ms per decode step (~40% baseline latency) | gfx906-local kernel; does NOT change the spec ratio — parked after Phase 1 | parked |
+| **W4** | the same `dense_gemv` extension at M≤16 (weight-row-parallel skinny fp16 GEMM; replaces the triton floor for gated shapes — **all M, spec and no-spec**) | measured +14.5 % 35B / +6.1 % 27B at N=8 (x-L2-re-read bound; big shapes gated to triton) | gfx906-local kernel; does NOT change the spec ratio | **SHIPPED** (2026-08-23, `DEVLOG-fp16-skinny.md`) |
 
 GDN needs **no new kernel** for single-request spec decode.
 
@@ -388,15 +390,15 @@ one-file fallback.)
   kernel with per-token state slots + `num_accepted_tokens` already
   exists and is on the spec path. The original Phase-1 scope is
   satisfied by upstream FLA; nothing to build.
-- **W4 (skinny fp16 GEMM — general decode opt).** `triton_matmul`
-  costs ~19 ms/step at every M (weight-bound, M-invariant) and is
-  ~5× off HBM roofline on the big shapes (fa_q 31.5 MB → 31 µs
-  roofline vs 174 µs measured; rocBLAS is *slower*, 340 µs). A
-  weight-row-parallel skinny fp16 GEMM (GEMV structure, M≤16) would
-  cut it to ~4–6 ms: ~40% off every decode step, spec and no-spec
-  alike. Parked behind Phase 1: it moves the no-spec baseline
-  (36.5 → ~22 ms) underneath the spec A/B, so do it after the spec
-  work is gated (or use it to lift the parked ceiling).
+- **W4 (skinny fp16 GEMM — general decode opt) — SHIPPED
+  2026-08-23 (`DEVLOG-fp16-skinny.md`).** Original entry estimated
+  ~40 % off every decode step; the microbench falsified that (the
+  weight-row-parallel kernel is x-L2-re-read bound at M·B/1.6 TB/s,
+  not HBM-weight bound — the big shapes lose at M≥12 and are gated to
+  triton). Measured serving: 35B MoE N=8 graph **+14.5 %** (191.0 vs
+  166.9 t/s), 27B Qwen3.8 N=8 **+6.1 %** (104.2 vs 98.2), 27B N=4
+  control flat; kernel behind `VLLM_GFX906_SKINNY_M16` (default off);
+flag-on soak passed (30 reps × 2 models, drift < 0.2 %, rc=0).
 
 ## 7. Artifacts
 

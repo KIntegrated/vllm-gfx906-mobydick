@@ -83,68 +83,6 @@ reboot: 74.9 t/s same wall-time), not `--async-scheduling` (no effect
 on the degraded host), not `--stream-interval` (no effect — it is a
 no-op on the healthy host).
 
-## Open questions (record answers here as evidence lands)
-
-1. **Onset:** does degradation need N accumulated resets, long uptime,
-   many big weight-load cycles (host page-cache/mem pressure), or a
-   specific single event? Data so far: 2 resets post-reboot did NOT
-   degrade (n3 served fast at 13:02); ≥14 resets + 14 h uptime DID.
-   Need a canary probe scheduled after each HW burst to bisect (see
-   "detection" below).
-2. **TP=2-specific?** All clear-cut DEG observations are TP=2 serving.
-   In-process TP=1 mtp2 in the same window was mixed (one slow
-   81.6 ms/step reading, later same-boot readings 54–71 ms/step) —
-   ambiguous. TP=2 stresses the P2P/IPC paths the resets hit, so it is
-   plausible, not proven.
-3. **Load-time only?** Resets TRIGGER at load/teardown boundaries, but
-   the DEG manifests during steady inference (spec decode cadence).
-   Two distinct things: trigger (load/teardown) vs symptom (inference
-   sync latency).
-
-## Detection (cheap canary — run this before trusting any spec numbers)
-
-~60 s, TP=1, GPU0, no server needed — after any suspected wedge burst:
-
-```bash
-cd /local/git/vllm-gfx906-mobydick && source ~/env-rocm-7.14-gfx906.sh
-HIP_VISIBLE_DEVICES=0 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE HF_HUB_OFFLINE=1 \
-VLLM_ENABLE_V1_MULTIPROCESSING=0 BENCH_MODEL=/local/cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/63768c10df38c0395e12ef49edac1bd539eaeeea \
-.venv/bin/python - <<'EOF'
-import os, time, torch
-from vllm import LLM, SamplingParams
-llm = LLM(model=os.environ["BENCH_MODEL"], max_model_len=2816, max_num_seqs=4,
-          gpu_memory_utilization=0.95,
-          speculative_config={"method": "mtp", "num_speculative_tokens": 2},
-          seed=0, compilation_config={"cudagraph_capture_sizes": [1, 2, 3, 4]})
-p = "The quick brown fox jumps over the lazy dog. " * 40
-llm.generate([p], SamplingParams(temperature=0.0, max_tokens=16), use_tqdm=False)
-t0 = time.perf_counter()
-o = llm.generate([p], SamplingParams(temperature=0.0, max_tokens=256), use_tqdm=False)
-dt = time.perf_counter() - t0
-n = len(o[0].outputs[0].token_ids)
-# healthy host: ~55-63 ms/step at acceptance ~2.9  =>  ~40-47 t/s
-print(f"CANARY: {n} tok / {dt:.1f}s = {n/dt:.1f} t/s "
-      f"(healthy ~40-47; degraded <25 => REBOOT before benching)")
-EOF
-```
-
-A canary run in the degraded state would have read <25 t/s; on the
-healthy host it reads ~40+.
-
-## Boot/recovery procedure
-
-- FW (PSP −62): host reboot required (BACO reset needs root, which the
-  bench user lacks). After reboot, verify `rocm-smi` shows both GPUs
-  with real temps/clocks before starting anything.
-- HW: GPU recovers but all contexts are dead — SIGTERM any servers,
-  verify VRAM 0 %, then relaunch clean. If boots keep failing in a
-  burst (13:55–14:06 pattern), a full wedge is likely imminent; stop
-  retrying and reboot.
-- DEG: reboot. Do NOT record spec-decode numbers from a boot whose
-  canary reads slow — they are host artifacts (this cost us a day of
-  misattribution on 2026-08-22: the "mtp2 TP=2 regression"
-  investigation, see `fa-masked-mtp-regression-glm5.md`).
-
 ## 2026-08-22 evening: TP=2 35B-MoE amdsmi crash (C2-V t2n1_off) — no kernel reset
 
 First TP=2 run of the 35B MoE on this box (offline `LLM()`,
@@ -239,3 +177,79 @@ full wedge (the one that needed the ~14:50 reboot). GPU0 is dead
 until a host reboot; BACO reset needs root, which the bench user
 lacks. All W2 GPU work stopped. Session data safe in /tmp (survives
 reboot).
+## 2026-08-23 OOM-teardown collateral (W4 A/B, not a wedge)
+
+W4 serving A/B on the 06:33 boot. 27B (Qwen3.8) N=8 off arm OOM'd at
+util 0.93 (356 MB inductor prefill buffer, free: 0 — Qwen3.8's FA KV
+is 655 KB/token; 64 layers) and aborted; the *next* arm (on) died
+`hipErrorLaunchFailure` rc=134 at boot (08:52). GPU0 read clean
+afterwards (0 % VRAM, 0 % busy, no zombies); re-run of both arms at
+util 0.90 / maxlen 1280 passed clean (off 98.2 / on 104.2 t/s, no
+launch failures, ksplit=5 atomicAdd path graph-safe). Verdict:
+one-off reset collateral of the aborted OOM arm, NOT a half-wedge
+(nothing was wedged afterwards; no PSP failure; the next two engines
+on the same GPU booted fine). Counts as a reset for the onset
+bracket (see the 08-22 15:41 row pattern).
+
+## Open questions (record answers here as evidence lands)
+
+1. **Onset:** does degradation need N accumulated resets, long uptime,
+   many big weight-load cycles (host page-cache/mem pressure), or a
+   specific single event? Data so far: 2 resets post-reboot did NOT
+   degrade (n3 served fast at 13:02); ≥14 resets + 14 h uptime DID.
+   Need a canary probe scheduled after each HW burst to bisect (see
+   "detection" below).
+2. **TP=2-specific?** All clear-cut DEG observations are TP=2 serving.
+   In-process TP=1 mtp2 in the same window was mixed (one slow
+   81.6 ms/step reading, later same-boot readings 54–71 ms/step) —
+   ambiguous. TP=2 stresses the P2P/IPC paths the resets hit, so it is
+   plausible, not proven.
+3. **Load-time only?** Resets TRIGGER at load/teardown boundaries, but
+   the DEG manifests during steady inference (spec decode cadence).
+   Two distinct things: trigger (load/teardown) vs symptom (inference
+   sync latency).
+
+## Detection (cheap canary — run this before trusting any spec numbers)
+
+~60 s, TP=1, GPU0, no server needed — after any suspected wedge burst:
+
+```bash
+cd /local/git/vllm-gfx906-mobydick && source ~/env-rocm-7.14-gfx906.sh
+HIP_VISIBLE_DEVICES=0 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE HF_HUB_OFFLINE=1 \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 BENCH_MODEL=/local/cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/63768c10df38c0395e12ef49edac1bd539eaeeea \
+.venv/bin/python - <<'EOF'
+import os, time, torch
+from vllm import LLM, SamplingParams
+llm = LLM(model=os.environ["BENCH_MODEL"], max_model_len=2816, max_num_seqs=4,
+          gpu_memory_utilization=0.95,
+          speculative_config={"method": "mtp", "num_speculative_tokens": 2},
+          seed=0, compilation_config={"cudagraph_capture_sizes": [1, 2, 3, 4]})
+p = "The quick brown fox jumps over the lazy dog. " * 40
+llm.generate([p], SamplingParams(temperature=0.0, max_tokens=16), use_tqdm=False)
+t0 = time.perf_counter()
+o = llm.generate([p], SamplingParams(temperature=0.0, max_tokens=256), use_tqdm=False)
+dt = time.perf_counter() - t0
+n = len(o[0].outputs[0].token_ids)
+# healthy host: ~55-63 ms/step at acceptance ~2.9  =>  ~40-47 t/s
+print(f"CANARY: {n} tok / {dt:.1f}s = {n/dt:.1f} t/s "
+      f"(healthy ~40-47; degraded <25 => REBOOT before benching)")
+EOF
+```
+
+A canary run in the degraded state would have read <25 t/s; on the
+healthy host it reads ~40+.
+
+## Boot/recovery procedure
+
+- FW (PSP −62): host reboot required (BACO reset needs root, which the
+  bench user lacks). After reboot, verify `rocm-smi` shows both GPUs
+  with real temps/clocks before starting anything.
+- HW: GPU recovers but all contexts are dead — SIGTERM any servers,
+  verify VRAM 0 %, then relaunch clean. If boots keep failing in a
+  burst (13:55–14:06 pattern), a full wedge is likely imminent; stop
+  retrying and reboot.
+- DEG: reboot. Do NOT record spec-decode numbers from a boot whose
+  canary reads slow — they are host artifacts (this cost us a day of
+  misattribution on 2026-08-22: the "mtp2 TP=2 regression"
+  investigation, see `fa-masked-mtp-regression-glm5.md`).
+

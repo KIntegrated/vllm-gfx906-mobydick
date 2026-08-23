@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
-"""C2-V (v2) multi-request MoE serving A/B bench (roadmap C2-V,
-docs/gfx906/moe-decode-roadmap.md).
+"""Multi-request decode A/B bench (originally C2-V (v2) on the 35B MoE,
+docs/gfx906/moe-decode-roadmap.md; reused for the W4 skinny-M A/B on the
+27B/35B FA layers, docs/gfx906/DEVLOG-fp16-skinny.md).
 
 N concurrent prompts (C2V_PP tokens each) decoding C2V_TG tokens, one
 engine per process; the driver alternates flag off/on engines to cancel
@@ -169,6 +170,7 @@ def main():
         "capture_sizes": sizes if not eager else None,
         "vllm_gfx906_moe_m1": os.environ.get("VLLM_GFX906_MOE_M1", "0"),
         "vllm_gfx906_moe_npt": os.environ.get("VLLM_GFX906_MOE_NPT", ""),
+        "vllm_gfx906_skinny_m16": os.environ.get("VLLM_GFX906_SKINNY_M16", "0"),
         "load_s": round(load_s, 1),
         "warmup_s": round(warmup_s, 1),
         "decode_tps_mean": round(mean, 2),

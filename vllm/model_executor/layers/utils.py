@@ -269,14 +269,17 @@ def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor:
 def _gfx906_spec_gemv_m4(
     weight: torch.Tensor, x_view: torch.Tensor
 ) -> torch.Tensor | None:
-    """M=2..4 W16A16 dense GEMM via the row-parallel GEMV-family kernel
-    (spec decode L1'; see csrc/rocm/dense_gemv_gfx906.cu).
+    """M=2..16 W16A16 dense GEMM via the row-parallel GEMV-family kernel
+    (spec decode L1' for M=2..4, default on; W4 skinny M=5..16 behind
+    VLLM_GFX906_SKINNY_M16, default off; see
+    csrc/rocm/dense_gemv_gfx906.cu).
 
     The triton_matmul skinny fallback is weight-bound and M-invariant on
     MI50 (bench_fp16_skinny_m.py: 174 us at M=1..16 for the 3072x5120
     shape, ~7x off the HBM floor); the GEMV-family kernel keeps the M=1
-    weight-read speed at M=2..4 (bench_fp16_m4.py). Returns None when the
-    shape is unsupported so the caller falls back to the triton path.
+    weight-read speed at M=2..4 (bench_fp16_m4.py) and extends it to
+    M=5..16 (W4). Returns None when the shape is unsupported so the
+    caller falls back to the triton path.
     """
     from vllm.platforms.rocm import on_gfx906
 
@@ -296,7 +299,25 @@ def _gfx906_spec_gemv_m4(
     v = os.environ.get("VLLM_GFX906_GEMVM_RPT")
     if v in ("2", "4"):
         rpt = int(v)
-    if not (2 <= n <= 4 and k % 8 == 0 and m % rpt == 0):
+    # W4 skinny M=5..16 (gated; see csrc/rocm/dense_gemv_gfx906.cu).
+    # Measured model: this kernel is x-L2-re-read bound at
+    # ~M*B/1.6 TB/s (B = N*K*2 weight bytes) while triton is
+    # ~B/0.2 TB/s on the big shapes (plus a ~100 us floor on small
+    # ones) - crossover at M ~= 7.4, size-independent. Gate: M<=7
+    # everywhere, M=8 to <=32 MB, M>=9 to <=10 MB (small-shape
+    # triton-floor regime).
+    m16 = os.environ.get("VLLM_GFX906_SKINNY_M16", "0") == "1"
+    if rpt == 4:
+        m16 = False  # the m16 kernel is RPT=1
+    if m16 and 5 <= n <= 16:
+        mb = m * k * 2
+        if not (n <= 7 or (n == 8 and mb <= 32 * 1024 * 1024) or
+                mb <= 10 * 1024 * 1024):
+            m16 = False
+    if not (
+        ((2 <= n <= 4) or (m16 and 5 <= n <= 16)) and k % 8 == 0
+        and m % rpt == 0
+    ):
         return None
     # Keep the tuned hipBLAS special case (m==5120, 2048<=k<=2304, n=2..16)
     # below untouched.
