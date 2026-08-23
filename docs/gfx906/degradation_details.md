@@ -364,3 +364,56 @@ sit behind parallel two-bridge chains off adjacent root ports 03.1/03.2;
 the 18:50 simultaneous dual-card latch). Discriminating experiment:
 card swap between the symmetric slots. Full experiment record +
 artifacts (`/local/tmp/boot_fail/`): `DEVLOG-boot-failure.md` §7.
+
+## 2026-08-23 21:46Z — fa-gather-lifecycle arm A: isolated GPU1 wedge at worker init
+
+First 256k needle-harness attempt (TP=2, Qwen3.8-27B, `GFX906_FA_GATHER_EXACT=1`
+arm — the pre-fix-policy OOM repro) died at worker init, ~1 min in:
+
+```
+21:46:53 amdgpu 0000:0e:00.0: GPU reset begin!. Source: 4
+21:46:53 amdgpu 0000:0e:00.0: BACO reset
+21:46:55 VRAM is lost due to GPU reset!
+21:46:56 GPU reset(1) succeeded!
+21:46:56 [drm] device wedged, but recovered through reset
+```
+
+Worker log: `c10::AcceleratorError` / `hipErrorLaunchFailure` at
+`SetDevice` (both ranks), `WorkerProc initialization failed`.
+
+- 85 min of quiet between wedges (20:21:33 → 21:46:53) with passing
+  canaries at 20:40/20:41 (38.2/38.6 t/s) — an **isolated wedge inside a
+  good window**, the pattern established in DEVLOG-boot-failure.md §7.1.2.
+- This one hit **GPU1** (0e:00.0 — 4th reset on GPU1 today vs 17 on GPU0),
+  so the flap is not strictly GPU0-primary at the per-event level even
+  though GPU0 dominates the count.
+- Clean recovery (no PSP ret −62, no zombie VRAM, rocm-smi 0 % both cards);
+  harness process exited on its own. Arm A retried after this entry.
+
+## 2026-08-23 21:46–22:42Z — fa-gather-lifecycle session: GPU1 flap → dual-card common-cause reset
+
+Session context: arm A (pre-fix policy, `GFX906_FA_GATHER_EXACT=1`) and arm
+B (the fix) of the 256k needle harness. Wedges at worker init (SetDevice /
+first kernel dispatch) in the ~6-min boot window:
+
+- 21:46:53 GPU1 (0e) — arm A attempt 1
+- 22:02:01 GPU1 — arm A attempt 2 (comp_1 fence fallback)
+- 22:25:12 GPU1 — arm A attempt 4 (attempt 3, launched 22:05, ran clean
+  22:07–22:16 through full boot + graph capture — then died on a harness
+  assert bug, not a wedge)
+- **22:42:12 BOTH cards (0b + 0e) in the same millisecond** — arm B attempt 1
+
+The dual-card same-millisecond reset matches the 18:50:19.637/.643
+dual-card pcie_bif latch: a shared host-side contributor (PCIe fabric /
+root-complex) is the leading common-cause candidate; card-local
+degradation alone would not reset both in one ms.
+
+**Arm A SUCCEEDED on attempt 5 (22:29–22:38, a wedge-free window):**
+the pre-fix OOM reproduced byte-exact (178,257,920 B, free: 0, gptq_gemm,
+3.3 min into prefill) with OOMHUNT pinning the unbounded `_gather_retired`
+dict (152 generations, 7.79 GB retired at the 60k-token OOM point).
+Arm B pending a clean boot window.
+
+Host state: 12 resets this boot (boot C, 19:20). Cadence accelerating
+(15 min → 23 min → 17 min between single-card wedges, then dual-card).
+If arm B cannot get a clean window, reboot is the next step (needs root).
