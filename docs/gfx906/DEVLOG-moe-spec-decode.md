@@ -2,7 +2,11 @@
 
 Copyright Kevin Read <me@kevin-read.com>
 
-**VERDICT:** OPEN (in progress)
+**VERDICT:** SHIPPED (2026-08-23: the rails port with no code changes —
+all four were in-tree from the merged 27B phase; mtp2 k=2 is +16–20 %
+graph / ~1.84× eager on the 35B MoE. No dispatch change to ship; the
+recommendation is config: `--speculative-config '{"method":"mtp",
+"num_speculative_tokens":2}'` + cg-small for 35B serving.)
 **Date:** 2026-08-23 (started)
 **Build:** `vllm 0.28.0rc2.dev318+gfed585110` (C2-V .venv; both C2-V flags
 default off → dispatch identical to the fed585110 baseline)
@@ -97,7 +101,47 @@ reboot. Token-identity gate: unusable on this model (baseline
 non-reproducible at temp=0 — see degradation_details 05:47Z section).
 
 2026-08-23 06:08Z: GPU0 full wedge (PSP -62) — session paused;
-reboot required (Kevin). All data in /tmp/moespec/.
+reboot required (Kevin). **Note: /tmp is tmpfs on this box — the
+reboot wiped /tmp/moespec and /tmp/c2v (raw logs); the numbers above
+were already committed here and in the degradation files.**
+
+### Post-reboot completion (2026-08-23 ~06:30Z reboot, canary 38.6 = healthy)
+
+Acceptance re-runs (the missing piece: `LLM()` defaults
+disable_log_stats=True — llm.py:228 — which suppressed
+observe_draft; fixed in the bench, `LOG_STATS=1`):
+
+| arm | steady t/s (prefill-incl) | tok/step | acceptance |
+|---|---|---|---|
+| base graph (w2b_base_g) | 76.27 / 76.10 / 76.25 / 76.09 | — | — |
+| **mtp2 graph (w2b_mtp2_g)** | **87.75 / 91.33 / 91.56 / 89.86** | **1.609** | **80.44 %** |
+| **mtp2 eager (w2b_mtp2_e)** | **44.83 / 46.14 / 44.90 / 45.71** | 1.566 | 78.31 % |
+| base eager (pre-reboot) | 24.51–24.72 | — | — |
+
+- **Graph: 89.9 vs 76.2 steady = 1.18×** (per-rep 1.15–1.20);
+  consistent with the pre-reboot mtp2_g (86.2–89.7) — reproduces
+  across the reboot. **Eager: 45.5 vs 24.5 = 1.86×** — spec
+  amortizes the launch-bound eager step (40.8 ms) across 1.57
+  tokens, so the relative win is much bigger than graph's.
+- **The 35B MTP drafter is a weaker proposer than the 27B's**: 80.4 %
+  acceptance / 1.609 tok/step vs the 27B's 90.95 % / 1.819 (same
+  k=2, both MoE-vs-dense MTP layers; the 35B MTP layer is itself
+  MoE, fp16). Break-even arithmetic: baseline decode ≈ 11.8
+  ms/step; mtp2 step ≈ 16.4 ms (1.39×) → break-even 1.39 tok/step;
+  measured 1.609 → +16 % margin. k=3 needs ~2.4 tok/step here (two
+  more draft forwards + a 4-token verify at em=32) — not viable at
+  80 % first-draft acceptance; leave k=2 as the config.
+- **Verdict:** the rails (MTP k=2 + UNIFORM_BATCH cg + cg-small +
+  fc GEMV + GDN spec path) work on the 35B MoE with **zero code
+  changes** — everything was already in-tree from the merged 27B
+  phase (`Qwen3_5MoeMTP` registered, fc K=4096 inside the GEMV
+  KCHUNK set, allowlist + UNIFORM_BATCH model-agnostic). W2's real
+  deliverable is the measured config recommendation: mtp2 + cg-small
+  for 35B serving (graph: +18 %; eager: +86 %).
+- Host: two clean canaries post-reboot window (38.6), no wedges in
+  the 06:30–06:52Z completion window (3 engine cycles). The
+  100 %-acceptance DEG symptom (Kevin's report) did NOT appear —
+  healthy-state acceptance is 78–80 %.
 
 ## Refrigerated residue
 
