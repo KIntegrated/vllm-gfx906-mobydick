@@ -555,18 +555,24 @@ def test_q_pad_buffer_survives_capture_then_prefill_grow():
     assert ((out_d - ref_d).norm() / ref_d.norm()).item() < 2e-2
 
 
-def test_gather_buffers_capture_sweep_keepalive():
-    """2026-08-19 init Memory Fault: FULL-graph capture used to bake a
-    separate gather-buffer generation per captured batch size, and the
-    bounded keep-alive evicted early-captured generations that replaying
-    graphs still referenced by VA. Two properties are pinned here by
-    driving the real Gfx906FAImpl._ensure_gather_buffers:
-    (a) a smaller-B capture request reuses the current buffer as a
-    leading-dim slice (same base VA, no new generation per size), and
-    (b) generations whose VA was baked into a captured graph are never
-    freed, even when later same-shape generations are retired (the
-    retire dict is keyed by data_ptr, so same-shape entries cannot
-    collide and overwrite each other).
+def test_gather_buffers_lifecycle_postfix():
+    """plan-gfx906-fa-fix.md §5 — pins the POST-FIX gather-buffer
+    contract (GFX906_FA_GATHER_EXACT=0) by driving the real
+    Gfx906FAImpl (class-level buffers; snapshot/restore so nothing
+    leaks into other tests):
+    (1) Sk shrink / ping-pong (130 -> 100 -> 130): no realloc (Sk is a
+        grow-only capacity), retire set unchanged;
+    (4) descending capture sweep (B=2 then B=1, as get_capture_descs
+        sorts): ONE generation, smaller-B reuses the base VA as a
+        leading-dim slice, end-of-capture retired <= 1;
+    (2) a captured generation is retired (kept alive) when replaced —
+        driven directly: capture at width 128, then grow past it to 160;
+    (5) the per-generation flag is reset, not OR'd: the eager
+        generation (flag False) that follows a retired captured one is
+        itself FREED on replacement;
+    (3) eager growth (never captured) frees the old generation —
+        allocator-level evidence: the delta is the new-minus-old
+        excess, not the new generation on top of the old.
     """
     dev = "cuda"
     torch.manual_seed(11)
@@ -580,18 +586,22 @@ def test_gather_buffers_capture_sweep_keepalive():
         num_kv_heads=HKV, alibi_slopes=None, sliding_window=None,
         kv_cache_dtype="float16",
     )
-    assert impl._legacy
+    assert impl._legacy  # this test targets the default serving path
     cls = type(impl)
 
-    # The gather buffers are ClassVars shared across impls: snapshot and
-    # restore so this test cannot leak generations into other tests.
     saved = (cls._k_gather_buf, cls._v_gather_buf, cls._gather_retired,
-             cls._gather_captured)
+             cls._gather_captured, cls._gather_buf_captured,
+             cls._gather_exact, cls._gather_retired_warned)
     cls._k_gather_buf = cls._v_gather_buf = None
     cls._gather_retired = {}
     cls._gather_captured = False
+    cls._gather_buf_captured = False
+    cls._gather_exact = False
+    cls._gather_retired_warned = False
     try:
-        n_blocks = 32
+        # 96 blocks so B=8 x 12-block tables stay in range (190 tokens
+        # need 12 blocks of 16).
+        n_blocks = 96
         _, vc, kv = _make_paged_cache(n_blocks, dev)
         k16 = kv[:, 0]
         K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
@@ -606,8 +616,8 @@ def test_gather_buffers_capture_sweep_keepalive():
                 num_actual_tokens=b * sq,
                 max_query_len=sq,
                 max_seq_len=sk,
-                query_start_loc=torch.arange(b + 1, dtype=torch.int32,
-                                             device=dev),
+                query_start_loc=torch.arange(
+                    0, b * sq + 1, sq, dtype=torch.int32, device=dev),
                 seq_lens=torch.full((b,), sk, dtype=torch.int32,
                                     device=dev),
                 block_table=torch.arange(
@@ -617,7 +627,7 @@ def test_gather_buffers_capture_sweep_keepalive():
                                          device=dev),
             )
 
-        layer = None  # impl.forward does not touch the layer object
+        layer = None
         s = torch.cuda.Stream()
 
         def decode(b, sk, nblk, q, out, m=None):
@@ -626,82 +636,393 @@ def test_gather_buffers_capture_sweep_keepalive():
 
         q1 = torch.randn(1, HQ, D, device=dev, dtype=torch.float16) * 0.5
         q2 = torch.randn(2, HQ, D, device=dev, dtype=torch.float16) * 0.5
+        q4 = torch.randn(4, HQ, D, device=dev, dtype=torch.float16) * 0.5
+        q8 = torch.randn(8, HQ, D, device=dev, dtype=torch.float16) * 0.5
         o1 = torch.zeros(1, HQ, D, device=dev, dtype=torch.float16)
         o2 = torch.zeros(2, HQ, D, device=dev, dtype=torch.float16)
+        o4 = torch.zeros(4, HQ, D, device=dev, dtype=torch.float16)
+        o8 = torch.zeros(8, HQ, D, device=dev, dtype=torch.float16)
 
         with torch.cuda.stream(s):
-            decode(1, 100, 7, q1, o1)  # gen1 [1,2,128,bpr] (Sk_pad(100)=128)
+            # (1) eager growth to Sk_pad(130)=160, then ping-pong down
+            # and up: capacity reuse, zero reallocs, empty retire set.
+            decode(1, 130, 9, q1, o1)
+            g1 = cls._k_gather_buf
+            assert g1.shape[2] == 160
+            decode(1, 100, 7, q1, o1)
+            # sk=100 reference: this is the input the g1g graph replays.
             ref1 = o1.clone()
-            decode(2, 100, 7, q2, o2)  # gen2 [2,2,128,bpr]; gen1 never
-            ref2 = o2.clone()          #   captured -> correctly freed
+            assert cls._k_gather_buf is g1 and not cls._gather_retired
+            decode(1, 130, 9, q1, o1)
+            assert cls._k_gather_buf is g1 and not cls._gather_retired
+            # Eager B-grow: gen1 never captured -> freed, not retired.
+            # Grow-only: the width (160) is preserved across the B-grow.
+            decode(2, 100, 7, q2, o2)
+            ref2 = o2.clone()
+            assert cls._k_gather_buf is not g1
+            assert g1.data_ptr() not in cls._gather_retired
+            g2 = cls._k_gather_buf
+            assert g2.shape[:3] == (2, HKV, 160)
+            assert not cls._gather_buf_captured
         torch.cuda.current_stream().wait_stream(s)
-        gen2 = cls._k_gather_buf
-        assert gen2.shape[:2] == (2, HKV) and gen2.shape[2] == 128
 
-        # Capture with pre-built metadata (capture-time allocations would
-        # land in the graph pool; the engine pins static tensors instead).
+        # (4) descending capture sweep on the pre-allocated buffer (the
+        # engine bakes the existing VA; no capture-time allocs). B=2
+        # first (largest-first), then B=1 via the leading-dim slice.
         m2_cap = meta(2, 1, 100, 7)
-        g2 = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g2):
+        g2g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g2g):
             decode(2, 100, 7, q2, o2, m2_cap)
-        assert cls._gather_captured  # latched during capture
-        assert cls._k_gather_buf is gen2
-
-        # (a) smaller-B request reuses the same base VA (slice, no new
-        # generation) — the old code allocated one per captured size.
-        # Pass the indexed device (query.device in production) — the
-        # equality check is exact, an index-less device would force a
-        # spurious realloc.
+        assert cls._k_gather_buf is g2
+        assert cls._gather_buf_captured  # latched in the reuse path
         k_slice = cls._ensure_gather_buffers(1, HKV, 100, D,
                                              kv.device)[0]
-        assert k_slice.data_ptr() == gen2.data_ptr()
-        assert cls._k_gather_buf is gen2
-
+        assert k_slice.data_ptr() == g2.data_ptr()
+        assert cls._k_gather_buf is g2
         m1_cap = meta(1, 1, 100, 7)
-        g1 = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g1):
+        g1g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g1g):
             decode(1, 100, 7, q1, o1, m1_cap)
+        # End-of-capture: the sweep retired nothing (largest-first).
+        assert len(cls._gather_retired) <= 1
 
-        # Post-capture churn: B grow, then Sk ping-pong that recreates
-        # SAME-SHAPED generations (the shape-key collision hazard). Each
-        # step retires the previous generation; all of them must survive.
-        q4 = torch.randn(4, HQ, D, device=dev, dtype=torch.float16) * 0.5
-        o4 = torch.zeros(4, HQ, D, device=dev, dtype=torch.float16)
-        retired = []
+        # (2) grow past the captured width (160): the captured generation
+        # is retired (kept alive); the replacement starts uncaptured.
+        with torch.cuda.stream(s):
+            decode(2, 190, 12, q2, o2)
+        torch.cuda.current_stream().wait_stream(s)
+        g3 = cls._k_gather_buf
+        assert g3.shape[2] == 192 and g3 is not g2
+        assert g2.data_ptr() in cls._gather_retired
+        assert not cls._gather_buf_captured  # reset, not OR'd
 
-        def churn(b, sk, nblk, q, out):
-            before = cls._k_gather_buf
-            decode(b, sk, nblk, q, out)
-            if cls._k_gather_buf is not before:
-                retired.append(before)
-            assert bool(torch.isfinite(out.float()).all())
-
-        churn(4, 100, 7, q4, o4)    # retires gen2 (captured!)
-        churn(1, 130, 9, q1, o1)    # [1,160]
-        churn(1, 100, 7, q1, o1)    # [1,128]
-        churn(1, 130, 9, q1, o1)    # retires [1,128] (gen2's sibling shape)
-        churn(2, 100, 7, q2, o2)    # [2,128] — same shape as captured gen2
-        churn(2, 130, 9, q2, o2)    # retires the [2,128] twin above
-
-        # (b) the captured generation and every retired twin are all
-        # still referenced — nothing baked into g1/g2 was freed.
-        kept = [pair[0] for pair in cls._gather_retired.values()]
-        assert any(g is gen2 for g in kept)
-        assert all(any(g is k for k in kept) for g in retired)
-        assert len(cls._gather_retired) == len(set(
-            g.data_ptr() for g in kept)) == len(retired)
-
-        # Replaying both graphs hits the retired-but-alive base VA.
-        o1.zero_()
+        # Replaying the B=2 graph hits the retired-but-alive base VA.
         o2.zero_()
-        g2.replay()
-        g1.replay()
+        g2g.replay()
         torch.cuda.synchronize()
         assert ((o2 - ref2).norm() / ref2.norm()).item() < 2e-2
+        o1.zero_()
+        g1g.replay()
+        torch.cuda.synchronize()
         assert ((o1 - ref1).norm() / ref1.norm()).item() < 2e-2
+
+        # (5) capture gen3 (flag latches True); a B-grow retires it.
+        # The following eager gen4 (flag False) is then FREED on its own
+        # B-grow — the flag did not leak across the replacement.
+        m2_cap190 = meta(2, 1, 190, 12)
+        with torch.cuda.graph(torch.cuda.CUDAGraph()):
+            decode(2, 190, 12, q2, o2, m2_cap190)
+        assert cls._gather_buf_captured and cls._k_gather_buf is g3
+        with torch.cuda.stream(s):
+            decode(4, 190, 12, q4, o4)  # B-grow: retires g3 (captured)
+        torch.cuda.current_stream().wait_stream(s)
+        g4 = cls._k_gather_buf
+        assert g4.shape[0] == 4 and g3.data_ptr() in cls._gather_retired
+        assert not cls._gather_buf_captured
+        with torch.cuda.stream(s):
+            decode(8, 190, 12, q8, o8)  # B-grow: g4 (eager) freed
+        torch.cuda.current_stream().wait_stream(s)
+        assert g4.data_ptr() not in cls._gather_retired
+        assert g3.data_ptr() in cls._gather_retired
+        kept = {g.data_ptr() for g, _ in cls._gather_retired.values()}
+        assert kept == {g2.data_ptr(), g3.data_ptr()}
+
+        # (3) eager growth frees: allocator-level evidence. Fresh state.
+        cls._k_gather_buf = cls._v_gather_buf = None
+        cls._gather_retired = {}
+        cls._gather_captured = False
+        cls._gather_buf_captured = False
+        with torch.cuda.stream(s):
+            decode(1, 100, 7, q1, o1)
+        torch.cuda.current_stream().wait_stream(s)
+        # Record the VA + size but DO NOT hold the tensors — a live
+        # Python reference would keep the generation alive and defeat
+        # the allocator-level check (plan §5 item 3).
+        gen_a_ptr = cls._k_gather_buf.data_ptr()
+        gen_a_bytes = cls._k_gather_buf.numel() + cls._v_gather_buf.numel() * 2
+        torch.cuda.synchronize()
+        alloc_before = torch.cuda.memory_allocated()
+        with torch.cuda.stream(s):
+            decode(1, 130, 9, q1, o1)  # grow 128 -> 160
+        torch.cuda.synchronize()
+        delta = torch.cuda.memory_allocated() - alloc_before
+        # If the old generation were kept alive the delta would be the
+        # full new generation; freed, it is only the 160-vs-128 excess.
+        assert gen_a_ptr not in cls._gather_retired
+        assert delta < gen_a_bytes, (delta, gen_a_bytes)
     finally:
         (cls._k_gather_buf, cls._v_gather_buf, cls._gather_retired,
-         cls._gather_captured) = saved
+         cls._gather_captured, cls._gather_buf_captured,
+         cls._gather_exact, cls._gather_retired_warned) = saved
+
+
+def test_persistent_gather_fa_wide_buffer_poisoned_tail():
+    """plan §5 — width >> live is safe end-to-end on the persistent
+    path: the gather's work is live-bounded (device-side seq_lens) and
+    the FA kernel cuts each sequence at kv_max, never at Sk. The stale
+    region [seq_len, width) of the class buffer is poisoned with huge
+    q8 bytes / fp16 NaN (exactly the data that would leak through if
+    the tail mask were ever broken); the FA output must be bit-equal
+    to the exact-width reference. Mixed seq_lens [37, 1000] exercise
+    the per-seq margin clamp at num_seqs > 1; a second uniform
+    multi-token (MTP-draft-shaped) forward reuses the same wide buffer.
+    """
+    dev = "cuda"
+    torch.manual_seed(13)
+    from vllm.gfx906_fa.gfx906_fa_backend import (
+        Gfx906FAImpl,
+        Gfx906FAMetadata,
+    )
+
+    impl = Gfx906FAImpl(
+        num_heads=HQ, head_size=D, scale=1.0 / math.sqrt(D),
+        num_kv_heads=HKV, alibi_slopes=None, sliding_window=None,
+        kv_cache_dtype="float16",
+    )
+    cls = type(impl)
+    saved = (cls._k_gather_buf, cls._v_gather_buf, cls._gather_retired,
+             cls._gather_captured, cls._gather_buf_captured)
+    try:
+        B, seq_lens, width = 2, [37, 1000], 4096
+        nblk = (seq_lens[-1] + BLOCK - 1) // BLOCK  # 63
+        n_blocks = B * nblk + 4
+        _, vc, kv = _make_paged_cache(n_blocks, dev)
+        k16 = kv[:, 0]
+        K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                        dtype=torch.float16) * 0.5
+        V = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                        dtype=torch.float16) * 0.5
+        k16.copy_(K.view(n_blocks, BLOCK, HKV, D))
+        _write_v(kv, V)
+
+        def meta(b, sq, sk, sl_, bt_):
+            return Gfx906FAMetadata(
+                num_actual_tokens=b * sq,
+                max_query_len=sq,
+                max_seq_len=sk,
+                query_start_loc=torch.arange(
+                    0, b * sq + 1, sq, dtype=torch.int32, device=dev),
+                seq_lens=sl_,
+                block_table=bt_,
+                slot_mapping=torch.empty(0, dtype=torch.int64,
+                                         device=dev),
+            )
+
+        bt = torch.arange(B * nblk, dtype=torch.int32,
+                          device=dev).view(B, nblk)
+        layer = None
+        q = torch.randn(B, HQ, D, device=dev, dtype=torch.float16) * 0.5
+        out = torch.zeros(B, HQ, D, device=dev, dtype=torch.float16)
+
+        def reset_class():
+            cls._k_gather_buf = cls._v_gather_buf = None
+            cls._gather_retired = {}
+            cls._gather_captured = False
+            cls._gather_buf_captured = False
+
+        # Reference: exact-width class buffer (fresh allocation).
+        reset_class()
+        sl = torch.tensor(seq_lens, dtype=torch.int32, device=dev)
+        m = meta(B, 1, seq_lens[-1], sl, bt)
+        impl.forward(layer, q, q, q, kv, m, output=out)
+        ref = out.clone()
+        assert cls._k_gather_buf.shape[2] == 1024  # Sk_pad(1000)
+
+        # Wide buffer with the stale region poisoned.
+        bpr = (D // 32) * 34
+        kw = torch.empty(B, HKV, width, bpr, dtype=torch.uint8,
+                         device=dev)
+        vw = torch.empty(B, HKV, width, D, dtype=torch.float16,
+                         device=dev)
+        for s_i, L in enumerate(seq_lens):
+            kw[s_i, :, L:, :].fill_(0x7F)  # huge q8 scale/data bytes
+            vw[s_i, :, L:, :].fill_(float("nan"))
+        cls._k_gather_buf, cls._v_gather_buf = kw, vw
+        cls._gather_buf_captured = False
+        out.zero_()
+        impl.forward(layer, q, q, q, kv, m, output=out)
+        assert torch.equal(out, ref), (
+            "poisoned wide buffer changed the FA output — tail mask "
+            "leak or width-bound work on the persistent path")
+
+        # MTP-draft-shaped second forward: multi-token queries, longer
+        # seq_lens, same wide buffer (capacity reuse, no realloc).
+        sl2 = torch.tensor([40, 1003], dtype=torch.int32, device=dev)
+        qd = torch.randn(2 * 3, HQ, D, device=dev,
+                         dtype=torch.float16) * 0.5
+        outd = torch.zeros(2 * 3, HQ, D, device=dev, dtype=torch.float16)
+        m2 = meta(2, 3, 1003, sl2, bt)
+        reset_class()
+        impl.forward(layer, qd, qd, qd, kv, m2, output=outd)
+        refd = outd.clone()
+        assert cls._k_gather_buf.shape[2] == 1024
+        for s_i, L in enumerate([40, 1003]):
+            kw[s_i, :, L:, :].fill_(0x7F)
+            vw[s_i, :, L:, :].fill_(float("nan"))
+        cls._k_gather_buf, cls._v_gather_buf = kw, vw
+        cls._gather_buf_captured = False
+        outd.zero_()
+        impl.forward(layer, qd, qd, qd, kv, m2, output=outd)
+        assert torch.equal(outd, refd), (
+            "poisoned wide buffer changed the draft-shaped FA output")
+    finally:
+        (cls._k_gather_buf, cls._v_gather_buf, cls._gather_retired,
+         cls._gather_captured, cls._gather_buf_captured) = saved
+
+
+def test_wide_buffer_b17_fused_quant_no_leak():
+    """plan §2.2c/§5 — num_seqs > _PERSIST_MAX_SEQS with a WIDE class
+    buffer: the fused-quant path keeps the exact contract, so it must
+    still work (no crash, finite output, wide buffer untouched) and
+    must not accumulate its per-call C++ allocations across steps
+    (they are freed after each call — no reuse, but no leak either).
+    """
+    dev = "cuda"
+    torch.manual_seed(17)
+    from vllm.gfx906_fa.gfx906_fa_backend import (
+        Gfx906FAImpl,
+        Gfx906FAMetadata,
+    )
+
+    impl = Gfx906FAImpl(
+        num_heads=HQ, head_size=D, scale=1.0 / math.sqrt(D),
+        num_kv_heads=HKV, alibi_slopes=None, sliding_window=None,
+        kv_cache_dtype="float16",
+    )
+    cls = type(impl)
+    B = 17
+    saved = (cls._k_gather_buf, cls._v_gather_buf, cls._gather_retired,
+             cls._gather_captured, cls._gather_buf_captured)
+    try:
+        sk = 64
+        nblk = (sk + BLOCK - 1) // BLOCK  # 4
+        n_blocks = B * nblk + 4
+        _, vc, kv = _make_paged_cache(n_blocks, dev)
+        k16 = kv[:, 0]
+        K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                        dtype=torch.float16) * 0.5
+        V = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                        dtype=torch.float16) * 0.5
+        k16.copy_(K.view(n_blocks, BLOCK, HKV, D))
+        _write_v(kv, V)
+
+        m = Gfx906FAMetadata(
+            num_actual_tokens=B,
+            max_query_len=1,
+            max_seq_len=sk,
+            query_start_loc=torch.arange(B + 1, dtype=torch.int32,
+                                         device=dev),
+            seq_lens=torch.full((B,), sk, dtype=torch.int32, device=dev),
+            block_table=torch.arange(B * nblk, dtype=torch.int32,
+                                     device=dev).view(B, nblk),
+            slot_mapping=torch.empty(0, dtype=torch.int64, device=dev))
+        bpr = (D // 32) * 34
+        cls._k_gather_buf = torch.empty(B, HKV, 1024, bpr,
+                                        dtype=torch.uint8, device=dev)
+        cls._v_gather_buf = torch.empty(B, HKV, 1024, D,
+                                        dtype=torch.float16, device=dev)
+        cls._gather_retired = {}
+        cls._gather_captured = False
+        cls._gather_buf_captured = False
+
+        q = torch.randn(B, HQ, D, device=dev, dtype=torch.float16) * 0.5
+        out = torch.zeros(B, HQ, D, device=dev, dtype=torch.float16)
+        impl.forward(None, q, q, q, kv, m, output=out)
+        assert bool(torch.isfinite(out.float()).all())
+        # The wide buffer was refused by the exact-contract site
+        # (no reuse, no retire, no consumption).
+        assert cls._k_gather_buf.shape[2] == 1024
+        assert not cls._gather_retired
+
+        # No accumulation across steps: per-call C++ allocs are freed.
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        for _ in range(3):
+            impl.forward(None, q, q, q, kv, m, output=out)
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() - before < 16 * 2**20
+    finally:
+        (cls._k_gather_buf, cls._v_gather_buf, cls._gather_retired,
+         cls._gather_captured, cls._gather_buf_captured) = saved
+
+
+def test_gather_exact_killswitch_restores_old_policy():
+    """plan §5 — GFX906_FA_GATHER_EXACT=1 (cls._gather_exact here; the
+    in-service A/B sets the env var, read at import by both files)
+    restores the pre-fix behavior: exact-Sk realloc and the sticky
+    _gather_captured latch, so an Sk ping-pong after capture retires
+    EVERY generation — the unbounded growth this fix removes. Pinned
+    so the kill switch stays a true A/B arm.
+    """
+    dev = "cuda"
+    torch.manual_seed(19)
+    from vllm.gfx906_fa.gfx906_fa_backend import (
+        Gfx906FAImpl,
+        Gfx906FAMetadata,
+    )
+
+    impl = Gfx906FAImpl(
+        num_heads=HQ, head_size=D, scale=1.0 / math.sqrt(D),
+        num_kv_heads=HKV, alibi_slopes=None, sliding_window=None,
+        kv_cache_dtype="float16",
+    )
+    cls = type(impl)
+    saved = (cls._k_gather_buf, cls._v_gather_buf, cls._gather_retired,
+             cls._gather_captured, cls._gather_buf_captured,
+             cls._gather_exact, cls._gather_retired_warned)
+    cls._k_gather_buf = cls._v_gather_buf = None
+    cls._gather_retired = {}
+    cls._gather_captured = False
+    cls._gather_buf_captured = False
+    cls._gather_exact = True
+    try:
+        n_blocks = 32
+        _, vc, kv = _make_paged_cache(n_blocks, dev)
+        k16 = kv[:, 0]
+        K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                        dtype=torch.float16) * 0.5
+        V = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                        dtype=torch.float16) * 0.5
+        k16.copy_(K.view(n_blocks, BLOCK, HKV, D))
+        _write_v(kv, V)
+
+        def m(sk):
+            return Gfx906FAMetadata(
+                num_actual_tokens=1, max_query_len=1, max_seq_len=sk,
+                query_start_loc=torch.arange(2, dtype=torch.int32,
+                                             device=dev),
+                seq_lens=torch.tensor([sk], dtype=torch.int32,
+                                      device=dev),
+                block_table=torch.arange(9, dtype=torch.int32,
+                                         device=dev).view(1, 9),
+                slot_mapping=torch.empty(0, dtype=torch.int64,
+                                         device=dev))
+
+        q1 = torch.randn(1, HQ, D, device=dev, dtype=torch.float16) * 0.5
+        o1 = torch.zeros(1, HQ, D, device=dev, dtype=torch.float16)
+        # Eager forward: allocs gen1 [1, HKV, 128] and grows q_pad.
+        impl.forward(None, q1, q1, q1, kv, m(100), output=o1)
+        gen1 = cls._k_gather_buf
+        assert gen1.shape[2] == 128
+        # Capture reuses gen1 and latches the sticky latch. Metadata is
+        # pre-built (capture-time allocations/copies are illegal).
+        m100 = m(100)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            impl.forward(None, q1, q1, q1, kv, m100, output=o1)
+        assert cls._gather_captured
+        # Sk ping-pong: every replacement retires (sticky latch) — the
+        # pre-fix unbounded behavior, kept byte-for-byte by the switch.
+        cls._ensure_gather_buffers(1, HKV, 130, D, kv.device)
+        assert gen1.data_ptr() in cls._gather_retired
+        gen2 = cls._k_gather_buf
+        cls._ensure_gather_buffers(1, HKV, 100, D, kv.device)
+        assert gen2.data_ptr() in cls._gather_retired
+        assert len(cls._gather_retired) == 2
+    finally:
+        (cls._k_gather_buf, cls._v_gather_buf, cls._gather_retired,
+         cls._gather_captured, cls._gather_buf_captured,
+         cls._gather_exact, cls._gather_retired_warned) = saved
 
 
 def test_forward_decode_prefill_vs_sdpa_on_unbind_cache():

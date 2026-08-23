@@ -306,19 +306,38 @@ class Gfx906FAImpl(AttentionImpl):
     # ------------------------------------------------------------------
     _k_gather_buf: ClassVar[torch.Tensor | None] = None
     _v_gather_buf: ClassVar[torch.Tensor | None] = None
-    # Keep-alive for gather buffer generations replaced after the first
-    # capture (the graphs keep their VAs). Keyed by data_ptr — unique for
-    # every live tensor, and a retained tensor is never freed, so its VA
-    # can never be reused and no entry can ever be overwritten (a shape
-    # key could collide between two same-shape generations, silently
-    # freeing a captured one). Every captured generation is thus retained
-    # for the worker's lifetime; freeing any of them leaves a replaying
-    # graph writing through stale pointers (init-time Memory Fault,
-    # 2026-08-19). Replacements after the first capture only happen on
-    # Sk/Hkv/D growth (num_seqs changes now reuse a leading-dim slice,
-    # same base VA), so this set stays small.
+    # Keep-alive for gather-buffer generations whose base VA is baked
+    # into a replaying CUDA graph — freeing one is a use-after-free on
+    # replay (2026-08-19 init-time Memory Fault). Post-fix
+    # (GFX906_FA_GATHER_EXACT=0) only generations that were current
+    # during a stream capture are retired (tracked per generation in
+    # _gather_buf_captured); eager-serving generations are freed, and
+    # since Sk is a grow-only capacity, replacement happens only on
+    # Hkv/D/B change — the set normally holds exactly the one
+    # capture-time generation. Under EXACT (pre-fix policy) the sticky
+    # _gather_captured latch retires on every Sk change — the unbounded
+    # growth behind the 256k Qwen3.8-27B TP=2 prefill OOM (see
+    # docs/gfx906/oom-256k-prefill.md, plan-gfx906-fa-fix.md §1).
+    # Keyed by data_ptr: unique for every live tensor, and a retained
+    # tensor is never freed, so its VA can never be reused and no entry
+    # can ever be overwritten (a shape key could collide between two
+    # same-shape generations, silently freeing a captured one).
     _gather_retired: ClassVar[dict[int, tuple[torch.Tensor, ...]]] = {}
+    # Pre-fix sticky latch (EXACT mode only): any generation replaced
+    # after the first capture is retired, whether or not it was baked.
     _gather_captured: ClassVar[bool] = False
+    # Post-fix per-generation flag: True iff THIS generation's base VA
+    # was current during a capture. Reset (not OR'd) at each allocation.
+    _gather_buf_captured: ClassVar[bool] = False
+    # Kill switch: GFX906_FA_GATHER_EXACT=1 restores the pre-fix
+    # exact-match policy at the backend (paged.py reads the same var),
+    # for A/B. Default: the new grow-only capacity policy.
+    _gather_exact: ClassVar[bool] = (
+        _os.environ.get("GFX906_FA_GATHER_EXACT", "0") == "1")
+    # One-shot guard for the capture-order coupling (see
+    # _ensure_gather_buffers); the single-generation-across-sweep
+    # property assumes largest-first capture order upstream.
+    _gather_retired_warned: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -506,92 +525,140 @@ class Gfx906FAImpl(AttentionImpl):
         """K_q8 + V_fp16 gather buffers, shared by all layers in a worker.
 
         shape:
-            K: [B, Hkv, Sk_pad, (D/32)*34]  uint8
-            V: [B, Hkv, Sk_pad, D]          fp16
+            K: [B, Hkv, Sk, (D/32)*34]  uint8
+            V: [B, Hkv, Sk, D]          fp16
+
+        Post-fix policy (default; GFX906_FA_GATHER_EXACT=0):
+        the Sk dimension is a *capacity*, not an exact shape. Any buffer
+        wide enough (>= Sk_pad) is reused; grow-to-exact-need allocates
+        at max(needed, existing) per axis (the in-tree _q_pad_buf
+        pattern). FULL capture runs at max_model_len
+        (build_for_cudagraph_capture), so after the first capture the
+        buffer spans every seq_len the engine can schedule and eager
+        chunked prefill reuses it forever — no per-chunk realloc/retire
+        churn (the unbounded _gather_retired growth that drained the
+        ~2 GiB post-capture headroom in the 256k Qwen3.8-27B TP=2
+        prefill; docs/gfx906/oom-256k-prefill.md,
+        plan-gfx906-fa-fix.md). Width-wider-than-live is safe: the
+        persistent gather's work is live-bounded (device-side seq_lens)
+        and the FA kernel cuts each sequence at kv_max, never at Sk.
 
         A request for a smaller B than the current buffer returns a
         leading-dim slice [:B] — zero-copy, contiguous, and same base VA
-        (a non-leading-dim slice would copy, which is why Sk/Hkv/D changes
+        (a non-leading-dim slice would copy, which is why Hkv/D changes
         realloc instead). Because FULL-graph capture bakes the base VA of
         ONE generation into every captured batch size, this slice reuse
         is what keeps a single generation alive across the whole capture
         sweep (up to ~35 batch sizes at max_num_seqs=256).
 
-        Capture-safety: as with q_pad — the buffer current during a
-        capture is baked into the graph by VA, so after the first
-        capture, retired generations are kept in _gather_retired (not
-        freed) and empty_cache() is gone from the forward path (illegal
-        during capture; the caching allocator reuses freed blocks
-        itself).
+        Capture-safety: the generation current during a stream capture is
+        baked into the graph by VA. _gather_buf_captured tracks that
+        *per generation* — reset to the capture state at each allocation,
+        latched forward only within a generation's no-realloc path — so
+        only graph-baked generations are retired into _gather_retired on
+        replacement. Eager-serving generations are never baked (attention
+        is a splitting op — vllm::unified_attention_with_output in the
+        default splitting_ops — so eager forwards run outside any
+        captured subgraph) and are simply freed; the caching allocator
+        reuses the blocks. Bounded: post-fix replacement happens only on
+        Hkv/D/B change, so the set normally holds exactly one generation.
+        (splitting_ops=[] — attention inside piecewise graphs — is still
+        safe, at one extra retained generation: such generations latch
+        captured and are retired, not freed.)
 
-        Retired generations are retained for the worker's lifetime,
-        keyed by data_ptr (unique per live tensor — see the class var).
-        Replacement after the first capture only happens on Sk_pad/Hkv/D
-        growth (rare — a handful of times over a long generation), so the
-        retention set stays small. Freeing a
-        generation whose VA is baked into a replaying graph is a
-        use-after-free: the 2026-08-19 init-time Memory Fault was exactly
-        that (35 captured sizes vs a 4-generation keep-alive bound).
+        Pre-fix policy (GFX906_FA_GATHER_EXACT=1, A/B kill switch):
+        exact-Sk match and the sticky _gather_captured latch — the old
+        behavior byte-for-byte, unbounded retire growth included.
         """
         Sk_pad = ((max_seqlen_k + 31) // 32) * 32
         bytes_per_row = (head_size // 32) * 34
+        capturing = torch.cuda.is_current_stream_capturing()
 
-        need_realloc = False
-        if cls._k_gather_buf is None:
-            need_realloc = True
-        else:
-            b = cls._k_gather_buf
-            if (b.shape[1] != num_kv_heads
-                or b.shape[2] != Sk_pad or b.shape[3] != bytes_per_row
-                or b.device != device or b.shape[0] < num_seqs):
-                need_realloc = True
-            else:
-                # Only num_seqs differs and the buffer is big enough: a
-                # leading-dim slice [:num_seqs] is contiguous and has the
-                # same base VA and row layout as the parent, so the kernel
-                # (which addresses the output from shapes) and every graph
-                # captured against this base see identical addresses. This
-                # keeps ONE generation across all captured batch sizes
-                # instead of one per size (35 at max_num_seqs=256).
-                if not cls._gather_captured:
-                    # Latch: this base VA may be getting baked into a graph
-                    # right now, so it must be retired (not freed) if a
-                    # later Sk/Hkv/D grow replaces it.
-                    cls._gather_captured = (
-                        torch.cuda.is_current_stream_capturing())
-                if b.shape[0] == num_seqs:
+        cur = cls._k_gather_buf
+        if cur is not None:
+            fit = (cur.shape[1] == num_kv_heads
+                   and cur.shape[3] == bytes_per_row
+                   and cur.device == device
+                   and cur.shape[0] >= num_seqs
+                   and (cur.shape[2] == Sk_pad if cls._gather_exact
+                        else cur.shape[2] >= Sk_pad))
+            if fit:
+                # Reuse; latch the capture flag within THIS generation's
+                # lifetime only (the buffer VA may be getting baked into
+                # a graph right now).
+                if cls._gather_exact:
+                    if not cls._gather_captured:
+                        cls._gather_captured = capturing
+                else:
+                    if not cls._gather_buf_captured:
+                        cls._gather_buf_captured = capturing
+                if cur.shape[0] == num_seqs:
                     # Exact size: no view (the hot decode path calls this
                     # per FA layer per step; a fresh TensorImpl per call
                     # is measurable on short steps).
-                    return b, cls._v_gather_buf
-                return b[:num_seqs], cls._v_gather_buf[:num_seqs]
+                    return cur, cls._v_gather_buf
+                # A leading-dim slice is contiguous and has the same base
+                # VA and row layout as the parent, so the kernel and every
+                # graph captured against this base see identical addresses.
+                return cur[:num_seqs], cls._v_gather_buf[:num_seqs]
 
-        if need_realloc:
-            capturing = torch.cuda.is_current_stream_capturing()
-            if (cls._k_gather_buf is not None
-                    and (cls._gather_captured or capturing)):
-                cls._gather_retired[cls._k_gather_buf.data_ptr()] = (
-                    cls._k_gather_buf, cls._v_gather_buf)
-            cls._k_gather_buf = torch.empty(
-                (num_seqs, num_kv_heads, Sk_pad, bytes_per_row),
-                dtype=torch.uint8, device=device,
-            )
-            cls._v_gather_buf = torch.empty(
-                (num_seqs, num_kv_heads, Sk_pad, head_size),
-                dtype=torch.float16, device=device,
-            )
+        # First allocation, or a growth/shape change: retire-or-free the
+        # old generation, then allocate.
+        new_b = num_seqs
+        new_sk = Sk_pad
+        if cur is not None:
+            keep = ((cls._gather_captured or capturing)
+                    if cls._gather_exact
+                    else cls._gather_buf_captured)
+            if keep:
+                # Graph-baked VA: must outlive every replay.
+                cls._gather_retired[cur.data_ptr()] = (
+                    cur, cls._v_gather_buf)
+            if not cls._gather_exact:
+                # Grow-to-exact-need (no doubling hysteresis — it could
+                # overshoot max_model_len permanently); never shrink.
+                new_b = max(num_seqs, cur.shape[0])
+                new_sk = max(Sk_pad, cur.shape[2])
+        cls._k_gather_buf = torch.empty(
+            (new_b, num_kv_heads, new_sk, bytes_per_row),
+            dtype=torch.uint8, device=device,
+        )
+        cls._v_gather_buf = torch.empty(
+            (new_b, num_kv_heads, new_sk, head_size),
+            dtype=torch.float16, device=device,
+        )
+        if cls._gather_exact:
             cls._gather_captured = cls._gather_captured or capturing
-            _oomhunt_log(
-                f"alloc num_seqs={num_seqs} Sk_pad={Sk_pad} "
-                f"k={cls._k_gather_buf.numel()}B v={cls._v_gather_buf.numel()*2}B "
-                f"retired={len(cls._gather_retired)} "
-                f"retired_B={_oomhunt_retired_bytes(cls)} "
-                f"capturing={int(bool(capturing))}")
-        elif not cls._gather_captured:
-            # No grow: latch the flag once we serve a forward during
-            # capture (the buffer VA is being baked into a graph).
-            cls._gather_captured = torch.cuda.is_current_stream_capturing()
-        return cls._k_gather_buf, cls._v_gather_buf
+        else:
+            # Per generation: the new buffer starts from its own state,
+            # not the old generation's capture history.
+            cls._gather_buf_captured = capturing
+        if (not cls._gather_exact and not capturing
+                and cls._gather_buf_captured
+                and not cls._gather_retired_warned
+                and len(cls._gather_retired) > 1):
+            # The single-generation-across-sweep property assumes
+            # largest-first capture order (get_capture_descs). More than
+            # one retired generation means the sweep itself retired
+            # generations — an OOM at capture is possible, so make it
+            # loud (plan §2.2b).
+            logger.warning(
+                "GFX906_FA: %d retired capture-time gather generations "
+                "(expected <= 1; capture-order coupling — see "
+                "plan-gfx906-fa-fix.md §2.2b)", len(cls._gather_retired))
+            cls._gather_retired_warned = True
+        _oomhunt_log(
+            f"alloc num_seqs={num_seqs} Sk_pad={Sk_pad} width={new_sk} "
+            f"mode={'exact' if cls._gather_exact else 'capacity'} "
+            f"k={cls._k_gather_buf.numel()}B "
+            f"v={cls._v_gather_buf.numel() * 2}B "
+            f"retired={len(cls._gather_retired)} "
+            f"retired_B={_oomhunt_retired_bytes(cls)} "
+            f"capturing={int(bool(capturing))}")
+        b, v = cls._k_gather_buf, cls._v_gather_buf
+        if b.shape[0] == num_seqs:
+            return b, v
+        return b[:num_seqs], v[:num_seqs]
 
     def do_kv_cache_update(
         self,
