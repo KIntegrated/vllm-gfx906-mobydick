@@ -15,6 +15,15 @@ Transferability of this work to other model families (AWQ MoE in
 general, Ling-3.0-tiny, DeepSeek-V4-Flash) is assessed in
 `roadmap-more-models.md` (same directory).
 
+**Re-measure note (2026-08-23, W4 merged):** W4 (skinny fp16 GEMM
+M=5..16, `VLLM_GFX906_SKINNY_M16`, default off at merge) lifts the 35B
+no-spec baseline by **+14.5 % under concurrent decode** (N=8 graph:
+166.9 → 191.0 t/s; `DEVLOG-fp16-skinny.md`). The W2 35B spec numbers
+(mtp2 89.9 vs 76.2 = 1.18×, `DEVLOG-moe-spec-decode.md`) were set on
+the **pre-W4** build. **Re-measure the 35B no-spec baseline and the
+mtp2 arms with W4 on** before quoting the spec ratio or its ceiling
+from the W2 numbers (the no-spec N=8 denominator moves ~15 %).
+
 Model facts (Qwen3.5-35B-A3B-AWQ, this deployment): 40 layers, all MoE
 (E=256, topk=8, hidden 2048, expert w13 N=1024×K=2048 fused gate+up,
 w2 N=2048×K=512, AWQ w4a16 128-group), shared expert N=512 (dense

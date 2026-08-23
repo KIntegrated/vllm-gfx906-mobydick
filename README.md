@@ -25,19 +25,22 @@ The vendor kernels originally target **prefill** on **long contexts** of
 full-attention layers) the prefill gain is small. This fork adds the decode
 path (B=1 parallelism via GQA head-packing + KV split, fused
 gather-and-quantize, native BSHD output), making `CUSTOM` the default for
-**decode** as well: 18.9 → 24.1 t/s serving on dense Qwen3.5-27B, and part
-of the MoE stack reaching 67 t/s. See [`docs/gfx906/`](docs/gfx906/) for
-the full change inventory, numbers, and bench recipes.
+**decode** as well: 18.9 → 25.6 t/s serving on dense Qwen3.5-27B, and the
+MoE flagship at 67.4 t/s single-request / 191.0 t/s concurrent (N=8).
+See [`docs/gfx906/`](docs/gfx906/) for the full change inventory, numbers,
+and bench recipes.
 
 ### Model support and performance on gfx906 (single MI50/MI60)
 
 | model | status | decode t/s |
 |---|---|---|
-| Qwen3.5-35B-A3B-AWQ (MoE) | flagship, fully optimized | **67.4** (~2140 t/s prefill) |
+| Qwen3.5-35B-A3B-AWQ (MoE) | flagship, fully optimized | **67.4** (single request; ~2140 t/s prefill) |
+| ↳ N=8 concurrent decode | W4 (`VLLM_GFX906_SKINNY_M16=1`) | **191.0** (+14.5 % vs 166.9) |
+| ↳ with MTP k=2 speculative decoding | recommended spec config | **89.9** (1.18× vs 76.2) |
 | Qwen3.5-27B-AWQ (dense) | optimized | **25.6** |
 | ↳ with MTP k=2 speculative decoding | recommended spec config | **39.4** (1.41×) |
 | Gemma-4-26B-A4B-it-AWQ-4bit | optimized | **67.8** |
-| Qwen3.8-27B-AWQ-INT4 | experimental (eager only, `--dtype float16`) | — |
+| Qwen3.8-27B-AWQ-INT4 | experimental (graph + MTP canary; `--dtype float16`, util 0.90) | **104.2** (N=8, W4 on) |
 | Qwen3.6 fp16 checkpoints (52–67 GB) | do not fit 32 GB | — |
 
 Details, per-model caveats, and bench recipes:
