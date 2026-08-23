@@ -182,3 +182,60 @@ broadcast (GPU0 pinned 100 %) until SIGTERM at ~20:11Z.
 - Canary this boot: 38.8 t/s (band ~40–47) — see
   `DEVLOG-moe-c2v.md`; the official 35B harness run is the
   tie-breaker for host health.
+
+## 2026-08-23 05:18Z: GPU0 half-wedge — comp_1 fence timeout, driver reset
+
+First HW reset this boot. Trigger: the 27B mtp2 canary (W2
+spec-decode session) — SIGABRT rc=134 (core dumped) during/after the
+measured generate. Kernel log: `Fence fallback timer expired on ring
+comp_1.0.0` → `GPU reset(1) succeeded!` → `[drm] device wedged, but
+recovered through reset` (05:18:28–29Z, 0000:0b:00.0 = GPU0).
+rocm-smi back to 0/0 use after.
+
+Pre-wedge symptoms (unexplained, possibly early degradation, possibly
+unrelated): amdsmi broken since boot; 35B-MoE smoke A/B at 04:5x–
+05:1xZ showed (a) baseline greedy output FP NON-REPRODUCIBLE across
+two identical runs (`270672f1…` vs `147420f5…`) and (b) mtp2 decode
+~39.5 t/s vs baseline ~81 (0.49×) with a mid-run Triton JIT spike
+(`eagle_prepare_inputs_padded_kernel` compiled during the measured
+generate). Both numbers are suspect; the FP non-reproducibility in a
+temp=0 baseline is the stronger anomaly. Canary re-run post-reset is
+the arbiter (if it reads <25 t/s or 100 % acceptance — reported as a
+degradation symptom — the boot is degraded: REBOOT).
+
+Open: does the 100 %-acceptance symptom (reported by Kevin 2026-08-23,
+unconfirmed) accompany DEG? The canary should print the spec stats to
+check (in-process runs need `VLLM_LOG_STATS=1` for the
+SpecDecoding-metrics line).
+
+## 2026-08-23 05:47Z: second GPU0 half-wedge (W2 mtp2 eager boot) + FP resolution
+
+Same signature: `Fence fallback timer expired on ring comp_1.0.0` →
+`GPU reset(2) succeeded` (05:47:46Z), during the w2_mtp2_e arm's boot
+(`hipErrorLaunchFailure` at SetDevice, core dumped). Four clean engine
+cycles (w2_base_g, w2_base_g2, w2_mtp2_g, w2_base_e) ran in the
+05:18–05:47 window between resets.
+
+**FP-mystery resolution:** post-reset baseline re-runs (w2_base_g /
+w2_base_g2) showed the SAME temp=0 greedy non-reproducibility
+(per-prompt FPs differ across reps; partial cross-process overlap:
+8c4c58ea… / 3b96c1fe… appear in both runs). The pre-wedge FP drift
+was therefore NOT a host artifact — the 35B MoE baseline is
+non-deterministic in this build (hypothesis: fp16-atomic K-split
+epilogue in the M=1 MoE q_gemm → last-bit logit noise → argmax flips
+at near-ties). Consequence: token-identity gates are unusable for the
+35B; the W2 A/B stands on perf + acceptance + output sanity. (The
+27B dense baseline was deterministic in its spec A/B — consistent
+with the dense M=1 path being the non-atomic dense_gemv.)
+
+## 2026-08-23 06:08Z: GPU0 FULL WEDGE — PSP -62, host reboot required
+
+The post-reset#2 canary hit the third comp_1 fence timeout this boot
+(50 min apart: 05:18, 05:47, 06:08). This one did not recover:
+`MAPPING_ERROR: 0x1` → `PSP load sys drv failed!` → `PSP resume
+failed` → `resume of IP block <psp> failed -62` → `GPU reset end with
+ret = -62` (06:08:32–37Z). Same signature as the 2026-08-22 14:06Z
+full wedge (the one that needed the ~14:50 reboot). GPU0 is dead
+until a host reboot; BACO reset needs root, which the bench user
+lacks. All W2 GPU work stopped. Session data safe in /tmp (survives
+reboot).

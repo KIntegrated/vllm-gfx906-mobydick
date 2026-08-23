@@ -370,10 +370,20 @@ one-file fallback.)
   non-spec rows to the packed/sequential path instead of
   reclassifying). Matters only for concurrent serving (production
   config 4–8 seqs); measure with a 2-request mixed probe.
-- **W2 (MoE 35B).** 30 GDN + 10 FA layers, ~15 ms baseline step. The
-  same rails apply (the 35B's MoE experts are the W4A16 path —
-  different kernels, but the fp16/GDN and AWQ-dense families are
-  shared). Phase 1 lands first on the 27B; port after.
+- **W2 (MoE 35B) — DONE (2026-08-23, `DEVLOG-moe-spec-decode.md`,
+  branch `gfx906/moe-spec-decode`).** The rails ported with **zero
+  code changes** (all in-tree from the merged 27B phase;
+  `Qwen3_5MoeMTP` registered, fc K=4096 in the GEMV KCHUNK set).
+  mtp2 k=2: **graph 89.9 vs 76.2 t/s steady = 1.18×** (80.4 %
+  acceptance, 1.609 tok/step; break-even 1.39) and **eager 45.5 vs
+  24.5 = 1.86×** (launch-bound baseline amplifies the win). The 35B
+  MTP head is a weaker proposer than the 27B's (80 % vs 91 %);
+  k=3 needs ~2.4 tok/step — not viable. Recommendation: mtp2 +
+  cg-small for 35B serving. 35B caveats: temp=0 baseline is
+  non-reproducible (token-identity gates unusable — fp16-atomic
+  MoE epilogue suspected); the 35B baseline is also
+  non-determinism-sensitive, so spec A/Bs there stand on perf +
+  acceptance only.
 - **W3 (GDN small-M kernel — CLOSED, no work).** The sequential
   kernel with per-token state slots + `num_accepted_tokens` already
   exists and is on the spec path. The original Phase-1 scope is
