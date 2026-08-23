@@ -71,9 +71,33 @@ roadmap-level finding (dense vs MoE spec-decode economics).
   audited (above); in-tree rail audit (all four rails present from
   the merged 27B phase — see Interactions); smoke next.
 
-## Results
+## Results (interim — graph A/B; session interrupted by FW wedge)
 
-(none yet)
+Post-reset#1 (05:18Z), host canary 38.9 t/s (healthy-for-this-boot):
+
+| arm | steady t/s (prefill-incl, 256 tok) | notes |
+|---|---|---|
+| base graph (cycle 1) | 76.09 / 76.09 / 76.23 / 76.10 | rep0 cold (fused_moe JIT mid-run) |
+| base graph (cycle 2) | 76.87 / 76.75 / 75.27 / 76.69 | |
+| **mtp2 graph (k=2)** | **86.85 / 88.22 / 86.23 / 89.67** | **≈1.14–1.17× baseline** |
+| base eager | 24.51 / 24.65 / 24.53 / 24.72 | |
+| mtp2 eager | — | crashed into the 05:47Z reset#2 (re-run pending) |
+
+**≈+15 % on the graph regime before the wedge ended the session.**
+The pre-wedge 0.49× smoke was host artifact, confirmed: post-reset
+the rail is solidly positive. Break-even fear (em=24 verify cost) did
+not materialize — the sparse MoE MTP drafter (~1.1 GB/forward) is
+cheap enough that k=2 pays off even with the M-sensitive grouped
+verify path.
+
+Acceptance counters are missing from this pass (the scheduler's
+`log_stats` gate suppresses `observe_draft`; the driver env lacked
+`VLLM_LOG_STATS=1`) — mtp2 arms re-run with the flag pending the
+reboot. Token-identity gate: unusable on this model (baseline
+non-reproducible at temp=0 — see degradation_details 05:47Z section).
+
+2026-08-23 06:08Z: GPU0 full wedge (PSP -62) — session paused;
+reboot required (Kevin). All data in /tmp/moespec/.
 
 ## Refrigerated residue
 
