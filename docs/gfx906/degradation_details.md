@@ -144,3 +144,48 @@ healthy host it reads ~40+.
   canary reads slow — they are host artifacts (this cost us a day of
   misattribution on 2026-08-22: the "mtp2 TP=2 regression"
   investigation, see `fa-masked-mtp-regression-glm5.md`).
+
+## 2026-08-22 evening: TP=2 35B-MoE amdsmi crash (C2-V t2n1_off) — no kernel reset
+
+First TP=2 run of the 35B MoE on this box (C2-V). Rank-1 worker died in
+`RocmPlatform.get_device_name` (torch compile-cache-dir query,
+`vllm/utils/platform_utils.py:72`, no try/except) during `profile_run`
+at `torch.ops.vllm.moe_forward_shared`; final exception was
+`AMDSMI_STATUS_NOT_INIT` from `amdsmi_shut_down()` in the
+`with_amdsmi_context` `finally` — the finally masks the primary error.
+Rank-0 hung on the shm broadcast (GPU0 100 %) until SIGTERM. No kernel
+reset in the window (`journalctl -k` clean). amdsmi is broken on this
+boot in ALL runs (every run logs the protected fallback at
+rocm.py:913; `get_device_name` is the only unprotected caller).
+Transient 44 %-VRAM-on-GPU1-with-no-owner 20:11–20:12Z = the next
+config's in-flight allocation (false alarm; both GPUs 0 % after kills).
+Workaround for the C2-V TP=2 arms: `sitecustomize.py` shim (swallows
+amdsmi_init/shut_down, replaces `get_device_name` with the same
+`AMD_<arch>` fallback the code has for 0 handles), PYTHONPATH-injected
+to TP=2 runs only. Permanent fix belongs in `vllm/platforms/rocm.py`
+(a `finally` must not mask the primary error).
+
+## 2026-08-23 05:18Z: GPU0 half-wedge — comp_1 fence timeout, driver reset
+
+First HW reset this boot. Trigger: the 27B mtp2 canary (W2
+spec-decode session) — SIGABRT rc=134 (core dumped) during/after the
+measured generate. Kernel log: `Fence fallback timer expired on ring
+comp_1.0.0` → `GPU reset(1) succeeded!` → `[drm] device wedged, but
+recovered through reset` (05:18:28–29Z, 0000:0b:00.0 = GPU0).
+rocm-smi back to 0/0 use after.
+
+Pre-wedge symptoms (unexplained, possibly early degradation, possibly
+unrelated): amdsmi broken since boot; 35B-MoE smoke A/B at 04:5x–
+05:1xZ showed (a) baseline greedy output FP NON-REPRODUCIBLE across
+two identical runs (`270672f1…` vs `147420f5…`) and (b) mtp2 decode
+~39.5 t/s vs baseline ~81 (0.49×) with a mid-run Triton JIT spike
+(`eagle_prepare_inputs_padded_kernel` compiled during the measured
+generate). Both numbers are suspect; the FP non-reproducibility in a
+temp=0 baseline is the stronger anomaly. Canary re-run post-reset is
+the arbiter (if it reads <25 t/s or 100 % acceptance — reported as a
+degradation symptom — the boot is degraded: REBOOT).
+
+Open: does the 100 %-acceptance symptom (reported by Kevin 2026-08-23,
+unconfirmed) accompany DEG? The canary should print the spec stats to
+check (in-process runs need `VLLM_LOG_STATS=1` for the
+SpecDecoding-metrics line).
