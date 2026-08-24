@@ -16,6 +16,21 @@ needle retrieved, `retired_B=0`), decode A/B flat. Record:
 (Originally blocked on the weight-load `hipErrorLaunchFailure`,
 `DEVLOG-boot-failure.md` — cleared by the 2026-08-24 05:20 reboot.)
 
+**Post-landing review follow-up (2026-08-24):** a code review of the
+branch found three issues, fixed on the same branch: (1) the §2.2b
+capture-order guard was dead code (its condition required
+`not capturing` while checking a flag just set to `capturing`) — moved
+to the retire-insertion site, one-shot at >1 retired capture-baked
+generation; (2) §2.2a's grow-only `max()` per axis also applied to
+never-captured (freeable) replacements, pinning the B×Sk high-water
+product (~13 GB/rank at `[32, 262144]`) — freeable replacements now
+allocate at exact need (realloc frequency unchanged; FULL-mode
+capture-time sizing identical, so the validated arm-B path is
+unaffected); (3) the persistent branch's k/v capacity reuse now
+requires equal K/V widths (an unequal hand-set pair was half-reused,
+silently dropping V to per-call C++ allocations). Unit gate: 28/28.
+See the Review follow-up section of the dev-log entry.
+
 **Revision note:** this supersedes `/local/tmp/gfx906-fa-fix.md`
 (now stale/gone from `/tmp`). It was rewritten after four independent
 adversarial reviews (`gfx906-fa-fix-code-review-{claude,ds4,glm,gwen}.md`,

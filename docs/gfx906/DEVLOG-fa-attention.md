@@ -558,6 +558,50 @@ attempts — degraded-state territory, cleared by the 05:20 reboot
 `window_watch.sh` passed `1` as the EXACT arg — a launcher bug, not a
 code path (the log line's `mode=exact` field caught it).
 
+## Review follow-up (2026-08-24, same branch)
+
+Post-landing code review found three issues in `090673ad21`; fixed
+with unit gates (28/28 in `test_gfx906_fa.py`):
+
+1. **Dead guard (the §2.2b capture-order warning).** The warning's
+   condition required `not capturing` while checking
+   `_gather_buf_captured`, which the immediately preceding assignment
+   had just set to `capturing` — it could never fire. Moved to the
+   retire-insertion site: one-shot warning once >1 capture-baked
+   generation has been retired (capture-order coupling OR repeated
+   re-captures / Hkv-D flaps). Pinned by
+   `test_gather_multi_retire_warns` (two capture-then-B-grow cycles ->
+   exactly one warning; a third retire stays silent).
+2. **B×Sk high-water product on freeable generations.** Grow-only
+   `max()` per axis also applied to never-captured (freeable)
+   replacements: 32-way short-context decode followed by one 250k
+   prefill left a `[32, 262144]` standing buffer (~13 GB/rank at the
+   arm-B geometry) that no single request needed — a new OOM class in
+   no-capture modes. Freeable replacements now allocate at exact need.
+   Realloc frequency is unchanged by construction (a replacement
+   happens exactly when the current buffer no longer fits; the old
+   block is freed either way). FULL modes are unaffected beyond the
+   first capture — post-capture generations are capture-baked and take
+   the retire (grow-only) path, and capture-time sizing is identical
+   (capture B ≥ any warmup B, max_model_len ≥ any warmup Sk) — so the
+   validated arm-B behavior is byte-identical. GATE: unit
+   (`test_gather_freeable_generation_exact_need`) + the frozen decode
+   A/B above (decode hits the fit path; the changed branch runs only
+   pre-capture / no-capture).
+3. **Mixed-width k/v reuse (persistent branch).** The k/v capacity
+   coupling required both buffers non-None but not equal-width: a
+   hand-set class pair with unequal K/V widths (impossible via
+   `_ensure_gather_buffers`, reachable by manual tampering) passed
+   `Sk` = K's width, so the C++ exact-match silently dropped V to a
+   per-call allocation — the exact mixed state the coupling exists to
+   prevent. Now requires equal widths. Pinned by
+   `test_gather_mixed_width_buffers_not_reused` (bitwise-identical
+   output, pair refused whole).
+
+Plus: env-var parity comments at both `GFX906_FA_GATHER_EXACT` read
+sites (backend `_gather_exact` / paged `_GATHER_EXACT`, both read once
+at import — flipping one at runtime splits the A/B).
+
 VERDICT: SHIPPED — the unbounded `_gather_retired` growth is fixed and
 validated on the exact situation that failed (byte-exact OOM under the
 kill switch, clean 256k prefill + needle retrieval under the fix,
