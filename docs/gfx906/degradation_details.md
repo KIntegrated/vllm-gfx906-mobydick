@@ -433,3 +433,57 @@ degraded-state signature (many half-wedges in one boot → only a reboot
 clears it). After a reboot: run `window_watch.sh` (it auto-launches
 arm B on a confirmed window) or launch arm B directly; arm A evidence
 is already on record (`/local/tmp/fa_fix/arm_A.log`, `oomhunt_A.log`).
+
+## 2026-08-24 (boot D) — first reset: 07:46:46 GPU0, 256k server launch
+
+Boot D (05:20:44) held **zero resets** through a ~60-min heavy window
+(arm A2 byte-exact OOM repro 05:28–05:37, arm B 250k PASS 05:44–06:19,
+MoE decode A/B through ~06:40). First GPU use after that window: the
+Qwen3.8-27B 256k TP=2 + MTP *serving* server (27B AWQ, util 0.82,
+maxlen 262144, capture [1,2,3,4]) launched 07:45:44. ~60 s in, at
+worker init: `hipErrorLaunchFailure` at SetDevice → comp_1 fence
+fallback timeout → `GPU reset(1) succeeded` on `0000:0b:00.0` (GPU0)
+at 07:46:46 — "device wedged, but recovered through reset".
+
+**First reset since boot D** — boot-D flap onset at ~2.5 h, on GPU0
+(the historical primary). Post-reset: both cards pass the 200-round
+probe, VRAM 0 %, no zombie procs. Launch retried — per the boot-C
+pattern, an isolated wedge inside a good window is not the degradation
+signature; the burst (≥ several resets close together) is. If the retry
+also wedges, treat as a burst and stop retrying (reboot remedy).
+
+Note: the launch initially failed twice earlier the same hour for a
+non-GPU reason — `python -m vllm.entrypoints.openai.api_server` does
+not map the positional `model_tag` to `args.model` (only the `vllm
+serve` CLI does), so the engine tried to resolve its default model id
+offline. `vllm serve` is the correct entry point on this tree.
+
+**Resolution:** serving metrics over the following ~1 h confirmed the
+degraded signature at SHORT context (serving canary 20-25 t/s vs 56+ on
+boot E; the 08-23 20:41/20:43 canaries on the 19:20 boot had passed at
+38.2/38.6). The 16.4 t/s long-ctx agentic decode (≈61k live) was NOT a
+degradation symptom — boot E re-measure: 16.6 t/s @64k; the residual
+live O(Sk) FA gather+attention cost caps long-context decode on any
+healthy boot (see 13:00 section). Reboot 11:37 (boot E) cleared it.
+
+## 2026-08-24 13:00Z: boot E first wedge — GPU0 comp_1 fence at greedy-server weight load
+
+Boot E ran ~75 min clean before this: the rc2-image 27B TP=2 MTP serve
+(Kevin's; 5 shards in 55 s, fault-free), serving canary 56.2/56.7 t/s,
+the 27B MTP context curve (59.2/44.9/25.2/16.6 t/s at 2k/8k/32k/64k
+live ctx), and the 35B re-stamp session (28/28 + 43/43 suites; single
+65.7/66.1; MTP 88.6 vs 76.7; N=8 192.9/194.0). First reset 13:00:53:
+GPU0 (0000:0b:00.0) `qcm fence wait loop timeout expired` → BACO →
+`Fence fallback timer expired on ring comp_1.0.0` → `GPU reset(1)
+succeeded` mid weight-load (shard 2/5) of the boot's second launch
+(greedy 27B TP=2 docker); rocr `HW Exception by GPU node-1 reason :GPU
+Hang` ×4 → worker abort (SIGSEGV, exit 139). Post: rocm-smi OK,
+VRAM 0/0, 31 °C. Isolated-wedge-in-good-window pattern (cf.
+2026-08-23 20:21:33, 21:46:53).
+
+Retry 13:05: clean — 5/5 shards in 58 s, init + capture OK, canary
+34.8/39.8 t/s, full greedy context curve completed (40.8/38.1/30.5/24.1
+t/s at 2k/8k/32k/64k). Isolated wedge confirmed; boot E window remains
+good. (Note: an early monitor false-alarmed a "second wedge" — its
+grep scanned the whole T13: hour and re-matched the 13:00 events; no
+second wedge existed.)
