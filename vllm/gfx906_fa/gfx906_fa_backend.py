@@ -311,13 +311,15 @@ class Gfx906FAImpl(AttentionImpl):
     # was current during a capture. Reset (not OR'd) at each allocation.
     _gather_buf_captured: ClassVar[bool] = False
     # Kill switch: GFX906_FA_GATHER_EXACT=1 restores the pre-fix
-    # exact-match policy at the backend (paged.py reads the same var),
-    # for A/B. Default: the new grow-only capacity policy.
+    # exact-match policy at the backend, for A/B. Default: the new
+    # grow-only capacity policy. Read once at import here AND as
+    # _GATHER_EXACT in gfx906_fa_paged.py — keep the two in sync;
+    # flipping only one site produces a split (meaningless) A/B.
     _gather_exact: ClassVar[bool] = (
         _os.environ.get("GFX906_FA_GATHER_EXACT", "0") == "1")
-    # One-shot guard for the capture-order coupling (see
-    # _ensure_gather_buffers); the single-generation-across-sweep
-    # property assumes largest-first capture order upstream.
+    # One-shot warning once more than one capture-baked generation has
+    # been retired (capture-order coupling or repeated captures — see
+    # _ensure_gather_buffers).
     _gather_retired_warned: ClassVar[bool] = False
 
     def __init__(
@@ -511,9 +513,13 @@ class Gfx906FAImpl(AttentionImpl):
 
         Post-fix policy (default; GFX906_FA_GATHER_EXACT=0):
         the Sk dimension is a *capacity*, not an exact shape. Any buffer
-        wide enough (>= Sk_pad) is reused; grow-to-exact-need allocates
-        at max(needed, existing) per axis (the in-tree _q_pad_buf
-        pattern). FULL capture runs at max_model_len
+        wide enough (>= Sk_pad) is reused. Replacement sizing depends on
+        the old generation's fate: one being retired (capture-baked)
+        keeps capacity per axis — max(needed, existing), the in-tree
+        _q_pad_buf pattern; one being freed (never capture-baked) is
+        replaced at exact need, so a freeable generation never inherits
+        dead capacity (see the sizing comment at the replacement site).
+        FULL capture runs at max_model_len
         (build_for_cudagraph_capture), so after the first capture the
         buffer spans every seq_len the engine can schedule and eager
         chunked prefill reuses it forever — no per-chunk realloc/retire
@@ -595,11 +601,42 @@ class Gfx906FAImpl(AttentionImpl):
                 # Graph-baked VA: must outlive every replay.
                 cls._gather_retired[cur.data_ptr()] = (
                     cur, cls._v_gather_buf)
-            if not cls._gather_exact:
-                # Grow-to-exact-need (no doubling hysteresis — it could
-                # overshoot max_model_len permanently); never shrink.
-                new_b = max(num_seqs, cur.shape[0])
-                new_sk = max(Sk_pad, cur.shape[2])
+                if (not cls._gather_exact
+                        and not cls._gather_retired_warned
+                        and len(cls._gather_retired) > 1):
+                    # Post-fix, ONE capture-baked generation is the norm
+                    # (the FULL-capture sweep reuses a single base VA
+                    # across every captured batch size). A second retire
+                    # means either the sweep itself retired generations —
+                    # capture-order coupling (plan §2.2b; capture-time OOM
+                    # possible) — or repeated re-captures / Hkv-D flaps.
+                    logger.warning(
+                        "GFX906_FA: %d retired capture-baked gather "
+                        "generations (expected <= 1; capture-order "
+                        "coupling — see plan-gfx906-fa-fix.md §2.2b)",
+                        len(cls._gather_retired))
+                    cls._gather_retired_warned = True
+                if not cls._gather_exact:
+                    # The retired generation's block stays resident
+                    # anyway, so keeping its capacity costs nothing: a
+                    # FULL capture spans B=max_num_seqs x
+                    # Sk=max_model_len and later needs never exceed it.
+                    new_b = max(num_seqs, cur.shape[0])
+                    new_sk = max(Sk_pad, cur.shape[2])
+            # else, capacity mode + never capture-baked: the replacement
+            # allocates at exact need (new_b/new_sk as initialized).
+            # Grow-only max() on BOTH axes here would pin the
+            # B-highwater x Sk-highwater product forever — 32-way
+            # short-context decode then one 250k prefill leaves a
+            # [32, 262144] standing buffer (~13 GB/rank at the arm-B
+            # geometry) that no single request ever needed. Reallocation
+            # frequency is unchanged (a replacement happens exactly when
+            # the current buffer no longer fits, and this block is freed
+            # either way); only the new allocation stops inheriting dead
+            # capacity. In FULL modes this branch runs only before the
+            # first capture (post-capture generations are capture-baked
+            # and take the keep path), so capture-time sizing — the
+            # validated arm-B path — is unaffected.
         cls._k_gather_buf = torch.empty(
             (new_b, num_kv_heads, new_sk, bytes_per_row),
             dtype=torch.uint8, device=device,
@@ -614,20 +651,6 @@ class Gfx906FAImpl(AttentionImpl):
             # Per generation: the new buffer starts from its own state,
             # not the old generation's capture history.
             cls._gather_buf_captured = capturing
-        if (not cls._gather_exact and not capturing
-                and cls._gather_buf_captured
-                and not cls._gather_retired_warned
-                and len(cls._gather_retired) > 1):
-            # The single-generation-across-sweep property assumes
-            # largest-first capture order (get_capture_descs). More than
-            # one retired generation means the sweep itself retired
-            # generations — an OOM at capture is possible, so make it
-            # loud (plan §2.2b).
-            logger.warning(
-                "GFX906_FA: %d retired capture-time gather generations "
-                "(expected <= 1; capture-order coupling — see "
-                "plan-gfx906-fa-fix.md §2.2b)", len(cls._gather_retired))
-            cls._gather_retired_warned = True
         b, v = cls._k_gather_buf, cls._v_gather_buf
         if b.shape[0] == num_seqs:
             return b, v

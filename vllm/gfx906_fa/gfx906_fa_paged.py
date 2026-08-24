@@ -126,7 +126,9 @@ _PERSIST_MAX_SEQS = 16
 # Sk <= 65535, so a wide buffer must not reach them (a mismatch there
 # would also silently fall back to a per-layer C++ allocation).
 # GFX906_FA_GATHER_EXACT=1 restores the pre-fix exact-match policy at
-# every site (A/B kill switch; the backend reads the same variable).
+# every site (A/B kill switch). Read once at import here AND as
+# Gfx906FAImpl._gather_exact in gfx906_fa_backend.py — keep the two in
+# sync; flipping only one site produces a split (meaningless) A/B.
 _GATHER_EXACT = _os.environ.get("GFX906_FA_GATHER_EXACT", "0") == "1"
 # P3-4: skip the LEGACY-path q_pad zero_ on the Sq=1 decode fast path
 # (pad rows are per-row-independent and discarded; the q8_0 quantization
@@ -501,9 +503,15 @@ def forward_paged(
             and _buf_fit(v_gather_buf, torch.float16, value_cache.shape[2], D)
             and v_gather_buf.shape[2] >= Sk_pad
         ) else None
-        if k_cap is not None and v_cap is not None:
+        if (k_cap is not None and v_cap is not None
+                and k_cap.shape[2] == v_cap.shape[2]):
             # Sk = the buffer's own width: the persistent kernel's work
             # is live-bounded and the C++ exact-match passes trivially.
+            # The k/v widths must match: _ensure_gather_buffers always
+            # allocates the pair at one width, but a hand-set class
+            # buffer with unequal widths would otherwise pass Sk = K's
+            # width and silently drop V to a per-call C++ allocation —
+            # exactly the mixed state the coupling exists to prevent.
             kbuf, vbuf, Sk_arg = k_cap, v_cap, k_cap.shape[2]
         else:
             kbuf, vbuf, Sk_arg = None, None, Sk_pad
