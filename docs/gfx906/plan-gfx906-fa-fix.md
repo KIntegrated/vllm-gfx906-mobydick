@@ -537,7 +537,16 @@ Plus new units:
   entirely — keep as-is; it makes things worse, only for debugging).
 - Add `GFX906_FA_GATHER_EXACT=1` to restore the old exact-match policy
   for A/B (default: new grow-only), gated at all three sites listed
-  in §5's last bullet.
+  in §5's last bullet. **Lifecycle note (2026-08-24):** this is a
+  temporary A/B arm, NOT a permanent knob like `GFX906_FA_PERSIST`/
+  `GFX906_FA_LEGACY`. Its value is that the pre-fix policy stays
+  byte-for-byte (that is what made the arm-A OOM repro byte-exact) —
+  which is why the EXACT branches are deliberately NOT deduplicated
+  with the capacity policy. Drop the switch (both files, both read
+  sites, the kill-switch test, and the `k_exact` derivation) at the
+  NEXT gather-lifecycle change, re-gated on a serving A/B; until then
+  any lifecycle edit must touch both policies and keep them
+  divergence-free.
 - `GFX906_FA_CG=never` removes the captured-gen path entirely (retire
   set stays empty) — cheapest bisect knob if anything regresses.
 - Config-level (no code): `--attention-backend TRITON_ATTN` bypasses

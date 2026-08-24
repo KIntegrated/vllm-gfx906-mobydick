@@ -129,6 +129,13 @@ _PERSIST_MAX_SEQS = 16
 # every site (A/B kill switch). Read once at import here AND as
 # Gfx906FAImpl._gather_exact in gfx906_fa_backend.py — keep the two in
 # sync; flipping only one site produces a split (meaningless) A/B.
+# TEMPORARY A/B arm, NOT a permanent knob (plan-gfx906-fa-fix.md §6):
+# drop at the NEXT gather-lifecycle change — both read sites, the
+# _gather_exact branches in _ensure_gather_buffers, the _GATHER_EXACT
+# branch below (plus the k_exact/v_exact derivation feeding it), and
+# test_gather_exact_killswitch_restores_old_policy — re-gated on a
+# serving A/B. Until then every lifecycle edit must touch BOTH
+# policies and keep them divergence-free.
 _GATHER_EXACT = _os.environ.get("GFX906_FA_GATHER_EXACT", "0") == "1"
 # P3-4: skip the LEGACY-path q_pad zero_ on the Sq=1 decode fast path
 # (pad rows are per-row-independent and discarded; the q8_0 quantization
@@ -469,22 +476,29 @@ def forward_paged(
                 and t.shape[3] == brow
                 and t.is_contiguous())
 
+    # Capacity (>= Sk_pad) selection — the post-fix persistent-branch
+    # contract. The pre-fix exact (== Sk_pad) selection is DERIVED from
+    # it below, so the two width comparisons cannot drift apart.
+    k_cap = k_gather_buf if (
+        not _NO_BUF_REUSE
+        and _buf_fit(k_gather_buf, torch.uint8, hkv_k,
+                     bytes_per_row_expected)
+        and k_gather_buf.shape[2] >= Sk_pad
+    ) else None
+    v_cap = v_gather_buf if (
+        not _NO_BUF_REUSE
+        and _buf_fit(v_gather_buf, torch.float16, value_cache.shape[2], D)
+        and v_gather_buf.shape[2] >= Sk_pad
+    ) else None
     # Exact-Sk selection — the pre-fix contract, still the ONLY contract
     # for the non-persistent call sites (fused q8 / fused quantized /
     # fp16 two-kernel): they must keep seeing kbuf=None on a wide buffer
     # exactly as they would with no buffer at all (no reuse, no silent
     # divergence — plan §2.2c).
-    k_exact = k_gather_buf if (
-        not _NO_BUF_REUSE
-        and _buf_fit(k_gather_buf, torch.uint8, hkv_k,
-                     bytes_per_row_expected)
-        and k_gather_buf.shape[2] == Sk_pad
-    ) else None
-    v_exact = v_gather_buf if (
-        not _NO_BUF_REUSE
-        and _buf_fit(v_gather_buf, torch.float16, value_cache.shape[2], D)
-        and v_gather_buf.shape[2] == Sk_pad
-    ) else None
+    k_exact = (k_cap if k_cap is not None and k_cap.shape[2] == Sk_pad
+               else None)
+    v_exact = (v_cap if v_cap is not None and v_cap.shape[2] == Sk_pad
+               else None)
     if _GATHER_EXACT:
         # Pre-fix policy: exact match at every call site, logical Sk.
         kbuf, vbuf, Sk_arg = k_exact, v_exact, Sk_pad
@@ -492,17 +506,6 @@ def forward_paged(
         # Post-fix: capacity (>= Sk_pad) reuse on the persistent branch
         # only, with the k/v decisions coupled (a mixed state — k reused,
         # v fresh per layer — would leak per-layer allocations).
-        k_cap = k_gather_buf if (
-            not _NO_BUF_REUSE
-            and _buf_fit(k_gather_buf, torch.uint8, hkv_k,
-                         bytes_per_row_expected)
-            and k_gather_buf.shape[2] >= Sk_pad
-        ) else None
-        v_cap = v_gather_buf if (
-            not _NO_BUF_REUSE
-            and _buf_fit(v_gather_buf, torch.float16, value_cache.shape[2], D)
-            and v_gather_buf.shape[2] >= Sk_pad
-        ) else None
         if (k_cap is not None and v_cap is not None
                 and k_cap.shape[2] == v_cap.shape[2]):
             # Sk = the buffer's own width: the persistent kernel's work

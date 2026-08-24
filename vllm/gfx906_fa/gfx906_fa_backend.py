@@ -315,6 +315,13 @@ class Gfx906FAImpl(AttentionImpl):
     # grow-only capacity policy. Read once at import here AND as
     # _GATHER_EXACT in gfx906_fa_paged.py — keep the two in sync;
     # flipping only one site produces a split (meaningless) A/B.
+    # TEMPORARY A/B arm, NOT a permanent knob (plan-gfx906-fa-fix.md
+    # §6): drop at the NEXT gather-lifecycle change — both read sites,
+    # the _gather_exact branches in _ensure_gather_buffers, the
+    # _GATHER_EXACT branch in forward_paged, and
+    # test_gather_exact_killswitch_restores_old_policy — re-gated on
+    # a serving A/B. Until then every lifecycle edit must touch BOTH
+    # policies and keep them divergence-free.
     _gather_exact: ClassVar[bool] = (
         _os.environ.get("GFX906_FA_GATHER_EXACT", "0") == "1")
     # One-shot warning once more than one capture-baked generation has

@@ -600,7 +600,16 @@ with unit gates (28/28 in `test_gfx906_fa.py`):
 
 Plus: env-var parity comments at both `GFX906_FA_GATHER_EXACT` read
 sites (backend `_gather_exact` / paged `_GATHER_EXACT`, both read once
-at import — flipping one at runtime splits the A/B).
+at import — flipping one at runtime splits the A/B). Second review
+round (same day): the paged.py exact/capacity selections were
+collapsed (exact now DERIVED from capacity — `k_exact = k_cap if
+k_cap.shape[2] == Sk_pad` — so the two width comparisons cannot drift
+apart and the hot path runs 2 fit-checks instead of 4); the kill
+switch stays duplicated BY DESIGN (byte-for-byte pre-fix policy = the
+arm-A repro's value) with its removal plan now written down in code
+(drop notes at both read sites and on the kill-switch test) and in
+plan §6: drop at the next gather-lifecycle change, re-gated on a
+serving A/B).
 
 VERDICT: SHIPPED — the unbounded `_gather_retired` growth is fixed and
 validated on the exact situation that failed (byte-exact OOM under the

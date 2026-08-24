@@ -955,6 +955,8 @@ def test_gather_exact_killswitch_restores_old_policy():
     _gather_captured latch, so an Sk ping-pong after capture retires
     EVERY generation — the unbounded growth this fix removes. Pinned
     so the kill switch stays a true A/B arm.
+    Drop this test together with the switch itself at the next
+    gather-lifecycle change (plan §6 lifecycle note).
     """
     dev = "cuda"
     torch.manual_seed(19)
