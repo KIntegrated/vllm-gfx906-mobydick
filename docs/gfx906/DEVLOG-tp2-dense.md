@@ -127,3 +127,45 @@ the capture-time-Sk-bound fix lever: `tp_decode_investigation.md`
 RESOLUTION (cross-linked, also roadmap N4). Implication: even 131k
 configs overpay — replays attend max_model_len-wide for short contexts;
 fixing this could speed all decode (TP=1 included).
+
+### S9 — final-build restamps + live-context decode tax curve (2026-08-24, boot E)
+
+**VERDICT:** SHIPPED (records) — README final numbers restamped on the
+final build (rc2 image @ `7e4567053e`, post FA-gather-lifecycle + PERSIST
++ C2-V/W2/W4); **live O(Sk) decode tax quantified; MTP < greedy beyond
+~20k ctx.**
+
+**GATE:** serving, rc2 docker image, TP=2, maxlen 262144, util 0.82,
+chunk 1024, capture [1,2,3,4]; cold prefill per rep (per-rep unique
+prompt header defeats prefix-cache carryover); n=3 (2k/8k), n=2
+(32k/64k). Boot E healthy: 0 resets through ~75 min, canary 56.2/56.7
+t/s. (One isolated GPU0 wedge 13:00:53 at the 2nd launch — retry clean;
+`degradation_details.md`.)
+
+27B MTP k=2 (record line replaced; old 42.63 was short-ctx pre-final):
+
+| live ctx | MTP t/s | greedy t/s | MTP/greedy |
+|---|---|---|---|
+| ~1.5k | **59.2** (58.6/59.6/58.8 interleaved) | 40.8 | 1.45× |
+| ~6k | 44.9 | 38.1 | 1.18× |
+| ~32k | 25.2 | 30.5 | 0.83× |
+| ~64k | 16.6 | 24.1 | 0.69× |
+
+- **Mechanism**: PERSIST removed the capture-baked pad32(max_model_len)
+  width, but the live-bounded gather+quant and decode-attention work
+  still scales O(Sk) and is latency-bound at these sizes (~12 ms/step at
+  8k vs 2k; step ≈ 40 ms + ~1.7 µs/token). The PERSIST A/B only
+  measured a 1091-token prompt — it could not see this. Crossover:
+  MTP's 2.5 tok/step no longer beats greedy's 1× FA/draft overhead
+  beyond ~20k live ctx. **Agentic ~60k-ctx work: run greedy (24.1 t/s)
+  or accept 16.6 (MTP).** This also explains why boot D's 16.4 t/s
+  agentic decode matched healthy physics (see degradation resolution) —
+  only the short-ctx canary was the true degradation signal.
+- Superseded cells: "28.83 @4k + 32.79 @131k TP=2" (mixed provenance;
+  32.79 @131k physically impossible on this curve).
+- 35B re-stamps (in-process, GPU0, final build): single 65.7/66.1 (8
+  samples; record 67.39, band widened 65.3–67.0); MTP k=2 88.6 vs
+  76.7 greedy (1.16×; record 89.9/76.2, 1.18×) — the pre-W4 re-measure
+  debt is paid; N=8 192.9/194.0 (record 191.0, soak 189.9±0.4).
+- Suites: 28/28 FA + 43/43 MoE GEMM (README line "15/15, 12/12" stale).
+- Prefill (cold): ~470-525 t/s at 2k-32k, 357 @64k (attention growth).

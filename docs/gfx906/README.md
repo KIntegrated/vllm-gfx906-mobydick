@@ -37,7 +37,7 @@ Reference point: llama.cpp (Q4_K_XL GGUF, full offload) — **70.3 t/s decode,
 | MoE concurrent decode (N=8) | 166.9 t/s (W4 off) | **191.0 t/s** | +14.5% | W4 skinny fp16 M≤16 (`VLLM_GFX906_SKINNY_M16`, flag on, soak-verified; `DEVLOG-fp16-skinny.md`) |
 
 Correctness gates: PPL on a fixed 442-token probe — MoE band 6.6817–6.6942,
-dense band 6.6993–6.7197. Kernel test suites: 15/15 FA, 12/12 MoE GEMM.
+dense band 6.6993–6.7197. Kernel test suites: 28/28 FA, 43/43 MoE GEMM (2026-08-24).
 
 ## Model support status (single MI50, MI60 numbers similar)
 
@@ -47,14 +47,14 @@ request (4 samples) unless noted. Recipes: §Bench recipes +
 
 | model | status | decode t/s | prefill t/s | notes |
 |---|---|---|---|---|
-| **Qwen3.5-35B-A3B-AWQ** (MoE) | **flagship, optimized** | **67.39** (band 65.9–67.0) | **~2140** | full custom stack (W4A16 MoE GEMM + Q8 FA); 19.3× over fork base; llama.cpp parity on decode, 2.7× ahead on prefill |
-| ↳ same, **N=8 concurrent decode** | W4 (`VLLM_GFX906_SKINNY_M16=1`, soak-verified) | 191.0 (baseline 166.9; **+14.5 %**; soak 189.9 ± 0.4) | — | first N=8 record for this model (off arm = C2-V t1n8 steady); skinny fp16 M=5..16 kernel, M-dependent gate |
-| ↳ same, **MTP k=2 spec decode** | recommended spec config (35B, W2) | 89.9 (1.18× vs 76.2 greedy graph; 1.86× eager) | — | 80.4 % acceptance, 1.61 tok/step (in-process metric, pre-W4 build); re-measure vs W4 baseline — note in `moe-decode-roadmap.md` |
+| **Qwen3.5-35B-A3B-AWQ** (MoE) | **flagship, optimized** | **67.39** (record; band 65.3–67.0; final-build restamp 66.1, 2026-08-24) | **~2140** | full custom stack (W4A16 MoE GEMM + Q8 FA); 19.3× over fork base; llama.cpp parity on decode, 2.7× ahead on prefill |
+| ↳ same, **N=8 concurrent decode** | W4 (`VLLM_GFX906_SKINNY_M16=1`, soak-verified) | 191.0 (baseline 166.9; **+14.5 %**; soak 189.9 ± 0.4; final-build restamp 192.9/194.0, 2026-08-24) | — | first N=8 record for this model (off arm = C2-V t1n8 steady); skinny fp16 M=5..16 kernel, M-dependent gate |
+| ↳ same, **MTP k=2 spec decode** | recommended spec config (35B, W2) | 88.6 (1.16× vs 76.7 greedy graph; 1.83× vs eager 44.9) | — | **final-build restamp 2026-08-24** (the pre-W4 re-measure debt): 78.7 % acceptance, 1.57 tok/step; record 89.9 (1.18× vs 76.2; 80.4 % / 1.61 tok/step, pre-W4 build) |
 | **Qwen3.5-27B-AWQ** (dense) | **well supported, optimized** | **25.60** (official-harness record; 27.99 no-spec on the current max-ilp split build, in-process metric) | ~257 (chunked) | GEMV + CUSTOM FA + max-ilp; serving needs `--gpu-memory-utilization 0.93` |
 | ↳ same, **MTP k=2 spec decode** | recommended spec config | **39.4** (1.41×; 1.50× no-max build) | ~250 (neutral) | 90.9% draft acceptance, 1.82 tok/step; `--speculative-config '{"method":"mtp","num_speculative_tokens":2}'` |
 | ↳ same, ngram-3 | works, weak | 28.0–28.9 (1.0–1.09×) | — | agentic prompts only break even; MTP preferred |
 | **Gemma-4-26B-A4B-it-AWQ-4bit** (MoE) | **well supported, optimized** | **67.79** | — | no-zero-point W4A16 expert kernel (`gfx906/gemma4-moe-nzp` work, 1.79× over Triton); chat template required (thinking model); PPL/prompt_logprobs unreliable on this model — gate on coherent text + logprob A/B |
-| **Qwen3.8-27B-AWQ-INT4** (dense) | **loads & serves (experimental)** | 104.2 (N=8, W4 on; 98.2 off) · 79.6 (N=4) | — | `--dtype float16` required (auto-bf16→fp16 fallback landed); graph mode verified (W4 A/B, 2026-08-23); needs `--gpu-memory-utilization 0.90` (64 layers, FA KV 655 KB/token); mtp2 canary 38.6 t/s; non-deterministic at temp=0 (token-identity gates unusable) |
+| **Qwen3.8-27B-AWQ-INT4** (dense) | **fully functional (TP=1 + TP=2)** | MTP k=2 TP=2 (2026-08-24 final): **59.2** @2k / 44.9 @8k / 25.2 @32k / 16.6 @64k · greedy TP=2: 40.8/38.1/30.5/24.1 · 28.62 @4k TP=1 (record) · 104.2 (N=8, W4 on) | — | `--dtype float16` required (auto-bf16→fp16 fallback landed); **live-ctx tax: FA gather/attention O(Sk) — MTP < greedy beyond ~20k ctx** (agentic ~60k: 16.6 MTP / 24.1 greedy t/s); MTP k=2 41.41 TP=1 (record, 2026-08-23; lifecycle fix byte-identical in graph mode); N=8 needs `--gpu-memory-utilization 0.90` (64 layers, FA KV 655 KB/token); TP=2 needs the official amdgpu DKMS driver + trimmed capture `[1,2,3,4]`; 445k-token KV pool — **256k context validated** (FA gather fix 2026-08-24, `oom-256k-prefill.md` §9); non-deterministic at temp=0 (token-identity gates unusable); records: `DEVLOG-tp2-dense.md` S1–S9, `DEVLOG-masked-fa.md`, `DEVLOG-qwen38.md` |
 | **Qwen3.6-27B / 3.6-35B-A3B** (fp16) | **not supported** | — | — | 52/67 GB fp16 checkpoints do not fit a 32 GB card; 3.6 GGUF only used as a llama.cpp reference point |
 | small AWQ models (e.g. Qwen3.5-9B-AWQ, 0.8B) | supported | — | 590–1483 (9B, eager) | fine on ≤0.85 util; FA prefill benchmarks in top-level README |
 
@@ -180,7 +180,7 @@ load-time repack (~65 s). Handles both MoeWNA16 (N-first uint8) and AutoAWQ
 
 | model | shape | W4 off | W4 on | Δ |
 |---|---|---|---|---|
-| Qwen3.5-35B-A3B-AWQ (MoE) | pp=2048/tg=256 | 166.9 | **191.0** (soak 189.9 ± 0.4) | **+14.5 %** |
+| Qwen3.5-35B-A3B-AWQ (MoE) | pp=2048/tg=256 | 166.9 | **191.0** (soak 189.9 ± 0.4; final-build restamp 192.9/194.0) | **+14.5 %** |
 | Qwen3.8-27B-AWQ-INT4 (dense) | pp=1024/tg=160 (KV cap, util 0.90) | 98.2 | **104.2** | **+6.1 %** |
 
 `VLLM_GFX906_SKINNY_M16=1` (default off); 27B N=4 control flat (−0.6 %, flag
