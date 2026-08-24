@@ -487,3 +487,52 @@ t/s at 2k/8k/32k/64k). Isolated wedge confirmed; boot E window remains
 good. (Note: an early monitor false-alarmed a "second wedge" — its
 grep scanned the whole T13: hour and re-matched the 13:00 events; no
 second wedge existed.)
+
+## 2026-08-24 14:47–14:56Z (boot E): CPU stuck-threads on HSA P2P-IPC + Worker_TP0 death
+
+New failure signature — **CPU-side**, not a GPU reset. Observed on both
+boot-E serving instances (13:25 docker, 14:37 host-venv; identical
+config: rc2 image/tree, 27B TP=2 MTP, maxlen 262k):
+
+- ~15–20 min after start, each TP worker process had **two threads at
+  ~100% CPU each** (4 cores total; container CPU ~410%). Serving numbers
+  were unaffected (canaries 55–59 t/s, full curves clean) — so this is
+  **not** the sync-cadence degradation; it is idle-core burn.
+- By ~14:55 the threads were **frozen, not spinning**: rip constant on a
+  *trivial* instruction (register `mov`/post-syscall `cmp`) across
+  minutes and repeated gdb attaches; utime ticking at 100%, stime flat
+  (pure user mode); `voluntary_ctxt_switches` ~0–1. A frozen rip on a
+  register move is not software — it is a core endlessly replaying an
+  instruction (microarch stuck state).
+- Locations (file offsets, identical lib in both host and image,
+  md5-verified): two threads in/near `rocr::core::Runtime::IPCClientImport`
+  in `libhsa-runtime64.so.1.21.0` (the HSA P2P-IPC import — the GPU0↔GPU1
+  path on this dual-root-port topology), one at glibc `__poll`
+  post-syscall, one in a libhsa stack-save. So the stuck context is the
+  **P2P IPC channel establishment**, the same hardware path as the
+  wedges — first CPU-side manifestation of that failure family.
+- The vLLM Python side was clean: py-spy showed MainThread correctly
+  parked in `SpinCondition.wait` (zmq poll); all other Python threads
+  idle. So the "200% CPU" is **not** the RPC reader's
+  `sched_yield` busy-branch and not a vLLM busy-wait.
+- Taskset test: pinning a frozen thread to another core kept the frozen
+  rip → the stuck state travels with the thread, not a dead core.
+  `kill -9 <tid>` did remove a frozen thread (kernel delivery works).
+- 14:56:10: Worker_TP0 "died unexpectedly (exit code: None)" — no OOM,
+  no MCE, no segfault/fence in kern.log; engine cascade-shut at
+  14:56:16. The death landed ~5 min after my gdb attach/detach cycles to
+  that worker (ptrace stop/resume of stuck threads) — correlation, not
+  proven causation; the stuck threads had been frozen before any attach.
+- Cleared by the 15:01 reboot (boot F: 0 resets/wedges since boot).
+  Open question: does the stuck-thread signature recur on boot F? If yes
+  within ~20 min of a fresh TP=2 start, the P2P-IPC path is
+  deterministically locking threads on this host → driver/firmware
+  escalation (official amdgpu DKMS 6.19.14 in use).
+
+Tracing notes (for the next time): worker procs set `dumpable=0`
+(HSA) — `/proc/<tid>/syscall` and same-user py-spy/gdb are EPERM; use a
+helper container `--pid=host --cap-add SYS_PTRACE --security-opt
+seccomp=unconfined --security-opt apparmor=unconfined` (AppArmor
+`docker-default` denies ptrace even with the cap). Single-shot gdb
+`info threads`/`info registers` only — a gdb `while`-loop in batch mode
+hung with the inferior stopped (killing gdb released it).
