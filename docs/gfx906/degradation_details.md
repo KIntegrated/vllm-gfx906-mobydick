@@ -191,6 +191,33 @@ one-off reset collateral of the aborted OOM arm, NOT a half-wedge
 on the same GPU booted fine). Counts as a reset for the onset
 bracket (see the 08-22 15:41 row pattern).
 
+## 2026-08-23: Qwen3.8-27B 256k-prefill OOM cluster — verified diagnosis
+
+Seven OOMs in one session, all on the first big prefill of a ~250k-
+token request, never during steady serving. The failing allocation in
+four of the arms is exactly **178,257,920 B at `torch.ops._C.gptq_gemm`
+(`free: 0`)** — the exllama AWQ **per-call dequant scratch**
+(`temp_dq = [N×32/bit, K/8]` fp16, weight-shape-sized, *not
+token-scaled*): 8×17,408×640×2 for the MLP gate_up. The lm_head
+(vocab 248,320, quantized) needs **2.37 GiB** of the same scratch on
+every forward. Ruled out by direct test: `mamba_cache_mode: align`
+(auto-enabled for Qwen3.5/3.6/3.8 with prefix caching; the scheduler
+only *clips* chunks to the 784/800-token block, never bumps — the
+`--no-enable-prefix-caching` arm OOMed identically), MTP, chunk size
+(8192→1024), and util (0.93→0.82; the post-capture headroom
+`profiled + graph_est − graph_actual` ≈ 1.9-2.5 GiB is util-
+independent by construction). The 250k sequence is the common factor:
+it drains the headroom via unprofiled request-time consumers (lazy Q8
+side-buffer ~0.4 GiB, FA buffer growth, inductor dynamic shapes) plus
+an unidentified ~1-2 GiB long-context transient, leaving no contiguous
+block for the next scratch. W4 soak (same pool size, maxlen 1536,
+30 reps) ran flat — not a leak.
+
+**Full mechanism + verbatim evidence (log lines, C++ allocation site,
+accounting arithmetic, arm matrix, fix directions): `oom-256k-prefill.md`.**
+131k is the validated ceiling on this model (dense Qwen3.5-27B serves
+256k fine).
+
 ## Open questions (record answers here as evidence lands)
 
 1. **Onset:** does degradation need N accumulated resets, long uptime,
@@ -253,3 +280,156 @@ healthy host it reads ~40+.
   misattribution on 2026-08-22: the "mtp2 TP=2 regression"
   investigation, see `fa-masked-mtp-regression-glm5.md`).
 
+
+## 2026-08-23 17:59–18:06Z: OOM-hunt canary burst — 3 weight-load aborts, 3 GPU0 resets
+
+Successive canary attempts (the detection protocol probe, 27B mtp2
+in-process) all SIGABRT rc=134 with `hipErrorLaunchFailure` at
+safetensors shard 2/5→3, each leaving `Fence fallback timer expired
+on ring comp_1.0.0` → `GPU reset(N) succeeded` in kern.log (18:00:02,
+18:01:35, 18:06:15Z; boot's reset #1 was the 12:48 GPU1 event). VRAM
+0 % and rocm-smi clean between attempts; attempt 3 ran with
+AMD_SERIALIZE_KERNEL=3 with no change. 4 resets this boot (06:33
+onward) = the documented burst pattern → stopped retrying
+(full-wedge risk); host-health verdict deferred until a canary can
+run on a fresh boot. Context: the 256k-OOM-hunt session
+(oom-256k-prefill.md follow-up) needed the canary only as a
+pre-bench health gate; the OOM mechanism itself is allocator-level
+and unaffected by DEG.
+
+## 2026-08-23 18:23Z: OOM-hunt 9B boot — GPU1 reset (5th+ this boot)
+
+The instrumented Qwen3.5-9B TP=2 boot (gather-generation probe for the
+256k OOM hunt) aborted at rank-1 SetDevice with
+`hipErrorLaunchFailure`, triggering `GPU reset(2) succeeded` on GPU1
+(0000:0e:00.0, 18:23:00Z). Combined with the 17:59–18:06 canary burst
+(GPU0 ×3) the boot is at 5+ resets — confirmed wedge-burst state.
+Host reboot requested (Kevin, 18:2xZ); all OOM-hunt GPU experiments
+deferred to the fresh boot. Teardown clean: SIGTERM, VRAM 0 % both
+GPUs, no zombie KFD procs.
+
+Interim (static) conclusion of the OOM hunt — see
+oom-256k-prefill.md follow-up notes: the ~1–2 GiB "unidentified
+long-context transient" is predicted to be the FA gather-buffer
+generations retired into the unbounded `_gather_retired` keep-alive
+(5d960a503c) as chunked prefill grows Sk_pad every 32 tokens —
+simulation of the 27B TP=2 shape (B=2, Hkv=2, D=256, chunk 1024)
+predicts 89.4 GiB accumulated by 250k tokens; the 1.94 GiB run-4
+headroom is exhausted at ~30k tokens (~2.7 min at prefill rate),
+matching every observed arm. Live confirmation on the fresh boot.
+
+## 2026-08-23 18:35Z→20:15Z: boot-failure wedges — on-die RAS latches + GTT refutation
+
+The 18:30 warm reboot did NOT clear the wedge-burst state: GPU0 reset
+18:35:55 (canary, weight load) with the day's first **on-die RAS latch**
+(`ERREVENT_ATHUB_INTERRUPT` uncorrectable — the on-die host fabric hub);
+GPU1 reset 18:39:40; **pcie_bif correctable latch on BOTH cards within
+6 ms** (18:50:19.637/.643 — simultaneous dual-card timing; shared
+host-side cause or delayed post-reset flush, ambiguous); the 19:14–19:20
+full power cycle did NOT clear it either (first canary on the 19:20 boot
+failed 19:23:30; failures continued 19:35–19:46).
+
+Second session (20:00–20:30, pi) established the failure is
+**intermittent, not deterministic**, and refuted the GTT-exhaustion
+theory:
+
+- Flap pattern on the 19:20 boot: 4 fails (19:23–19:46) → 5 passes
+  (repro ×4 + full 27B-mtp2 canary 38.9 t/s, 20:03–20:08) → 2 fails
+  (20:15:16/20:15:48, live-caught) → 5+ passes (20:16–20:23). Bad
+  windows ~60-90 s; good windows 30+ min to hours. Same-day totals:
+  **19 BACO resets, GPU0 ×16 / GPU1 ×3** (GPU0 primary).
+- The 20:15:16 wedge was preceded 41 s earlier by a GPU0 `pcie_bif`
+  correctable RAS latch (20:14:35) — the second such latch on GPU0
+  (first 18:50:19). All on-die error events of the day (mmhub no-retry
+  page fault 06:08:32, ATHUB uncorrectable 18:35:55, pcie_bif
+  18:50:19 + 20:14:35) are on GPU0's host-fabric/PCIe-interface blocks.
+  PCIe AER device counters: all zero, link x16/16 GT/s (the faults are
+  on-die, not link-level).
+- **GTT refutation (the decisive measurement):** `mem_info_gtt_total` =
+  12,553,486,336 B (11.68 GiB; kernel: "11971M of GTT memory ready");
+  `mem_info_gtt_used` sampled at 150 ms during the full 19.57 GiB /
+  2396-tensor distinct-mmap weight load peaked at **20 MiB (0.16 %)**;
+  idle baseline 14 MiB. A 19.57 GiB load has also PASSED many times
+  today — impossible under a strict 11.7 GiB capacity mechanism. The
+  "tensor #801 / ~8 GiB" failure point is a time-to-failure artifact
+  (cold load reaches tensor 801 at ~40 s; runs die when they enter a bad
+  window), not a capacity crossing. fwupd installed nothing today;
+  nothing ran on the GPUs 13:06–17:59 (the 17:59 failure followed a 5 h
+  idle).
+
+Classification: **HW-class, GPU die/fabric flap — GPU0 primary** (NOT
+GTT-pressure origin). Leading hypotheses: degrading GPU0
+(ATHUB/pcie_bif/mmhub) and/or a shared host-side contributor (both GPUs
+sit behind parallel two-bridge chains off adjacent root ports 03.1/03.2;
+the 18:50 simultaneous dual-card latch). Discriminating experiment:
+card swap between the symmetric slots. Full experiment record +
+artifacts (`/local/tmp/boot_fail/`): `DEVLOG-boot-failure.md` §7.
+
+## 2026-08-23 21:46Z — fa-gather-lifecycle arm A: isolated GPU1 wedge at worker init
+
+First 256k needle-harness attempt (TP=2, Qwen3.8-27B, `GFX906_FA_GATHER_EXACT=1`
+arm — the pre-fix-policy OOM repro) died at worker init, ~1 min in:
+
+```
+21:46:53 amdgpu 0000:0e:00.0: GPU reset begin!. Source: 4
+21:46:53 amdgpu 0000:0e:00.0: BACO reset
+21:46:55 VRAM is lost due to GPU reset!
+21:46:56 GPU reset(1) succeeded!
+21:46:56 [drm] device wedged, but recovered through reset
+```
+
+Worker log: `c10::AcceleratorError` / `hipErrorLaunchFailure` at
+`SetDevice` (both ranks), `WorkerProc initialization failed`.
+
+- 85 min of quiet between wedges (20:21:33 → 21:46:53) with passing
+  canaries at 20:40/20:41 (38.2/38.6 t/s) — an **isolated wedge inside a
+  good window**, the pattern established in DEVLOG-boot-failure.md §7.1.2.
+- This one hit **GPU1** (0e:00.0 — 4th reset on GPU1 today vs 17 on GPU0),
+  so the flap is not strictly GPU0-primary at the per-event level even
+  though GPU0 dominates the count.
+- Clean recovery (no PSP ret −62, no zombie VRAM, rocm-smi 0 % both cards);
+  harness process exited on its own. Arm A retried after this entry.
+
+## 2026-08-23 21:46–22:42Z — fa-gather-lifecycle session: GPU1 flap → dual-card common-cause reset
+
+Session context: arm A (pre-fix policy, `GFX906_FA_GATHER_EXACT=1`) and arm
+B (the fix) of the 256k needle harness. Wedges at worker init (SetDevice /
+first kernel dispatch) in the ~6-min boot window:
+
+- 21:46:53 GPU1 (0e) — arm A attempt 1
+- 22:02:01 GPU1 — arm A attempt 2 (comp_1 fence fallback)
+- 22:25:12 GPU1 — arm A attempt 4 (attempt 3, launched 22:05, ran clean
+  22:07–22:16 through full boot + graph capture — then died on a harness
+  assert bug, not a wedge)
+- **22:42:12 BOTH cards (0b + 0e) in the same millisecond** — arm B attempt 1
+
+The dual-card same-millisecond reset matches the 18:50:19.637/.643
+dual-card pcie_bif latch: a shared host-side contributor (PCIe fabric /
+root-complex) is the leading common-cause candidate; card-local
+degradation alone would not reset both in one ms.
+
+**Arm A SUCCEEDED on attempt 5 (22:29–22:38, a wedge-free window):**
+the pre-fix OOM reproduced byte-exact (178,257,920 B, free: 0, gptq_gemm,
+3.3 min into prefill) with OOMHUNT pinning the unbounded `_gather_retired`
+dict (152 generations, 7.79 GB retired at the 60k-token OOM point).
+Arm B pending a clean boot window.
+
+Host state: 12 resets this boot (boot C, 19:20). Cadence accelerating
+(15 min → 23 min → 17 min between single-card wedges, then dual-card).
+If arm B cannot get a clean window, reboot is the next step (needs root).
+
+### 22:48–22:58 addendum — stop-retrying decision
+
+- 22:48:02 GPU0 (0b) — arm B attempt 1 (launched 22:47:09)
+- 22:57:38 window_watch confirmed a 5.5-min clean probe window (10×30s,
+  both cards) and auto-launched arm B; 22:58:30 GPU1 (0e) wedged at
+  SetDevice 52 s later.
+
+Cadence over the session: 21:46 → 22:02 → 22:25 → 22:42 (dual) →
+22:48 → 22:58 — 12 resets this boot. Good windows have shrunk below
+the ~6-min boot time, so every launch attempt now lands in (or creates)
+a bad window. **Retrying stopped.** This matches the AGENTS.md
+degraded-state signature (many half-wedges in one boot → only a reboot
+clears it). After a reboot: run `window_watch.sh` (it auto-launches
+arm B on a confirmed window) or launch arm B directly; arm A evidence
+is already on record (`/local/tmp/fa_fix/arm_A.log`, `oomhunt_A.log`).

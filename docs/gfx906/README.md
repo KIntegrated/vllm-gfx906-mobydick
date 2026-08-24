@@ -69,6 +69,7 @@ request (4 samples) unless noted. Recipes: §Bench recipes +
 | `DEVLOG-moe-opt.md` | MoE kernel record (W4A16 GEMM, tuning, pile, merges) |
 | `DEVLOG-fa-attention.md` | custom Q8 FA / decode backend record |
 | `DEVLOG-dense-decode.md` | Qwen3.5-27B dense decode record |
+| `DEVLOG-boot-failure.md` | 2026-08-23 weight-load `hipErrorLaunchFailure` hunt (OPEN: minimal torch repro, GTT-exhaustion theory) |
 | `moe-decode-roadmap.md` | future MoE-decode candidates (roadmap, not a committed plan) |
 | `spec-decode-roadmap.md` | speculative-decode on gfx906: n-gram probe results + phase plan (ngram/suffix/MTP rails) |
 | `running.md` | how to run/build/bench: local venv (canonical) + docker images |
@@ -253,6 +254,23 @@ targets matrix cores; gfx906 has none).
   needs a decode-specialized kernel store; only matters for batched decode).
 - **Eager decode is launch-bound**: eager A/B of kernel improvements can tie
   even when the kernels differ; always gate in graph/serving mode.
+- **256k-context prefill OOM on Qwen3.8-27B — RESOLVED 2026-08-24
+  (branch `gfx906/fa-gather-lifecycle`; history: 7 OOMs on 2026-08-23,
+  full mechanism + verbatim evidence in `oom-256k-prefill.md`, fix +
+  validation in `DEVLOG-fa-attention.md` "Gather-buffer lifecycle fix").**
+  The unprofiled long-context transient was the custom-FA
+  `_gather_retired` keep-alive dict: pre-fix, every chunked-prefill chunk
+  with a larger max-seq-len reallocated the gather buffers at exact Sk and
+  retired the previous capture-flagged generation (measured 7.79 GB / 152
+  generations by the 60k-token OOM point — vs ~1.94 GiB headroom; the AWQ
+  `temp_dq` scratch was the allocation that landed on the remains). Fixed:
+  capacity-width grow-only buffers + per-generation capture flag
+  (`GFX906_FA_GATHER_EXACT=1` restores the old policy). The 250k run-4
+  prefill now completes with the needle retrieved (148 tok/s incl.
+  prefill), decode A/B flat; **the 131k ceiling is lifted** on this model.
+  Not a serving-time leak (W4 soak flat at 98-99 %). KV sizing facts:
+  Qwen3.8-27B 64 KB/token (TP=1) / 32 KB/rank (TP=2); Qwen3.5-27B 20 KB;
+  Qwen3.5-35B 10 KB.
 - Dense GEMM dispatch (exllama gptq + LLMM1) is at its measured optimum —
   a purpose-built W4A16 dense GEMV is the top remaining dense lever
   (roadmap item).
