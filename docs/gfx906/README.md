@@ -240,6 +240,11 @@ targets matrix cores; gfx906 has none).
 
 ## Known issues / limitations
 
+- **CPU stuck-threads in TP=2 serving** (host-level, 2026-08-24): 2
+  threads per worker freeze at 100% user CPU in the HSA P2P-IPC handshake
+  (`libc __poll` / `libhsa IPCClientImport`) within ~15-20 min of start;
+  reboot does not clear it; serving unaffected so far. Full write-up +
+  options (NCCL_P2P_DISABLE A/B, AMD escalation): `cpu-stuck-threads.md`.
 - **rocprofv3 finalization race**: dense-model traces consistently fail
   (ring buffer invalid at exit; EngineCore teardown races HSA). Use
   three-anchor inference or eager torch-profiler attribution instead.
