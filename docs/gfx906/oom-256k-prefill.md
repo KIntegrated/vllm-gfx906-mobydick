@@ -242,3 +242,31 @@ pool), not the cause.
 - Cross-refs: `degradation_details.md` § 2026-08-23 OOM cluster
   (summary), `README.md` § Known issues (pointer),
   `DEVLOG-tp2-dense.md` (131k/256k dense context records).
+
+## 9. Resolution — the transient was `_gather_retired` (2026-08-24)
+
+The "unidentified ~1–2 GiB long-context transient" (§6/§7) was the
+custom-FA gather-buffer keep-alive dict. `GFX906_OOMHUNT_LOG` probe on
+the 250k run-4 config (pre-fix policy via `GFX906_FA_GATHER_EXACT=1`):
+
+- pre-fix, every chunked-prefill chunk with a larger max-seq-len
+  reallocated the gather buffers at exact Sk and retired the previous
+  (sticky-capture-latched) generation;
+- retired dict: 1.19 GB @13.6k → 2.45 GB @28.8k → 4.62 GB @44k →
+  **7.79 GB (152 generations) @60k tokens — OOM** at
+  `178,257,920 bytes (free: 0, total: 34,342,961,152)` in
+  `torch.ops._C.gptq_gemm`, 3.3 min into prefill (run-4 band 2.5–4.5
+  min). Reproduced byte-exact on two independent boots.
+
+So the dict — not the token-independent AWQ `temp_dq` — drained the
+~1.94 GiB headroom; the 178 MB dequant scratch was the allocation that
+landed on the remains. Fix: capacity-width grow-only gather buffers +
+per-generation capture flag (branch `gfx906/fa-gather-lifecycle`,
+`090673ad21`; design + reviews in `plan-gfx906-fa-fix.md` +
+`gfx906-fa-fix-code-review-*.md`). **Validated on the §1 situation
+itself:** pre-fix policy OOMs byte-exact (×2); fixed policy completes
+the 250k prefill (148 tok/s incl. prefill) with the needle at token
+125k retrieved, `retired_B=0` throughout; decode A/B flat (35B MoE
+65.92 vs 66.13 t/s). **The 131k ceiling (§7 era) is lifted** on
+Qwen3.8-27B; 256k TP=2 works at the run-4 config. Full record:
+`DEVLOG-fa-attention.md` (Gather-buffer lifecycle fix, 2026-08-24).

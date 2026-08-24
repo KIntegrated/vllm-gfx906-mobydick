@@ -5,9 +5,16 @@ Copyright Kevin Read <me@kevin-read.com>
 2026-08-23. Target: `vllm-gfx906-mobydick` @ `gfx906/main` (4a9e24b5ca).
 Companion docs: `docs/gfx906/oom-256k-prefill.md` (OOM analysis),
 `docs/gfx906/DEVLOG-masked-fa.md` (N4 persistent gather),
-`degradation_details.md` (2026-08-23 OOM cluster). Status: design, not
-yet implemented — blocked on the weight-load `hipErrorLaunchFailure`
-(see `DEVLOG-boot-failure.md`).
+`degradation_details.md` (2026-08-23 OOM cluster).
+
+**STATUS (2026-08-24): IMPLEMENTED + VALIDATED** — branch
+`gfx906/fa-gather-lifecycle` @ `090673ad21`; the run-4 situation OOMs
+byte-exact under `GFX906_FA_GATHER_EXACT=1` (×2 boots, OOMHUNT retired
+7.79 GB at the OOM point) and completes under the fix (250k prefill,
+needle retrieved, `retired_B=0`), decode A/B flat. Record:
+`DEVLOG-fa-attention.md` (Gather-buffer lifecycle fix, 2026-08-24).
+(Originally blocked on the weight-load `hipErrorLaunchFailure`,
+`DEVLOG-boot-failure.md` — cleared by the 2026-08-24 05:20 reboot.)
 
 **Revision note:** this supersedes `/local/tmp/gfx906-fa-fix.md`
 (now stale/gone from `/tmp`). It was rewritten after four independent
