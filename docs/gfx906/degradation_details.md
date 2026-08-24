@@ -523,11 +523,23 @@ config: rc2 image/tree, 27B TP=2 MTP, maxlen 262k):
   14:56:16. The death landed ~5 min after my gdb attach/detach cycles to
   that worker (ptrace stop/resume of stuck threads) — correlation, not
   proven causation; the stuck threads had been frozen before any attach.
-- Cleared by the 15:01 reboot (boot F: 0 resets/wedges since boot).
-  Open question: does the stuck-thread signature recur on boot F? If yes
-  within ~20 min of a fresh TP=2 start, the P2P-IPC path is
-  deterministically locking threads on this host → driver/firmware
-  escalation (official amdgpu DKMS 6.19.14 in use).
+- Cleared by the 15:01 reboot (boot F: 0 resets/wedges since boot) —
+  but **RECURRED on boot F**: fresh docker TP=2 MTP server (15:09, same
+  image/config), canary healthy (33.5/55.1 t/s), and by ~15:25 the same
+  signature again — 2 threads per worker at 99.9% (workers at 200%
+  instantaneous), ALL FOUR frozen at the SAME location as one boot-E
+  thread: glibc `__poll` post-`syscall` (libc+0x11b5fd, constant rip
+  across samples), one-to-one pairing per worker (one "python3" + one
+  "VLLM::Worker" thread), symmetric across ranks.
+- **Verdict: deterministic host-level defect** — reproduces across
+  reboots, docker/venv, and boots (E + F) within ~15-20 min of a fresh
+  TP=2 start; the P2P-IPC handshake path locks the threads in a CPU
+  instruction-replay stuck state. Not a vLLM bug; not boot-state
+  degradation (reboot does not fix it). Impact so far: 4 idle cores; no
+  serving degradation; boot E additionally lost Worker_TP0 (14:56:10).
+- Next step: `NCCL_P2P_DISABLE=1` (SHM transport) A/B to confirm the
+  mechanism and test as a workaround; escalation candidate for
+  ROCm-HSA / amdgpu-DKMS (gfx906, 2× MI50 dual-root-port P2P).
 
 Tracing notes (for the next time): worker procs set `dumpable=0`
 (HSA) — `/proc/<tid>/syscall` and same-user py-spy/gdb are EPERM; use a
