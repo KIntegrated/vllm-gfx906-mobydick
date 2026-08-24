@@ -118,6 +118,25 @@ _PERSISTENT = _os.environ.get("GFX906_FA_PERSIST", "1") != "0"
 # behavior, still Sk-bounded) instead of dispatching to the persistent
 # kernel.
 _PERSIST_MAX_SEQS = 16
+# Post-fix gather-buffer policy (plan-gfx906-fa-fix.md §2.2c): the
+# persistent branch reuses any buffer with width >= Sk_pad and passes
+# the buffer's own width as Sk — safe only there (live-bounded work,
+# FA cuts at kv_max). Every other call site keeps the exact contract:
+# their tail zeroing is width-bound work and their launchers enforce
+# Sk <= 65535, so a wide buffer must not reach them (a mismatch there
+# would also silently fall back to a per-layer C++ allocation).
+# GFX906_FA_GATHER_EXACT=1 restores the pre-fix exact-match policy at
+# every site (A/B kill switch). Read once at import here AND as
+# Gfx906FAImpl._gather_exact in gfx906_fa_backend.py — keep the two in
+# sync; flipping only one site produces a split (meaningless) A/B.
+# TEMPORARY A/B arm, NOT a permanent knob (plan-gfx906-fa-fix.md §6):
+# drop at the NEXT gather-lifecycle change — both read sites, the
+# _gather_exact branches in _ensure_gather_buffers, the _GATHER_EXACT
+# branch below (plus the k_exact/v_exact derivation feeding it), and
+# test_gather_exact_killswitch_restores_old_policy — re-gated on a
+# serving A/B. Until then every lifecycle edit must touch BOTH
+# policies and keep them divergence-free.
+_GATHER_EXACT = _os.environ.get("GFX906_FA_GATHER_EXACT", "0") == "1"
 # P3-4: skip the LEGACY-path q_pad zero_ on the Sq=1 decode fast path
 # (pad rows are per-row-independent and discarded; the q8_0 quantization
 # clamps NaN/Inf garbage). GFX906_FA_QPAD_EMPTY=0 reverts to the zero_.
@@ -448,22 +467,57 @@ def forward_paged(
     bytes_per_row_expected = (D // 32) * 34
     hkv_k = key_cache_q8.shape[2] if key_cache_q8 is not None \
         else key_cache.shape[2]
-    kbuf = k_gather_buf if (
+    def _buf_fit(t, dtype, nhead, brow):
+        return (t is not None
+                and t.dtype == dtype
+                and t.dim() == 4
+                and t.shape[0] == num_seqs
+                and t.shape[1] == nhead
+                and t.shape[3] == brow
+                and t.is_contiguous())
+
+    # Capacity (>= Sk_pad) selection — the post-fix persistent-branch
+    # contract. The pre-fix exact (== Sk_pad) selection is DERIVED from
+    # it below, so the two width comparisons cannot drift apart.
+    k_cap = k_gather_buf if (
         not _NO_BUF_REUSE
-        and k_gather_buf is not None
-        and k_gather_buf.dtype == torch.uint8
-        and k_gather_buf.dim() == 4
-        and k_gather_buf.shape == (num_seqs, hkv_k, Sk_pad, bytes_per_row_expected)
-        and k_gather_buf.is_contiguous()
+        and _buf_fit(k_gather_buf, torch.uint8, hkv_k,
+                     bytes_per_row_expected)
+        and k_gather_buf.shape[2] >= Sk_pad
     ) else None
-    vbuf = v_gather_buf if (
+    v_cap = v_gather_buf if (
         not _NO_BUF_REUSE
-        and v_gather_buf is not None
-        and v_gather_buf.dtype == torch.float16
-        and v_gather_buf.dim() == 4
-        and v_gather_buf.shape == (num_seqs, value_cache.shape[2], Sk_pad, D)
-        and v_gather_buf.is_contiguous()
+        and _buf_fit(v_gather_buf, torch.float16, value_cache.shape[2], D)
+        and v_gather_buf.shape[2] >= Sk_pad
     ) else None
+    # Exact-Sk selection — the pre-fix contract, still the ONLY contract
+    # for the non-persistent call sites (fused q8 / fused quantized /
+    # fp16 two-kernel): they must keep seeing kbuf=None on a wide buffer
+    # exactly as they would with no buffer at all (no reuse, no silent
+    # divergence — plan §2.2c).
+    k_exact = (k_cap if k_cap is not None and k_cap.shape[2] == Sk_pad
+               else None)
+    v_exact = (v_cap if v_cap is not None and v_cap.shape[2] == Sk_pad
+               else None)
+    if _GATHER_EXACT:
+        # Pre-fix policy: exact match at every call site, logical Sk.
+        kbuf, vbuf, Sk_arg = k_exact, v_exact, Sk_pad
+    else:
+        # Post-fix: capacity (>= Sk_pad) reuse on the persistent branch
+        # only, with the k/v decisions coupled (a mixed state — k reused,
+        # v fresh per layer — would leak per-layer allocations).
+        if (k_cap is not None and v_cap is not None
+                and k_cap.shape[2] == v_cap.shape[2]):
+            # Sk = the buffer's own width: the persistent kernel's work
+            # is live-bounded and the C++ exact-match passes trivially.
+            # The k/v widths must match: _ensure_gather_buffers always
+            # allocates the pair at one width, but a hand-set class
+            # buffer with unequal widths would otherwise pass Sk = K's
+            # width and silently drop V to a per-call C++ allocation —
+            # exactly the mixed state the coupling exists to prevent.
+            kbuf, vbuf, Sk_arg = k_cap, v_cap, k_cap.shape[2]
+        else:
+            kbuf, vbuf, Sk_arg = None, None, Sk_pad
     if key_cache_q8 is not None and _FUSED:
         # Level 1 fused path: gather K_q8 + V_fp16 одним HIP kernel'ом.
         # Возвращает tensors с Sk=Sk_pad (хвост в V уже обнулён, K — мусор).
@@ -475,7 +529,7 @@ def forward_paged(
         sl_i32 = sl_i32.contiguous()
         K_q8, V_bhsd = gfx906_fa.gather_paged_kv_q8(
             key_cache_q8, value_cache, bt_i32, sl_i32, Sk_pad,
-            k_out=kbuf, v_out=vbuf,
+            k_out=k_exact, v_out=v_exact,
         )
         # K_q8: [B, Hkv, Sk_pad, bytes]; V_bhsd: [B, Hkv, Sk_pad, D] — уже padded.
         if _DOUBLE_CHECK:
@@ -522,7 +576,7 @@ def forward_paged(
                 # GFX906_FA_PERSIST_MARGIN). num_seqs > _PERSIST_MAX_SEQS
                 # falls through to the fused/two-kernel paths below.
                 K_q8, V_bhsd = gfx906_fa.gather_paged_kv_quant_persistent(
-                    key_cache, value_cache, bt_i32, sl_i32, Sk_pad,
+                    key_cache, value_cache, bt_i32, sl_i32, Sk_arg,
                     k_out=kbuf, v_out=vbuf,
                 )
                 if _DOUBLE_CHECK:
@@ -554,7 +608,7 @@ def forward_paged(
             elif _FUSED_QUANT and Sk_pad <= 65535:
                 K_q8, V_bhsd = gfx906_fa.gather_paged_kv_quantized(
                     key_cache, value_cache, bt_i32, sl_i32, Sk_pad,
-                    k_out=kbuf, v_out=vbuf,
+                    k_out=k_exact, v_out=v_exact,
                 )
             else:
                 # Fallback (GFX906_FA_FUSED_QUANT=0): K output is fp16 [B,Hkv,Sk,D],
@@ -562,7 +616,7 @@ def forward_paged(
                 # buffer.
                 K_bhsd, V_bhsd = gfx906_fa.gather_paged_kv_fp16(
                     key_cache, value_cache, bt_i32, sl_i32, Sk_pad,
-                    v_out=vbuf,
+                    v_out=v_exact,
                 )
                 K_q8 = gfx906_fa.quantize_q8_0(K_bhsd)
 

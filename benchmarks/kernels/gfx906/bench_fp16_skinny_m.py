@@ -13,7 +13,10 @@ per shape to set the gfx906 dispatch for 1 < M <= 16.
 import torch
 import torch.nn.functional as F
 
-from vllm.model_executor.layers.utils import triton_matmul
+from vllm.model_executor.layers.utils import (
+    _gfx906_spec_gemv_m4,
+    triton_matmul,
+)
 
 # (m=N_out, k=K_in, name)
 SHAPES = [
@@ -39,7 +42,15 @@ def bench(fn, iters=30):
         fn()
     e.record()
     torch.cuda.synchronize()
-    return s.elapsed_time(e) / iters * 1000  # us
+    v = s.elapsed_time(e) / iters * 1000  # us
+    return v
+
+
+def bench_maybe(fn, iters=30):
+    """bench() for fns that may return None (gated kernel paths)."""
+    if fn() is None:
+        return None
+    return bench(fn, iters)
 
 
 def main():
@@ -51,20 +62,34 @@ def main():
         for path, fn in (
             ("triton", lambda x: triton_matmul(x, w)),
             ("rocmblas", lambda x: F.linear(x, w)),
+            ("gemv", lambda x: _gfx906_spec_gemv_m4(w, x)),
         ):
             row = []
             for mm in MS:
                 x = torch.randn(mm, k, device=dev, dtype=torch.float16)
-                row.append(bench(lambda: fn(x)))
-            print(f"{name:16s} {path:8s} " +
-                  " ".join(f"{v:<10.0f}" for v in row) + "  (us)",
-                  flush=True)
-        # sanity: same result?
+                if path == "gemv":
+                    v = bench_maybe(lambda x=x: fn(x))
+                else:
+                    v = bench(lambda x=x: fn(x))
+                row.append(v)
+            cells = " ".join(
+                f"{v:<10.0f}" if v is not None else f"{'n/a':<10s}"
+                for v in row)
+            print(f"{name:16s} {path:8s} " + cells + "  (us)", flush=True)
+        # sanity: same result? (triton vs rocmblas, and the gated gemv
+        # path vs rocmblas at M=2, 8, 16 when enabled)
         x = torch.randn(4, k, device=dev, dtype=torch.float16)
         a = triton_matmul(x, w)
         b = F.linear(x, w)
         print(f"{name:16s} {'diff':8s} max|a-b|={
             (a - b).abs().max().item():.5f}", flush=True)
+        for mm in (2, 8, 16):
+            x = torch.randn(mm, k, device=dev, dtype=torch.float16) * 0.5
+            g = _gfx906_spec_gemv_m4(w, x)
+            if g is not None:
+                d = (g - F.linear(x, w)).abs().max().item()
+                print(f"{name:16s} {'diff':8s} gemv M={mm}: max|g-b|={d:.5f}",
+                      flush=True)
         print(flush=True)
 
 

@@ -55,26 +55,15 @@ looked sane. Same latent class in `reshape_and_cache_q8`. Fixed all three
 sites to use `tensor.stride(i)` (× element size for fp16 V) + contiguity
 TORCH_CHECKs on the last dim. After: `K=True V=True`, exact correct greedy.
 
-**Benchmarks (eager t/s, single req):**
+**Eager single-req (superseded by the serving numbers below):** Triton
+19.49 best; CUSTOM LEGACY=1 18.49 (FA kernel 194→72 µs/layer, 2.7×); CUSTOM
+LEGACY=0 FUSED 19.33; DIRECT 19.21. At B=1 eager the FA win is eaten by
+gather/conversion tax (eager is CPU-launch-bound anyway). Also fixed:
+`_bench_gfx906.py` counted tokens by re-encoding output *text* (garbage
+re-encodes shorter — the mystery "32 tokens"); now counts `token_ids`.
 
-| config | eager t/s | notes |
-|---|---|---|
-| Triton paged + P3-1 | **19.49** | best eager |
-| CUSTOM LEGACY=1 (fp16 gather + per-step Q8 quant) | 18.49 | gather/quant tax; FA kernel 194→72 µs/layer (2.7×) |
-| CUSTOM LEGACY=0 FUSED (fixed) | 19.33 | fused gather removes quant tax |
-| CUSTOM LEGACY=0 DIRECT forced | 19.21 | block-table indirection tax at B=1 |
-| serving (cudagraph) + CUSTOM | **crashes** | `value_cache blocks mismatch` during piecewise capture — deferred |
-| serving (cudagraph) + Triton (P3-1) | **44.09** | current best decode at the time |
-
-Also fixed: `_bench_gfx906.py` counted tokens by re-encoding output *text* —
-garbage re-encodes to fewer tokens (the mystery "32 tokens" was 256 real
-tokens of garbage, 19.05 t/s). Now counts `token_ids`.
-
-**P3-3 near-term outcome:** attention 2.7× faster (72 µs/layer), but at
-B=1 eager the win is eaten by gather/conversion tax and eager is
-CPU-launch-bound anyway; serving can't use CUSTOM until cudagraph capture
-is fixed (capture calls attention with a different/aliasing kv_cache view;
-side-buffer alloc assumes the first cache shape). Learnings:
+**P3-3 outcome:** attention 2.7× faster per layer; serving needed the
+cudagraph-capture fixes that follow. Learnings:
 - **Stride bugs hide from synthetic tests that build contiguous caches** —
   always mirror the real allocation path (`unbind` views) in tests.
 - Silent registration fallbacks make dead backends invisible; assert the
@@ -82,9 +71,6 @@ side-buffer alloc assumes the first cache shape). Learnings:
 - Q8 K quant changes logits ~1e-3; greedy diverges from fp16 after
   ~10-25 tokens (both fluent) — same trade llama.cpp makes.
 - Pairwise A/B identity checks beat building a math reference from scratch.
-
-Next: (a) cudagraph-safe CUSTOM, (b) prefill uses CUSTOM, (c) back to
-Triton partitioning.
 
 ## Day 1 — gather micro-bench + P3-2(a) probe (2026-08-15)
 
@@ -113,21 +99,11 @@ supported"); aiter triton-gemm whitelist is GPT-OSS shapes, none match. →
 **arch exclusion, not shape/dtype selection.**
 
 **LLGemm1 rows_per_block sweep** (the one real knob; dispatch hardcodes 4):
-
-| shape (M×K) | ×/step | rpb2 | rpb4 (cur) | rpb8 | rpb16 | floor |
-|---|---|---|---|---|---|---|
-| 12288×2048 in_proj | 30 | 57.8 | 64.7 | 60.1 | 61.0 | 63.1 |
-| 248320×2048 LM head | 1 | 1134.6 | 1209.8 | 1244.2 | 1178.6 | 1274.6 |
-| 9216×2048 qkv | 10 | 43.9 | 60.9 | 49.7 | 51.0 | 47.3 |
-| 2048×4096 o_proj | 40 | 21.5 | 23.0 | 25.3 | 28.9 | 21.0 |
-| 1024×2048 shared gate_up | 40 | **47.7** | 7.6 | 8.8 | 9.9 | 5.3 |
-| 2048×512 shared down | 40 | 5.5 | 7.1 | 6.8 | 7.8 | 2.6 |
-| 256×2048 router | 40 | 4.7 | 5.0 | 5.1 | 5.9 | 1.3 |
-| 64×2048 GDN small | 30 | 4.6 | 4.6 | 4.6 | 5.7 | 0.3 |
-
-Weighted/step: rpb4 5604 µs, rpb8 5523 (+1.4% best), rpb16 5793, rpb2 6626
-(rpb2 is 6× slower on gate_up while winning 6-11% on big shapes — block-tail
-effect; net negative). No shape moves ≥20% → config retune not worth it.
+all 8 rows × 4 configs measured — rpb8 best weighted (5523 vs 5604 µs/step,
++1.4%), rpb2 worst (6626; 6× slower on gate_up while winning 6-11% on big
+shapes — block-tail effect). No shape moves ≥20% → config retune not worth
+it. (Full table pruned for the size budget; the row data was in the
+2026-08-15 session log.)
 
 **P3-2(b) scoping:** big rows (in_proj/LM/qkv/o_proj) are **BW-bound at
 rpb=4** (0.95–1.29× floor, capture ~0.2–0.5 ms/step); small rows
@@ -340,11 +316,10 @@ stage 2 candidate), q_pad zero/copy pile.
 - **C1 (CRITICAL) — GEMV dispatch arch-gating:** `dense_gemv_gfx906` was
   routed on every ROCm arch. Added `on_gfx906()` in `_llmm1_tiny_m` (both
   call sites) + dispatch tests.
-- **F1/F6 (HIGH) — capture-safe q_pad/gather buffer lifecycle:** no longer
+- **F1/F6 (HIGH) — capture-safe q_pad/gather buffer lifecycle:** no
   free-then-realloc+`empty_cache()` on grow; a buffer current during capture
-  (`_q_pad_captured`/`_gather_captured` latches) is retired to a keep-alive
-  list (graph bakes its VA). Latch makes the poll zero in steady state. New
-  test drives small-decode → capture → large-prefill-grow → decode replay.
+  is retired to a keep-alive list (graph bakes its VA). (Superseded as a
+  design by the 2026-08-24 entry below; the `_q_pad` half lives on.)
 - **F2/M1 — GEMV numeric tests:** real kernel vs `F.linear`, kchunk=2048
   (RPT=2) + kchunk=512 (K-split), m∈{256,2048}. Pass.
 - **F4 — RPT env hardening:** `VLLM_GFX906_GEMV_RPT=0` errors; non-{1,2,4}
@@ -354,29 +329,22 @@ stage 2 candidate), q_pad zero/copy pile.
 - **F7 — LEGACY=0 RC2 guards:** loud ERROR on LEGACY=0 + prefix caching;
   WARNING it's inconsistent with FULL capture. F7b: debug env hooks are
   eager-only (syncs illegal under capture).
-- **F9 — dead code / stale docs:** removed dead `gathered_sk`; kept `ops.h`
-  kchunk doc; translated vendored Russian comments in the 3 `gfx906_fa/`
-  files; added Kevin Read SPDX alongside vendor; rewrote stale MVP headers.
-- **F10 — repo hygiene:** `.gitignore` + `.rocprofv3/` `gpucore.*.gpu`;
-  bench scripts canonical in `docs/gfx906/`; stale tables re-pointed.
+- **F9/F10 — docs/hygiene:** dead `gathered_sk` removed; vendored Russian
+  comments translated; Kevin Read SPDX alongside vendor; `.rocprofv3/` +
+  `gpucore.*.gpu` gitignored; bench scripts canonical in `docs/gfx906/`.
 - **F3 (evidence):** PPL CUSTOM 6.6811 vs Triton 6.6775 = +0.05% (Q8-K
   PPL-negligible). Multi-batch greedy: req1 128/128 identical + across runs;
   req2 127/128 (near-tie at loop end); **pure Triton shows the same
   run-to-run non-determinism** → engine-level (MoE routing near-ties), not
   the CUSTOM backend. B=1 path logs byte-identical (bit-deterministic).
-- **H3/M3 — V2 7× in-graph regression root-caused:** gather-only graph does
-  NOT reproduce it (V1 eager 33.7/graph 40.5; V2 eager 36.5/graph 38.6,
-  ratio 1.06). Needs the full decode graph. Re-characterized: V2's 416 WGs
-  fill ~43% of 960 wavefront slots → co-reside with MoE/GDN/elementwise and
-  interleave, inflating observed duration; V1's 6656 WGs saturate, nothing
-  co-resides. (Supersedes the "barrier + low-WG" candidate.)
+- **H3/M3 — V2 in-graph regression root-caused:** needs the full decode
+  graph (gather-only doesn't reproduce); V2's 416 WGs co-reside and
+  interleave with MoE/GDN/elementwise, inflating observed duration (V1's
+  6656 WGs saturate). V2 was dropped; V1 became the default (Route B).
 
-**Bench — no regression:** 56.75/56.81/56.73 post-fix; HEAD `01526dfc69`
-today 56.79/56.83/56.58 → mean 56.73. The 57.09→~56.7 drift is machine-state,
-not code.
-
-**Test status:** `test_gfx906_fa.py` 5/5; `test_rocm_unquantized_gemm.py` 8
-new GEMV pass, 8 pre-existing mock failures not ours.
+**Bench — no regression:** 56.75/56.81/56.73 post-fix vs 56.79/56.83/56.58
+HEAD (mean 56.73; the 57.09→~56.7 drift is machine-state, not code).
+**Tests:** `test_gfx906_fa.py` 5/5; 8 new GEMV numeric tests pass.
 
 ---
 
@@ -485,16 +453,16 @@ through stale VAs into freed segments.
 
 **Fix (`gfx906_fa_backend.py`):** smaller-B requests slice the current buffer
 `[:B]` (same base VA, one generation for all sizes); real growth retires into
-an unbounded dict so captured VAs are never freed. Latch `_gather_captured`
-on the slice path too.
+a keep-alive dict so captured VAs are never freed. Latch `_gather_captured`
+on the slice path too. Retire dict keyed by `data_ptr` (a `(shape, device)`
+key let same-shape generations collide; regression test drives
+warmup→capture→Sk/B churn and asserts every retired generation stays
+referenced + both graphs replay correct).
 
-**Review hardening (takeover):** the retire dict was keyed by `(shape,
-device)` — two generations of identical shape would collide (latter entry
-frees the captured one; UAF recurs). Re-keyed by **`data_ptr`** (unique among
-live tensors; a retained tensor is never freed, so an entry can't be
-overwritten). New regression test drives warmup→capture (B=2 then B=1 slice,
-same VA)→Sk/B churn recreating same-shape generations; asserts every retired
-generation stays referenced + both graphs replay correct.
+> SUPERSEDED by the 2026-08-24 entry below: the "unbounded dict + sticky
+> latch" design here was itself the 256k-prefill OOM bug (unbounded under
+> chunked-prefill Sk growth); it is now a capacity-width buffer +
+> per-generation flag.
 
 **Verified:** repro 4/4 clean (was 10/10 fault); FA suite 18/18 (+new);
 instrumentation reverted. Also added a no-view fast path when
@@ -506,3 +474,146 @@ regression); MoE 65.98/65.81 (in-session A/B ~0.5% vs 66.3-66.5 = day variance,
 not the fix). **MoE production (max_num_seqs=32 → 7+ captured sizes > old
 bound 4) had been exposed to silent corruption under the old bound.** Full
 trail: `/tmp/fa-analysis.md` (§11).
+## Gather-buffer lifecycle fix — unbounded `_gather_retired` (2026-08-24)
+
+**Problem:** `oom-256k-prefill.md` — all 7 Qwen3.8-27B TP=2 256k arms OOM
+on the first large prefill (chunk/util/MTP/prefix-caching all irrelevant),
+with an ~1–2 GiB "unidentified long-context transient" draining the
+~1.94 GiB util-independent headroom. The `GFX906_OOMHUNT_LOG` probe
+(temp commit `beb39136b5`, reverted before merge) attributes it:
+`_gather_retired` in `Gfx906FABackend._ensure_gather_buffers`.
+
+## HYPOTHESIS
+
+If the pre-fix exact-Sk reallocate + sticky-capture-latch policy is the
+OOM cause, then (a) the run-4 config under the pre-fix policy
+reproduces the OOM with the retired dict dominating at the OOM point,
+and (b) the capacity-width + per-generation-flag policy completes the
+same prefill with the retired dict flat and the needle intact.
+
+**Arm A — pre-fix policy (`GFX906_FA_GATHER_EXACT=1`), the run-4
+situation** (TP=2, util 0.82, maxlen 262144, chunk 1024, MTP k=2,
+prefix caching; 249,991-token prompt, needle at token 125,000; harness
+`/local/tmp/fa_fix/needle_256k.py`):
+
+| boot | OOM at | failing alloc | retired dict at OOM |
+|---|---|---|---|
+| C 22:29–22:38 | 3.3 min into prefill | 178,257,920 B, free: 0, `gptq_gemm` | 152 gens, 7.79 GB @ Sk=60k |
+| D 05:28–05:37 | 3.35 min into prefill | identical byte count / free / total | 137 gens, 6.46 GB @ Sk=53.6k |
+
+Both byte-exact to the run-4 signature in `oom-256k-prefill.md` §1
+(same 178,257,920 B, `free: 0`, `total: 34,342,961,152`, same op).
+Retired-GB curve (run C): 0.55 MB (capture) → 1.19 GB @13.6k →
+2.45 GB @28.8k → 4.62 GB @44k → 7.79 GB @60k (OOM). Growth ≈ 2.15 GB
+per 15k tokens (quadratic in time: each generation ∝ Sk). The dict —
+not the token-independent AWQ scratch — drained the headroom; the
+178 MB `temp_dq` was the allocation that landed on the remains. This
+also resolves plan §3.1: the pre-fix OOM point in this config is
+~60k tokens, so the earlier 131k record ran under a different
+code/config state (its logs were wiped in the 19:20 reboot).
+
+**Arm B — the fix (default policy), same harness, boot D:** 4 OOMHUNT
+lines total (Sk=352 warmup ×2 ranks, Sk=262,144 FULL capture ×2 ranks,
+`mode=capacity`), `retired=0 retired_B=0` throughout — the warmup
+generation is freed (never capture-baked) and the full-width capture
+generation is reused for every prefill chunk. 250k prefill completes
+(generate wall 1692.4 s = 148 tok/s incl. prefill); the answer
+retrieves the needle code `XQ47-KF92-PL08` from token 125k.
+0 BACO resets on boot D through ~70 min of heavy use.
+
+**The fix** (branch `gfx906/fa-gather-lifecycle`, `090673ad21`):
+(1) the Sk dimension is a *capacity* — grow-only `>=` reuse,
+grow-to-exact-need (no doubling); FULL capture runs at max_model_len
+so one generation spans every later eager shape; (2) per-generation
+`_gather_buf_captured` (reset at allocation) instead of the sticky OR
+latch — only graph-baked generations retire, eager ones free;
+(3) persistent-branch-only wide reuse — the three non-persistent call
+sites keep the exact-Sk contract (wide buffer → `kbuf=None` → the same
+`torch::empty` fallback as no buffer at all); (4) `GFX906_FA_GATHER_EXACT=1`
+kill switch = pre-fix policy byte-for-byte. Design + safety case:
+`plan-gfx906-fa-fix.md` (persistent gather live-bounded, FA tile loop
+cuts at kv_max not Sk, margin 128 ≥ nbatch_fa); four adversarial
+reviews in `gfx906-fa-fix-code-review-{claude,ds4,glm,gwen}.md`.
+
+**GATE:** (a) the run-4 situation A/B (above) — OOM vs PASS+needle;
+(b) serving-wall decode A/B, `_bench_gfx906.py` pp=2048/tg=256
+4-sample (Qwen3.5-35B-A3B, the standard recipe; the 27B dense model
+was on the unmounted NFS share): post-fix 66.16/65.21/66.12/66.16
+(mean 65.92) vs EXACT 66.17/66.12/66.11/66.10 (mean 66.13) t/s —
+flat (−0.2 t/s noise), both inside the 65.9–67.0 record band. The
+decode wall is expected flat: at B=1 the per-32-step reallocation
+churn of the EXACT policy allocates ~5 MiB blocks the caching
+allocator serves in sub-ms; the policy difference only shows at
+GiB-scale generations (256k prefill).
+
+**Unit tests:** 25/25 in `tests/kernels/attention/test_gfx906_fa.py`
+(rewritten capture-sweep keepalive with grow-only width retention,
+poisoned-tail width≫live bit-equality, B=17 fused-quant no-leak,
+exact-killswitch policy test).
+
+**Ops note:** boot C's wedge flap (12 resets, 21:46–22:58; two
+same-millisecond dual-card resets at 22:42) blocked the first arm B
+attempts — degraded-state territory, cleared by the 05:20 reboot
+(`degradation.md`). Arm A2 ran with the kill switch only because
+`window_watch.sh` passed `1` as the EXACT arg — a launcher bug, not a
+code path (the log line's `mode=exact` field caught it).
+
+## Review follow-up (2026-08-24, same branch)
+
+Post-landing code review found three issues in `090673ad21`; fixed
+with unit gates (28/28 in `test_gfx906_fa.py`):
+
+1. **Dead guard (the §2.2b capture-order warning).** The warning's
+   condition required `not capturing` while checking
+   `_gather_buf_captured`, which the immediately preceding assignment
+   had just set to `capturing` — it could never fire. Moved to the
+   retire-insertion site: one-shot warning once >1 capture-baked
+   generation has been retired (capture-order coupling OR repeated
+   re-captures / Hkv-D flaps). Pinned by
+   `test_gather_multi_retire_warns` (two capture-then-B-grow cycles ->
+   exactly one warning; a third retire stays silent).
+2. **B×Sk high-water product on freeable generations.** Grow-only
+   `max()` per axis also applied to never-captured (freeable)
+   replacements: 32-way short-context decode followed by one 250k
+   prefill left a `[32, 262144]` standing buffer (~13 GB/rank at the
+   arm-B geometry) that no single request needed — a new OOM class in
+   no-capture modes. Freeable replacements now allocate at exact need.
+   Realloc frequency is unchanged by construction (a replacement
+   happens exactly when the current buffer no longer fits; the old
+   block is freed either way). FULL modes are unaffected beyond the
+   first capture — post-capture generations are capture-baked and take
+   the retire (grow-only) path, and capture-time sizing is identical
+   (capture B ≥ any warmup B, max_model_len ≥ any warmup Sk) — so the
+   validated arm-B behavior is byte-identical. GATE: unit
+   (`test_gather_freeable_generation_exact_need`) + the frozen decode
+   A/B above (decode hits the fit path; the changed branch runs only
+   pre-capture / no-capture).
+3. **Mixed-width k/v reuse (persistent branch).** The k/v capacity
+   coupling required both buffers non-None but not equal-width: a
+   hand-set class pair with unequal K/V widths (impossible via
+   `_ensure_gather_buffers`, reachable by manual tampering) passed
+   `Sk` = K's width, so the C++ exact-match silently dropped V to a
+   per-call allocation — the exact mixed state the coupling exists to
+   prevent. Now requires equal widths. Pinned by
+   `test_gather_mixed_width_buffers_not_reused` (bitwise-identical
+   output, pair refused whole).
+
+Plus: env-var parity comments at both `GFX906_FA_GATHER_EXACT` read
+sites (backend `_gather_exact` / paged `_GATHER_EXACT`, both read once
+at import — flipping one at runtime splits the A/B). Second review
+round (same day): the paged.py exact/capacity selections were
+collapsed (exact now DERIVED from capacity — `k_exact = k_cap if
+k_cap.shape[2] == Sk_pad` — so the two width comparisons cannot drift
+apart and the hot path runs 2 fit-checks instead of 4); the kill
+switch stays duplicated BY DESIGN (byte-for-byte pre-fix policy = the
+arm-A repro's value) with its removal plan now written down in code
+(drop notes at both read sites and on the kill-switch test) and in
+plan §6: drop at the next gather-lifecycle change, re-gated on a
+serving A/B).
+
+VERDICT: SHIPPED — the unbounded `_gather_retired` growth is fixed and
+validated on the exact situation that failed (byte-exact OOM under the
+kill switch, clean 256k prefill + needle retrieval under the fix,
+flat decode A/B). Qwen3.8-27B TP=2 256k prefill now works at the run-4
+config; the 131k ceiling in `oom-256k-prefill.md` is lifted for this
+consumer.
