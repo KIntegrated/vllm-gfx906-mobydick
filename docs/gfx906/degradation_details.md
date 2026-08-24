@@ -433,3 +433,27 @@ degraded-state signature (many half-wedges in one boot → only a reboot
 clears it). After a reboot: run `window_watch.sh` (it auto-launches
 arm B on a confirmed window) or launch arm B directly; arm A evidence
 is already on record (`/local/tmp/fa_fix/arm_A.log`, `oomhunt_A.log`).
+
+## 2026-08-24 (boot D) — first reset: 07:46:46 GPU0, 256k server launch
+
+Boot D (05:20:44) held **zero resets** through a ~60-min heavy window
+(arm A2 byte-exact OOM repro 05:28–05:37, arm B 250k PASS 05:44–06:19,
+MoE decode A/B through ~06:40). First GPU use after that window: the
+Qwen3.8-27B 256k TP=2 + MTP *serving* server (27B AWQ, util 0.82,
+maxlen 262144, capture [1,2,3,4]) launched 07:45:44. ~60 s in, at
+worker init: `hipErrorLaunchFailure` at SetDevice → comp_1 fence
+fallback timeout → `GPU reset(1) succeeded` on `0000:0b:00.0` (GPU0)
+at 07:46:46 — "device wedged, but recovered through reset".
+
+**First reset since boot D** — boot-D flap onset at ~2.5 h, on GPU0
+(the historical primary). Post-reset: both cards pass the 200-round
+probe, VRAM 0 %, no zombie procs. Launch retried — per the boot-C
+pattern, an isolated wedge inside a good window is not the degradation
+signature; the burst (≥ several resets close together) is. If the retry
+also wedges, treat as a burst and stop retrying (reboot remedy).
+
+Note: the launch initially failed twice earlier the same hour for a
+non-GPU reason — `python -m vllm.entrypoints.openai.api_server` does
+not map the positional `model_tag` to `args.model` (only the `vllm
+serve` CLI does), so the engine tried to resolve its default model id
+offline. `vllm serve` is the correct entry point on this tree.
