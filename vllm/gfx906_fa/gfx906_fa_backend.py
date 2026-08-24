@@ -63,25 +63,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
-# OOM-hunt instrumentation (2026-08-23): log gather-buffer generation
-# changes to a file so VRAM accumulation during long prefills can be
-# attributed without a debugger. Disabled unless OOMHUNT_LOG is set.
-_OOMHUNT_LOG = _os.environ.get("OOMHUNT_LOG", "")
-
-
-def _oomhunt_log(msg: str) -> None:
-    if not _OOMHUNT_LOG:
-        return
-    import time as _t
-    with open(_OOMHUNT_LOG, "a") as f:
-        f.write(f"{_t.time():.3f} {msg}\n")
-
-
-def _oomhunt_retired_bytes(cls) -> int:
-    return sum(k.numel() + v.numel() * 2 for k, v in
-               cls._gather_retired.values())
-
-
 # -----------------------------------------------------------------------------
 # Metadata
 # -----------------------------------------------------------------------------
@@ -647,14 +628,6 @@ class Gfx906FAImpl(AttentionImpl):
                 "(expected <= 1; capture-order coupling — see "
                 "plan-gfx906-fa-fix.md §2.2b)", len(cls._gather_retired))
             cls._gather_retired_warned = True
-        _oomhunt_log(
-            f"alloc num_seqs={num_seqs} Sk_pad={Sk_pad} width={new_sk} "
-            f"mode={'exact' if cls._gather_exact else 'capacity'} "
-            f"k={cls._k_gather_buf.numel()}B "
-            f"v={cls._v_gather_buf.numel() * 2}B "
-            f"retired={len(cls._gather_retired)} "
-            f"retired_B={_oomhunt_retired_bytes(cls)} "
-            f"capturing={int(bool(capturing))}")
         b, v = cls._k_gather_buf, cls._v_gather_buf
         if b.shape[0] == num_seqs:
             return b, v
