@@ -575,6 +575,53 @@ AI-assistance disclosure), these are the items:
   benefit is eager-path only — inductor fuses the decomposition in
   compiled mode.
 
+## 8b. ROCm/TheRock upstream candidates (ROCR-Runtime, not vLLM)
+
+Two source-confirmed ROCR-Runtime bugs, found and fixed locally (patches
+live in the separate `/local/git/TheRock` checkout, not this repo) while
+chasing the TP CPU-spin investigation (2026-08-25,
+`tp_stuck_threads_analyze_claude.md`). The CPU-spin symptom itself
+turned out to have a different, HIP-level root cause (§8 fix note in
+that doc — a `.pth` shim, `docs/gfx906/gfx906-blocking-sync.pth`), but
+both bugs below are real and independent of that fix; worth offering to
+`ROCm/TheRock` if/when there's capacity, per the same
+duplicate-work-check + accountability policy this repo's AGENTS.md
+requires for vLLM contributions.
+
+- **R1 — `IPCRecvHandle` unbounded EOF spin** —
+  `rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/core/util/lnx/os_linux.cpp`,
+  `IPCRecvHandle()`. `recvmsg()` returning `0` (peer EOF, sticky on a
+  stream socket) is treated as "keep retrying" instead of "give up" —
+  `while (!rcv) rcv = recvmsg(...)` spins at full CPU forever once hit.
+  Triggered by a TP=2 P2P handle-import race: if the client-side
+  `IPCClientImport` connects before the exporting rank's `IPCExport`
+  registers the handle, the server closes the connection without
+  replying and the client spins forever with no error surfaced
+  anywhere. Fix: treat `rcv <= 0` as an error return, not a retry
+  condition (matches `MSG_WAITALL`'s existing short-read handling — a
+  `0` return here can only mean EOF, not a partial read). Evidence
+  state: **measured** (source-confirmed bug, live-traced trigger
+  mechanism, fix built and verified in the binary; see
+  `tp_stuck_threads_analyze_claude.md` §0).
+- **R2 — `InterruptSignal::EventPool::alloc()` permanent latch** —
+  `rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/interrupt_signal.cpp`
+  + `core/inc/interrupt_signal.h`. The first failed `hsaKmtCreateEvent`
+  call in a process's life sets `allEventsAllocated = true` and never
+  retries — every signal created afterward via the general-purpose path
+  (`hsa_amd_signal_create`) then gets no interrupt event, forcing
+  `Signal::WaitMultiple`'s callers (notably `Runtime::AsyncEventsLoop`)
+  into a permanent userspace busy-poll instead of a real kernel wait for
+  the rest of the process's life. A single transient KFD event-creation
+  failure (not necessarily true exhaustion) is enough to trigger it.
+  Fix: retry `hsaKmtCreateEvent` on every `alloc()` call instead of
+  latching a permanent give-up flag; live-tested and does not by itself
+  eliminate the process's overall CPU-spin symptom (that's R-unrelated,
+  HIP-level — see the `.pth` fix above), but is a real correctness
+  improvement on its own terms. Evidence state: **measured** (built,
+  binary-verified, live A/B — no change in the CPU-spin metric,
+  confirming it's independent of R1/R2's mechanism; see
+  `tp_stuck_threads_analyze_claude.md` §8).
+
 ## 9. Code-review items (parked 2026-08-17, resolved 2026-08-18)
 
 The pre-merge code review of the branch (`gfx906_qwen_impr_code_rev_qwen.md`
