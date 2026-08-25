@@ -737,3 +737,36 @@ that run looked "successful" in the log but wasn't). Live-validated on a
 fresh boot with `rocm.py`/`gpu_worker.py` fully reverted to upstream:
 hottest thread/worker 6-7 ticks/5s (~1.2-1.4%), correct chat completion,
 no wedge. Install step: `docs/gfx906/running.md` §0.
+
+## 2026-08-25 22:19Z (boot G, 19:58:22): first wedge — GPU0 qcm fence at Ornith triton-arm weight load
+
+Boot G (19:58:22). Session: Ornith-1.5-35B-A3B-AWQ-INT4 onboarding on branch
+`gfx906/moe-ct-asym-zp` (compressed-tensors asymmetric W4A16 MoE support).
+Five clean eager runs preceded the wedge (smoke gfx906-arm 21:47, smoke
+triton-arm 21:50, PPL gfx906 22:12, PPL triton 22:15, PPL gfx906-run2
+~22:17 — all loaded + ran to completion, no resets in that window).
+
+First graph-mode serving launch of the boot (`_bench_gfx906.py`,
+`BENCH_EAGER=0 BENCH_MAX_SEQS=8`, `BENCH_MOE_BACKEND=triton` arm) died at
+safetensors shard 3/5 with `c10::AcceleratorError: CUDA error: unspecified
+launch failure` (SIGABRT, exit 134). Kernel log (22:19:02):
+
+```
+amdgpu 0000:0b:00.0: qcm fence wait loop timeout expired
+amdgpu 0000:0b:00.0: The cp might be in an unrecoverable state due to an unsuccessful queues preemption
+amdgpu 0000:0b:00.0: GPU reset begin!. Source:  4
+amdgpu 0000:0b:00.0: BACO reset
+amdgpu 0000:0b:00.0: GPU reset succeeded, trying to resume
+amdgpu 0000:0b:00.0: VRAM is lost due to GPU reset!
+```
+
+GPU0 (0b:00.0) wedged; GPU1 clean. Post-reset probe: rocm-smi healthy,
+VRAM 0%/0%, 36 °C, clocks normal; no vllm procs left. Log:
+`/tmp/ornith_serve_trt.log` (wiped on reboot — the load progress lines
+above are transcribed from it: shards 1-2 at 15.9/13.4 s/it, abort during
+shard 3). Note the crash is during plain safetensors weight load — no
+custom gfx906 kernel in the triton arm's load path; consistent with the
+recurring load-time fence-timeout signature (cf. 2026-08-24 13:00:53,
+2026-08-25 08:21:31).
+
+Verdict: isolated wedge (1st of boot G) → retried once per house recipe.

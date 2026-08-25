@@ -574,6 +574,22 @@ AI-assistance disclosure), these are the items:
   PPL in band both models). Caveat for upstream reception: the
   benefit is eager-path only — inductor fuses the decomposition in
   compiled mode.
+- **U4 — CT-asym W4A16 MoE: Triton-backend qzeros repack** —
+  `vllm/model_executor/layers/fused_moe/oracle/int_wna16.py`
+  (`gfx906/moe-ct-asym-zp`). The TRITON branch of
+  `convert_to_wna16_moe_kernel_format` passed the checkpoint's K-first
+  int32 qzeros through, but `fused_moe_kernel_gptq_awq` indexes them
+  as `[E, N/2, G]` (2 zps per word) — a transposed read that silently
+  mis-dequantized asymmetric CT/GPTQ W4A16 MoE on any platform where
+  TRITON is the selected backend (previously unreachable: the CT
+  scheme asserted symmetric for non-Marlin backends). The repack
+  fixes it. Related ROCm-specific finding, not an upstream fix: on
+  gfx906 that kernel's `has_zp` branch is ~30× slower than the no-zp
+  class (267 ms/tok decode vs the 13.7 ms/tok dense control, both zp
+  storage layouts measured, values correct) — kernel-level, suspect
+  the per-element data-dependent shift on triton-hip/CDNA1. Evidence
+  state: **measured** (PPL A/B 16.45/16.67, serving A/B 3.50/65.03;
+  `DEVLOG-ornith-wna16.md`).
 
 ## 8b. ROCm/TheRock upstream candidates (ROCR-Runtime, not vLLM)
 
