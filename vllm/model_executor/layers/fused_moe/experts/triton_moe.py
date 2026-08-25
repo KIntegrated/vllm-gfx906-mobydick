@@ -48,6 +48,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
     kInt4Static,
     kInt4Static32,
+    kInt4Static32Asym,
+    kInt4StaticAsym,
     kInt8DynamicTensorSym,
     kInt8DynamicTokenSym,
     kInt8Static,
@@ -592,6 +594,10 @@ class TritonWNA16Experts(TritonExperts):
             kInt4Static,
             kInt8Static,
             kInt4Static32,
+            # Asymmetric (stored int32-packed zps): the WNA16 Triton kernel
+            # consumes w1_zp/w2_zp in both gemm passes.
+            kInt4StaticAsym,
+            kInt4Static32Asym,
             # other group sizes?
         ]
         return weight_key in SUPPORTED_W

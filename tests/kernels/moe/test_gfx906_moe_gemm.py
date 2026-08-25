@@ -71,6 +71,14 @@ def _make_layer(N, K, layout, gs=GS):
             q,
             torch.full((E, G, N), 8, device=q.device, dtype=torch.int32),
         )
+    if layout == "gptq_kfirst":
+        # compressed-tensors asymmetric pack-quantized: weights packed
+        # along K like gptq_kfirst_sym; zps arrive from the MoE loader
+        # already in the kernel's layout [E, G, N/8] int32 (8 consecutive
+        # n per word, low nibble first — the standard CT packing).
+        w = (q.view(E, K // 8, 8, N) * sh.view(1, 1, 8, 1)).sum(2).to(torch.int32)
+        zw = (z.view(E, G, N // 8, 8) * sh).sum(-1).to(torch.int32)
+        return w, s, zw, q, z
     # MoeWNA16 N-first uint8: byte j holds k=2j low / 2j+1 high;
     # zp byte i holds n=2i low / 2i+1 high
     qn = q.permute(0, 2, 1).reshape(E, N, K // 2, 2)
@@ -221,7 +229,14 @@ def _ids(c):
 
 @pytest.mark.parametrize(
     "layout",
-    ["awq_kfirst", "wna16", "awq_kfirst_sym", "wna16_sym", "gptq_kfirst_sym"],
+    [
+        "awq_kfirst",
+        "wna16",
+        "awq_kfirst_sym",
+        "wna16_sym",
+        "gptq_kfirst_sym",
+        "gptq_kfirst",
+    ],
 )
 @pytest.mark.parametrize("case", _CASES, ids=_ids)
 def test_gfx906_moe_gemm(case, layout):
@@ -232,7 +247,8 @@ def test_gfx906_repack_gptq_kfirst_sym():
     """compressed-tensors symmetric (no-zp) GPTQ K-first repack: the
     exllama shuffle is bit-exact, scales pass through, no zp tensor is
     returned (the kernel inlines the constant zero point 8 for an empty
-    zp), and asymmetric GPTQ fails closed.
+    zp), and the asymmetric (stored-zp) variant passes its zps through
+    bit-exact while a wrong zp shape fails closed.
 
     Shape mirrors Gemma-4: K = 704 (gemm2 K, 88 words), N = 1408 (gemm1
     N), group-32 (22 groups). CPU-only."""
@@ -255,9 +271,18 @@ def test_gfx906_repack_gptq_kfirst_sym():
         dest = shifts[j].item() // 4  # bit slot holding source nibble j
         assert torch.equal(got[..., dest], nib[..., j]), f"nibble {j} misplaced"
 
-    # Asymmetric GPTQ (stored qzeros) is unsupported: fail closed.
-    with pytest.raises(ValueError, match="stored zero points"):
-        _repack_w4a16_gfx906_expert(w, s, torch.randint(0, 2**31, (E, G, N // 8)))
+    # Asymmetric pack-quantized (stored qzeros): the MoE loader presents
+    # them K-first [E, G, N/8] int32 — the kernel's native layout — and
+    # they must pass through bit-exact.
+    zw = torch.randint(0, 2**31, (E, G, N // 8))
+    wq_asym, sc_asym, zp_asym = _repack_w4a16_gfx906_expert(w, s, zw)
+    assert torch.equal(wq_asym, wq), "asymmetric shuffle must match"
+    assert torch.equal(sc_asym, s), "scales must pass through unchanged"
+    assert torch.equal(zp_asym, zw), "zps must pass through unchanged"
+
+    # A zp tensor outside the [E, G, N/8] contract fails closed.
+    with pytest.raises(ValueError, match="N/8"):
+        _repack_w4a16_gfx906_expert(w, s, torch.randint(0, 2**31, (E, G, N)))
 
 
 @pytest.mark.parametrize("layout", ["awq_kfirst", "awq_kfirst_sym"])

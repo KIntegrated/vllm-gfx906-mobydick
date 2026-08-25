@@ -124,7 +124,17 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             # grouped actorder isn't supported by this kernel
             assert weight_quant.actorder != "group"
 
-            assert self.symmetric, "Only symmetric quantization is supported for MoE"
+            # Asymmetric (stored-zp) checkpoints need a zp-consuming kernel:
+            # the TRITON WNA16 and gfx906 HIP MoE kernels both take
+            # w1_zp/w2_zp; the other backends on this path have no zp
+            # support, so fail closed instead of mis-dequanting.
+            assert self.symmetric or self.wna16_backend in (
+                WNA16MoEBackend.TRITON,
+                WNA16MoEBackend.GFX906_HIP,
+            ), (
+                "Only symmetric quantization is supported for MoE on the "
+                f"{self.wna16_backend.name} WNA16 backend"
+            )
 
             # Non-Marlin WNA16 always uses bf16/fp16 inputs
             self.input_dtype = torch.bfloat16

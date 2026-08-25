@@ -13,9 +13,10 @@ Usage:
   .venv/bin/python benchmarks/kernels/gfx906/greedy_probe.py TAG
 """
 import hashlib
+import os
 import sys
 
-MODEL = "/local/models/QuantTrio/Qwen3.5-35B-A3B-AWQ"
+MODEL = os.environ.get("BENCH_MODEL", "/local/models/QuantTrio/Qwen3.5-35B-A3B-AWQ")
 PROMPTS = [
     "The capital of France is",
     "In a distant galaxy, the last star began to",
@@ -39,6 +40,12 @@ def main():
 
     from vllm import LLM, SamplingParams
 
+    extra = {}
+    # BENCH_MOE_BACKEND (e.g. triton) overrides the MoE backend selection
+    # for A/B runs (default auto picks the gfx906 W4A16 kernel where gated).
+    moe_backend = os.environ.get("BENCH_MOE_BACKEND")
+    if moe_backend:
+        extra["moe_backend"] = moe_backend
     llm = LLM(
         model=MODEL,
         trust_remote_code=True,
@@ -47,6 +54,7 @@ def main():
         gpu_memory_utilization=0.95,
         enforce_eager=True,
         seed=0,
+        **extra,
     )
     tok = llm.get_tokenizer()
     prompts = []
