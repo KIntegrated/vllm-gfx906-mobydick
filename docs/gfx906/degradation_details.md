@@ -548,3 +548,192 @@ seccomp=unconfined --security-opt apparmor=unconfined` (AppArmor
 `docker-default` denies ptrace even with the cap). Single-shot gdb
 `info threads`/`info registers` only — a gdb `while`-loop in batch mode
 hung with the inferior stopped (killing gdb released it).
+
+## 2026-08-25 — boot E/F CPU-spin: root cause found, fix built, GPU1 wedge burst blocked validation
+
+Follow-up to the boot-E/F entry above. Full analysis and source citations
+live in `tp_stuck_threads_analyze_claude.md` (repo root) — this section
+is the terse pointer + the same-day GPU-wedge interaction.
+
+**Root cause (source-confirmed, §8 of the analysis doc):** the 100%-CPU
+frozen-looking threads are `rocr::core::Runtime::AsyncEventsLoop` and
+`InterruptSignal::WaitRelaxed`, both stuck in `Signal::WaitMultiple`'s
+`HSA_WAIT_STATE_ACTIVE` busy-poll branch (`signal.cpp:315-317`, never
+falls through to the real kernel sleep). That branch is forced
+permanently once any watched signal has `EopEvent() == NULL`
+(`signal.cpp:213-220`), which happens forever after the **first** failed
+`hsaKmtCreateEvent` ioctl call in the process's life —
+`InterruptSignal::EventPool::alloc()` used to latch
+`allEventsAllocated = true` on that first failure and never retry
+(`interrupt_signal.cpp:50-63`, old code). Independently corroborated by
+unrelated reporters (gfx1151, torch, ComfyUI) hitting the identical
+`AsyncEventsLoop` stack in
+[ROCm/TheRock#7051](https://github.com/ROCm/TheRock/issues/7051) — not
+gfx906/ACS-workaround-specific. (That issue thread also contains what
+reads as a prompt-injection payload aimed at AI agents — a fake
+"agent-reviewed" `LD_PRELOAD` shim dressed up with fabricated benchmark
+tables; not used, flagged for the record only.)
+
+**Fix built:** two source patches to a local TheRock checkout
+(`/local/git/TheRock`, `rocm-systems/projects/rocr-runtime`), rebuilt as
+a minimal-scope `ROCR-Runtime`-only build (system clang toolchain
+override, trimmed `BUILD_TOPOLOGY.toml` deps, local `LibElf` CMake shim
+— avoids a full amd-llvm/LLVM rebuild):
+1. `os_linux.cpp` `IPCRecvHandle`: bounded EOF check instead of
+   unbounded `while(!rcv) recvmsg(...)` retry (separate bug, startup-time
+   IPC-handle-import race — real, but not the CPU-spin cause; see
+   `tp_stuck_threads_analyze_claude.md` §0).
+2. `interrupt_signal.cpp` `EventPool::alloc()`: retry
+   `hsaKmtCreateEvent` on every call instead of latching a permanent
+   give-up flag after the first failure — this is the actual CPU-spin
+   fix.
+
+Deployed via `LD_LIBRARY_PATH` (not touching `/opt/rocm`) ahead of the
+installed 1.21.0.
+
+**Validation blocked by an unrelated GPU1 wedge burst, same day:** two
+back-to-back server launches with the patched lib both hit the
+already-documented `comp_1.0.0` fence-timeout/BACO-reset signature on
+GPU1 (0000:0e:00.0) during the **drafter (MTP) model** weight-load phase
+— 07:45:35 and 07:48:15 (see `degradation.md` rows). Per house recipe
+(2nd wedge = burst → stop retrying), did not attempt a 3rd launch, so
+the server never reached steady-state serving on the patched build and
+the `EventPool::alloc()` fix's effect on the live CPU-spin symptom is
+**still unconfirmed** — only confirmed so far via static analysis +
+symbol/offset verification against the rebuilt binary, not a live
+re-trace. This wedge pattern is not obviously related to the library
+patch (GPU fence/hardware failure, not HSA-runtime control flow) and the
+identical `comp_1.0.0`/GPU1 signature predates any of this session's
+patches (recurs across many boots — 2026-08-23 18:23, 2026-08-24
+13:00:53, etc.) — but ruling the patch in/out with a clean stock-library
+run for comparison is still open.
+
+**Next steps:** (a) fresh boot, retry the patched-lib server once
+cleanly to get the live re-trace (per-thread CPU deltas + gdb/nm offset
+resolution against the rebuilt `libhsa-runtime64.so`, method in
+`tp_stuck_threads_analyze_claude.md` §8.1) and confirm the spin is
+actually gone; (b) if it recurs, dig into the true proximate cause of
+the first `hsaKmtCreateEvent` failure (kernel-side `kfd_events.c` trace
+— signal-page mapping vs. event-ID-space exhaustion) rather than only
+the userspace symptom.
+
+## 2026-08-25 (same day, later) — EventPool fix validated as ineffective; real root cause found in HIP (clr), not ROCR
+
+The (b) above happened, and the answer is more interesting than a KFD
+trace: **the `EventPool::alloc()` fix does not touch the actual
+mechanism.** Full trace in `tp_stuck_threads_analyze_claude.md`
+("Update, same day" section after §8) — summary here.
+
+Live re-test on a fresh boot (reboot per house recipe after the prior
+GPU1 wedge burst) confirmed the patched lib loads and runs correctly
+(server reached steady-state serving), but the CPU-spin symptom was
+**unchanged** — same ~236% CPU, same two hot functions
+(`AsyncEventsLoop`, `WaitRelaxed`). A live `strace -f -e trace=ioctl` on
+the hot TIDs over a 4-second window showed **zero**
+`AMDKFD_IOC_WAIT_EVENTS` calls — confirmed pure userspace spin, never
+calling into the kernel wait at all. This rules out the
+`hsaKmtCreateEvent`-failure theory entirely.
+
+Traced the actual mechanism into `clr` (HIP's implementation,
+`rocm-systems/projects/clr`, separate from `rocr-runtime`) instead:
+`WaitRelaxed`'s wait-state hint is a straight pass-through of HIP's
+per-device `ActiveWait()` flag
+(`clr/rocclr/device/device.hpp:2381-2383`), set by `hipSetDeviceFlags()`
+(`clr/hipamd/src/hip_device_runtime.cpp:800-843`). **`hipDeviceScheduleAuto`
+(the default when nothing overrides it) resolves to permanent active-wait
+whenever `device_count < hardware_concurrency()`** — true here (2 GPUs,
+16 threads) and true on essentially any multi-GPU server. Neither torch
+nor vLLM calls `hipSetDeviceFlags()` anywhere, so this default just
+applies silently. **Not a ROCm bug — documented, intentional low-latency
+behavior**, which also explains why the identical `AsyncEventsLoop`
+signature is reported across completely unrelated projects/GPU families
+in ROCm/TheRock#7051: they're all just default HIP clients.
+
+`ROC_ACTIVE_WAIT_TIMEOUT` (an env var string found via `strings` on
+`libamdhip64.so`) does **not** override `ActiveWait()` — tested live,
+confirmed present in the worker env, no effect on the hot-thread
+signature.
+
+**Fix candidate (untested live yet):** call
+`hipSetDeviceFlags(hipDeviceScheduleBlockingSync)` per device before the
+hot loops start. Built a `.pth`-file injection
+(`_hip_blocking_sync_test.pth` in the venv's site-packages, gated on
+`VLLM_HIP_BLOCKING_SYNC_TEST=1`) — `.pth` chosen over `sitecustomize.py`
+because the venv's `sitecustomize.py` gets shadowed by the system
+Python's own copy (stdlib precedes venv site-packages in `sys.path`,
+only one `sitecustomize` module loads). First two live-test attempts
+were blocked: one by a library-path bug in the hook itself (bare
+`libamdhip64.so` isn't resolvable via `ctypes.CDLL` at `.pth`-exec time;
+fixed by using the absolute path), one by an unrelated GPU1 wedge burst
+(2 resets this boot — 08:21:31 isolated + retried clean, then 09:10:50
+during the still-broken hook's run — see `degradation.md`) that stopped
+further retries per house recipe before a clean run with the corrected
+hook completed. Hook is fixed and verified working standalone
+(`hipSetDevice`/`hipSetDeviceFlags` both return 0 for both devices) —
+ready for next boot.
+
+Also per Kevin: if `hipDeviceScheduleBlockingSync` does eliminate the
+spin, a follow-up idea (lower priority, not yet designed) is toggling
+`ActiveWait` dynamically — spin (`hipDeviceScheduleSpin`) while actively
+serving requests for lowest latency, blocking-sync while idle to save
+the CPU core — rather than a static per-process choice. Would need
+hooking vLLM's request-scheduler idle/busy transitions.
+
+**CONFIRMED on next reboot, same day: fix works.** Fresh boot, `.pth`
+hook fired in both TP worker processes (`hipSetDevice`/`hipSetDeviceFlags`
+both `ret=0` for devices 0 and 1), server reached steady state cleanly
+(no GPU wedge this run). Per-thread CPU delta: hottest thread per worker
+dropped from ~330 ticks/3s (~110%) to 7 ticks/5s (~1.4%); `ps` per-worker
+total dropped ~236% → ~88%. Functional check: `curl` chat completion
+returned correct output in 230ms round-trip, no regression. `rocm-smi`/
+`journalctl -k` clean after.
+
+**Verdict: root cause is HIP's default active-wait scheduling
+(`hipDeviceScheduleAuto` → `SetActiveWait(true)` whenever GPU count <
+CPU thread count, `clr/hipamd/src/hip_device_runtime.cpp:823-843`), not
+a ROCR/HSA bug.** Full trace + fix details in
+`tp_stuck_threads_analyze_claude.md` (the section after §8).
+
+**Follow-up (same day): the obvious next move — move the
+`hipSetDeviceFlags` call into `vllm/platforms/rocm.py`'s `set_device()`
++ call it from `gpu_worker.py`'s `init_device()`/`load_model()` — was
+tried and does NOT work, and cannot be made to work as an in-process
+vLLM call at any point.** Root cause of *that* failure, traced into HIP
+source: `VirtualGPU::HwQueueTracker::Create()`
+(`clr/rocclr/device/rocm/rocvirtual.cpp:536-566`) reads `ActiveWait()`
+**once, at queue-creation time** to decide whether each signal in that
+queue's pool is created with a real interrupt event or with
+`HSA_AMD_SIGNAL_AMD_GPU_ONLY` (permanently active-wait for that signal's
+whole life). Flipping the device flag *after* the queue already exists
+is a no-op for that queue. torch/vLLM's default HIP queue gets created
+very early — well before `init_device()` runs, per `rocm.py`'s own
+`_get_gcn_arch()` fallback comment ("Ultimate fallback: use torch.cuda
+... will initialize CUDA") — so there is no reliably-early-enough
+in-process call site. Confirmed live: `set_device()` called from
+`init_device()` correctly set and read back the flag (`hipGetDeviceFlags`
+→ `0x4`), yet the hot threads' `strace` still showed zero KFD wait
+syscalls — the setting took for *future* queues only. (This attempt also
+surfaced and required fixing a real, separate bug on the way: looping
+`hipSetDevice()` over every visible device to flag each one leaves the
+process's "current device" pointed at the last one in the loop, which
+broke NCCL — `"this nccl communicator is created to work on cuda:0, but
+the input tensor is on cuda:1"` — any future in-process attempt must
+restore the caller's intended device afterward.) The `rocm.py`/
+`gpu_worker.py` changes from this attempt were reverted; `git diff`
+against upstream is clean.
+
+**Actual shipped fix:** `docs/gfx906/gfx906-blocking-sync.pth`, tracked in
+this repo, copied into the venv's `lib/python3.12/site-packages/`.
+`.pth` files execute at interpreter startup, before torch/vLLM import
+anything — the only point that's reliably before any HIP queue exists.
+It loads `libamdhip64.so` via `ctypes` and calls `hipSetDeviceFlags`
+for every visible device, gated on `VLLM_GFX906_HIP_BLOCKING_SYNC`
+(default on), resolving the library via `VLLM_GFX906_HIP_LIB_PATH` (set
+this explicitly — a bare SONAME search at `.pth`-execution time silently
+fails when `LD_LIBRARY_PATH` hasn't been populated yet, which is the
+normal case for a from-scratch launch script; the original `try/except:
+pass` swallowed this without a trace on one early test run, which is why
+that run looked "successful" in the log but wasn't). Live-validated on a
+fresh boot with `rocm.py`/`gpu_worker.py` fully reverted to upstream:
+hottest thread/worker 6-7 ticks/5s (~1.2-1.4%), correct chat completion,
+no wedge. Install step: `docs/gfx906/running.md` §0.

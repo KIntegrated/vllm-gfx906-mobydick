@@ -22,6 +22,34 @@ editable install of this repo; the compiled extensions live in-tree.
 source ~/env-rocm-7.14-gfx906.sh        # LD_LIBRARY_PATH=/opt/rocm-7.14/lib (REQUIRED)
 ```
 
+- **TP=2+ serving needs the HIP blocking-sync `.pth` shim, once per venv**
+  (2026-08-25): without it, every TP worker permanently pegs 1-2 host
+  cores at ~100%+ each for the life of the process (HIP's default
+  `hipDeviceScheduleAuto` resolves to active-wait whenever GPU count <
+  CPU thread count — true of almost any TP box — and the flag can only
+  be flipped before the process's first HIP queue is created, so it
+  must run before torch/vLLM import anything; see
+  `degradation_details.md` 2026-08-25 for the full trace). One-time
+  setup:
+
+  ```bash
+  cp docs/gfx906/gfx906-blocking-sync.pth .venv/lib/python3.12/site-packages/
+  ```
+
+  Then export `VLLM_GFX906_HIP_LIB_PATH` (the absolute path to your ROCm
+  install's `libamdhip64.so`) alongside `LD_LIBRARY_PATH` in every launch
+  — a bare SONAME search fails silently at this early point if
+  `LD_LIBRARY_PATH` isn't already populated:
+
+  ```bash
+  export VLLM_GFX906_HIP_LIB_PATH=/opt/rocm-7.14/lib/libamdhip64.so.7
+  ```
+
+  Set `VLLM_GFX906_HIP_BLOCKING_SYNC=0` to disable (e.g. if
+  lowest-dispatch-latency active-wait matters more than idle CPU for a
+  given deployment). This `.pth` file must be re-copied after any fresh
+  `.venv` rebuild — it does not survive `uv venv`/`pip install -e .`.
+
 - The system `/opt/rocm` libs are the wrong vintage (libhipsparse symbol
   mismatch; RCCL missing `ncclCommResume` until the 7.14 point release).
 - `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` is **required** at import time:
