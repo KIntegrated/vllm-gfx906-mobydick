@@ -176,6 +176,25 @@ docker run ... -v /tmp/bench:/bench <image> -c \
 Full zero-ambiguity runner scripts lived here historically; the current
 canonical runner is the local venv recipe in §0.
 
+### `_bench_gfx906.py` env-var surface (W1 additions, 2026-08-26)
+
+Core knobs (documented in the harness header): `BENCH_PP`, `BENCH_TG`,
+`BENCH_GPU_UTIL`, `BENCH_MAX_SEQS`, `BENCH_SAMPLES`, `BENCH_EAGER`.
+The W1 work (`DEVLOG-gdn-mixed-decode.md`) added:
+
+- `BENCH_NREQS=<n>` — send `n` prompts as one batch (default 1).
+- `BENCH_SPEC_CONFIG='<json>'` — speculative-decoding config for the
+  harness engine (e.g. the production ngram config
+  `{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_max":2}`).
+- `BENCH_CG_MAX=<n>` — cap the cudagraph capture sizes (use a multiple
+  of `num_speculative_tokens + 1` for ngram; e.g. 12 for n=5, 2 requests).
+- `BENCH_MIXED=1` — with `BENCH_NREQS>=2`: request 0 gets a 2048-token
+  repetitive filler (always drafts), the rest get the 190-token diverse
+  sentence pool ending mid-sentence (rarely drafts) → spec-mixed
+  batches on most decode steps. The W1 gate recipe:
+  `BENCH_NREQS=2 BENCH_MIXED=1 BENCH_CG_MAX=12` + the ngram
+  `BENCH_SPEC_CONFIG`, graph, 0.82, `BENCH_MAX_SEQS=4`, 4 samples/arm.
+
 ## 4. Developing against / modifying the vLLM **source**
 
 For compiling and validating changes to the fork's Python/C++ (e.g. the custom

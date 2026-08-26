@@ -1,13 +1,23 @@
-# DEVLOG: W1 — multi-request GDN chunk reclass (mixed spec batches)
+# W1 — multi-request GDN chunk reclass (spec-mixed batches)
 
-Status: **SHIPPED** (2026-08-26, branch `gfx906/gdn-mixed-decode`) —
-all gates green, incl. the serving wall-clock A/B: 27B mixed 2-request
-ngram serving **59.35 vs 55.60 t/s = +6.7 %** (4 samples/arm, bands
-±0.3 %).
+> Branch `gfx906/gdn-mixed-decode` off `gfx906/main` @ `67ae6c3f96` ·
+> model Qwen3.5-9B (probes) / Qwen3.8-27B-AWQ-INT4 (gate) ·
+> 2026-08-26 · roadmap item W1 (`spec-decode-roadmap.md`).
 
-GATE: serving wall-clock A/B on a 2-request mixed probe + numerics
-identity + kernel-path spy (house protocol). Unit tests are a
-correctness floor, not the gate.
+**VERDICT:** SHIPPED · **GATE:** serving wall-clock A/B — 27B mixed
+2-request ngram serving, graph, 0.82, max_seqs 4, pp2048/tg256, 4
+samples/arm, `BENCH_NREQS=2 BENCH_MIXED=1` on `_bench_gfx906.py`:
+**59.35 vs 55.60 t/s = +6.7 %** (bands ±0.3 %). Numerics identity
+(request A token-identical) and the kernel-path spy are co-gates;
+unit tests are a correctness floor, not the gate.
+
+## HYPOTHESIS
+
+If spec-mixed batches peel the 1-token non-spec decodes to the per-seq
+recurrent kernel (instead of reclassifying them into 1-token "prefills"
+that pay the chunk kernel), then the ~415 µs/layer chunk cost
+disappears from mixed steps and serving throughput on a mixed ngram
+workload improves — without changing any spec-path output.
 
 ## Problem
 
@@ -76,7 +86,7 @@ uniformity). No stale-buffer replay is possible.
   already `num_decodes > 0` in effect; the slice→index_select change
   only applies when `spec_sequence_masks is not None`).
 
-## Validation (2026-08-26, boot H; canary 38.9 t/s healthy)
+## Validation — session 1 (2026-08-26, boot H; canary 38.9 t/s healthy)
 
 Probe: `probe_gdn_mixed.py` (9B eager, ngram n=5; A = repetitive
 filler, temp 0 → always drafts; B variant per gate; kernel + per-step
@@ -130,19 +140,123 @@ composition spies, scheduler-level ground truth).
    the mixed-step fraction; production agentic batches with several
    non-drafting requests alongside drafting ones get more.
 
-## Verdict
+## Session 2 — code-review fixes (2026-08-26, boot H)
+
+Per `docs/gfx906/gdn-mixed-decode-code-rev.md` (merged human + GPT
+review of this branch). The review's view of the W1 dispatch itself
+was unchanged (coherent, +6.7 % real); the blockers were around the
+contract change's blast radius and branch hygiene. All 10 findings
+addressed:
+
+- **[P1] CPU GDN backend** (finding 1) — the contract change broke
+  `_spec_aware_nonspec_subset`: it fed the full non-spec token range
+  (decodes + prefills) to the chunked path with prefill-only
+  cu_seqlens, so any spec batch containing a non-spec decode crashed
+  (index-size mismatch) or mis-routed. Fixed per the review's
+  Option A: the 1-token decodes peel to the per-seq recurrent update
+  (factored as `_wide_buffer_nonspec_decode`, shared with
+  `_spec_aware_nonspec`) and the prefill tail goes to the chunked
+  path with prefill-only metadata (`ae87ce7c25`).
+- **[P1] Kimi K3 AMD** (finding 2) — same contract mismatch latent in
+  `kimi_k3/amd/kda.py` (full non-spec cu_seqlens + prefill-only
+  `m.chunk_indices`). Fixed per the review's option (a): the peel
+  keys off `m.num_decodes > 0` alone, so the spec case takes the
+  already-consistent no-spec path (`b15b88cc1f`, standalone commit).
+  Kimi K3 does not ship spec-decode today and no Kimi checkpoint is
+  local, so this dead path is **not runtime-validated** (compile- and
+  read-checked only); drop the commit if a minimal W1 diff is wanted.
+- **[P2] Scope creep** (finding 7) — the three L3 ngram probe scripts
+  (verbatim copy of `18c235772d` via `8ac610f8a0`) removed from this
+  branch (−379 lines; canonically on `gfx906/ngram-cpu-d2h`). The
+  harness env-var support from that commit is kept — W1's own gate
+  recipe uses `BENCH_NREQS`/`BENCH_SPEC_CONFIG`/`BENCH_CG_MAX`
+  (`2aa0a92ae8`).
+- **[P2] Lint** (finding 3) — ruff clean on all W1-touched files
+  (F401/F841 by hand, E501 wraps; string concatenations
+  byte-identical, incl. the probe's novel mid-sentence ending that
+  keeps request B non-spec) (`9b0b58bbc6`).
+- **[P2] Contract made explicit** (findings 5, 9 + carried items,
+  `233e8f202b`) — `GDNAttentionMetadata` docstring states the
+  contract; the builder asserts the decode-first ramp on the CPU-side
+  `non_spec_query_start_loc_cpu` (once per step, **no device sync** —
+  the ramp check lives in the builder rather than per-layer in
+  `_forward_core`, an intentional adaptation of the review's sketch
+  to keep the decode hot path sync-free); `_forward_core` asserts
+  `num_decode_tokens == num_decodes` (int compare, free) and the 1.2
+  conv comment records that its full-non-spec coverage is intentional;
+  stale W1-history comment trails trimmed.
+- **[P3] Devlog template** (finding 6) — this restructure.
+- **[P3] PR #53077** (finding 10) — **checked, already present**:
+  both `gfx906/main` and this branch zero `num_spec_decodes` in the
+  empty-draft early-exit of `GDNAttentionMetadataBuilder.build()`
+  (same semantics as upstream `6df7adc17f`), so the stale-count
+  interaction the review flagged cannot occur. No action needed.
+- **[P3] Harness env vars** (finding 8) — documented in
+  `running.md` §3.
+
+Evidence (session 2):
+
+- New contract test `tests/kernels/mamba/cpu/test_cpu_gdn_nonspec_peel.py`
+  (torch-reference leaf ops; runs on any platform — the C++ CPU ops
+  exist only in CPU builds): 3 shapes — [decode, prefill, spec],
+  [decode, spec], [prefill, spec]. **3/3 pass on the fix; 2/3 fail on
+  the pre-fix code with the exact index-size mismatch** (the shapes
+  with a non-spec decode) — a true regression test for finding 1.
+  State advancement (SSM + conv rolling buffer, untouched slots) and
+  scatter placement are asserted, not just the core outputs.
+  Kernel-vs-reference accuracy stays covered by
+  `test_cpu_gdn_ops.py` on CPU builds.
+- GDN metadata builder tests 10/10 (the new builder assert is silent
+  on all existing shapes); ruff clean; py_compile clean on the Kimi
+  file.
+- **Perf sanity (same-day A/B, both arms on today's machine state)** —
+  27B mixed 2-request ngram, same recipe as the gate, 4 samples:
+  post-fix **57.50 / 57.37 / 57.19 / 57.05 (mean 57.28, ±0.2 %)** vs
+  pre-review-fix (`b31ed39e05`) **57.23 / 57.10 / 57.14 / 57.19
+  (mean 57.17, ±0.2 %)** → **+0.2 %, neutral**. Both bands sit ~3.3 %
+  below the session-1 record (59.35) uniformly — host drift over the
+  boot, not a code effect (no wedge/hang event; spec path not
+  collapsed). `/tmp/bench27_w1rev_after_sanity*.log`,
+  `/tmp/bench27_w1rev_before_sanity4.log`.
+
+Open (session 2):
+
+- `schema_version` / per-backend `decode_peel_supported` on the
+  metadata (finding 6, medium-term): **deferred** — after the CPU and
+  Kimi fixes there are no stale consumers in-tree, the docstring +
+  builder assert make future drift loud, and a capability table is
+  process overhead until a third consumer appears. Revisit then.
+- 4-request mixed serving A/B (human-review carryover): still
+  pending; the 2-request shape is the recorded gate.
+
+**VERDICT (session 2): SHIPPED.** Both P1s fixed and regression-tested
+(CPU) / guarded (Kimi), P2s closed, P3s closed or explicitly deferred;
+no perf regression (same-day A/B neutral).
+
+## Verdict (overall)
 
 **VERDICT: SHIPPED.** The reclass was real (2016 wasted 1-token chunk
 kernel calls in the 9B probe alone), the peel removes it at the
 kernel level, changes nothing on the spec path (A token-identical),
 adds no new output modes for the peeled side, and is +6.7 % on the
-27B mixed serving A/B. GATE: serving wall-clock A/B — passed.
+27B mixed serving A/B. Session 2 closed the review's blast-radius
+findings (CPU + Kimi) and the branch-hygiene items. GATE: serving
+wall-clock A/B — passed.
 
 ## Files
 
 - `vllm/v1/attention/backends/gdn_attn.py`
 - `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py`
+- `vllm/model_executor/layers/mamba/ops/cpu/gdn_attention.py`
+  (session 2: non-spec decode peel, review P1)
+- `vllm/models/kimi_k3/amd/kda.py` (session 2: spec-mixed peel,
+  review P1, standalone commit)
 - `tests/v1/attention/test_gdn_metadata_builder.py`
+- `tests/kernels/mamba/cpu/test_cpu_gdn_nonspec_peel.py` (new,
+  session 2: contract regression test)
 - `benchmarks/kernels/gfx906/probe_gdn_mixed.py` (new)
 - `docs/gfx906/_bench_gfx906.py` (`BENCH_MIXED` mixed-prompt mode +
   cherry-picked `18c235772d` harness envs)
+- `docs/gfx906/running.md` (session 2: harness env-var surface)
+- removed (session 2): `benchmarks/kernels/gfx906/{bench_ngram_cpu,
+  compare_ngram_cpu_gpu,probe_ngram_cpu_engine}.py` (L3 scope creep)
