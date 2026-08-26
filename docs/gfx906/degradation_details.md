@@ -737,3 +737,102 @@ that run looked "successful" in the log but wasn't). Live-validated on a
 fresh boot with `rocm.py`/`gpu_worker.py` fully reverted to upstream:
 hottest thread/worker 6-7 ticks/5s (~1.2-1.4%), correct chat completion,
 no wedge. Install step: `docs/gfx906/running.md` §0.
+
+## 2026-08-25 22:19Z + 2026-08-26 00:20Z (boot G): two isolated GPU0 half-wedges, ~2 h apart
+
+Boot G = 2026-08-25 19:58:22 (fresh boot after the 08-25 blocking-sync
+fix session). First GPU use this boot: Ornith-1.5-35B-A3B-AWQ WNA16
+A/B, then Qwen3.8-27B ngram A/B battery (local venv, TP=1,
+`HIP_VISIBLE_DEVICES=0`).
+
+- **2026-08-25 22:19:02** — Ornith A/B, TRITON-arm serving launch
+  wedged at weight-load shard 3/5 (`hipErrorLaunchFailure` in
+  `copy_()` → `SetDevice`). Kernel: `GPU reset begin! Source: 4` →
+  BACO → `GPU reset(1) succeeded` on 0000:0b:00.0, "VRAM is lost due
+  to GPU reset!". Process aborted (SIGABRT); the isolated-wedge retry
+  was clean and the Ornith A/B completed that session (gfx906 65.03
+  t/s vs triton 3.50 t/s — `DEVLOG-ornith-wna16.md`).
+- **2026-08-26 00:20:25** — Qwen3.8-27B ngram-battery run 1
+  (nospec_r1, launched 00:19:49) SIGABRTed at weight-load shard 1/5
+  (same `hipErrorLaunchFailure` in `copy_()` → `SetDevice` signature).
+  ~25 s after that process died, kernel logged
+  `qcm fence wait loop timeout expired` → `GPU reset begin! Source: 4`
+  → BACO → `Fence fallback timer expired on ring comp_1.0.0` →
+  `GPU reset(2) succeeded` on 0000:0b:00.0, "device wedged, but
+  recovered through reset". The *next* battery process (ngram_r1,
+  launched 00:20:00 — i.e. before the reset landed) completed weight
+  load, an 89 s torch.compile, and cudagraph capture with no visible
+  effect. The reset is best read as cleanup of queue state the
+  aborted nospec_r1 left mid-operation (failure mode 1: "worker dying
+  mid-memcpy"), not a fresh die event hitting ngram_r1.
+
+Assessment: two HW events on boot G, ~2 h apart, both GPU0
+(0000:0b:00.0), both self-recovered via BACO; neither killed a live
+workload (the 22:19 one got its house-recipe retry; the 00:20:25 one
+hit no live process). Not a burst per the house recipe (bursts on
+prior boots were ≤~30 min apart: 08-25 07:45/07:48, 08-23
+21:46/22:02/22:25). Battery continues; a 3rd event — especially one
+that kills a live run, or two close together — stops the session and
+reboots (root).
+
+## 2026-08-26 ~00:58Z (boot G): same-minute dual-card weight-load wedges — BURST, session stopped
+
+Two independent launches, both on boot G, both at weight-load, both
+`hipErrorLaunchFailure`, both within the same minute:
+
+- **GPU0, ~00:58** — Qwen3.8-27B `nggpu_r4` re-run (the ngram_gpu
+  arm of the 27B spec-decode battery; launched 00:57:16 to replace a
+  battery run that silently ran without the ngram_gpu spec config —
+  see below) SIGABRTed at weight-load shard 3/5. Kernel-side
+  recovery per the usual BACO path; rocm-smi clean after (0% VRAM,
+  32 °C).
+- **GPU1, ~00:58** — the GDN mixed-batch before-probe (9B, first GPU1
+  use this boot) SIGABRTed at weight-load shard 1/3. Follow-up torch
+  matmul on GPU1 clean; VRAM back to ~11 MB.
+
+House-recipe reading: two wedges in the same minute (across both
+cards) = burst. **All GPU work stopped.** Boot G has now had three HW
+events (22:19:02, 00:20:25, 00:58) over ~6 h — the two 00:58 ones
+happened while both GPUs were loading 20 GB-class weights
+concurrently, which is the highest-HBM-bandwidth moment of any run
+and the moment prior boots have shown the flaps. A reboot (root) is
+required before further inference; the 00:58 window matches the
+"degraded state" signature (everything boots, weight-load hangs).
+
+Side finding (harness, not HW): the *original* battery `nggpu_r4`
+(00:51, the run that produced 24.9 t/s / 256 tokens / 1 prompt) ran
+on a working tree whose `_bench_gfx906.py` had been reverted —
+`BENCH_NREQS`/`BENCH_CG_MAX`/`BENCH_SPEC_CONFIG` are read only by the
+harness commit on `gfx906/ngram-cpu-d2h` (`18c235772d`), not by
+`gfx906/main`. The battery script was launched from the ngram branch
+but the 27B re-runs after the branch switch hit the main-branch
+harness, so `nggpu_r4` silently ran as a plain 1-request nospec
+number (24.9 t/s ≈ the 25.25 t/s 27B nospec record — consistent).
+`nggpu_r1`, `ngram_r1`, `ngram_r4` (all before the switch) are valid.
+Lesson: pin the harness to the branch under test; env vars that are
+silently ignored by the older harness read as "no spec / 1 request".
+6 ~06:03Z (boot H): first weight-load hang on the fresh boot
+
+Boot H = 2026-08-26 05:48 (post the 00:58 dual-card burst). mtp2 27B
+canary at ~05:53: **38.9 t/s — healthy** (prior passing canaries
+38.6–38.9). Seven minutes later, the W1 after-probe (9B, GPU0,
+first non-canary load of the boot) hit the recurring
+`hipErrorLaunchFailure` weight-load hang at shard 2/3
+(`copy_()` → `SetDevice`, c10::AcceleratorError abort). GPU0 clean
+after (0% VRAM, matmul OK). This is the 5th occurrence of this
+exact signature across boots (22:19, 00:20, 00:58×2, 06:03) —
+independent of the degradation model (canary passed minutes earlier;
+boot is 15 min old). House recipe: log + one retry. (The retry
+succeeded — all subsequent 9B/27B loads on boot H clean.)
+
+### 2026-08-26 ~06:52 — 27B W1-before serving A/B, weight-load
+hang #6
+
+Same signature at shard 5/5 (`hipErrorLaunchFailure` in
+`copy_`→SetDevice). ~49 min after the 06:03 event with a ~45-min
+clean window between (10 successful loads, incl. the 27B W1
+after-arm) — NOT within a 30-min burst; the house recipe's burst
+rule was not triggered. Read: the chronic intermittent weight-load
+hang (see boot-E "13:55–14:06 burst" history for the same
+intermittent shape). GPU0 probe-clean after; one retry per house
+recipe succeeded (the W1 before-arm 27B number: 55.60 t/s).
