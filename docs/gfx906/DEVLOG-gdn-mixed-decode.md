@@ -225,7 +225,12 @@ Open (session 2):
   metadata (finding 6, medium-term): **deferred** — after the CPU and
   Kimi fixes there are no stale consumers in-tree, the docstring +
   builder assert make future drift loud, and a capability table is
-  process overhead until a third consumer appears. Revisit then.
+  process overhead until a third consumer appears. Revisit then. The
+  review's `vllm/_xpu_ops.py` audit item: checked — the XPU custom op
+  reads only W1-invariant fields (`non_spec_*` full, `spec_*`,
+  counts, `has_initial_state`), never the changed `prefill_*` /
+  `chunk_indices`, so W1 does not break it (the XPU path is also dead
+  code on this gfx906 machine).
 - 4-request mixed serving A/B (human-review carryover): still
   pending; the 2-request shape is the recorded gate.
 
