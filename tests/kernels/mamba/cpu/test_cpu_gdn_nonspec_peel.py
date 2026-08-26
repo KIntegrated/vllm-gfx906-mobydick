@@ -142,7 +142,6 @@ def _patch_leaves(
         gdn_attention, "is_conv_state_dim_first", lambda: True
     )
     w = layer.conv1d.weight
-    bias = layer.conv1d.bias
 
     def causal_conv1d_update_cpu(
         x, conv_state, weight, bias, activation, conv_state_indices, **kwargs
@@ -408,12 +407,16 @@ def test_spec_mixed_decode_prefill_spec_contract(monkeypatch: pytest.MonkeyPatch
 
     # Outputs land on the right rows: decode first, then spec (stub zeros),
     # then prefill.
-    torch.testing.assert_close(core_attn_out[0], exp_dec, atol=2e-2, rtol=2e-2, check_dtype=False)
+    torch.testing.assert_close(
+        core_attn_out[0], exp_dec, atol=2e-2, rtol=2e-2, check_dtype=False
+    )
     torch.testing.assert_close(
         core_attn_out[1 : 1 + n_spec_tok],
         torch.zeros(n_spec_tok, NUM_V_HEADS, V_HEAD_DIM, dtype=torch.bfloat16),
     )
-    torch.testing.assert_close(core_attn_out[4:9], exp_pre, atol=2e-2, rtol=2e-2, check_dtype=False)
+    torch.testing.assert_close(
+        core_attn_out[4:9], exp_pre, atol=2e-2, rtol=2e-2, check_dtype=False
+    )
 
     # SSM states advance only at the decode and prefill slots.
     torch.testing.assert_close(ssm_state[DECODE_SLOT], exp_dec_state,
@@ -496,7 +499,9 @@ def test_spec_mixed_decode_only_contract(monkeypatch: pytest.MonkeyPatch):
     exp_dec, exp_dec_state, exp_dec_conv = _ref_decode(
         layer, mixed_qkv[0], a[0], b[0], conv_before, ssm_before
     )
-    torch.testing.assert_close(core_attn_out[0], exp_dec, atol=2e-2, rtol=2e-2, check_dtype=False)
+    torch.testing.assert_close(
+        core_attn_out[0], exp_dec, atol=2e-2, rtol=2e-2, check_dtype=False
+    )
     torch.testing.assert_close(
         core_attn_out[1:],
         torch.zeros(n_spec_tok, NUM_V_HEADS, V_HEAD_DIM, dtype=torch.bfloat16),
@@ -549,7 +554,6 @@ def test_spec_mixed_prefill_only_contract(monkeypatch: pytest.MonkeyPatch):
     layer = _make_fake_layer()
     layer.kv_cache = [conv_buf, ssm_state]
     _patch_leaves(monkeypatch, layer)
-    conv_before = conv_buf.clone()
     ssm_before = ssm_state.clone()
 
     core_attn_out = torch.empty(n_tokens, NUM_V_HEADS, V_HEAD_DIM, dtype=torch.bfloat16)
@@ -578,7 +582,9 @@ def test_spec_mixed_prefill_only_contract(monkeypatch: pytest.MonkeyPatch):
         core_attn_out[0:3],
         torch.zeros(3, NUM_V_HEADS, V_HEAD_DIM, dtype=torch.bfloat16),
     )
-    torch.testing.assert_close(core_attn_out[3:8], exp_pre, atol=2e-2, rtol=2e-2, check_dtype=False)
+    torch.testing.assert_close(
+        core_attn_out[3:8], exp_pre, atol=2e-2, rtol=2e-2, check_dtype=False
+    )
     torch.testing.assert_close(ssm_state[PREFILL_SLOT], exp_pre_state,
                                atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(conv_buf[PREFILL_SLOT, :, : CONV_WIDTH - 1],

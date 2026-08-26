@@ -28,8 +28,6 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 import collections
 
-import torch
-
 # --- spies BEFORE model load ---------------------------------------------
 import vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn as g
 
@@ -195,7 +193,8 @@ def main():
         # Novel mid-sentence ending: the greedy continuation of this has
         # never occurred in B's context, so B's 2-grams are new and the
         # ngram proposer finds no match -> B stays non-spec.
-        "The lighthouse keeper climbed the spiral staircase each evening and trimmed the "
+        "The lighthouse keeper climbed the spiral staircase each evening "
+        "and trimmed the "
     )
     if os.environ.get("PROBE_B_TEXT") == "1":
         prompt_b = bpool

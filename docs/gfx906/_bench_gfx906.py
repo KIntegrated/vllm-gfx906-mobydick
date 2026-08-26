@@ -133,7 +133,8 @@ def main():
             "Quantum computers exploit superposition and entanglement to "
             "explore many candidate solutions at once, though error "
             "correction remains the principal obstacle to practical machines. "
-            "The lighthouse keeper climbed the spiral staircase each evening and trimmed the "
+            "The lighthouse keeper climbed the spiral staircase each evening "
+            "and trimmed the "
         )
         prompts = [prompt] + [pool] * (nreqs - 1)
 
