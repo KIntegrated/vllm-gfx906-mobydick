@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+    WNA16_BACKENDS_WITH_STORED_ZP,
     WNA16MoEBackend,
     convert_to_wna16_moe_kernel_format,
     make_wna16_moe_kernel,
@@ -124,13 +125,12 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             # grouped actorder isn't supported by this kernel
             assert weight_quant.actorder != "group"
 
-            # Asymmetric (stored-zp) checkpoints need a zp-consuming kernel:
-            # the TRITON WNA16 and gfx906 HIP MoE kernels both take
-            # w1_zp/w2_zp; the other backends on this path have no zp
-            # support, so fail closed instead of mis-dequanting.
-            assert self.symmetric or self.wna16_backend in (
-                WNA16MoEBackend.TRITON,
-                WNA16MoEBackend.GFX906_HIP,
+            # Asymmetric (stored-zp) checkpoints need a zp-consuming
+            # kernel; the zp-capable backends are declared in the oracle
+            # (WNA16_BACKENDS_WITH_STORED_ZP). Any other backend has no
+            # zp support, so fail closed instead of mis-dequanting.
+            assert self.symmetric or (
+                self.wna16_backend in WNA16_BACKENDS_WITH_STORED_ZP
             ), (
                 "Only symmetric quantization is supported for MoE on the "
                 f"{self.wna16_backend.name} WNA16 backend"

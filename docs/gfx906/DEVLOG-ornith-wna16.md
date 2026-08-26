@@ -6,7 +6,7 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 Model: `cyankiwi/Ornith-1.5-35B-A3B-AWQ-INT4` (Qwen3.5-MoE VLM, 40 layers,
-128 experts × 8 top-k, moe_inter 512, 24.33 GiB checkpoint — the same
+256 experts × 8 top-k, moe_inter 512, 24.33 GiB checkpoint — the same
 decode-shape class as the flagship Qwen3.5-35B-A3B-AWQ). Quant:
 compressed-tensors **asymmetric** W4A16, group-32, int8 zero points,
 pack-quantized, routed experts only. Branch `gfx906/moe-ct-asym-zp`
@@ -162,8 +162,119 @@ which the oracle selects by default).
 
 Refrigerated residue: a standalone microbench of
 `fused_moe_kernel_gptq_awq` with `has_zp` True/False at M=64
-(128 experts, w13 N=1024/K=2048) would pin the mechanism in minutes —
+(256 experts, w13 N=1024/K=2048) would pin the mechanism in minutes —
 worth doing only if the Triton zp path ever becomes a supported
 fallback on gfx906.
 
 VERDICT: OPEN
+
+## 2026-08-26 — code-review fixes (g_idx actorder gate + qzeros repack
+fail-closed + capability constant + doc expert-count)
+
+## HYPOTHESIS
+
+An independent high-effort code review (`/tmp/moe-ct-asym-zp-code-rev-claude.md`,
+folding a second review) found the Triton fallback's g_idx gate and the
+qzeros repack could silently mis-dequant on checkpoint shapes this diff
+made newly reachable. If so, the gate should be a single source of truth
+and the repack should fail closed, not patch each site in isolation.
+
+## What was done
+
+- **Finding 1 (real, blocking) — Triton g_idx gate missed `dynamic`.**
+  The Triton gate checked `actorder == "group"` only, but
+  compressed-tensors `ActivationOrdering` has four distinct members
+  (`group`, `weight`, `dynamic`, `static`) with **no** alias collapsing
+  `dynamic`→`group` (verified against the installed `compressed_tensors`
+  package: `qa.actorder == 'group'` is `False` for a dynamic config). An
+  asymmetric CT W4A16 checkpoint with `actorder=dynamic` was rejected
+  from GFX906_HIP, fell through Marlin (unconditionally False on ROCm),
+  and landed on TRITON with the actorder check silently passing → silent
+  mis-dequant (missing g_idx reordering). This diff is what made asym CT
+  reachable on TRITON at all, so it introduced the path.
+- **Finding 3 (root cause) — three near-duplicate g_idx checks drifted.**
+  Factored the shared predicate into
+  `_gidx_actorder_reason(quant_config, family)` (single source of truth:
+  `group`/`dynamic` carry a runtime g_idx the kernels lack; `weight`/
+  `static` are natural-order safe), now used by the gfx906 symmetric/no-zp
+  gate, the asymmetric-CT gate, and the Triton gate. The Triton gate
+  message becomes `"the Triton WNA16 MoE backend does not support g_idx
+  activation ordering"` (still matches the `"activation ordering"`
+  test substring).
+- **Finding 2 (real, lower reachability) — qzeros repack silently
+  accepted input it didn't validate.** `_repack_qzeros_kfirst_for_triton`
+  derived the output width from the tensor's last dim with no check, so a
+  qzeros tensor in an unexpected layout/packing (a different quantization
+  source's convention) would mis-dequant silently. It now takes the
+  weight's output width `n_out` (K-first axis 2) and fails closed unless
+  `dtype==int32`, `words == n_out//8`, and `n_out % 8 == 0`. Note: for the
+  two supported sources the packed width is in fact consistent (both
+  auto-gptq `pack_cols2ints` and compressed-tensors pack-quantized store
+  8 zps per word along N, and the fused w13 width `2*inter` is handled
+  because the function derives it from the tensor) — the review's
+  "wrong shape for auto-gptq w13" analysis was re-derived and does not
+  hold; this is a fail-closed guard, not a behavior change for the
+  supported path.
+- **Finding 4 (maintainability) — hardcoded backend tuple in the CT
+  assert.** Moved the zp-capable-backend set to a single source of truth,
+  `WNA16_BACKENDS_WITH_STORED_ZP = frozenset({TRITON, GFX906_HIP})`, in
+  the oracle; `CompressedTensorsWNA16MoEMethod.__init__` now references
+  it instead of a literal tuple, so a future zp-capable backend is
+  declared once.
+- **Finding 6 (docs) — expert count.** Ornith is **256** experts
+  (verified against the live checkpoint config.json: `num_experts=256`,
+  `num_experts_per_tok=8`, `moe_intermediate_size=512`), not 128 as the
+  devlog stated. Corrected the model line and the refrigerated-microbench
+  shape. A/B perf numbers are unaffected (they ran against the real
+  checkpoint).
+
+Rejected/deferred review items: Finding 5 (repack's `[E,G,N]` int32
+intermediate) is load-time-only transient memory — deferred per the
+review's own "optional cleanup, only if a practical OOM". The
+`pytest.mark.gpu` marker item: this file has no such markers anywhere and
+its sibling GPU tests in `tests/kernels/moe/` don't use them either, so
+adding it would not match convention.
+
+## Evidence FOR
+
+- Oracle unit suite: **40/40** (was 34; +TRITON `dynamic` reject,
+  +TRITON `weight` asym accept, +repack fail-closed layout cases). The
+  new TRITON `dynamic` case is the regression test for Finding 1 — it
+  fails on the pre-fix gate (`actorder == "group"`).
+- gfx906 GPU kernel E2E suite: **51/51** (one transient
+  `M2-bm1-N1536-gs128-gptq_kfirst_sym` failure on a random-seed run
+  re-passed in isolation and on full rerun — pre-existing flake,
+  unrelated to this diff, which touches no gfx906 kernel path).
+- Ornith real-checkpoint smoke (eager, gpu_util 0.85): **auto
+  (GFX906_HIP) arm** — loads and decodes coherently ("Paris is the
+  largest city in France..."); **explicit `moe_backend=triton` arm** —
+  loads and decodes coherently ("Paris. A. True..."), exercising the new
+  repack width validation end-to-end on a real asymmetric checkpoint.
+- No behavior change on the supported path: the gfx906 gate and the CT
+  repack pass-through are logic-identical (only the actorder predicate is
+  now shared); the Triton gate and the repack strictly add
+  rejection/validation. The 65.03 t/s A/B (Entry 1) is unaffected.
+
+## Evidence AGAINST
+
+None. The one GPU-suite failure was a seed flake that re-passed; the
+supported-path logic is unchanged.
+
+## Verdict
+
+**VERDICT: SHIPPED.** The review's blocking finding (Triton g_idx gate
+missing `dynamic`) is a real silent-mis-dequant path introduced by this
+diff and is fixed by construction via the shared
+`_gidx_actorder_reason` helper (Finding 3); the repack now fails closed
+on unexpected layouts (Finding 2); the zp-capable-backend set is a single
+source of truth (Finding 4); the doc expert count is corrected (Finding
+6). GATE: oracle unit suite (40/40) + gfx906 E2E (51/51) +
+real-checkpoint smoke on both the auto (gfx906) and explicit-triton arms
+— all green.
+
+## Files
+
+- `vllm/model_executor/layers/fused_moe/oracle/int_wna16.py`
+- `vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16.py`
+- `tests/quantization/test_moe_wna16.py`
+- `docs/gfx906/DEVLOG-ornith-wna16.md`

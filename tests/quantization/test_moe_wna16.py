@@ -65,6 +65,42 @@ def test_map_wna16_backend_supports_triton():
             False,
             "activation ordering",
         ),
+        # DYNAMIC is a distinct actorder value (not an alias of GROUP):
+        # the Triton gate must reject it too, or a g_idx-ordered
+        # checkpoint reaches the repack and mis-dequants silently.
+        (
+            WNA16MoEBackend.TRITON,
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=False,
+                dynamic=False,
+                group_size=128,
+                actorder=ActivationOrdering.DYNAMIC,
+            ),
+            False,
+            False,
+            "activation ordering",
+        ),
+        # WEIGHT-ordered asymmetric CT is g_idx-free: the Triton gate
+        # must accept it (reaches the repack, which is the supported
+        # CT-asym fallback).
+        (
+            WNA16MoEBackend.TRITON,
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=False,
+                dynamic=False,
+                group_size=128,
+                actorder=ActivationOrdering.WEIGHT,
+            ),
+            False,
+            False,
+            None,
+        ),
         (
             WNA16MoEBackend.TRITON,
             AutoGPTQConfig(4, 128, False, True, False, {}, {}),
@@ -113,6 +149,9 @@ def test_wna16_oracle_rejects_incompatible_quant_structures(
         allow_tile_padding=True,
     )
 
+    if expected is None:
+        assert reason is None
+        return
     assert reason is not None
     assert expected in reason
 
@@ -577,7 +616,7 @@ def test_repack_qzeros_kfirst_for_triton_matches_kernel_indexing():
         _repack_qzeros_kfirst_for_triton,
     )
 
-    assert _repack_qzeros_kfirst_for_triton(None) is None
+    assert _repack_qzeros_kfirst_for_triton(None, 128) is None
 
     E, G, N = 3, 16, 128  # N/8 = 16 words
     zp = (
@@ -585,7 +624,7 @@ def test_repack_qzeros_kfirst_for_triton_matches_kernel_indexing():
         .to(torch.int32)
         .contiguous()
     )
-    out = _repack_qzeros_kfirst_for_triton(zp)
+    out = _repack_qzeros_kfirst_for_triton(zp, N)
     assert out.shape == (E, N // 2, G)
     assert out.dtype == torch.int32
     # Logical [E, N // 2, G] backed by physical [E, G, N // 2]: the kernel
@@ -597,3 +636,28 @@ def test_repack_qzeros_kfirst_for_triton_matches_kernel_indexing():
     expected = (zp[:, :, n // 8] >> ((n % 8) * 4)) & 0xF  # [E, G, N]
     got = (out[:, n // 2, :] >> ((n % 2) * 4)[:, None]).transpose(1, 2) & 0xF
     assert torch.equal(got, expected)  # [E, G, N]
+
+
+@pytest.mark.parametrize(
+    ("zp_shape", "zp_dtype", "n_out"),
+    [
+        # Packed width not N_out // 8 (e.g. a quantization source whose
+        # qzeros use a different packing convention): fail closed.
+        ((3, 16, 8), torch.int32, 128),
+        ((3, 16, 64), torch.int32, 128),
+        # N_out not a multiple of 8: the 8-per-word packing is impossible.
+        ((3, 16, 1), torch.int32, 10),
+        # Non-int32 storage.
+        ((3, 16, 16), torch.uint8, 128),
+    ],
+)
+def test_repack_qzeros_kfirst_for_triton_rejects_unexpected_layouts(
+    zp_shape, zp_dtype, n_out
+):
+    from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+        _repack_qzeros_kfirst_for_triton,
+    )
+
+    zp = torch.zeros(*zp_shape, dtype=zp_dtype)
+    with pytest.raises(ValueError, match="qzeros must be K-first"):
+        _repack_qzeros_kfirst_for_triton(zp, n_out)

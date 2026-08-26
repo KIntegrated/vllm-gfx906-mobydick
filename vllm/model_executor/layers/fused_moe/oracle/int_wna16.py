@@ -62,6 +62,17 @@ class WNA16MoEBackend(Enum):
     GFX906_HIP = "GFX906_HIP"
 
 
+# WNA16 MoE backends whose kernels consume stored zero points (w1_zp /
+# w2_zp) — the only ones an asymmetric (stored-zp) checkpoint may use.
+# Single source of truth: the compressed-tensors asymmetric gate in
+# CompressedTensorsWNA16MoEMethod.__init__ must fail closed for any
+# backend outside this set, so a backend that later gains zp support is
+# declared here rather than discovered in an unrelated assert.
+WNA16_BACKENDS_WITH_STORED_ZP = frozenset(
+    {WNA16MoEBackend.TRITON, WNA16MoEBackend.GFX906_HIP}
+)
+
+
 def _is_symmetric_no_zp(
     quant_config: QuantizationConfig | QuantizationArgs,
 ) -> bool:
@@ -69,6 +80,27 @@ def _is_symmetric_no_zp(
     pack-quantized): dequant is (q - 8) * scale; the gfx906 kernel inlines
     the constant zero point 8 when the zp tensor is empty."""
     return isinstance(quant_config, QuantizationArgs) and quant_config.symmetric
+
+
+def _gidx_actorder_reason(
+    quant_config: QuantizationArgs,
+    family: str,
+) -> str | None:
+    """Why this config's activation ordering needs the runtime g_idx
+    reordering that the W4A16 MoE kernels (gfx906 custom and Triton
+    fallback) cannot apply (None if the ordering is safe).
+
+    Single source of truth for which compressed-tensors actorder values
+    carry a g_idx — shared by the gfx906 symmetric/no-zp gate, the
+    asymmetric-CT gate, and the Triton gate. `group` (and its `dynamic`
+    spelling) store weights in original column order with a runtime g_idx
+    permutation; `weight`/`static` are format-identical to natural order.
+    A kernel without g_idx support would mis-dequant silently on the
+    g_idx families, so every gate rejects them here.
+    """
+    if quant_config.actorder in ("group", "dynamic"):
+        return f"{family} does not support g_idx activation ordering"
+    return None
 
 
 def _gfx906_no_zp_reason(
@@ -103,13 +135,9 @@ def _gfx906_no_zp_reason(
             "symmetric no-zp MoE requires group size 32 or 128 "
             f"(got {quant_config.group_size})"
         )
-    # GROUP (and its DYNAMIC alias) stores weights in original column
-    # order and needs a runtime g_idx reordering the kernel lacks (a
-    # silent mis-dequant); WEIGHT/STATIC are format-identical to no
-    # activation ordering and are safe.
-    if quant_config.actorder in ("group", "dynamic"):
-        return "symmetric no-zp MoE does not support g_idx activation ordering"
-    return None
+    # g_idx activation ordering (group/dynamic) needs a runtime weight
+    # reordering the kernel lacks; weight/static are natural-order safe.
+    return _gidx_actorder_reason(quant_config, "symmetric no-zp MoE")
 
 
 def _gfx906_asym_ct_reason(
@@ -145,12 +173,9 @@ def _gfx906_asym_ct_reason(
             "asymmetric compressed-tensors MoE requires group size 32 or 128 "
             f"(got {quant_config.group_size})"
         )
-    if quant_config.actorder in ("group", "dynamic"):
-        return (
-            "asymmetric compressed-tensors MoE does not support g_idx "
-            "activation ordering"
-        )
-    return None
+    return _gidx_actorder_reason(
+        quant_config, "asymmetric compressed-tensors MoE"
+    )
 
 
 def backend_to_kernel_cls(
@@ -306,11 +331,17 @@ def _backend_incompatibility_reason(
             return "the AutoAWQ weight layout is not supported"
         if isinstance(quant_config, AutoGPTQConfig) and quant_config.desc_act:
             return "GPTQ activation ordering is not supported"
-        if (
-            isinstance(quant_config, QuantizationArgs)
-            and quant_config.actorder == "group"
-        ):
-            return "group activation ordering is not supported"
+        if isinstance(quant_config, QuantizationArgs):
+            # Shared with the gfx906 gates: both `group` and `dynamic`
+            # carry a runtime g_idx the Triton kernel cannot apply. (The
+            # previous check caught only `group`, silently letting a
+            # `dynamic`-ordered checkpoint reach the repack and
+            # mis-dequant.)
+            gidx_reason = _gidx_actorder_reason(
+                quant_config, "the Triton WNA16 MoE backend"
+            )
+            if gidx_reason is not None:
+                return gidx_reason
 
     # Marlin only supports certain problem/group sizes.
     allow_marlin = not isinstance(quant_config, MoeWNA16Config)
@@ -1796,7 +1827,10 @@ def _process_weights_gfx906(
     )
 
 
-def _repack_qzeros_kfirst_for_triton(qzeros: torch.Tensor) -> torch.Tensor:
+def _repack_qzeros_kfirst_for_triton(
+    qzeros: torch.Tensor | None,
+    n_out: int,
+) -> torch.Tensor | None:
     """Convert int4 qzeros from the checkpoint K-first layout to the layout
     the Triton WNA16 MoE kernel indexes.
 
@@ -1818,11 +1852,22 @@ def _repack_qzeros_kfirst_for_triton(qzeros: torch.Tensor) -> torch.Tensor:
     both layouts measured identical decode (267-270 ms/tok, ~30x below
     the no-zp class); the slowness is in the kernel's has_zp path, not
     the zp storage. See DEVLOG-ornith-wna16.md.
+
+    ``n_out`` is the weight's output width (K-first axis 2); the packed
+    width is validated against it so a qzeros tensor in an unexpected
+    layout (e.g. a different quantization source's convention) fails
+    closed at weight load instead of silently mis-dequantizing.
     """
     if qzeros is None:
         return None
     E, G, words = qzeros.shape
-    N = words * 8
+    if qzeros.dtype != torch.int32 or words != n_out // 8 or n_out % 8:
+        raise ValueError(
+            "WNA16 MoE qzeros must be K-first [E, G, N_out // 8] int32 "
+            "(8 zps per word) for the weight output width, got shape "
+            f"{tuple(qzeros.shape)} dtype {qzeros.dtype} for N_out={n_out}"
+        )
+    N = n_out
     n = torch.arange(N, device=qzeros.device, dtype=torch.int32)
     z = (qzeros[:, :, n // 8] >> ((n % 8) * 4)) & 0xF  # [E, G, N]
     packed = (z[:, :, 0::2] | (z[:, :, 1::2] << 4)).to(torch.int32)
@@ -2084,12 +2129,19 @@ def convert_to_wna16_moe_kernel_format(
             w2_uint8 = w2.transpose(1, 2).contiguous().view(torch.uint8)
             w13_scale = w13_scale.transpose(1, 2).contiguous()
             w2_scale = w2_scale.transpose(1, 2).contiguous()
-            # The checkpoint qzeros are K-first [E, G, N // 8] (8 zps per
-            # word); the Triton kernel indexes [E, N // 2, G] (2 zps per
-            # word). Repack; the passthrough read a transposed layout and
-            # mis-dequantized asymmetric checkpoints.
-            w13_qzeros = _repack_qzeros_kfirst_for_triton(w13_qzeros)
-            w2_qzeros = _repack_qzeros_kfirst_for_triton(w2_qzeros)
+            # The checkpoint qzeros are K-first [E, G, N_out // 8] (8 zps
+            # per word) for both supported sources — compressed-tensors
+            # pack-quantized and auto-gptq (pack_cols2ints, same
+            # 8-per-word convention); the Triton kernel indexes
+            # [E, N_out // 2, G] (2 zps per word). Repack; the passthrough
+            # read a transposed layout and mis-dequantized asymmetric
+            # checkpoints.
+            w13_qzeros = _repack_qzeros_kfirst_for_triton(
+                w13_qzeros, w13.shape[2]
+            )
+            w2_qzeros = _repack_qzeros_kfirst_for_triton(
+                w2_qzeros, w2.shape[2]
+            )
         else:
             # MoeWNA16 uses N-first uint8 weights and scales.
             w13_uint8 = w13.view(torch.uint8)
