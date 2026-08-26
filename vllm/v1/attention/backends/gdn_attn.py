@@ -40,6 +40,19 @@ class GDNAttentionBackend(AttentionBackend):
 
 @dataclass
 class GDNAttentionMetadata:
+    """GDN attention metadata.
+
+    Contract: whenever ``num_decodes > 0`` (spec-mixed or not), the
+    non-spec rows are decode-first and the ``prefill_*`` fields plus
+    ``chunk_indices``/``chunk_offsets`` cover the real prefills only
+    (rebased cu_seqlens). ``has_initial_state``,
+    ``non_spec_state_indices_tensor`` and ``non_spec_query_start_loc``
+    always cover the full non-spec set (decodes + prefills) in
+    decode-first order. Consumers of the ``prefill_*`` fields must peel
+    the decode front slice themselves (GPU ``_forward_core``, CPU
+    ``_spec_aware_nonspec_subset``, Kimi KDA all do).
+    """
+
     num_prefills: int
     num_prefill_tokens: int
     num_decodes: int
@@ -361,14 +374,24 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_query_start_loc: torch.Tensor | None = None
         prefill_state_indices: torch.Tensor | None = None
         prefill_has_initial_state: torch.Tensor | None = None
+        if num_decodes > 0:
+            # V1 invariant: non-spec 1-token decodes are scheduled first, so
+            # the front slice of the non-spec ramp is 0..num_decodes. The peel
+            # (and every consumer of the prefill_* fields below) relies on it;
+            # fail loudly instead of silently mis-slicing. CPU-side tensors,
+            # so this adds no device sync.
+            assert non_spec_query_start_loc_cpu[: num_decodes + 1].equal(
+                torch.arange(
+                    num_decodes + 1, dtype=non_spec_query_start_loc_cpu.dtype
+                )
+            ), "GDN decode-first invariant violated: non-spec decodes not first"
+
         if num_prefills > 0:
-            # In a mixed non-spec batch, decodes are peeled off to the recurrent
-            # kernel (decode-first front slice), so build chunk metadata from the
-            # rebased prefill-only cu_seqlens; otherwise use the full non-spec one.
-            # _forward_core keys off the same condition, so they agree.
-            # Applies to spec-mixed batches as well: non-spec decodes there are
-            # also peeled to the per-seq decode kernel (W1 — they used to be
-            # reclassified as 1-token "prefills" and paid the chunk kernel).
+            # In a mixed non-spec batch (spec-mixed or not), decodes are peeled
+            # to the per-seq recurrent kernel (decode-first front slice), so
+            # build chunk metadata from the rebased prefill-only cu_seqlens;
+            # otherwise use the full non-spec one. _forward_core keys off the
+            # same condition, so they agree.
             if num_decodes > 0:
                 assert non_spec_query_start_loc is not None
                 assert non_spec_query_start_loc_cpu is not None

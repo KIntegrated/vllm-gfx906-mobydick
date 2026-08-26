@@ -1333,6 +1333,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
         num_decode_tokens = attn_metadata.num_decode_tokens
+        # V1 invariant: non-spec 1-token decodes are the decode-first front
+        # slice (the metadata builder asserts the ramp), so the token slices
+        # below select exactly the decode rows.
+        assert num_decode_tokens == attn_metadata.num_decodes
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
@@ -1383,6 +1387,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
+            # In the mixed (prefill + peeled decode) case this intentionally
+            # covers the FULL non-spec batch with the full has_initial_state:
+            # conv is per-sequence, so the 1-token decode "sequences" share
+            # the no-spec mixed-batch semantics; only the delta-rule split
+            # below is prefill-only.
             mixed_qkv_non_spec = causal_conv1d_fn(
                 mixed_qkv_non_spec_T,
                 conv_weights,
@@ -1412,13 +1421,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
-        # Split mixed non-spec-decode+prefill to process independently.
-        # In spec-mixed batches the non-spec decodes are peeled too (W1):
-        # they used to be reclassified as 1-token "prefills" by the metadata
-        # builder and paid the chunk kernel (~415 us/layer) instead of the
-        # per-seq recurrent kernel. Mixed decode-only steps are never
-        # full-cudagraph replayed (non-uniform query lengths), so the eager
-        # metadata path below is the only consumer.
+        # Split the mixed non-spec batch: decodes go to the per-seq
+        # recurrent kernel, the prefill tail to the chunk kernel. Mixed
+        # decode-only steps are never full-cudagraph replayed (non-uniform
+        # query lengths), so the eager metadata path below is the only
+        # consumer.
         split_non_spec = (
             attn_metadata.num_prefills > 0 and attn_metadata.num_decodes > 0
         )
