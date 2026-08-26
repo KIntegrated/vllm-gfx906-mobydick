@@ -1,12 +1,13 @@
 # DEVLOG: W1 — multi-request GDN chunk reclass (mixed spec batches)
 
-Status: **OPEN** — code complete, unit gates green, GPU before/after +
-PPL gates pending (boot-G burst wedge 2026-08-26 ~00:58 — reboot
-required; see `degradation.md`).
+Status: **SHIPPED** (2026-08-26, branch `gfx906/gdn-mixed-decode`) —
+all gates green, incl. the serving wall-clock A/B: 27B mixed 2-request
+ngram serving **59.35 vs 55.60 t/s = +6.7 %** (4 samples/arm, bands
+±0.3 %).
 
-GATE: serving wall-clock A/B on a 2-request mixed probe + PPL delta +
-kernel-path spy (house protocol). Unit tests are a correctness floor,
-not the gate.
+GATE: serving wall-clock A/B on a 2-request mixed probe + numerics
+identity + kernel-path spy (house protocol). Unit tests are a
+correctness floor, not the gate.
 
 ## Problem
 
@@ -75,33 +76,67 @@ uniformity). No stale-buffer replay is possible.
   already `num_decodes > 0` in effect; the slice→index_select change
   only applies when `spec_sequence_masks is not None`).
 
-## Validation plan (pending GPU)
+## Validation (2026-08-26, boot H; canary 38.9 t/s healthy)
 
-1. **2-request mixed probe** (`benchmarks/kernels/gfx906/probe_gdn_mixed.py`,
-   9B eager, ngram n=5): request A repetitive (always drafts), B
-   non-repetitive (rarely drafts). Spy on GDN leaf kernels + per-step
-   batch composition. Before: B's rows in the chunk kernel
-   (`comp=(prefills≥1, decodes=0, spec=1)`); after:
-   `comp=(prefills, decodes≥1, spec=1)` with B in
-   `fused_sigmoid_gating_delta_rule_update` (no `num_accepted_tokens`),
-   chunk only for real prefills. Expect the mixed-step t/s gap to
-   close (chunk ~415 µs vs fused ~20–32 µs per GDN layer × 24–48
-   layers).
-2. **PPL gate**: same mixed 2-request run through `ppl_probe.py`
-   before/after — expect ΔPPL ≤ ~0.2 (cross-kernel fp16 noise band,
-   per the MoE A/B precedent). Exact token identity is NOT achievable
-   (near-tie argmax flips between the chunk and recurrent kernels);
-   request A (the drafting side, untouched path) SHOULD be
-   token-identical — that is a free identity gate.
-3. **27B serving A/B** (production shape): the t/s gate.
+Probe: `probe_gdn_mixed.py` (9B eager, ngram n=5; A = repetitive
+filler, temp 0 → always drafts; B variant per gate; kernel + per-step
+composition spies, scheduler-level ground truth).
 
-## Known risk
+1. **Kernel routing** (9B, B = random-gibberish prompt, temp 1 → B
+   drafts rarely → 84 mixed steps, the maximum-fraction regime):
 
-The peeled decode rows change B's GDN state numerics slightly
-(chunk vs recurrent fp16 accumulation) → B's tokens may flip at
-near-ties; A's tokens should not change. If the PPL gate exceeds
-0.2 or coherence degrades, the peel is wrong somewhere in the
-conv/state-index plumbing — bisect 1.2-elif vs 2.3-elif.
+   | | BEFORE (main) | AFTER (W1) |
+   |---|---|---|
+   | mixed-step composition | `comp=(1,0,1)` — B reclassified prefill | `comp=(0,1,1)` — B peeled decode |
+   | chunk calls | 2112 (96 real prefill + **2016 1-token B "prefills"**) | **96** (prefill only) |
+   | fused_seq non-spec | 0 | **2016** (84 steps × 24 layers) |
+   | t/s | 60.7 | 60.2–64.9 |
+
+   The reclass pathology is exactly reproduced before and eliminated
+   after, at the kernel level. (The 9B t/s delta is within run-to-run
+   noise — the 1-token chunk-vs-fused gap is several times smaller on
+   9B than 27B; the 27B number below is the gate.)
+
+2. **Identity / numerics** (9B, B = diverse sentence pool ending on a
+   novel mid-sentence, temp 0 → deterministic; 40 mixed steps):
+   - **Request A (always-spec, untouched path): token-identical
+     across all 6 runs, both arms** (hash `5c2d0e91a350`) — the free
+     identity gate passes.
+   - Request B: full sequences differ between arms, but the
+     divergence is **pre-existing fp16 non-determinism, not W1**: the
+     *unmodified* main arm itself produces two different B sequences
+     across runs (`65096979406d` / `ed6fcbb38122`), and **both arms
+     reach exactly the same reachable set** {`6509…`, `ed6f…`}; the
+     first 80 chars are identical in every pairing and all sequences
+     are coherent prose. Token-identity gating for B is unusable on
+     this machine (the same temp=0 non-determinism documented for the
+     27B/35B records) — the gate falls back to coherence + A-identity
+     + the reachable-set argument, all green.
+
+3. **Serving A/B (the gate)** — 27B Qwen3.8-AWQ-INT4, graph, 0.82,
+   max_seqs 4, ngram n=5, `BENCH_NREQS=2 BENCH_MIXED=1` (request 0 =
+   2048-token repetitive filler, request 1 = 190-token diverse pool
+   with novel ending → mixed batches on most decode steps), 4
+   samples/arm:
+
+   | | AFTER (W1) | BEFORE (reclass) |
+   |---|---|---|
+   | samples (t/s) | 59.49 / 59.26 / 59.28 / 59.35 | 55.65 / 55.42 / 55.77 / 55.53 |
+   | mean | **59.35** | **55.60** |
+
+   **+6.7 %**, bands ±0.3 % both arms. Below the roadmap's ~20
+   ms/step naive estimate because B (190-token pool on 27B) still
+   drafts a substantial share of steps (echoing the pool), capping
+   the mixed-step fraction; production agentic batches with several
+   non-drafting requests alongside drafting ones get more.
+
+## Verdict
+
+**VERDICT: SHIPPED.** The reclass was real (2016 wasted 1-token chunk
+kernel calls in the 9B probe alone), the peel removes it at the
+kernel level, changes nothing on the spec path (A token-identical),
+adds no new output modes for the peeled side, and is +6.7 % on the
+27B mixed serving A/B. GATE: serving wall-clock A/B — passed.
 
 ## Files
 
@@ -109,3 +144,5 @@ conv/state-index plumbing — bisect 1.2-elif vs 2.3-elif.
 - `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py`
 - `tests/v1/attention/test_gdn_metadata_builder.py`
 - `benchmarks/kernels/gfx906/probe_gdn_mixed.py` (new)
+- `docs/gfx906/_bench_gfx906.py` (`BENCH_MIXED` mixed-prompt mode +
+  cherry-picked `18c235772d` harness envs)

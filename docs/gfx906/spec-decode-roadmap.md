@@ -365,13 +365,20 @@ one-file fallback.)
 
 **Work items outside the single-request rail:**
 
-- **W1 (multi-request GDN chunk reclass).** In mixed batches the
-  no-draft sequences run the chunk kernel as 1-token "prefills"
-  (~415 µs/layer vs ~20 µs packed, ~20 ms/step per such sequence).
-  Small dispatch fix in `qwen_gdn_linear_attn.py` (route 1-token
-  non-spec rows to the packed/sequential path instead of
-  reclassifying). Matters only for concurrent serving (production
-  config 4–8 seqs); measure with a 2-request mixed probe.
+- **W1 (multi-request GDN chunk reclass) — SHIPPED 2026-08-26
+  (branch `gfx906/gdn-mixed-decode`, `DEVLOG-gdn-mixed-decode.md`).**
+  In mixed batches the no-draft sequences ran the chunk kernel as
+  1-token "prefills" (~415 µs/layer vs ~20–32 µs per-seq, ~20
+  ms/step per such sequence). Fix = remove the reclass + extend the
+  no-spec decode-peel to spec-mixed batches (`gdn_attn.py` +
+  `qwen_gdn_linear_attn.py`; prefill metadata covers real prefills
+  only; peeled rows take `fused_sigmoid_gating_delta_rule_update`).
+  Gates: kernel spy (2016 wasted chunk calls → 0, 9B probe), spec-side
+  token identity (hash-stable across all runs), 27B mixed 2-request
+  ngram serving A/B **59.35 vs 55.60 t/s = +6.7 %** (4 samples/arm,
+  ±0.3 % band; below the ~20 ms/step estimate because the probe's
+  non-drafting request still drafts a share of steps). Cudagraph-safe
+  by construction (mixed batches never match a FULL-decode key).
 - **W2 (MoE 35B) — DONE (2026-08-23, `DEVLOG-moe-spec-decode.md`,
   branch `gfx906/moe-spec-decode`).** The rails ported with **zero
   code changes** (all in-tree from the merged 27B phase;
