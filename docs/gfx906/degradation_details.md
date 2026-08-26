@@ -856,3 +856,36 @@ rule was not triggered. Read: the chronic intermittent weight-load
 hang (see boot-E "13:55–14:06 burst" history for the same
 intermittent shape). GPU0 probe-clean after; one retry per house
 recipe succeeded (the W1 before-arm 27B number: 55.60 t/s).
+
+### 2026-08-26 20:05 — TP=2 promotion smoke half-wedge on GPU1
+
+The second proper TP=2 smoke attempt for the main-branch promotion used
+Qwen3.8-27B, `max_num_batched_tokens=4096`, `max_num_seqs=4`,
+`gpu_memory_utilization=0.82`, and trimmed capture sizes `[1,2,3,4]`.
+The first TP=2 attempt was invalid because it ran Python from stdin under
+`spawn`; the corrected file-based retry reached model load and generated 64
+tokens successfully, but exited with a multiprocessing teardown status of 1.
+
+The next corrected retry began loading the five checkpoint shards and failed
+on worker TP1 at `SetDevice`/`copy_()` at 20:05:23Z. Kernel evidence was:
+
+```text
+qcm fence wait loop timeout expired
+The cp might be in an unrecoverable state due to an unsuccessful queues preemption
+Failed to evict process queues
+Failed to quiesce KFD
+GPU reset begin!. Source: 4
+BACO reset
+GPU reset succeeded, trying to resume
+VRAM is lost due to GPU reset!
+Fence fallback timer expired on ring comp_1.0.0
+GPU reset(1) succeeded
+[drm] device wedged, but recovered through reset
+```
+
+This is a **HW half-wedge**, GPU1 (`0000:0e:00.0`), not a full wedge: both
+cards returned to 0% VRAM and `rocm-smi` remained responsive afterward. The
+TP2 smoke therefore has no clean exit gate; further dual-card inference is
+stopped pending the normal reboot/recovery procedure. Persistent copies of
+all session logs and the TP2 probe script are in
+`/local/tmp/gfx906-promotion-2026-08-26/`.
