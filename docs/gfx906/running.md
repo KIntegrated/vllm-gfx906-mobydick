@@ -62,7 +62,7 @@ source ~/env-rocm-7.14-gfx906.sh        # LD_LIBRARY_PATH=/opt/rocm-7.14/lib (RE
   `BENCH_GPU_UTIL=0.95` (dense bench uses 0.92 + explicit KV cap instead).
 - MoE serving recipe: see `README.md` §Bench recipes. Dense 27B (NFS model,
   no fastsafetensors): `BENCH_GPU_UTIL=0.92 BENCH_KV_MEM=6442450944
-  BENCH_MAXSEQS=8 BENCH_BATCHED_TOKENS=512 BENCH_TEXT_ONLY=1`.
+  BENCH_MAXSEQS=8 BENCH_BATCHED_TOKENS=4096 BENCH_TEXT_ONLY=1`.
 
 ### Building the C/HIP extensions locally
 

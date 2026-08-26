@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """gfx906 benchmark (0.23 vs 0.26 vs main). Usage: python3 /bench/_b.py <model>
-Env: BENCH_PP (2048), BENCH_TG (256), BENCH_GPU_UTIL (0.85), BENCH_MAXLEN,
-     BENCH_WARMUP (1=do untimed warmup), BENCH_SAMPLES (default 1).
+Env: BENCH_PP (2048), BENCH_TG (256), BENCH_GPU_UTIL (0.85),
+     BENCH_BATCHED_TOKENS (4096), BENCH_MAXLEN, BENCH_WARMUP
+     (1=do untimed warmup), BENCH_SAMPLES (default 1).
 Measures one pp-prefill + tg-decode request (after an untimed warmup).
 Prints "BENCH: {json}". Robust to cross-version SamplingParams differences.
 """
@@ -43,6 +44,9 @@ def main():
     # This vLLM dropped VLLM_ATTENTION_BACKEND; force the backend via
     # attention_config (AttentionConfig.backend). On gfx906 the default
     # resolves to the CUSTOM (Q8 FA) backend.
+    extra["max_num_batched_tokens"] = int(
+        os.environ.get("BENCH_BATCHED_TOKENS", "4096")
+    )
     attn_backend = os.environ.get("BENCH_ATTN_BACKEND")
     if attn_backend:
         extra["attention_config"] = {"backend": attn_backend}

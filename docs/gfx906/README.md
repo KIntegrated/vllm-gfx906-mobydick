@@ -195,13 +195,14 @@ legacy; both documented in `running.md`). MoE:
 source ~/env-rocm-7.14-gfx906.sh
 HIP_VISIBLE_DEVICES=0 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE HF_HUB_OFFLINE=1 \
 BENCH_EAGER=0 BENCH_PP=2048 BENCH_TG=256 BENCH_MAXLEN=3328 BENCH_GPU_UTIL=0.95 \
-BENCH_CG_MODE=FULL_DECODE_ONLY BENCH_LOAD_FORMAT=fastsafetensors BENCH_SAMPLES=2 \
+BENCH_BATCHED_TOKENS=4096 BENCH_CG_MODE=FULL_DECODE_ONLY \
+BENCH_LOAD_FORMAT=fastsafetensors BENCH_SAMPLES=2 \
 .venv/bin/python /tmp/bench/_b.py /local/models/QuantTrio/Qwen3.5-35B-A3B-AWQ
 ```
 
 Dense 27B (NFS model; no fastsafetensors; smaller KV):
 `BENCH_GPU_UTIL=0.92 BENCH_KV_MEM=6442450944 BENCH_MAXSEQS=8
-BENCH_BATCHED_TOKENS=512 BENCH_TEXT_ONLY=1` with model path
+BENCH_BATCHED_TOKENS=4096 BENCH_TEXT_ONLY=1` with model path
 `/data/models/qwen/Qwen3.5-27B-AWQ`.
 
 Rules: serving benches run sequentially; check `uptime` first (background CPU
