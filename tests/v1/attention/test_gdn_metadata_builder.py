@@ -1,8 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for GDNAttentionMetadataBuilder.build() — specifically the
-reclassification of non-spec decodes as prefills when spec decodes exist.
-Covers the fix for https://github.com/vllm-project/vllm/issues/34845.
+"""Tests for GDNAttentionMetadataBuilder.build() — specifically how
+non-spec decodes are classified when spec decodes exist.
+
+Historically non-spec decodes were reclassified as 1-token "prefills"
+(the #34845 fix); since the W1 dispatch fix the metadata builder keeps
+`num_decodes > 0` in spec-mixed batches and peels the decode rows to
+the per-seq recurrent kernel instead (prefill-only chunk metadata is
+built for the remaining real prefills). The batch is ordered
+decode → ... → prefill (V1 invariant), so the non-spec group is
+decode-first.
 """
 
 from dataclasses import dataclass
@@ -42,18 +49,19 @@ class GDNBuildTestCase:
 
 
 GDN_BUILD_TEST_CASES = {
-    # The original #34845 crash: non-spec query_len=1 + spec decode
+    # The original #34845 crash: non-spec query_len=1 + spec decode.
+    # The decode is kept as a decode (peeled to the per-seq kernel).
     "mixed_decode_and_spec_decode": GDNBuildTestCase(
         seq_lens=[65, 20],
         query_lens=[1, 3],
         num_decode_draft_tokens=[-1, 2],
         num_speculative_tokens=2,
-        expected_num_decodes=0,
-        expected_num_prefills=1,
-        expected_num_prefill_tokens=1,
+        expected_num_decodes=1,
+        expected_num_prefills=0,
+        expected_num_prefill_tokens=0,
         expected_num_spec_decodes=1,
     ),
-    # All requests are spec decodes — no reclassification needed
+    # All requests are spec decodes — nothing to peel
     "pure_spec_decode": GDNBuildTestCase(
         seq_lens=[50, 30],
         query_lens=[3, 3],
@@ -75,48 +83,49 @@ GDN_BUILD_TEST_CASES = {
         expected_num_prefill_tokens=0,
         expected_num_spec_decodes=0,
     ),
-    # Multi-token prefill alongside spec decode — no decode to reclassify
+    # Multi-token prefill alongside spec decode — no decode to peel
     "spec_decode_with_real_prefill": GDNBuildTestCase(
-        seq_lens=[100, 20],
-        query_lens=[50, 3],
-        num_decode_draft_tokens=[-1, 2],
+        seq_lens=[20, 100],
+        query_lens=[3, 50],
+        num_decode_draft_tokens=[2, -1],
         num_speculative_tokens=2,
         expected_num_decodes=0,
         expected_num_prefills=1,
         expected_num_prefill_tokens=50,
         expected_num_spec_decodes=1,
     ),
-    # All three types in one batch — decode gets reclassified
+    # All three types in one batch — decode is peeled, prefill metadata
+    # covers the 50-token prefill only
     "prefill_decode_and_spec_decode": GDNBuildTestCase(
-        seq_lens=[100, 65, 20],
-        query_lens=[50, 1, 3],
+        seq_lens=[65, 100, 20],
+        query_lens=[1, 50, 3],
         num_decode_draft_tokens=[-1, -1, 2],
         num_speculative_tokens=2,
-        expected_num_decodes=0,
-        expected_num_prefills=2,
-        expected_num_prefill_tokens=51,
+        expected_num_decodes=1,
+        expected_num_prefills=1,
+        expected_num_prefill_tokens=50,
         expected_num_spec_decodes=1,
     ),
-    # Multiple non-spec query_len=1 requests all reclassified
-    "multiple_decodes_reclassified": GDNBuildTestCase(
+    # Multiple non-spec query_len=1 requests, all peeled (no prefill)
+    "multiple_decodes_with_spec": GDNBuildTestCase(
         seq_lens=[40, 50, 60, 20],
         query_lens=[1, 1, 1, 3],
         num_decode_draft_tokens=[-1, -1, -1, 2],
         num_speculative_tokens=2,
-        expected_num_decodes=0,
-        expected_num_prefills=3,
-        expected_num_prefill_tokens=3,
+        expected_num_decodes=3,
+        expected_num_prefills=0,
+        expected_num_prefill_tokens=0,
         expected_num_spec_decodes=1,
     ),
-    # Zero-length padded sequence excluded from counts
+    # Zero-length padded sequence (at the back) excluded from counts
     "zero_length_padding_with_spec": GDNBuildTestCase(
-        seq_lens=[16, 65, 20],
-        query_lens=[0, 1, 3],
-        num_decode_draft_tokens=[-1, -1, 2],
+        seq_lens=[65, 20, 16],
+        query_lens=[1, 3, 0],
+        num_decode_draft_tokens=[-1, 2, -1],
         num_speculative_tokens=2,
-        expected_num_decodes=0,
-        expected_num_prefills=1,
-        expected_num_prefill_tokens=1,
+        expected_num_decodes=1,
+        expected_num_prefills=0,
+        expected_num_prefill_tokens=0,
         expected_num_spec_decodes=1,
     ),
 }
@@ -184,18 +193,49 @@ def test_gdn_build_classification(test_case: GDNBuildTestCase):
     assert meta.num_spec_decodes == test_case.expected_num_spec_decodes
 
 
-def test_has_initial_state_after_reclassification():
-    """After reclassification, num_prefills > 0 so the prefill kernel path
-    should compute has_initial_state. For the reclassified request with
-    context_lens > 0, the corresponding entry must be True."""
+def test_prefill_metadata_peels_decodes_in_spec_mixed_batch():
+    """Spec + decode + prefill: prefill chunk metadata must cover the
+    real prefill only (decode rows peeled off the front)."""
     builder = _create_gdn_builder(num_speculative_tokens=2)
-    batch = BatchSpec(seq_lens=[65, 20], query_lens=[1, 3])
-    meta = _build(builder, batch, num_decode_draft_tokens=[-1, 2])
+    # Batch order (V1 invariant): decode, prefill, spec.
+    # req0: 1-token non-spec decode, context 64 -> has initial state
+    # req1: 50-token prefill, context 0 (fresh) -> no initial state
+    # req2: 3-token spec decode
+    batch = BatchSpec(seq_lens=[65, 50, 20], query_lens=[1, 50, 3])
+    meta = _build(builder, batch, num_decode_draft_tokens=[-1, -1, 2])
 
-    assert meta.num_prefills > 0, "reclassification should produce prefills"
+    assert meta.num_decodes == 1
+    assert meta.num_prefills == 1
+    assert meta.num_prefill_tokens == 50
+
+    assert meta.prefill_query_start_loc is not None
+    assert meta.prefill_query_start_loc.tolist() == [0, 50]
+    assert meta.prefill_has_initial_state is not None
+    assert meta.prefill_has_initial_state.tolist() == [False]
+    # Full non-spec has_initial_state (decode + prefill, decode-first):
+    # req0 context 64 > 0 -> True; req1 context 0 -> False.
     assert meta.has_initial_state is not None
-    # req0 has context_lens = 65 - 1 = 64 > 0, so has_initial_state[0] = True
-    assert meta.has_initial_state[0].item() is True
+    assert meta.has_initial_state.tolist() == [True, False]
+    # Prefill state indices are the non-spec ones with the decode row
+    # peeled off.
+    assert meta.prefill_state_indices is not None
+    assert meta.prefill_state_indices.shape[0] == 1
+
+
+def test_no_prefill_metadata_when_only_decodes_peeled():
+    """Spec + non-spec decodes only: no prefill metadata at all, and
+    the full non-spec cu_seqlens lists the decodes (decode-first)."""
+    builder = _create_gdn_builder(num_speculative_tokens=2)
+    batch = BatchSpec(seq_lens=[40, 50, 60, 20], query_lens=[1, 1, 1, 3])
+    meta = _build(builder, batch, num_decode_draft_tokens=[-1, -1, -1, 2])
+
+    assert meta.num_decodes == 3
+    assert meta.num_prefills == 0
+    assert meta.prefill_query_start_loc is None
+    assert meta.prefill_state_indices is None
+    assert meta.has_initial_state is None
+    assert meta.non_spec_query_start_loc is not None
+    assert meta.non_spec_query_start_loc.tolist() == [0, 1, 2, 3]
 
 
 def test_full_cudagraph_spec_metadata_uses_request_count():

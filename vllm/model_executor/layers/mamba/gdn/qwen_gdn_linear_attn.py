@@ -1332,6 +1332,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        # V1 invariant: non-spec 1-token decodes are the decode-first front
+        # slice (the metadata builder asserts the ramp), so the token slices
+        # below select exactly the decode rows.
+        assert num_decode_tokens == attn_metadata.num_decodes
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
@@ -1382,6 +1387,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
+            # In the mixed (prefill + peeled decode) case this intentionally
+            # covers the FULL non-spec batch with the full has_initial_state:
+            # conv is per-sequence, so the 1-token decode "sequences" share
+            # the no-spec mixed-batch semantics; only the delta-rule split
+            # below is prefill-only.
             mixed_qkv_non_spec = causal_conv1d_fn(
                 mixed_qkv_non_spec_T,
                 conv_weights,
@@ -1402,7 +1412,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.conv1d.bias,
                 self.activation,
                 conv_state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
-                    : attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
+                    : num_decode_tokens
                 ],
                 validate_data=True,
             )
@@ -1411,13 +1421,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
-        # Split mixed non-spec-decode+prefill to process independently
+        # Split the mixed non-spec batch: decodes go to the per-seq
+        # recurrent kernel, the prefill tail to the chunk kernel. Mixed
+        # decode-only steps are never full-cudagraph replayed (non-uniform
+        # query lengths), so the eager metadata path below is the only
+        # consumer.
         split_non_spec = (
-            spec_sequence_masks is None
-            and attn_metadata.num_prefills > 0
-            and attn_metadata.num_decodes > 0
+            attn_metadata.num_prefills > 0 and attn_metadata.num_decodes > 0
         )
-        num_decode_tokens = attn_metadata.num_decode_tokens
+
+        # a/b rows of the peeled non-spec decodes: the decode-first front
+        # slice of the non-spec token space. In no-spec batches the non-spec
+        # tokens are the batch, so a slice suffices; in spec-mixed batches
+        # they are scattered and need the index.
+        if spec_sequence_masks is not None and num_decode_tokens > 0:
+            a_non_spec_decode = a.index_select(
+                0, non_spec_token_indx[:num_decode_tokens]
+            )
+            b_non_spec_decode = b.index_select(
+                0, non_spec_token_indx[:num_decode_tokens]
+            )
+        else:
+            a_non_spec_decode = a[:num_decode_tokens]
+            b_non_spec_decode = b[:num_decode_tokens]
 
         if attn_metadata.num_prefills > 0:
             assert mixed_qkv_non_spec is not None, (
@@ -1503,8 +1529,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
                 A_log=self.A_log,
-                a=a[:num_decode_tokens],
-                b=b[:num_decode_tokens],
+                a=a_non_spec_decode,
+                b=b_non_spec_decode,
                 dt_bias=self.dt_bias,
                 q=query_decode,
                 k=key_decode,
@@ -1561,8 +1587,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
-                    a=a,
-                    b=b,
+                    a=a_non_spec_decode,
+                    b=b_non_spec_decode,
                     dt_bias=self.dt_bias,
                     q=query_non_spec,
                     k=key_non_spec,

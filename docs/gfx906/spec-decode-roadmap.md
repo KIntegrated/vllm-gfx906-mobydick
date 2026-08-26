@@ -365,13 +365,35 @@ one-file fallback.)
 
 **Work items outside the single-request rail:**
 
-- **W1 (multi-request GDN chunk reclass).** In mixed batches the
-  no-draft sequences run the chunk kernel as 1-token "prefills"
-  (~415 µs/layer vs ~20 µs packed, ~20 ms/step per such sequence).
-  Small dispatch fix in `qwen_gdn_linear_attn.py` (route 1-token
-  non-spec rows to the packed/sequential path instead of
-  reclassifying). Matters only for concurrent serving (production
-  config 4–8 seqs); measure with a 2-request mixed probe.
+- **W1 (multi-request GDN chunk reclass) — SHIPPED 2026-08-26
+  (branch `gfx906/gdn-mixed-decode`, `DEVLOG-gdn-mixed-decode.md`).**
+  In mixed batches the no-draft sequences ran the chunk kernel as
+  1-token "prefills" (~415 µs/layer vs ~20–32 µs per-seq, ~20
+  ms/step per such sequence). Fix = remove the reclass + extend the
+  no-spec decode-peel to spec-mixed batches (`gdn_attn.py` +
+  `qwen_gdn_linear_attn.py`; prefill metadata covers real prefills
+  only; peeled rows take `fused_sigmoid_gating_delta_rule_update`).
+  Gates: kernel spy (2016 wasted chunk calls → 0, 9B probe), spec-side
+  token identity (hash-stable across all runs), 27B mixed 2-request
+  ngram serving A/B **59.35 vs 55.60 t/s = +6.7 %** (4 samples/arm,
+  ±0.3 % band; below the ~20 ms/step estimate because the probe's
+  non-drafting request still drafts a share of steps). Cudagraph-safe
+  by construction (mixed batches never match a FULL-decode key).
+  Post-ship review pass (2026-08-26, review doc
+  `gdn-mixed-decode-code-rev.md` on `gfx906/main`): all 10 findings
+  closed — the two P1s fixed on this branch (CPU GDN backend
+  spec+decode+prefill crash → decode peel, regression-tested 3/3 with
+  2/3 failing pre-fix; Kimi K3 AMD cu_seqlens/chunk_indices mismatch
+  → peel keyed off `num_decodes > 0`, standalone commit, dead path
+  untested), the L3 scope-creep scripts moved to
+  `gfx906/ngram-cpu-d2h` (their lint + probe-metric fixes landed
+  there), ruff clean, metadata contract made explicit (docstring +
+  CPU-side builder ramp assert — no hot-path device sync), PR #53077
+  checked-already-present, `_xpu_ops.py` audited (reads only
+  W1-invariant fields), same-day 27B mixed A/B neutral (57.28 vs
+  57.17 t/s). `schema_version`/`decode_peel_supported` hardening
+  deferred (review's own medium-term scoping; no stale consumers
+  remain). **Branch is merge-ready.**
 - **W2 (MoE 35B) — DONE (2026-08-23, `DEVLOG-moe-spec-decode.md`,
   branch `gfx906/moe-spec-decode`).** The rails ported with **zero
   code changes** (all in-tree from the merged 27B phase;

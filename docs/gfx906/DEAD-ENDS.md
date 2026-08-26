@@ -34,7 +34,7 @@ DEVLOG). Pattern: **hypothesis → gate → verdict → commit/revert → commen
 `D`=DEVLOG-dense-decode.md · `M1`=DEVLOG-moe-m1-sprint.md ·
 `G1`=DEVLOG-moe-gemm1-retiling.md · `S`=DEVLOG-spec-decode.md ·
 `Q`=DEVLOG-qwen38.md (incident, not a dead-end) ·
-`GA`=DEVLOG-gemma4-*.md.
+`GA`=DEVLOG-gemma4-*.md · `W1`=DEVLOG-gdn-mixed-decode.md.
 
 ## OPEN / IN-FLIGHT (verdict not yet recorded)
 
@@ -44,6 +44,7 @@ DEVLOG). Pattern: **hypothesis → gate → verdict → commit/revert → commen
 | C3 zeroing fold into neighbor kernels | serving wall-clock | ~234 µs/step measured, no numerics change — cheap lever | G1, roadmap C3 |
 | Spec-decode MTP k=2 | serving graph | **SHIPPED** 39.4 t/s (1.41×; 1.50× no-max build), 1.82 tok/step | S |
 | Dense W16A16 long-K GEMV (K=17408 down_proj) | serving | **SHIPPED**, at HBM floor (227.6 vs 795 µs, 101% floor) | D |
+| W1 GDN mixed-batch chunk reclass (~20 ms/step per no-draft seq) | 2-req mixed probe + identity + serving A/B | **SHIPPED** 2026-08-26: kernel spy 2016 wasted chunk calls → 0 (9B); spec side token-identical; 27B mixed 2-req ngram serving 59.35 vs 55.60 t/s = **+6.7 %** (4 samples/arm, ±0.3 %) | W1 |
 
 ## The recurring lessons (why the negative evidence is the point)
 

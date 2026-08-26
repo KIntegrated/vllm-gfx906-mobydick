@@ -298,6 +298,75 @@ def _unpacked_conv_weight(layer) -> torch.Tensor:
     return w
 
 
+def _wide_buffer_nonspec_decode(
+    layer,
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    decode_state_indices: torch.Tensor,
+    conv_buf: torch.Tensor,
+    ssm_state: torch.Tensor,
+    width: int,
+    decode_cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Per-seq recurrent update for 1-token non-spec decodes on the wide
+    conv buffer (non-spec sequences only use its first ``width - 1``
+    columns). The SSM state is updated in place at ``decode_state_indices``.
+
+    Returns the core attention output for the decode rows.
+    """
+    is_amx = torch.cpu._is_amx_tile_supported()
+    if is_amx:
+        decode_mixed_qkv = ops.causal_conv1d_update_cpu(
+            x=mixed_qkv,
+            conv_states=conv_buf,
+            weight=layer.conv1d.weight,
+            bias=layer.conv1d.bias,
+            silu_activation=layer.activation == "silu",
+            conv_state_indices=decode_state_indices,
+            is_vnni=True,
+        )
+    else:
+        # Only the first ``width-1`` columns hold the real conv state.
+        conv_state_view = conv_buf[:, :, : width - 1]
+        conv_weights = _unpacked_conv_weight(layer)
+        if current_platform.get_cpu_architecture() == CpuArchEnum.ARM:
+            decode_conv_state = conv_state_view[decode_state_indices].contiguous()
+            decode_mixed_qkv = causal_conv1d_update_torch(
+                x=mixed_qkv.unsqueeze(-1),
+                conv_state=decode_conv_state,
+                weight=conv_weights,
+                bias=layer.conv1d.bias,
+                activation=layer.activation,
+            ).squeeze(-1)
+            conv_state_view[decode_state_indices] = decode_conv_state
+        else:
+            decode_mixed_qkv = causal_conv1d_update_cpu(
+                x=mixed_qkv,
+                conv_state=conv_state_view,
+                weight=conv_weights,
+                bias=layer.conv1d.bias,
+                activation=layer.activation,
+                conv_state_indices=decode_state_indices,
+            )
+
+    query, key, value = layer.rearrange_mixed_qkv(decode_mixed_qkv)
+    attn_out = ops.fused_sigmoid_gating_delta_rule_update_cpu(
+        A_log=layer.A_log,
+        dt_bias=layer.dt_bias,
+        q=query,
+        k=key,
+        v=value,
+        a=a,
+        b=b,
+        initial_state_source=ssm_state,
+        initial_state_indices=decode_state_indices,
+        cu_seqlens=decode_cu_seqlens,
+        use_qk_l2norm_in_kernel=True,
+    )
+    return attn_out.squeeze(1)
+
+
 def _cpu_gdn_attention_spec_aware(
     layer,
     attn_metadata_i: GDNAttentionMetadata,
@@ -360,7 +429,7 @@ def _cpu_gdn_attention_spec_aware(
         state_len,
     )
 
-    # Process the (rare) non-spec subset (prefill) tokens, if any.
+    # Process the (rare) non-spec subset (decode + prefill) tokens, if any.
     nonspec_out = None
     if (num_prefills > 0 or num_decodes > 0) and non_spec_token_indx is not None:
         mixed_qkv_ns = mixed_qkv.index_select(0, non_spec_token_indx)
@@ -519,58 +588,17 @@ def _spec_aware_nonspec(
     num_prefill_tokens = attn_metadata_i.num_prefill_tokens
 
     if num_decodes > 0:
-        decode_mixed_qkv = mixed_qkv[:num_decode_tokens]
-        decode_b = b[:num_decode_tokens]
-        decode_a = a[:num_decode_tokens]
-        decode_state_indices = state_indices_tensor[:num_decodes]
-        if is_amx:
-            decode_mixed_qkv = ops.causal_conv1d_update_cpu(
-                x=decode_mixed_qkv,
-                conv_states=conv_buf,
-                weight=layer.conv1d.weight,
-                bias=layer.conv1d.bias,
-                silu_activation=layer.activation == "silu",
-                conv_state_indices=decode_state_indices,
-                is_vnni=True,
-            )
-        else:
-            # Only the first ``width-1`` columns hold the real conv state.
-            conv_state_view = conv_buf[:, :, : width - 1]
-            if current_platform.get_cpu_architecture() == CpuArchEnum.ARM:
-                decode_conv_state = conv_state_view[decode_state_indices].contiguous()
-                decode_mixed_qkv = causal_conv1d_update_torch(
-                    x=decode_mixed_qkv.unsqueeze(-1),
-                    conv_state=decode_conv_state,
-                    weight=conv_weights,
-                    bias=layer.conv1d.bias,
-                    activation=layer.activation,
-                ).squeeze(-1)
-                conv_state_view[decode_state_indices] = decode_conv_state
-            else:
-                decode_mixed_qkv = causal_conv1d_update_cpu(
-                    x=decode_mixed_qkv,
-                    conv_state=conv_state_view,
-                    weight=conv_weights,
-                    bias=layer.conv1d.bias,
-                    activation=layer.activation,
-                    conv_state_indices=decode_state_indices,
-                )
-
-        query, key, value = layer.rearrange_mixed_qkv(decode_mixed_qkv)
-        attn_out = ops.fused_sigmoid_gating_delta_rule_update_cpu(
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            q=query,
-            k=key,
-            v=value,
-            a=decode_a,
-            b=decode_b,
-            initial_state_source=ssm_state,
-            initial_state_indices=decode_state_indices,
-            cu_seqlens=query_start_loc[: num_decodes + 1],
-            use_qk_l2norm_in_kernel=True,
+        core_attn_out[:num_decode_tokens] = _wide_buffer_nonspec_decode(
+            layer,
+            mixed_qkv[:num_decode_tokens],
+            b[:num_decode_tokens],
+            a[:num_decode_tokens],
+            state_indices_tensor[:num_decodes],
+            conv_buf,
+            ssm_state,
+            width,
+            query_start_loc[: num_decodes + 1],
         )
-        core_attn_out[:num_decode_tokens] = attn_out.squeeze(1)
 
     if num_prefills > 0:
         has_initial_state = attn_metadata_i.has_initial_state
@@ -650,15 +678,51 @@ def _spec_aware_nonspec_subset(
     ssm_state: torch.Tensor,
     width: int,
 ) -> torch.Tensor:
-    """Process non-spec (prefill) tokens that coexist with spec sequences.
+    """Process non-spec (decode + prefill) tokens that coexist with spec
+    sequences.
+
+    V1 schedules the non-spec rows decode-first, so the 1-token decodes are
+    peeled to the per-seq recurrent update and the prefill tail goes to the
+    chunked path with the builder's prefill-only metadata (W1 contract).
 
     Returns outputs ordered like ``non_spec_token_indx``.
     """
+    num_decodes = attn_metadata_i.num_decodes
+    num_decode_tokens = attn_metadata_i.num_decode_tokens
+    assert num_decode_tokens == num_decodes, (
+        "GDN spec-mixed peel assumes 1-token non-spec decodes"
+    )
+
+    decode_out = None
+    if num_decodes > 0:
+        non_spec_qsl = attn_metadata_i.non_spec_query_start_loc
+        state_indices = attn_metadata_i.non_spec_state_indices_tensor
+        assert non_spec_qsl is not None and state_indices is not None
+        decode_out = _wide_buffer_nonspec_decode(
+            layer,
+            mixed_qkv[:num_decode_tokens],
+            b[:num_decode_tokens],
+            a[:num_decode_tokens],
+            state_indices[:num_decodes].contiguous(),
+            conv_buf,
+            ssm_state,
+            width,
+            non_spec_qsl[: num_decodes + 1],
+        )
+
+    if attn_metadata_i.num_prefills == 0:
+        assert decode_out is not None
+        return decode_out
+
+    prefill_qkv = mixed_qkv[num_decode_tokens:]
+    prefill_b = b[num_decode_tokens:]
+    prefill_a = a[num_decode_tokens:]
     has_initial_state = attn_metadata_i.has_initial_state
     prefill_state_indices = attn_metadata_i.prefill_state_indices
     prefill_qsl = attn_metadata_i.prefill_query_start_loc
     assert prefill_state_indices is not None and prefill_qsl is not None
     assert has_initial_state is not None
+    prefill_has_initial_state = has_initial_state[num_decodes:]
     prefill_state_indices = prefill_state_indices.contiguous()
 
     is_amx = torch.cpu._is_amx_tile_supported()
@@ -667,37 +731,37 @@ def _spec_aware_nonspec_subset(
 
     if is_amx:
         conv_out = ops.causal_conv1d_fwd_cpu(
-            x=mixed_qkv.transpose(0, 1),
+            x=prefill_qkv.transpose(0, 1),
             weight=layer.conv1d.weight,
             bias=layer.conv1d.bias,
             conv_states=conv_buf,
             query_start_loc=prefill_qsl,
             cache_indices=prefill_state_indices,
-            has_initial_state=has_initial_state,
+            has_initial_state=prefill_has_initial_state,
             silu_activation=layer.activation == "silu",
             is_vnni=True,
         ).transpose(0, 1)
     else:
         conv_weights = _unpacked_conv_weight(layer)
         conv_out = causal_conv1d_torch(
-            x=mixed_qkv.transpose(0, 1),
+            x=prefill_qkv.transpose(0, 1),
             weight=conv_weights,
             bias=layer.conv1d.bias,
             conv_states=conv_buf,
             query_start_loc=prefill_qsl,
             cache_indices=prefill_state_indices,
-            has_initial_state=has_initial_state,
+            has_initial_state=prefill_has_initial_state,
             activation=layer.activation,
         ).transpose(0, 1)
 
     query, key, value = layer.rearrange_mixed_qkv(conv_out)
     g, beta = ops.fused_gdn_gating_cpu(
-        A_log=layer.A_log, a=a, b=b, dt_bias=layer.dt_bias
+        A_log=layer.A_log, a=prefill_a, b=prefill_b, dt_bias=layer.dt_bias
     )
     # zero pool slots for sequences without a prior state; the kernel
     # gathers/mutates ssm_state in place via prefill_state_indices, so no
     # separate scatter-back is needed after the call.
-    no_initial_state = prefill_state_indices[~has_initial_state]
+    no_initial_state = prefill_state_indices[~prefill_has_initial_state]
     if no_initial_state.numel() > 0:
         ssm_state[no_initial_state] = 0
     attn_out, _ = ops.chunk_gated_delta_rule_cpu(
@@ -713,7 +777,10 @@ def _spec_aware_nonspec_subset(
         use_qk_l2norm_in_kernel=True,
         initial_state_indices=prefill_state_indices,
     )
-    return attn_out.squeeze(0)
+    prefill_out = attn_out.squeeze(0)
+    if decode_out is None:
+        return prefill_out
+    return torch.cat([decode_out, prefill_out], dim=0)
 
 
 def cpu_gdn_attention_core_fake(
