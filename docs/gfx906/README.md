@@ -70,7 +70,7 @@ request (4 samples) unless noted. Recipes: §Bench recipes +
 | `DEVLOG-fa-attention.md` | custom Q8 FA / decode backend record |
 | `DEVLOG-dense-decode.md` | Qwen3.5-27B dense decode record |
 | `DEVLOG-boot-failure.md` | 2026-08-23 weight-load `hipErrorLaunchFailure` hunt (OPEN: minimal torch repro, GTT-exhaustion theory) |
-| `DEVLOG-gdn-mixed-decode.md` | W1 GDN mixed-batch chunk reclass peel (OPEN — GPU gates pending reboot, 2026-08-26) |
+| `DEVLOG-gdn-mixed-decode.md` | W1 GDN mixed-batch chunk reclass peel — **SHIPPED** 2026-08-26 (27B mixed 2-req ngram serving A/B +6.7 %, 59.35 vs 55.60 t/s) |
 | `moe-decode-roadmap.md` | future MoE-decode candidates (roadmap, not a committed plan) |
 | `spec-decode-roadmap.md` | speculative-decode on gfx906: n-gram probe results + phase plan (ngram/suffix/MTP rails) |
 | `running.md` | how to run/build/bench: local venv (canonical) + docker images |
