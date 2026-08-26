@@ -51,6 +51,14 @@ def main():
     moe_backend = os.environ.get("BENCH_MOE_BACKEND")
     if moe_backend:
         extra["moe_backend"] = moe_backend
+    # BENCH_SPEC_CONFIG (JSON) sets speculative_config, e.g.
+    # '{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_max":2}'.
+    spec_config = os.environ.get("BENCH_SPEC_CONFIG")
+    if spec_config:
+        extra["speculative_config"] = json.loads(spec_config)
+    # BENCH_NREQS (default 1) runs that many identical prompts concurrently
+    # (prefix caching is off, so prefills are real); totals are aggregated.
+    nreqs = int(os.environ.get("BENCH_NREQS", "1"))
     if not eager:
         # Hybrid GDN model: cudagraph capture requires max_num_seqs <= number
         # of Mamba cache blocks. Single-request bench -> 32 is plenty.
@@ -61,7 +69,9 @@ def main():
         extra["max_num_seqs"] = int(os.environ.get("BENCH_MAX_SEQS", "32"))
         extra["compilation_config"] = {
             "cudagraph_mode": os.environ.get("BENCH_CG_MODE", "FULL_DECODE_ONLY"),
-            "max_cudagraph_capture_size": 8,
+            # Spec decode: steps carry nreqs*(k+1) tokens; BENCH_CG_MAX must
+            # cover that or mixed-batch steps fall back to eager.
+            "max_cudagraph_capture_size": int(os.environ.get("BENCH_CG_MAX", "8")),
         }
     llm = LLM(
         model=model,
@@ -96,23 +106,25 @@ def main():
                 max_tokens=max_tokens, temperature=0.0, ignore_eos=True
             )
 
+    prompts = [prompt] * nreqs
+
     if WARMUP:
-        llm.generate([prompt], gen_params(min(tg, 8)))
+        llm.generate(prompts, gen_params(min(tg, 8)))
         print("BENCH warmup_pass done", flush=True)
 
     results = []
     for s in range(SAMPLES):
         t0 = time.time()
-        outs = llm.generate([prompt], gen_params(tg))
+        outs = llm.generate(prompts, gen_params(tg))
         t1 = time.time()
-        o = outs[0].outputs[0]
-        n_out = len(o.token_ids)
+        n_out = sum(len(o.outputs[0].token_ids) for o in outs)
         # token_ids-based: text re-encoding collapses on degenerate/garbage
         # output (e.g. '!!!!...') and undercounts.
         elapsed = t1 - t0
         results.append(
             {
                 "sample": s,
+                "nreqs": nreqs,
                 "out_tokens": n_out,
                 "elapsed_s": round(elapsed, 3),
                 "tokens_per_s": round(n_out / elapsed, 3) if elapsed else 0.0,
