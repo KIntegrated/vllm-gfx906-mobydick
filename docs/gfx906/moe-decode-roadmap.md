@@ -574,6 +574,47 @@ AI-assistance disclosure), these are the items:
   PPL in band both models). Caveat for upstream reception: the
   benefit is eager-path only — inductor fuses the decomposition in
   compiled mode.
+- **U4 — CT-asym W4A16 MoE: Triton-backend qzeros repack** —
+  `vllm/model_executor/layers/fused_moe/oracle/int_wna16.py`
+  (`gfx906/moe-ct-asym-zp`). The TRITON branch of
+  `convert_to_wna16_moe_kernel_format` passed the checkpoint's K-first
+  int32 qzeros through, but `fused_moe_kernel_gptq_awq` indexes them
+  as `[E, N/2, G]` (2 zps per word) — a transposed read that silently
+  mis-dequantized asymmetric CT/GPTQ W4A16 MoE on any platform where
+  TRITON is the selected backend (previously unreachable: the CT
+  scheme asserted symmetric for non-Marlin backends). The repack
+  fixes it. Related ROCm-specific finding, not an upstream fix: on
+  gfx906 that kernel's `has_zp` branch is ~30× slower than the no-zp
+  class (267 ms/tok decode vs the 13.7 ms/tok dense control, both zp
+  storage layouts measured, values correct) — kernel-level, suspect
+  the per-element data-dependent shift on triton-hip/CDNA1. Evidence
+  state: **measured** (PPL A/B 16.45/16.67, serving A/B 3.50/65.03;
+  `DEVLOG-ornith-wna16.md`).
+- **U5 — CT-asym W4A16 MoE: code-review fixes (g_idx actorder gate,
+  repack fail-closed, zp-backend capability set)** —
+  `vllm/model_executor/layers/fused_moe/oracle/int_wna16.py` +
+  `compressed_tensors_moe_wna16.py` (`gfx906/moe-ct-asym-zp`, 2026-08-26,
+  per `/tmp/moe-ct-asym-zp-code-rev-claude.md`). Three fixes:
+  (1) **The Triton WNA16 gate's g_idx check caught only
+  `actorder == "group"`** — compressed-tensors `ActivationOrdering` has
+  four distinct members (`group`/`weight`/`dynamic`/`static`, no alias
+  collapsing, verified against the installed package), so an asymmetric
+  CT checkpoint with `actorder=dynamic` fell GFX906→Marlin→TRITON and
+  passed the gate silently → mis-dequant (missing g_idx reordering). The
+  g_idx predicate is now a single shared helper
+  (`_gidx_actorder_reason`) used by all three gates (gfx906 no-zp,
+  gfx906 asym-CT, Triton). (2) **`_repack_qzeros_kfirst_for_triton`
+  now validates** the qzeros dtype/packed width against the weight
+  output width and fails closed — any future convention mismatch is loud
+  instead of a silent mis-dequant (the two supported sources — CT
+  pack-quantized and auto-gptq `pack_cols2ints` — both use the same
+  8-zp-per-word convention, so this is a guard, not a behavior change).
+  (3) The zp-capable-backend set is declared once in the oracle
+  (`WNA16_BACKENDS_WITH_STORED_ZP`); the CT asymmetric assert references
+  it instead of a hardcoded tuple. Evidence: oracle unit 40/40 (the new
+  TRITON `dynamic` case fails on the pre-fix gate — verified), gfx906
+  E2E 51/51, Ornith real-checkpoint smoke coherent on both the auto
+  (gfx906) and explicit-triton arms. `DEVLOG-ornith-wna16.md` entry 3.
 
 ## 8b. ROCm/TheRock upstream candidates (ROCR-Runtime, not vLLM)
 

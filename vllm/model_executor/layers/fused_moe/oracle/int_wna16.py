@@ -62,6 +62,17 @@ class WNA16MoEBackend(Enum):
     GFX906_HIP = "GFX906_HIP"
 
 
+# WNA16 MoE backends whose kernels consume stored zero points (w1_zp /
+# w2_zp) — the only ones an asymmetric (stored-zp) checkpoint may use.
+# Single source of truth: the compressed-tensors asymmetric gate in
+# CompressedTensorsWNA16MoEMethod.__init__ must fail closed for any
+# backend outside this set, so a backend that later gains zp support is
+# declared here rather than discovered in an unrelated assert.
+WNA16_BACKENDS_WITH_STORED_ZP = frozenset(
+    {WNA16MoEBackend.TRITON, WNA16MoEBackend.GFX906_HIP}
+)
+
+
 def _is_symmetric_no_zp(
     quant_config: QuantizationConfig | QuantizationArgs,
 ) -> bool:
@@ -69,6 +80,27 @@ def _is_symmetric_no_zp(
     pack-quantized): dequant is (q - 8) * scale; the gfx906 kernel inlines
     the constant zero point 8 when the zp tensor is empty."""
     return isinstance(quant_config, QuantizationArgs) and quant_config.symmetric
+
+
+def _gidx_actorder_reason(
+    quant_config: QuantizationArgs,
+    family: str,
+) -> str | None:
+    """Why this config's activation ordering needs the runtime g_idx
+    reordering that the W4A16 MoE kernels (gfx906 custom and Triton
+    fallback) cannot apply (None if the ordering is safe).
+
+    Single source of truth for which compressed-tensors actorder values
+    carry a g_idx — shared by the gfx906 symmetric/no-zp gate, the
+    asymmetric-CT gate, and the Triton gate. `group` (and its `dynamic`
+    spelling) store weights in original column order with a runtime g_idx
+    permutation; `weight`/`static` are format-identical to natural order.
+    A kernel without g_idx support would mis-dequant silently on the
+    g_idx families, so every gate rejects them here.
+    """
+    if quant_config.actorder in ("group", "dynamic"):
+        return f"{family} does not support g_idx activation ordering"
+    return None
 
 
 def _gfx906_no_zp_reason(
@@ -103,13 +135,47 @@ def _gfx906_no_zp_reason(
             "symmetric no-zp MoE requires group size 32 or 128 "
             f"(got {quant_config.group_size})"
         )
-    # GROUP (and its DYNAMIC alias) stores weights in original column
-    # order and needs a runtime g_idx reordering the kernel lacks (a
-    # silent mis-dequant); WEIGHT/STATIC are format-identical to no
-    # activation ordering and are safe.
-    if quant_config.actorder in ("group", "dynamic"):
-        return "symmetric no-zp MoE does not support g_idx activation ordering"
-    return None
+    # g_idx activation ordering (group/dynamic) needs a runtime weight
+    # reordering the kernel lacks; weight/static are natural-order safe.
+    return _gidx_actorder_reason(quant_config, "symmetric no-zp MoE")
+
+
+def _gfx906_asym_ct_reason(
+    quant_config: QuantizationConfig | QuantizationArgs,
+) -> str | None:
+    """Why an asymmetric compressed-tensors checkpoint cannot use the
+    gfx906 W4A16 kernel (None if it can).
+
+    Only compressed-tensors configs are checked here; the stored zero
+    points are int32-packed 8-per-word along N (ascending n, low nibble
+    first), which the MoE loader presents K-first as [E, G, N/8] — the
+    kernel's native AWQ qzeros layout — and the dequant (q - zp) * scale
+    matches the kernel's zero_offset=0 convention. Everything else must
+    satisfy the same contract as the symmetric no-zp path.
+    """
+    if not isinstance(quant_config, QuantizationArgs):
+        return None
+    if _is_symmetric_no_zp(quant_config):
+        return None
+    if quant_config.num_bits != 4:
+        return (
+            f"asymmetric compressed-tensors MoE requires 4-bit weights "
+            f"(got {quant_config.num_bits}-bit)"
+        )
+    if quant_config.dynamic:
+        return (
+            "asymmetric compressed-tensors MoE requires static (non-dynamic) scales"
+        )
+    if quant_config.strategy != QuantizationStrategy.GROUP:
+        return "asymmetric compressed-tensors MoE requires the group strategy"
+    if quant_config.group_size not in (32, 128):
+        return (
+            "asymmetric compressed-tensors MoE requires group size 32 or 128 "
+            f"(got {quant_config.group_size})"
+        )
+    return _gidx_actorder_reason(
+        quant_config, "asymmetric compressed-tensors MoE"
+    )
 
 
 def backend_to_kernel_cls(
@@ -219,17 +285,24 @@ def _backend_incompatibility_reason(
     from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
     from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
-    # GPTQ-style checkpoints (AutoGPTQ / compressed-tensors asymmetric) use a
-    # stored zero-point convention (and may use activation ordering) which the
-    # gfx906 kernel and repack do not implement: only the AutoAWQ K-first,
-    # MoeWNA16 N-first, and compressed-tensors symmetric K-first layouts are
-    # supported.
+    # GPTQ-style checkpoints (AutoGPTQ) use a stored zero-point convention
+    # (and may use activation ordering) which the gfx906 kernel and repack
+    # do not implement: only the AutoAWQ K-first, MoeWNA16 N-first, and
+    # compressed-tensors K-first (symmetric no-zp or asymmetric
+    # pack-quantized) layouts are supported.
     if (
         backend == WNA16MoEBackend.GFX906_HIP
-        and isinstance(quant_config, (AutoGPTQConfig, QuantizationArgs))
+        and isinstance(quant_config, AutoGPTQConfig)
         and not _is_symmetric_no_zp(quant_config)
     ):
         return "GPTQ-style zero-point encoding is not supported"
+    # compressed-tensors asymmetric (stored int32-packed zps): accept only
+    # the pack-quantized contract; anything outside it falls through to
+    # Triton instead of reaching the repack.
+    if backend == WNA16MoEBackend.GFX906_HIP:
+        asym_ct_reason = _gfx906_asym_ct_reason(quant_config)
+        if asym_ct_reason is not None:
+            return asym_ct_reason
 
     # Symmetric no-zp is the only zero-point-less path the gfx906 kernel
     # supports; reject the symmetric variants it cannot dequant instead
@@ -258,11 +331,17 @@ def _backend_incompatibility_reason(
             return "the AutoAWQ weight layout is not supported"
         if isinstance(quant_config, AutoGPTQConfig) and quant_config.desc_act:
             return "GPTQ activation ordering is not supported"
-        if (
-            isinstance(quant_config, QuantizationArgs)
-            and quant_config.actorder == "group"
-        ):
-            return "group activation ordering is not supported"
+        if isinstance(quant_config, QuantizationArgs):
+            # Shared with the gfx906 gates: both `group` and `dynamic`
+            # carry a runtime g_idx the Triton kernel cannot apply. (The
+            # previous check caught only `group`, silently letting a
+            # `dynamic`-ordered checkpoint reach the repack and
+            # mis-dequant.)
+            gidx_reason = _gidx_actorder_reason(
+                quant_config, "the Triton WNA16 MoE backend"
+            )
+            if gidx_reason is not None:
+                return gidx_reason
 
     # Marlin only supports certain problem/group sizes.
     allow_marlin = not isinstance(quant_config, MoeWNA16Config)
@@ -1538,11 +1617,15 @@ def _repack_w4a16_gfx906_expert(
       scales: [E, G, N]   fp16
       qzeros: [E, G, N/8] int32 (word m holds n=8m..8m+7, low nibble first)
 
-    compressed-tensors (GPTQ-style K-first int32, symmetric, no qzeros;
-    e.g. Gemma-4-26B-A4B-AWQ). Raw on-disk tensors are N-first [N, K/8];
-    the MoE weight loader (is_transposed) presents them K-first:
+    compressed-tensors (GPTQ-style K-first int32; symmetric no-qzeros —
+    e.g. Gemma-4-26B-A4B-AWQ — or asymmetric pack-quantized with stored
+    zps — e.g. Ornith-1.5-35B-A3B-AWQ-INT4). Raw on-disk tensors are
+    N-first [N, K/8] (zps [N/8, G]); the MoE weight loader
+    (is_transposed) presents them K-first:
       w:      [E, K/8, N] int32 (word holds k=8q..8q+7, low nibble first)
       scales: [E, G, N]   fp16
+      qzeros: [E, G, N/8] int32 (asymmetric only; word holds
+               n=8m..8m+7, low nibble first — the kernel's native layout)
 
     Detection is collision-free: the packed dim of the int32 layouts is
     dim 2 (AWQ: N/8) or dim 1 (GPTQ: K/8), so w.shape[2] is N/8 (AWQ),
@@ -1669,17 +1752,15 @@ def _repack_w4a16_gptq_kfirst_layout(
     scales: torch.Tensor,
     qzeros: torch.Tensor | None,
     N: int,
-) -> tuple[torch.Tensor, torch.Tensor, None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """compressed-tensors GPTQ-style K-first int32 layout (see
-    _repack_w4a16_gfx906_expert). Symmetric only: the nibbles are already
-    packed 8-per-word along K exactly like the AutoAWQ K-first layout, so
-    the exllama shuffle is identical, scales pass through unchanged, and
-    there is no zp tensor (the kernel inlines the constant zero point 8)."""
-    if qzeros is not None:
-        raise ValueError(
-            "gfx906 W4A16 MoE repack does not support GPTQ-style stored "
-            "zero points (asymmetric compressed-tensors/AutoGPTQ)"
-        )
+    _repack_w4a16_gfx906_expert). The nibbles are already packed
+    8-per-word along K exactly like the AutoAWQ K-first layout, so the
+    exllama shuffle is identical and scales pass through unchanged.
+    Asymmetric (pack-quantized) inputs carry stored zps that the MoE
+    loader presents K-first [E, G, N/8] int32 — the kernel's native
+    layout — and pass through; symmetric inputs have no zp tensor and
+    the kernel inlines the constant zero point 8."""
     E, K8, _ = w.shape
 
     shifts_out = torch.tensor(
@@ -1702,7 +1783,18 @@ def _repack_w4a16_gptq_kfirst_layout(
         )
 
     sc = scales.to(torch.float16).contiguous()
-    return wq, sc, None
+    if qzeros is None:
+        return wq, sc, None
+    # Asymmetric pack-quantized: the loader already presents the zps in
+    # the kernel's layout ([E, G, N/8] int32, 8 nibbles per word, n
+    # ascending) — validate and pass through.
+    if qzeros.shape != (E, scales.shape[1], N // 8):
+        raise ValueError(
+            "compressed-tensors asymmetric MoE zps must be [E, G, N/8] "
+            f"int32-packed, got shape {tuple(qzeros.shape)} for "
+            f"w={tuple(w.shape)}, scales={tuple(scales.shape)}"
+        )
+    return wq, sc, qzeros.to(torch.int32).contiguous()
 
 
 def _process_weights_gfx906(
@@ -1733,6 +1825,54 @@ def _process_weights_gfx906(
         None,  # w13_bias
         None,  # w2_bias
     )
+
+
+def _repack_qzeros_kfirst_for_triton(
+    qzeros: torch.Tensor | None,
+    n_out: int,
+) -> torch.Tensor | None:
+    """Convert int4 qzeros from the checkpoint K-first layout to the layout
+    the Triton WNA16 MoE kernel indexes.
+
+    Checkpoint (CT/GPTQ, is_transposed loader): ``[E, G, N // 8]`` int32,
+    8 zps per word, output column ``n = 8 * w + j`` in nibble ``j``.
+
+    Triton kernel (``fused_moe_kernel_gptq_awq`` int4 zp branch): column
+    ``n`` reads word ``n // 2`` (axis 1), nibble ``(n % 2) * 4``, group
+    ``g`` on axis 2 — i.e. ``[E, N // 2, G]`` with 2 zps per word.
+
+    The result is stored physically as ``[E, G, N // 2]`` and returned as
+    a transposed view: the kernel walks axis 1 (``n // 2``) with axis 2
+    (``g``) fixed inside each k-block, so N-major storage makes those
+    int32 loads contiguous (a plain ``[E, N // 2, G]`` contiguous tensor
+    would stride them by G words).
+
+    Note (2026-08-25, Ornith A/B): the upstream kernel's int4 zp branch
+    is pathologically slow on gfx906 regardless of this layout choice —
+    both layouts measured identical decode (267-270 ms/tok, ~30x below
+    the no-zp class); the slowness is in the kernel's has_zp path, not
+    the zp storage. See DEVLOG-ornith-wna16.md.
+
+    ``n_out`` is the weight's output width (K-first axis 2); the packed
+    width is validated against it so a qzeros tensor in an unexpected
+    layout (e.g. a different quantization source's convention) fails
+    closed at weight load instead of silently mis-dequantizing.
+    """
+    if qzeros is None:
+        return None
+    E, G, words = qzeros.shape
+    if qzeros.dtype != torch.int32 or words != n_out // 8 or n_out % 8:
+        raise ValueError(
+            "WNA16 MoE qzeros must be K-first [E, G, N_out // 8] int32 "
+            "(8 zps per word) for the weight output width, got shape "
+            f"{tuple(qzeros.shape)} dtype {qzeros.dtype} for N_out={n_out}"
+        )
+    N = n_out
+    n = torch.arange(N, device=qzeros.device, dtype=torch.int32)
+    z = (qzeros[:, :, n // 8] >> ((n % 8) * 4)) & 0xF  # [E, G, N]
+    packed = (z[:, :, 0::2] | (z[:, :, 1::2] << 4)).to(torch.int32)
+    # physical [E, G, N // 2]; logical [E, N // 2, G]
+    return packed.transpose(1, 2)
 
 
 def convert_to_wna16_moe_kernel_format(
@@ -1989,6 +2129,19 @@ def convert_to_wna16_moe_kernel_format(
             w2_uint8 = w2.transpose(1, 2).contiguous().view(torch.uint8)
             w13_scale = w13_scale.transpose(1, 2).contiguous()
             w2_scale = w2_scale.transpose(1, 2).contiguous()
+            # The checkpoint qzeros are K-first [E, G, N_out // 8] (8 zps
+            # per word) for both supported sources — compressed-tensors
+            # pack-quantized and auto-gptq (pack_cols2ints, same
+            # 8-per-word convention); the Triton kernel indexes
+            # [E, N_out // 2, G] (2 zps per word). Repack; the passthrough
+            # read a transposed layout and mis-dequantized asymmetric
+            # checkpoints.
+            w13_qzeros = _repack_qzeros_kfirst_for_triton(
+                w13_qzeros, w13.shape[2]
+            )
+            w2_qzeros = _repack_qzeros_kfirst_for_triton(
+                w2_qzeros, w2.shape[2]
+            )
         else:
             # MoeWNA16 uses N-first uint8 weights and scales.
             w13_uint8 = w13.view(torch.uint8)

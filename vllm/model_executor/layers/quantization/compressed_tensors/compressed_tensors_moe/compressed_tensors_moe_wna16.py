@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+    WNA16_BACKENDS_WITH_STORED_ZP,
     WNA16MoEBackend,
     convert_to_wna16_moe_kernel_format,
     make_wna16_moe_kernel,
@@ -124,7 +125,16 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             # grouped actorder isn't supported by this kernel
             assert weight_quant.actorder != "group"
 
-            assert self.symmetric, "Only symmetric quantization is supported for MoE"
+            # Asymmetric (stored-zp) checkpoints need a zp-consuming
+            # kernel; the zp-capable backends are declared in the oracle
+            # (WNA16_BACKENDS_WITH_STORED_ZP). Any other backend has no
+            # zp support, so fail closed instead of mis-dequanting.
+            assert self.symmetric or (
+                self.wna16_backend in WNA16_BACKENDS_WITH_STORED_ZP
+            ), (
+                "Only symmetric quantization is supported for MoE on the "
+                f"{self.wna16_backend.name} WNA16 backend"
+            )
 
             # Non-Marlin WNA16 always uses bf16/fp16 inputs
             self.input_dtype = torch.bfloat16

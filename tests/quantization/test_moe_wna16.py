@@ -65,6 +65,42 @@ def test_map_wna16_backend_supports_triton():
             False,
             "activation ordering",
         ),
+        # DYNAMIC is a distinct actorder value (not an alias of GROUP):
+        # the Triton gate must reject it too, or a g_idx-ordered
+        # checkpoint reaches the repack and mis-dequants silently.
+        (
+            WNA16MoEBackend.TRITON,
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=False,
+                dynamic=False,
+                group_size=128,
+                actorder=ActivationOrdering.DYNAMIC,
+            ),
+            False,
+            False,
+            "activation ordering",
+        ),
+        # WEIGHT-ordered asymmetric CT is g_idx-free: the Triton gate
+        # must accept it (reaches the repack, which is the supported
+        # CT-asym fallback).
+        (
+            WNA16MoEBackend.TRITON,
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=False,
+                dynamic=False,
+                group_size=128,
+                actorder=ActivationOrdering.WEIGHT,
+            ),
+            False,
+            False,
+            None,
+        ),
         (
             WNA16MoEBackend.TRITON,
             AutoGPTQConfig(4, 128, False, True, False, {}, {}),
@@ -95,21 +131,6 @@ def test_map_wna16_backend_supports_triton():
             False,
             "zero points are required",
         ),
-        (
-            WNA16MoEBackend.GFX906_HIP,
-            QuantizationArgs(
-                num_bits=4,
-                type=QuantizationType.INT,
-                strategy=QuantizationStrategy.GROUP,
-                symmetric=False,
-                dynamic=False,
-                group_size=128,
-                actorder=None,
-            ),
-            True,
-            False,
-            "GPTQ-style zero-point",
-        ),
     ],
 )
 def test_wna16_oracle_rejects_incompatible_quant_structures(
@@ -128,6 +149,9 @@ def test_wna16_oracle_rejects_incompatible_quant_structures(
         allow_tile_padding=True,
     )
 
+    if expected is None:
+        assert reason is None
+        return
     assert reason is not None
     assert expected in reason
 
@@ -340,6 +364,152 @@ def test_gfx906_hip_oracle_accepts_symmetric_no_zp(group_size):
     assert reason is None
 
 
+@pytest.mark.parametrize(
+    ("quant_config", "expected"),
+    [
+        # W8A16: the kernel is W4A16 only.
+        (
+            QuantizationArgs(
+                num_bits=8,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=False,
+                dynamic=False,
+                group_size=128,
+            ),
+            "4-bit weights",
+        ),
+        # Dynamic scales: the kernel consumes static per-group scales.
+        (
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=False,
+                dynamic=True,
+                group_size=128,
+            ),
+            "static (non-dynamic) scales",
+        ),
+        # Group size outside the validated 32/128 set.
+        (
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=False,
+                dynamic=False,
+                group_size=64,
+            ),
+            "group size 32 or 128",
+        ),
+        # Channel strategy: no [E, G, N] group scales for the kernel.
+        (
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.CHANNEL,
+                symmetric=False,
+                dynamic=False,
+            ),
+            "group strategy",
+        ),
+        # g_idx activation ordering: weights are stored in original
+        # column order and need a runtime reordering the kernel lacks.
+        (
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=False,
+                dynamic=False,
+                group_size=128,
+                actorder=ActivationOrdering.GROUP,
+            ),
+            "g_idx activation ordering",
+        ),
+        # DYNAMIC is an alias of GROUP with the same runtime contract.
+        (
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=False,
+                dynamic=False,
+                group_size=128,
+                actorder=ActivationOrdering.DYNAMIC,
+            ),
+            "g_idx activation ordering",
+        ),
+        # WEIGHT is format-identical to no activation ordering: the
+        # repack consumes the stored weights in natural order, so the
+        # gate must not reject it.
+        (
+            QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.INT,
+                strategy=QuantizationStrategy.GROUP,
+                symmetric=False,
+                dynamic=False,
+                group_size=128,
+                actorder=ActivationOrdering.WEIGHT,
+            ),
+            None,
+        ),
+    ],
+)
+def test_gfx906_hip_oracle_asym_ct_contract_gate(quant_config, expected):
+    from tests.kernels.moe.utils import make_dummy_moe_config
+
+    # Qwen3.5-A3B-shaped config so the shape gate passes and the
+    # asymmetric-CT gate is what fires.
+    moe_config = make_dummy_moe_config(hidden_dim=2048, intermediate_size=1024)
+
+    reason = _backend_incompatibility_reason(
+        backend=WNA16MoEBackend.GFX906_HIP,
+        moe_config=moe_config,
+        quant_config=quant_config,
+        may_have_zp=True,
+        may_have_bias=False,
+        allow_tile_padding=True,
+    )
+
+    if expected is None:
+        assert reason is None
+        return
+    assert reason is not None
+    assert expected in reason
+
+
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_gfx906_hip_oracle_accepts_asym_ct(group_size):
+    from tests.kernels.moe.utils import make_dummy_moe_config
+
+    # Ornith-1.5-35B-A3B-shaped config (group-32 asymmetric
+    # pack-quantized): the stored int32-packed zps arrive K-first
+    # [E, G, N/8] and the gate must accept the config.
+    moe_config = make_dummy_moe_config(hidden_dim=2048, intermediate_size=1024)
+    quant_config = QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.INT,
+        strategy=QuantizationStrategy.GROUP,
+        symmetric=False,
+        dynamic=False,
+        group_size=group_size,
+    )
+
+    reason = _backend_incompatibility_reason(
+        backend=WNA16MoEBackend.GFX906_HIP,
+        moe_config=moe_config,
+        quant_config=quant_config,
+        may_have_zp=True,
+        may_have_bias=False,
+        allow_tile_padding=True,
+    )
+
+    assert reason is None
+
+
 def test_compressed_tensors_weights_are_transposed_for_triton():
     quant_config = QuantizationArgs(
         num_bits=4,
@@ -435,3 +605,59 @@ def test_moe_wna16_uses_humming_quant_config(monkeypatch):
     )
 
     assert method.get_fused_moe_quant_config(layer) is quant_config
+
+
+def test_repack_qzeros_kfirst_for_triton_matches_kernel_indexing():
+    """The Triton int4 WNA16 MoE kernel reads column n's zero point from
+    word ``n // 2`` (axis 1), nibble ``(n % 2) * 4``, group ``g`` (axis 2);
+    the repack must make the checkpoint's K-first 8-zp-per-word packing
+    satisfy exactly that indexing."""
+    from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+        _repack_qzeros_kfirst_for_triton,
+    )
+
+    assert _repack_qzeros_kfirst_for_triton(None, 128) is None
+
+    E, G, N = 3, 16, 128  # N/8 = 16 words
+    zp = (
+        torch.randint(0, 2**32, (E, G, N // 8), dtype=torch.int64)
+        .to(torch.int32)
+        .contiguous()
+    )
+    out = _repack_qzeros_kfirst_for_triton(zp, N)
+    assert out.shape == (E, N // 2, G)
+    assert out.dtype == torch.int32
+    # Logical [E, N // 2, G] backed by physical [E, G, N // 2]: the kernel
+    # walks axis 1 with axis 2 fixed, so axis 1 must be the contiguous one.
+    assert out.stride() == (G * (N // 2), 1, N // 2)
+
+    n = torch.arange(N)
+    # Checkpoint convention: column n = word n // 8, nibble (n % 8) * 4.
+    expected = (zp[:, :, n // 8] >> ((n % 8) * 4)) & 0xF  # [E, G, N]
+    got = (out[:, n // 2, :] >> ((n % 2) * 4)[:, None]).transpose(1, 2) & 0xF
+    assert torch.equal(got, expected)  # [E, G, N]
+
+
+@pytest.mark.parametrize(
+    ("zp_shape", "zp_dtype", "n_out"),
+    [
+        # Packed width not N_out // 8 (e.g. a quantization source whose
+        # qzeros use a different packing convention): fail closed.
+        ((3, 16, 8), torch.int32, 128),
+        ((3, 16, 64), torch.int32, 128),
+        # N_out not a multiple of 8: the 8-per-word packing is impossible.
+        ((3, 16, 1), torch.int32, 10),
+        # Non-int32 storage.
+        ((3, 16, 16), torch.uint8, 128),
+    ],
+)
+def test_repack_qzeros_kfirst_for_triton_rejects_unexpected_layouts(
+    zp_shape, zp_dtype, n_out
+):
+    from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+        _repack_qzeros_kfirst_for_triton,
+    )
+
+    zp = torch.zeros(*zp_shape, dtype=zp_dtype)
+    with pytest.raises(ValueError, match="qzeros must be K-first"):
+        _repack_qzeros_kfirst_for_triton(zp, n_out)

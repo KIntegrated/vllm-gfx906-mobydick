@@ -70,6 +70,8 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
         from vllm.model_executor.layers.quantization.utils.quant_utils import (
             kInt4Static,
             kInt4Static32,
+            kInt4Static32Asym,
+            kInt4StaticAsym,
             kInt4Static32GroupScale,
             kInt4StaticGroupScale,
         )
@@ -77,9 +79,13 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
         # MoeWNA16 (AWQ fallback on ROCm) uses the group-scale keys;
         # AutoAWQMoEMethod (Marlin path) uses the plain keys. Group size is
         # carried in the scales shape and handled at runtime by the kernel.
+        # The Asym keys are compressed-tensors asymmetric (stored
+        # int32-packed zps; the repack passes them through unchanged).
         return weight_key in (
             kInt4Static,
             kInt4Static32,
+            kInt4StaticAsym,
+            kInt4Static32Asym,
             kInt4StaticGroupScale,
             kInt4Static32GroupScale,
         )

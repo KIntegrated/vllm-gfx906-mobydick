@@ -56,6 +56,12 @@ PROMPTS = [
 
 
 def main():
+    extra = {}
+    # BENCH_MOE_BACKEND (e.g. triton) overrides the MoE backend selection
+    # for A/B runs (default auto picks the gfx906 W4A16 kernel where gated).
+    moe_backend = os.environ.get("BENCH_MOE_BACKEND")
+    if moe_backend:
+        extra["moe_backend"] = moe_backend
     llm = LLM(
         model=os.environ.get(
             "BENCH_MODEL", "/local/models/QuantTrio/Qwen3.5-35B-A3B-AWQ"),
@@ -64,6 +70,7 @@ def main():
         gpu_memory_utilization=0.95,
         enforce_eager=True,
         hf_overrides={},
+        **extra,
     )
     sp = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=20)
     outs = llm.generate(PROMPTS, sp)
