@@ -108,6 +108,35 @@ def main():
 
     prompts = [prompt] * nreqs
 
+    # BENCH_MIXED=1 (with nreqs>=2): request 0 is the repetitive filler
+    # (ngram always drafts -> spec), the rest are a diverse sentence pool
+    # ending on a novel mid-sentence (ngram finds no match -> non-spec
+    # decode) -> most decode steps are spec-mixed batches. For the W1 GDN
+    # reclass A/B (the reclass pathology only exists in mixed batches).
+    if os.environ.get("BENCH_MIXED") == "1" and nreqs >= 2:
+        pool = (
+            "The compiler first parses the source into an abstract syntax "
+            "tree, then walks the tree emitting instructions while keeping "
+            "register pressure within the limits of the target architecture. "
+            "Marble statues weather slowly as acid rain etches their "
+            "surfaces, turning sharp chiselled detail into soft shapes over "
+            "centuries of exposure to the open air. "
+            "Battery capacity fades with age because the solid electrolyte "
+            "interface layer thickens on the anode, trapping lithium ions "
+            "and reducing the charge the cell can deliver. "
+            "Good tests describe intent: a name like test_overflow_refunds "
+            "when total exceeds budget tells the reader what behavior is "
+            "protected without opening the body of the function. "
+            "The river braids and splits around gravel islands each spring, "
+            "carrying snowmelt from the high valleys down to the delta where "
+            "the marsh grass bends but does not break. "
+            "Quantum computers exploit superposition and entanglement to "
+            "explore many candidate solutions at once, though error "
+            "correction remains the principal obstacle to practical machines. "
+            "The lighthouse keeper climbed the spiral staircase each evening and trimmed the "
+        )
+        prompts = [prompt] + [pool] * (nreqs - 1)
+
     if WARMUP:
         llm.generate(prompts, gen_params(min(tg, 8)))
         print("BENCH warmup_pass done", flush=True)
