@@ -281,16 +281,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
             )
 
-            # num_decodes and num_spec_decodes are mutually exclusive.
-            # Reclassify non-spec decodes as prefills when spec decodes
-            # exist — the prefill kernel handles 1-token sequences with
-            # initial state correctly, producing identical results.
-            if num_decodes > 0 and num_spec_decodes > 0:
-                num_prefills += num_decodes
-                num_prefill_tokens += num_decode_tokens
-                num_decodes = 0
-                num_decode_tokens = 0
-
             if num_prefills == 0 and num_decodes == 0:
                 spec_token_size = min(
                     num_spec_decodes * (self.num_spec + 1),
@@ -376,7 +366,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             # kernel (decode-first front slice), so build chunk metadata from the
             # rebased prefill-only cu_seqlens; otherwise use the full non-spec one.
             # _forward_core keys off the same condition, so they agree.
-            if spec_sequence_masks is None and num_decodes > 0:
+            # Applies to spec-mixed batches as well: non-spec decodes there are
+            # also peeled to the per-seq decode kernel (W1 — they used to be
+            # reclassified as 1-token "prefills" and paid the chunk kernel).
+            if num_decodes > 0:
                 assert non_spec_query_start_loc is not None
                 assert non_spec_query_start_loc_cpu is not None
                 assert non_spec_state_indices_tensor is not None
@@ -410,18 +403,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     device=query_start_loc.device,
                 )
             )
-            if spec_sequence_masks is None and num_decodes > 0:
+            if num_decodes > 0:
                 prefill_has_initial_state = has_initial_state[num_decodes:]
             else:
                 prefill_has_initial_state = has_initial_state
         else:
             has_initial_state = None
-
-        # Function code counted on either presency non-spec decode or spec decode,
-        # but not both.
-        assert not (num_decodes > 0 and num_spec_decodes > 0), (
-            f"num_decodes: {num_decodes}, num_spec_decodes: {num_spec_decodes}"
-        )
 
         # Prepare per-request tensors for cudagraph. m.num_actual_tokens is
         # token-padded for FULL graph replay, but the GDN state/query/accepted
