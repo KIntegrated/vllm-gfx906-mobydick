@@ -379,6 +379,21 @@ one-file fallback.)
   ±0.3 % band; below the ~20 ms/step estimate because the probe's
   non-drafting request still drafts a share of steps). Cudagraph-safe
   by construction (mixed batches never match a FULL-decode key).
+  Post-ship review pass (2026-08-26, review doc
+  `gdn-mixed-decode-code-rev.md` on `gfx906/main`): all 10 findings
+  closed — the two P1s fixed on this branch (CPU GDN backend
+  spec+decode+prefill crash → decode peel, regression-tested 3/3 with
+  2/3 failing pre-fix; Kimi K3 AMD cu_seqlens/chunk_indices mismatch
+  → peel keyed off `num_decodes > 0`, standalone commit, dead path
+  untested), the L3 scope-creep scripts moved to
+  `gfx906/ngram-cpu-d2h` (their lint + probe-metric fixes landed
+  there), ruff clean, metadata contract made explicit (docstring +
+  CPU-side builder ramp assert — no hot-path device sync), PR #53077
+  checked-already-present, `_xpu_ops.py` audited (reads only
+  W1-invariant fields), same-day 27B mixed A/B neutral (57.28 vs
+  57.17 t/s). `schema_version`/`decode_peel_supported` hardening
+  deferred (review's own medium-term scoping; no stale consumers
+  remain). **Branch is merge-ready.**
 - **W2 (MoE 35B) — DONE (2026-08-23, `DEVLOG-moe-spec-decode.md`,
   branch `gfx906/moe-spec-decode`).** The rails ported with **zero
   code changes** (all in-tree from the merged 27B phase;
