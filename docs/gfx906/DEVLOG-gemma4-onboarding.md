@@ -127,7 +127,7 @@ custom-kernel question is settled.
 - Model at `/local/cache/huggingface/hub/models--cyankiwi--gemma-4-26B-A4B-it-AWQ-4bit`
   (standard layout, offline-resolvable).
 - No code changes; the only stack behavior exercised was the existing
-  dtype fallback. Docs: this log + `roadmap-more-models.md` §3/§6
-  updates (the 2026-08-18 note "gemma-4 is GGUF-only" is superseded).
+  dtype fallback. Docs: this log + `roadmap-more-models.md` and
+  `CHANGELOG.md` (the 2026-08-18 note "gemma-4 is GGUF-only" is superseded).
 
 Copyright Kevin Read <me@kevin-read.com>

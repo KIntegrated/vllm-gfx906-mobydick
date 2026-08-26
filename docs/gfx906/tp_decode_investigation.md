@@ -131,9 +131,9 @@ under MTP (`num_speculative_tokens=3`, variable accepted length) or a
 mixed batch where requests finish/start — the K/V gather buffers
 reallocate (`torch.empty`), not just resize a view.
 
-This was flagged in code review as **R3**/**R8** in
-`moe-decode-roadmap.md` §9.1/9.3 and is **already partially
-addressed**: R3 capped the retired-buffer keep-alive list at
+This was flagged in code review as **R3**/**R8** and is recorded in
+`CHANGELOG.md`; it is **already partially addressed**: R3 capped the
+retired-buffer keep-alive list at
 `_gather_retired_max = 4` (bounding the leak, not the realloc
 frequency), and R8 made the class-level gather buffers shared on both
 `LEGACY=0` and `LEGACY=1` paths (previously `LEGACY=1` allocated fresh
@@ -209,9 +209,8 @@ kernel census.
   fused-gather buffer design/capture-safety notes.
 - `DEVLOG-dense-decode.md` — earlier note on gather-buffer sizing vs
   `max_model_len` in a different (hybrid GDN+FA) deployment.
-- `moe-decode-roadmap.md` §9.1/9.3 (R3, R8) — the gather-buffer
-  retired-list cap and shared-buffer fixes that partially bear on the
-  thrash candidate in this doc.
+- `CHANGELOG.md` — the R3/R8 gather-buffer retired-list cap and
+  shared-buffer fixes that partially bear on the thrash candidate in this doc.
 
 ---
 ## RESOLUTION (2026-08-21 late, pi agent) — experiment #4 decisive: capture-baking CONFIRMED
@@ -421,7 +420,7 @@ table at all.
    fallback path is non-regressive (not just non-improving) relative
    to today's baseline at that context length.
 3. A concurrency/mixed-length A/B (`BENCH_MAX_SEQS`-style, per the
-   C2-V precedent in `moe-decode-roadmap.md`) — quantifies the
+   C2 precedent in `moe-decode-roadmap.md`) — quantifies the
    batch-wide-cliff discount versus the single-request numbers above.
 4. PPL/greedy correctness gate on the fallback path itself (should be
    a no-op numerically since eager/piecewise `GFX906_FA` is already
@@ -520,7 +519,8 @@ kernel entirely. **It is not free to enable today**: it requires the
 Q8 K side-buffer (`key_cache_q8 is not None`, i.e. `GFX906_FA_LEGACY=0`),
 and `GFX906_FA_LEGACY=0` is currently flagged experimental and
 **fails closed** (`RuntimeError`) when combined with prefix caching
-(`get_cudagraph_support`, per R2 in `moe-decode-roadmap.md` §9.1) —
+(`get_cudagraph_support`, per the completed R2 review item in
+`CHANGELOG.md`) —
 because the Q8 side-buffer misses COW'd prefix-cache blocks and
 produces corrupt output. Since prefix caching is exactly what makes
 long multi-turn conversations affordable, that correctness gap would

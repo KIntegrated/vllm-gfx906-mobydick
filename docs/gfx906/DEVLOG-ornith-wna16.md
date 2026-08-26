@@ -112,7 +112,7 @@ layout work was for the Triton baseline arm (Entry 2).
 
 - The Triton int4-zp path is now a *reachable* (was: assert-failed)
   fallback for CT-asym checkpoints on ROCm; its gfx906 slowness is
-  tracked below and cross-linked to `moe-decode-roadmap.md` §8 (U4).
+  tracked below and cross-linked to `moe-decode-roadmap.md` U4.
 - Precedent: gemma-4 no-zp CT W4A16 onboarding (`DEVLOG-gemma4-*.md`,
   1.79× over Triton) — same oracle/repack machinery, symmetric branch.
 

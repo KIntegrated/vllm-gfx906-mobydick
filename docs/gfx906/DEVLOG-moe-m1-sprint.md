@@ -3,10 +3,9 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 Branch: `gfx906/moe-m1-sprint` (off `gfx906/main` @ 53f5a79429).
-Plan: the 3-4 day set proposed from `moe-decode-roadmap.md` §A/§B:
-A1a/c/g (cheap expert-kernel wins) → A1b (vectorized loads) → A2'/A3
-(gate GEMV status / RMSNorm-gate fusion) → A4 (shared-expert GEMV
-dispatch) → B1/B2 (GDN chunk, FA page A/B).
+Plan: the 3-4 day set proposed in the former MoE roadmap. It covered
+cheap expert-kernel wins, vectorized loads, gate/GEMV status, RMSNorm-gate
+fusion, shared-expert GEMV dispatch, and GDN/FA follow-ups.
 
 Stop rule (agreed before starting): if the day-1 cluster lands < 0.8 ms
 combined, re-profile before continuing — the roadmap may be stale.

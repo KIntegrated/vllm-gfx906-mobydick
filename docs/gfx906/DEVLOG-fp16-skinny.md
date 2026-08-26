@@ -207,7 +207,8 @@ deterministic up to fp16 rounding order) - on the non-deterministic
 
 ## Interactions / superseded-by
 
-- `spec-decode-roadmap.md` W4 (the item); the 27B L1/L2 notes there
+- `CHANGELOG.md` (the completed W4 entry); the open 27B L2 note in
+  `spec-decode-roadmap.md`
   (triton vs rocBLAS vs GEMV per shape at M=1..16).
 - `csrc/rocm/dense_gemv_gfx906.cu` (the M=1 GEMV + M=2..4 rail this
   extends); `68243a61b2` (m4 M-templating, KCHUNK set).

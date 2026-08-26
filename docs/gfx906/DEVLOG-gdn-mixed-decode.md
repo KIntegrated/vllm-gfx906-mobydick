@@ -2,7 +2,7 @@
 
 > Branch `gfx906/gdn-mixed-decode` off `gfx906/main` @ `67ae6c3f96` ·
 > model Qwen3.5-9B (probes) / Qwen3.8-27B-AWQ-INT4 (gate) ·
-> 2026-08-26 · roadmap item W1 (`spec-decode-roadmap.md`).
+> 2026-08-26 · roadmap item W1 (`CHANGELOG.md`; formerly in the spec roadmap).
 
 **VERDICT:** SHIPPED · **GATE:** serving wall-clock A/B — 27B mixed
 2-request ngram serving, graph, 0.82, max_seqs 4, pp2048/tg256, 4

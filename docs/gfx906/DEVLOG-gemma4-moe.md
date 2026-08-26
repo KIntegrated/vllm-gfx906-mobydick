@@ -10,7 +10,8 @@ Serve Gemma-4-26B-A4B-AWQ's MoE layers (30 × {gemm1 N=1408 K=2816, gemm2
 N=2816 K=704}, E=128, topk=8, AWQ-style W4A16 group-32 **symmetric, no zero
 points**) on our `moe_gemm_q4` gfx906 kernel instead of Triton WNA16.
 
-Target (roadmap-more-models.md §6): Triton 232.8 µs/call × 59.8 calls/step
+Target (the Gemma-4 onboarding item in `roadmap-more-models.md`): Triton
+232.8 µs/call × 59.8 calls/step
 (13.9 ms, 46% of GPU-busy) → ~60–90 µs/call class → ~10 ms/step recovered →
 37.6 t/s → ~50–55 t/s class.
 
@@ -192,8 +193,8 @@ Follow-ups (not done here):
 
 ## Post-review no-zp gate hardening (2026-08-20)
 
-The post-`180f030ee3` review (roadmap-more-models.md §6.1) flagged two
-fails-open paths in the symmetric no-zp exemption. Both fixed on
+The post-`180f030ee3` review flagged two fails-open paths in the symmetric
+no-zp exemption. Both fixed on
 `gfx906/no-zp-gate-hardening`:
 
 - **`253942905c`** — `_is_symmetric_no_zp()` accepted *any* symmetric

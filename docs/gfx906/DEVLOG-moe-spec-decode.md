@@ -155,7 +155,7 @@ observe_draft; fixed in the bench, `LOG_STATS=1`):
 ## Interactions / superseded-by
 
 - `DEVLOG-spec-decode.md` (the 27B Phase-1 log; the rails this
-  ports) and `spec-decode-roadmap.md` W2.
+  ports) and the completed W2 entry in `CHANGELOG.md`.
 - `DEVLOG-moe-c2v.md` — C2-V (same day): the grouped-path step-cost
   data (em 8/32/64 → 12.3/21.7/47.8 ms) that motivates the risk
   above.

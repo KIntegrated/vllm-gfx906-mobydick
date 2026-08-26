@@ -2,7 +2,7 @@
 
 > Branch `gfx906/moe-c2v` off `gfx906/main` (d608aa40a5) · model
 > Qwen3.5-35B-A3B-AWQ (`/local/models/QuantTrio/Qwen3.5-35B-A3B-AWQ`) ·
-> 2026-08-22 · roadmap item C2-V (`moe-decode-roadmap.md`).
+> 2026-08-22 · roadmap item C2 (`moe-decode-roadmap.md`).
 
 **VERDICT:** SHIPPED (program complete 2026-08-23: reopen gate
 TRIGGERED — both re-tile candidates ≥0.5 % at **TP=2 M=1** (gemm2-v2
