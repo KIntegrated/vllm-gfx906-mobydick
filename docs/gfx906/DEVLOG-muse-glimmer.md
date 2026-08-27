@@ -621,11 +621,34 @@ withdrawn (it is reachable and gated).
   904,164 tokens (exactly the 6 GiB), graphs 0.89 GiB** (vs 1.28
   uncapped) — then the process group died silently because the
   launching shell call was operator-interrupted (not HW; no kernel
-  events, VRAM released; degradation_details.md 18:23–18:29). The
-  operator is relaunching detached. Remaining validation: the first
-  real 4096-token prefill (the boot-J OOM site), then the ngram
-  serving numbers + pp2048/8192/16384 × tg256/512 prefill grid
-  (`docs/gfx906/_bench_serve_grid_gfx906.py`) and this README row.
+  events, VRAM released; degradation_details.md 18:23–18:29). Operator
+  relaunch (128k max, 6 GiB cap = 848,301–884,644 tok):
+  - **bt4096 OOMed the first 4096-chunk prefill again** (18:41:32,
+    same 254 MiB last-straw alloc as boot J, free: 0) → the compiled
+    prefill transient scales ~linearly with the chunk; bt4096 needs
+    >10.6 GiB per-GPU headroom at TP=2 (4 data points, incl. TP=1
+    bt1024-OK / bt2048-OOM, fit it; degradation.md 18:41).
+  - **bt2048 relaunch: OOM site cleared** — 4106-token prefill
+    ttft 10.2 s (401 t/s), 0 OOM, coherent output (18:55).
+  - **Grid** (`docs/gfx906/_bench_serve_grid_gfx906.py`, 3 samples,
+    19:0x): prefill 542/491/438 t/s @2k/8k/16k; decode B=1 (filler,
+    ngram 100 % acceptance — a ceiling) 114.6/79.1/57.0 t/s @2k/8k/
+    16k (tg256), 112.0/79.2/56.8 (tg512); B=4 @2k/256 45.3 aggregate
+    (~11.3/req); real-prompt checks ~11.5/req. README row updated
+    with the working TP=2 example + these numbers.
+  - **Open (operator question):** is the >10.6 GiB first-prefill
+    transient caused by our custom FA/kernels? Partial evidence says
+    no: (a) the 532 MiB inductor-buffer OOM predates the window work
+    (boot I 22:30, hybrid config with Triton FA on sliding layers);
+    (b) the 27B GDN hybrid serves bt4096/0.82/256k on the same
+    all-CUSTOM stack; (c) our FA runs as a *split op* outside the
+    inductor segments — the failing alloc is an inductor-segment
+    buffer for `gptq_gemm` (Exllama); (d) Q8 side view is an alias
+    (0 bytes). Unexplained: geometry only accounts ~1.3× of the
+    27B→Muse gap. Definitive probe written
+    (`/local/tmp/muse/probe_oom_attribution.py`: memory-snapshot owner
+    breakdown at OOM; arms custom / rocm_attn / enforce_eager) —
+    needs a free GPU (server teardown).
 - LEGACY=0 is validated but stays **experimental**; the default
   remains LEGACY=1 (gather, the validated serving mode). Flipping
   the default is a roadmap decision after a longer bake.
