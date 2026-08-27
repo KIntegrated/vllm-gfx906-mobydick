@@ -1064,3 +1064,57 @@ gather path). Nothing GPU-dependent is pending.
   context + prefill t/s) — see the DEVLOG-muse-glimmer round-3 notes.
 - Optional: greedy (no-spec) baseline B=1 for the ngram-lift number
   (needs a spec-off server).
+
+## 2026-08-27 18:23–18:29Z (boot K): chronic weight-load hang (GPU1 reset) → clean retry → silent process-group kill (operator-aborted launcher), not HW
+
+**Timeline.**
+
+1. **~18:19Z** — boot K (after the 17:52 stop). rocm-smi both cards clean
+   (0%/0%, 32–33 °C, 938 MHz). mtp2-27B canary **38.8 t/s** (healthy;
+   prior passing canaries 38.4–38.9).
+2. **18:22:31Z** — Muse TP=2 serve launched with the 6 GiB KV cap
+   (`--kv-cache-memory-bytes 6442450944`; args unchanged otherwise).
+3. **18:23:30Z** — weight load hung at shard 2/5→3 on both ranks
+   (`hipErrorLaunchFailure` in `copy_`→SetDevice) — the chronic
+   weight-load-hang signature (6th occurrence across boots).
+4. **18:23:47Z** — kernel: `Fence fallback timer expired on ring
+   comp_1.0.0` → `GPU reset(1) succeeded` on **0000:0e:00.0 (GPU1)** →
+   "device wedged, but recovered through reset". First HW event of
+   boot K. rocm-smi clean after.
+5. **~18:25:30Z** — retry per house recipe: weights 5/5 in 42 s (clean),
+   **KV pool 904,164 tokens — exactly the 6 GiB cap** (3.45× the 256k
+   max, vs 1,358,787 uncapped), graph capture 9 s / 0.89 GiB (vs 1.28
+   uncapped — smaller pool, smaller piecewise workspace), "Application
+   startup complete" 18:28:07Z.
+6. **~18:29Z** — the entire process group (API + EngineCore + both
+   workers) died with **no log output, no kernel events, no OOM-kill**
+   in kern.log, and full VRAM release (both cards 0%/0%, 34 °C).
+
+**Classification.**
+
+- Event 3/4 = the chronic intermittent weight-load hang, isolated on a
+  fresh boot with a healthy canary and no OOM/SIGKILL precursor —
+  same class as 08-26 06:03/06:52 (boot H) and 08-27 08:2x (boot I);
+  all of those cleared on one retry, and so did this one.
+- Event 6 is **not a GPU event**. The launcher was a single shell call
+  (`nohup vllm serve … & sleep 240; grep …`); when that call was
+  interrupted by the operator ("Loaded" interjection), the tool killed
+  the call's process group — `nohup` only ignores SIGHUP, so the
+  backgrounded server died with it. Distinguishing evidence: kern.log
+  is empty for 18:28–18:31 (no fence timeout, no reset, no amdgpu
+  error), no "Killed process" OOM lines, and the GPUs released all
+  VRAM cleanly (a mid-op GPU kill would leave zombie VRAM / N/A
+  rocm-smi). Boot J's launches used the identical pattern but *completed*
+  their calls, which is why their servers survived.
+- **Process-management lesson (recurring trap):** launch long-lived
+  servers detached from the interactive call (`setsid nohup … &` from
+  a stable terminal, or a plain `nohup … &` whose call is never
+  interrupted) and check readiness in *separate* short calls.
+
+**Validation state of the 6 GiB-cap config (as of this entry).**
+Load, pool sizing (exactly the requested 904,164 tokens), and graph
+capture all clean on the retry. The one remaining validation is the
+**first real 4096-token prefill** — the exact site of the boot-J OOM.
+Pending with the operator-relaunched server: sanity request (pp4096) →
+the prefill grid (`docs/gfx906/_bench_serve_grid_gfx906.py`) → the
+README serving row.

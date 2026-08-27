@@ -614,9 +614,18 @@ withdrawn (it is reachable and gated).
   force-killed the TP=2 workers mid-P2P op; the next two relaunches
   failed with `hipErrorLaunchFailure` (the documented TP=2 SIGKILL
   wedge; TP=1 canary healthy between) → session stopped, reboot
-  required (degradation.md boot J, 17:40–17:52). Pending there:
-  ngram serving numbers + the pp2048/8192/16384 × tg256/512 prefill
-  grid (`/local/tmp/muse/bench_serve_grid.py`).
+  required (degradation.md boot J, 17:40–17:52).
+  **Boot K (18:16Z)**: canary 38.8 t/s; 1st launch hit the chronic
+  weight-load hang (GPU1 fence timeout → `GPU reset(1)`, 18:23:47);
+  retry loaded clean and validated the cap through capture — **KV pool
+  904,164 tokens (exactly the 6 GiB), graphs 0.89 GiB** (vs 1.28
+  uncapped) — then the process group died silently because the
+  launching shell call was operator-interrupted (not HW; no kernel
+  events, VRAM released; degradation_details.md 18:23–18:29). The
+  operator is relaunching detached. Remaining validation: the first
+  real 4096-token prefill (the boot-J OOM site), then the ngram
+  serving numbers + pp2048/8192/16384 × tg256/512 prefill grid
+  (`docs/gfx906/_bench_serve_grid_gfx906.py`) and this README row.
 - LEGACY=0 is validated but stays **experimental**; the default
   remains LEGACY=1 (gather, the validated serving mode). Flipping
   the default is a roadmap decision after a longer bake.
