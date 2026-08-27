@@ -84,6 +84,10 @@ _FUSED = _os.environ.get("GFX906_FA_FUSED", "1") != "0"
 _DIRECT_PAGED_MODE = _os.environ.get("GFX906_FA_DIRECT_PAGED", "auto").lower()
 _DIRECT_PAGED_MIN_BATCH = int(_os.environ.get("GFX906_FA_DIRECT_PAGED_MIN_BATCH", "2"))
 _DIRECT_PAGED_MAX_SQ = int(_os.environ.get("GFX906_FA_DIRECT_PAGED_MAX_SQ", "16"))
+# Phase C window-clip kill switch (A/B arms only): 0 disables the per-row
+# kv_start so windowed decode scans the FULL history and the window MASK
+# does all the work (numerically identical, slower at long context).
+_WINDOW_CLIP = _os.environ.get("GFX906_FA_WINDOW_CLIP", "1") != "0"
 # Diagnostics for the LEGACY=0 corruption hunt (P3-3).
 _ZERO_KTAIL = (_os.environ.get("GFX906_FA_ZERO_KTAIL", "0") == "1"
                or _FA_DEBUG)
@@ -424,11 +428,26 @@ def forward_paged(
             n_q_per_seq = cu_i64[1:num_seqs + 1] - cu_i64[:num_seqs]
             q_abs_offset_tensor = (sl_i64 - n_q_per_seq).to(torch.int32).contiguous()
 
+        # Phase C: sliding-window KV clip. A decode row only attends to
+        # [max(0, L-W), L), so the kernel k-loop starts there instead of
+        # scanning (and masking) the prefix. Bit-identical output (the
+        # prefix keys are window-masked to -INF anyway); the HBM reads
+        # drop to ~W/L of the full scan. Decode rows only — prefill rows
+        # have per-row windows [max(0, t-W+1), t] and the shared scan
+        # must start at 0 (that clip is still open work).
+        kv_start_tensor = None
+        if _WINDOW_CLIP and window > 0 and max_seqlen_q == 1:
+            # kv_start = max(0, q_abs + 1 - window), reuse the offset.
+            kv_start_tensor = (q_abs_offset_tensor.to(torch.int64)
+                               - window + 1).clamp_(min=0).to(torch.int32)
+            kv_start_tensor = kv_start_tensor.contiguous()
+
         if _DBG:
             _fwdlog(f"forward_paged DIRECT_PAGED: num_tokens={num_tokens} Hq={Hq} "
                     f"D={D} num_seqs={num_seqs} Sq_max={max_seqlen_q} "
                     f"Sk_max={max_seqlen_k} q_padded={tuple(q_padded.shape)} "
-                    f"causal={'inline' if need_causal else 'none'}")
+                    f"causal={'inline' if need_causal else 'none'} "
+                    f"kv_clip={'on' if kv_start_tensor is not None else 'off'}")
             torch.cuda.synchronize()
 
         try:
@@ -441,6 +460,7 @@ def forward_paged(
                 None,                     # mask
                 q_abs_offset_tensor,      # inline causal
                 window=window,
+                kv_start=kv_start_tensor,
             )
             if _DBG:
                 torch.cuda.synchronize()

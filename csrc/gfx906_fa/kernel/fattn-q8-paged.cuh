@@ -414,6 +414,13 @@ static __global__ void flash_attn_tile_q8_paged(
         const int  * __restrict__ KV_max,
         const int32_t * __restrict__ q_abs_offset,
         const int window,
+        // Per-row KV scan start (sliding-window clip, phase C): the k-loop
+        // walks [k0_base, k_VKQ_max) instead of [0, k_VKQ_max). Numerically
+        // identical to scanning [0, k0_base) when k0_base >= q_abs_row -
+        // window + 1 (those keys are window-masked to -INF anyway); the
+        // win is skipping the HBM reads. split-K still covers the clipped
+        // range exactly: slice y visits k0_base + (y+i*gridDim.y)*nbatch_fa.
+        const int32_t * __restrict__ kv_start,
         const int32_t * __restrict__ block_table,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
@@ -435,7 +442,7 @@ static __global__ void flash_attn_tile_q8_paged(
 #ifdef FLASH_ATTN_AVAILABLE
 
     if (use_logit_softcap && !(DV == 128 || DV == 256)) {
-        GGML_UNUSED_VARS(Q, K_paged_base, V_paged_base, mask, sinks, KV_max, q_abs_offset, window, block_table,
+        GGML_UNUSED_VARS(Q, K_paged_base, V_paged_base, mask, sinks, KV_max, q_abs_offset, window, kv_start, block_table,
             dst, dst_meta, scale, max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03, nb01, nb02, nb03,
             ne10, ne11, ne12, ne13,
@@ -526,8 +533,10 @@ static __global__ void flash_attn_tile_q8_paged(
         Q_f, Q_values, Q_scales, col_Q_0, int(ne01.z), head0, ne02, nb01, nb02, scale);
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    // Sliding-window clip start (0 = full scan; see param comment).
+    const int k0_base = kv_start ? kv_start[sequence] : 0;
     if (ncols2 == 1) {
-        int k_VKQ_0 = blockIdx.y*nbatch_fa;
+        int k_VKQ_0 = k0_base + blockIdx.y*nbatch_fa;
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_q8_q8_iter_paged<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
@@ -544,7 +553,7 @@ static __global__ void flash_attn_tile_q8_paged(
                 q_abs_offset, window, sequence, col_Q_0);
         }
     } else {
-        for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+        for (int k_VKQ_0 = k0_base + blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
             if (k_VKQ_0 + nbatch_fa > k_VKQ_max) {
                 // Tail strided tile crossing k_VKQ_max: mask OOB rows.
                 constexpr bool oob_check = true;
@@ -663,7 +672,7 @@ static __global__ void flash_attn_tile_q8_paged(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q, K_paged_base, V_paged_base, mask, sinks, KV_max, q_abs_offset, block_table,
+    GGML_UNUSED_VARS(Q, K_paged_base, V_paged_base, mask, sinks, KV_max, q_abs_offset, window, kv_start, block_table,
         dst, dst_meta, scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03, nb01, nb02, nb03,
         ne10, ne11, ne12, ne13,

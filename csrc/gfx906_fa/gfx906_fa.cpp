@@ -82,10 +82,14 @@ static int get_fa_nc2() {
     }();
     return v;
 }
+// Returns -1 when the env is unset so each call site applies its own
+// default: the gather path defaults to 16 (the B=1-decode tuning), the
+// direct-paged path to a batch-aware value (see gfx906_fa_forward_paged_
+// direct — the optimum there moves with the grid-z block count).
 static int get_fa_kv_split() {
     static int v = [] {
         const char *e = std::getenv("GFX906_FA_KVSPLIT");
-        return e ? std::atoi(e) : 16;
+        return e ? std::atoi(e) : -1;
     }();
     return v;
 }
@@ -153,6 +157,7 @@ extern "C" hipError_t gfx906_fa_launch_paged(
     int32_t         mask_seq_kv_padded,
     const int32_t * Q_ABS_OFFSET_d,
     int             window,
+    const int32_t * KV_START_d,
     int             batch,
     int             heads_q,
     int             heads_kv,
@@ -168,7 +173,8 @@ extern "C" hipError_t gfx906_fa_launch_paged(
     int64_t         v_token_stride,
     int64_t         v_head_stride,
     float           scale,
-    hipStream_t     stream
+    hipStream_t     stream,
+    int             kv_split
 );
 
 // Stage 2: fused gather + inline K quantization (LEGACY decode path).
@@ -321,6 +327,7 @@ torch::Tensor gfx906_fa_forward(
     // into o_bshd by gfx906_fa_split_combine.
     const int nc2 = get_fa_nc2();
     int kv_split = get_fa_kv_split();
+    if (kv_split < 0) kv_split = 16;  // gather-path default (B=1 tuning)
     if (seq_q > 2) {
         // KV-split is a B=1-decode parallelism trick (Sq=1 -> 16 blocks per
         // head tile); at prefill the seq_q tiles already fill the machine and
@@ -1016,7 +1023,8 @@ torch::Tensor gfx906_fa_forward_paged_direct(
     double scale,
     c10::optional<torch::Tensor> mask         = c10::nullopt,
     c10::optional<torch::Tensor> q_abs_offset = c10::nullopt,
-    int64_t window = 0
+    int64_t window = 0,
+    c10::optional<torch::Tensor> kv_start = c10::nullopt
 ) {
     TORCH_CHECK_CUDA(q);
     TORCH_CHECK_CUDA(key_cache_q8);
@@ -1094,6 +1102,36 @@ torch::Tensor gfx906_fa_forward_paged_direct(
     torch::Tensor o_bshd = torch::empty({batch, seq_q, heads_q, head_dim}, opts_f32);
     torch::Tensor o_meta = torch::empty({batch, seq_q, heads_q, 2}, opts_f32);
 
+    // KV-split: gridDim.y partials merged by gfx906_fa_split_combine — same
+    // machinery/guards as gfx906_fa_forward (the seq_q > 2 guard is the same
+    // OOM protection: the partial buffer scales with Sq).
+    //
+    // Default when GFX906_FA_KVSPLIT is unset: clamp(16/batch, 2, 8) —
+    // batch-aware because the paged grid-z is batch*heads_q blocks (NC2=1
+    // here), so the split that fills the 60-CU MI50 moves with the batch
+    // (MI50 micro-bench, B=4/Hq=32/D=128/L=2816, DEVLOG-muse-glimmer.md
+    // 2026-08-27 follow-up: S=8/8/5/2/2 best for B=1/2/3/4/8; the formula
+    // matches the measured optimum at B in {1,2,3,8} and is within 4% at
+    // B=4). The gather-path default (16) is the WRONG value here: at B=4
+    // it costs +18% (267 vs 226 us) on combine traffic. GFX906_FA_KVSPLIT=1
+    // is the kill switch (old grid.y=1 behavior).
+    int kv_split = get_fa_kv_split();
+    if (kv_split < 0) {
+        kv_split = std::max(2, std::min(8, 16 / std::max(1, batch)));
+    }
+    if (seq_q > 2) {
+        kv_split = 1;
+    }
+    torch::Tensor o_part, o_meta_split;
+    float * o_fp32_ptr = o_bshd.data_ptr<float>();
+    float2 * o_meta_ptr = reinterpret_cast<float2 *>(o_meta.data_ptr<float>());
+    if (kv_split > 1) {
+        o_part = torch::empty({batch, seq_q, heads_q, kv_split, head_dim}, opts_f32);
+        o_meta_split = torch::empty({batch, seq_q, heads_q, kv_split, 2}, opts_f32);
+        o_fp32_ptr = o_part.data_ptr<float>();
+        o_meta_ptr = reinterpret_cast<float2 *>(o_meta_split.data_ptr<float>());
+    }
+
     // KV_max expansion [B] → [B, grid_x] (тот же приём что в forward).
     const int ncols1 = fa_pick_ncols1(seq_q);
     const int grid_x = (seq_q + ncols1 - 1) / ncols1;
@@ -1129,6 +1167,25 @@ torch::Tensor gfx906_fa_forward_paged_direct(
         q_abs_offset_ptr = q_abs_offset_c.data_ptr<int32_t>();
     }
 
+    // Optional per-row KV scan start (sliding-window clip, phase C):
+    // the kernel k-loop walks [kv_start_row, seq_len_row). Only valid
+    // together with q_abs_offset + window (the keys before kv_start must
+    // be window-masked anyway, so the output is bit-identical to the
+    // full scan); the backend passes it for windowed decode (Sq=1) only.
+    const int32_t * kv_start_ptr = nullptr;
+    torch::Tensor kv_start_c;
+    if (kv_start.has_value()) {
+        TORCH_CHECK(q_abs_offset.has_value() && window > 0,
+            "kv_start requires q_abs_offset and window > 0");
+        auto ks = kv_start.value();
+        TORCH_CHECK_CUDA(ks);
+        TORCH_CHECK(ks.dtype() == torch::kInt32, "kv_start must be int32");
+        TORCH_CHECK(ks.dim() == 1 && ks.size(0) == batch,
+            "kv_start must be [batch]");
+        kv_start_c = ks.contiguous();
+        kv_start_ptr = kv_start_c.data_ptr<int32_t>();
+    }
+
     auto stream = c10::hip::getCurrentHIPStream().stream();
     hipError_t err = gfx906_fa_launch_paged(
         q.data_ptr<float>(),
@@ -1136,21 +1193,34 @@ torch::Tensor gfx906_fa_forward_paged_direct(
         reinterpret_cast<const __half *>(value_cache.data_ptr<at::Half>()),
         block_table_c.data_ptr<int32_t>(),
         kv_max_expanded.data_ptr<int32_t>(),
-        o_bshd.data_ptr<float>(),
-        reinterpret_cast<float2 *>(o_meta.data_ptr<float>()),
+        o_fp32_ptr,
+        o_meta_ptr,
         mask_ptr,
         mask_seq_kv_padded,
         q_abs_offset_ptr,
         window,
+        kv_start_ptr,
         batch, heads_q, heads_kv, seq_q, max_seq_kv, head_dim,
         block_size, max_blocks_per_seq,
         k_block_stride, k_token_stride, k_head_stride,
         v_block_stride, v_token_stride, v_head_stride,
         (float) scale,
-        stream
+        stream,
+        kv_split
     );
 
     TORCH_CHECK(err == hipSuccess, "gfx906_fa_launch_paged failed: ", hipGetErrorString(err));
+
+    if (kv_split > 1) {
+        const int rows = batch * seq_q * heads_q;
+        hipError_t cerr = gfx906_fa_split_combine(
+            o_part.data_ptr<float>(),
+            reinterpret_cast<float2 *>(o_meta_split.data_ptr<float>()),
+            o_bshd.data_ptr<float>(),
+            rows, kv_split, head_dim, stream);
+        TORCH_CHECK(cerr == hipSuccess, "gfx906_fa_split_combine failed: ",
+            hipGetErrorString(cerr));
+    }
 
     // Native BSHD [B, Sq, Hq, D] — see gfx906_fa_forward (no transpose copy).
     return o_bshd;
@@ -1216,5 +1286,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("block_table"), py::arg("seq_lens"), py::arg("scale"),
           py::arg("mask")         = c10::nullopt,
           py::arg("q_abs_offset") = c10::nullopt,
-          py::arg("window")       = 0);
+          py::arg("window")       = 0,
+          py::arg("kv_start")     = c10::nullopt);
 }

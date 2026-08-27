@@ -249,9 +249,124 @@ cost at ~0; both kernel copies now reference-tested. AGAINST: (none).
 ## Interactions / superseded-by
 
 Supersedes the B=1-only gate framing of the 2026-08-26 entry (numbers
-there stand; this entry adds the B=4 + control data). Open: B=4
-all-CUSTOM direct-paged step-time tuning (NC2/KVSPLIT knob sweep) if
-longer-context serving matters.
+there stand; this entry adds the B=4 + control data). The B=4
+step-time tuning this entry flagged is done in the next entry (split-K
++ batch-aware KVSPLIT default, Phase C window clip).
+
+## 2026-08-27 — perf follow-ups: direct-paged split-K + Phase C window clip
+
+**VERDICT:** SHIPPED (split-K +2.7% @ B=4; Phase C correct, e2e win
+below noise at pp4096) · **GATE:** B=4 pp2048 serving A/B (S=1 vs
+batch-aware default, same session) + pp4096 clip on/off A/B +
+kernel micro-bench.
+
+## HYPOTHESIS
+
+(B=4 anomaly) The direct-paged launch pinned `grid.y=1` (no split-K,
+unlike the gather path's KVSPLIT=16), so every block's critical path is
+the FULL ~88-iteration KV k-loop — hence B=4 steps cost 5.4× the B=1
+step for 4× the work. If the paged kernel's existing strided split-K +
+split_combine machinery (unused by the paged host path) is plumbed in
+with a batch-aware split count, B=4 decode recovers part of the gap
+without a kernel change. (Phase C) If a windowed decode row's k-loop
+starts at `max(0, L-W)` instead of 0, the output is bit-identical
+(prefix keys are window-masked to -INF anyway) and long-context decode
+reads ~W/L of the KV.
+
+## What was done
+
+- **Direct-paged split-K** (host-only): the paged kernel already
+  strides the k-loop by `gridDim.y*nbatch_fa` and stores unscaled
+  `[rows, y, D]` partials + meta when `gridDim.y>1` — the launcher
+  pinned `grid.y=1` and the binding never allocated/merged partials.
+  Plumbed `kv_split` through launch_paged + `forward_paged_direct`
+  (same OOM guard as the gather path: split=1 for Sq>2).
+  `GFX906_FA_KVSPLIT` now returns -1 when unset: gather keeps its
+  16 default; direct-paged defaults to `clamp(16/batch, 2, 8)` —
+  batch-aware because grid-z = batch×Hq (NC2=1 paged), so the split
+  that fills the 60-CU MI50 moves with the batch.
+- **Phase C clip** (kernel + plumbing): `kv_start` arg end-to-end
+  (binding → launcher → `fattn-q8-paged.cuh`); the k-loop walks
+  `[kv_start, L)` (split-K still covers the clipped range exactly —
+  slice y visits `kv_start + (y+i·S)·nbatch_fa`). Python passes
+  `kv_start = max(0, q_abs + 1 − W)` for windowed decode (Sq=1) only;
+  prefill rows keep the full scan (per-row windows; that clip is
+  still open). `GFX906_FA_WINDOW_CLIP=0` kill switch for A/B.
+- Tests: clip suite ×4 shapes (bit-identity to the masked full scan
+  < 1e-6; a functional check with an INERT window (W=L) + real clip
+  start proving the scan itself shrinks; unaligned start (W=64 →
+  start=448 vs nbatch_fa=128); B=2 per-row). Suite 40/40.
+
+## Gate result
+
+**B=4 split-K** (pp2048/tg256, 4 samples, prefix off, 0.75 GiB KV,
+same session/build):
+
+| arm | t/s (samples 1–3) |
+|---|---|
+| KVSPLIT=1 (old grid.y=1) | 20.05 (20.27/20.07/19.89) |
+| batch-aware default (S=4 @ B=4) | **20.59** (20.66/20.56/20.45) |
+| KVSPLIT=2 (micro-bench optimum) | 20.55 (20.72/20.48/20.44) |
+
+**+2.7%** e2e; S=4 (the formula) matches S=2 (the micro-bench
+optimum) within noise, so the shape-independent formula is kept.
+Micro-bench (B=4, Hq=32, D=128, L=2816, window=2048): best split per
+batch = 8/8/5/2/2 for B=1/2/3/4/8; `clamp(16/B, 2, 8)` hits the
+measured optimum at B∈{1,2,3,8}, within 4% at B=4 (235 vs 226 us).
+
+**Phase C** (pp4096/tg256, B=4, prefix off — window bites 50% of the
+decode KV at L=4096–4352):
+
+| arm | t/s (samples 1–3) |
+|---|---|
+| clip ON (run 1) | 10.35 (10.51/10.26/10.19) |
+| clip OFF (run 1) | 10.72 (10.65/10.68/10.76) |
+| clip ON (run 2) | 10.54 (10.80/10.47/10.33) |
+| clip OFF (run 2) | 10.44 (10.77/10.33/10.24) |
+
+Kernel micro-bench at the serving shape (L=4352): FA 337.8 → 175.7 us
+(S=4, −48%) — the clip works at kernel level. E2e the effect is below
+the noise floor: the four runs span 10.35–10.72 with clip OFF
+interleaved at 10.72 AND 10.44 (between the two clip-ON runs), and
+three of the four runs drift ~4% DOWN across their own samples (the
+host state fluctuates on the ~5 min timescale; an initial "clip ON
+slower" read was the run-1 ordering artifact). FA is only ~8% of the
+B=4 step at pp4096 (GEMM-bound), so the expected ~2.9% e2e win isn't
+resolvable here. At L=8k+ the same clip saves ~4× the FA work (~11%
+of the step) — re-measure on a longer-context config if long-ctx
+serving matters. Correctness is exact (bit-identical, 40/40), so clip
+ON stays the default; it is also the prerequisite for the gather-path
+clip.
+
+## Evidence — FOR / AGAINST
+
+FOR: 40/40 suite (clip bit-identity + functional scan-shrink);
+B=4 split-K +2.7% same-session A/B; micro-bench split matrix
+(stable across repeats: S=2 225.9/226.3 us across two runs); Phase C
+kernel −48% at L=4352; 4-run pp4096 A/B shows no clip-induced loss
+(OFF interleaved at both ends and the middle of the ON range).
+AGAINST: Phase C e2e WIN not resolvable at pp4096 (below the ~2% run
+noise); within-run drift ±4% on 3 of 4 runs (host-state fluctuation —
+recorded, not diagnosed).
+
+## Gotchas / notes
+
+- `GFX906_FA_FWD_DEBUG=1` is incompatible with cudagraph capture
+  (its `torch.cuda.synchronize()` at the _DBG log points invalidates
+  the stream capture — `hipErrorStreamCaptureInvalidated`). Debug
+  graph-mode runs without it.
+- Build note: the CMake build compiles a hipified copy of the .cu
+  staged under `build/temp…/csrc/` — the in-tree `.hip` mirrors are
+  NOT built (they predate even the window arg); edit the `.cu`.
+- A 16-way clang build concurrent with a 20 GB weight load
+  coincided with one `hipErrorLaunchFailure` (first non-OOM-collateral
+  event of boot I; retry clean) — see degradation.md. Serialize
+  builds and loads if it recurs.
+- Open: gather-path (B=1) window clip (needs the persistent gather
+  kernel's work list to start per-row at `max(0, L-W)` + compacted
+  store + shifted q_abs_offset); prefill-row clip (per-row windows
+  [max(0, t-W+1), t] — a 2D per-(row, k) problem, not a per-row
+  start); B=4 pp4096 clip e2e at L=8k+.
 
 
 ---

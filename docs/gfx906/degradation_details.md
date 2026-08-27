@@ -946,3 +946,33 @@ rule.
 Logs: `/local/tmp/muse/` (`bench_hybrid_graph*.log`,
 `bench_allcustom*.log`, `smoke_*.log`, `probe_allcustom*.log`); dev log:
 `DEVLOG-muse-glimmer.md`.
+
+## 2026-08-27 08:2x–08:3xZ (boot I): weight-load `hipErrorLaunchFailure` under a concurrent 16-way build — retry clean
+
+**Context.** Boot I is ~11 h 45 min old; the 08:1x–08:2x window-FA
+follow-up session ran two full B=4 bench launches that loaded clean.
+The 3rd launch (B=4 `GFX906_FA_KVSPLIT=2` arm) SIGABRT'd at weight-load
+shard 4/5 with `c10::AcceleratorError: CUDA error: unspecified launch
+failure` (HIP `hipErrorLaunchFailure`).
+
+**Unusual confounder.** A 16-way ccache/clang rebuild of the gfx906 FA
+extension (`setup.py build_ext --inplace`, Phase C kernel change) was
+running concurrently — the first observed overlap of a heavy CPU build
+with a weight load. No OOM preceded it (unlike both boot-I events from
+the onboarding session), so per the onboarding-session rule this counts
+as an independent launch-failure, not OOM collateral.
+
+**Unknowns.** `dmesg`/`journalctl -k` unreadable (no root) — cannot tell
+whether a BACO/kernel reset ran; rocm-smi showed both cards clean
+immediately after (VRAM 0%/0%, 38/31 °C, normal SCLK/MCLK), and a torch
+matmul probe was not needed because the retry loaded and served clean.
+
+**Outcome.** Isolated (1st since the ~00:0x session) → one retry per
+house recipe at 08:41Z: weights loaded clean, full 4-sample bench
+completed (20.55 t/s). No further launch-failures; the two subsequent
+pp4096 long-context bench launches also loaded clean.
+
+**Open question for the table:** does sustained high CPU load (16-way
+clang) during a 20 GB weight load raise the launch-failure rate? One
+data point; if weight-load failures recur under concurrent builds,
+serialize builds and loads.

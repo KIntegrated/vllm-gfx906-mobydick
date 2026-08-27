@@ -1560,3 +1560,80 @@ def test_forward_paged_direct_sliding_window_vs_torch_ref(d, hq, hkv, L, W):
         ref = _windowed_ref(qtok[t], Kf, Vf, scale, t, W)
         assert ((outf[t] - ref).norm() / ref.norm()).item() < 5e-2, \
             f"row {t}"
+
+
+# ---------------------------------------------------------------------------
+# Phase C: per-row kv_start clip (forward_paged_direct, decode). The k-loop
+# walks [kv_start, L) instead of [0, L); bit-identical to the full scan
+# when kv_start >= q_abs + 1 - window (prefix is window-masked anyway).
+# The functional check below uses an INERT mask (window=L) plus a real
+# kv_start to prove the scan itself shrinks, not just the mask.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("d, hq, hkv, L, W", [
+    (128, 32, 2, 512, 128),
+    (128, 32, 2, 512, 64),    # unaligned clip start (448 vs nbatch_fa=128)
+    (128, 32, 2, 96, 128),    # W > L: clip inert (kv_start = 0)
+    (256, 16, 2, 512, 128),
+])
+def test_forward_paged_direct_sliding_window_clip_vs_torch_ref(d, hq, hkv, L, W):
+    dev = "cuda"
+    torch.manual_seed(4)
+    n_blocks = L // BLOCK
+    kc = torch.zeros(n_blocks, BLOCK, hkv, (d // 32) * 34,
+                     dtype=torch.uint8, device=dev)
+    kv = torch.zeros(n_blocks, 2, BLOCK, hkv, d,
+                     dtype=torch.float16, device=dev)
+    K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    slot = torch.arange(L, dtype=torch.int64, device=dev)
+    fa.reshape_and_cache_q8(K, slot, kc)
+    staging = torch.zeros_like(kv[:, 1])
+    staging.view(-1, hkv, d)[:L].copy_(V)
+    kv[:, 1].copy_(staging)
+    vc = kv.unbind(1)[1]
+
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, n_blocks)
+    sl = torch.tensor([L], dtype=torch.int32, device=dev)
+    scale = 1.0 / math.sqrt(d)
+    Kf, Vf = K.float(), V.float()
+
+    q = torch.randn(1, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    q_abs = torch.tensor([L - 1], dtype=torch.int32, device=dev)
+    kv_start = torch.tensor([max(0, L - W)], dtype=torch.int32, device=dev)
+
+    out_full = fa.forward_paged_direct(
+        q, kc, vc, bt, sl, scale, None, q_abs, W)[0, 0]
+    out_clip = fa.forward_paged_direct(
+        q, kc, vc, bt, sl, scale, None, q_abs, W, kv_start)[0, 0]
+    ref = _windowed_ref(q[0, :, 0], Kf, Vf, scale, L - 1, W)
+    assert ((out_clip - ref).norm() / ref.norm()).item() < 5e-2
+    # clip must be (near-)bit-identical to the masked full scan: the
+    # skipped keys were exactly -INF in the softmax
+    assert ((out_clip - out_full).norm() / out_full.norm()).item() < 1e-6
+
+    # Functional: INERT window (W=L, mask does nothing) + real clip start
+    # -> the scan itself must shrink to the last W2 keys.
+    W2 = min(96, L - 1)
+    kv_start2 = torch.tensor([L - W2], dtype=torch.int32, device=dev)
+    out2 = fa.forward_paged_direct(
+        q, kc, vc, bt, sl, scale, None, q_abs, L, kv_start2)[0, 0]
+    ref2 = _windowed_ref(q[0, :, 0], Kf, Vf, scale, L - 1, W2)
+    assert ((out2 - ref2).norm() / ref2.norm()).item() < 5e-2
+    if L > W2:
+        assert (out2 - out_full).norm().item() > 1e-3  # clip actually bit
+
+    # B=2, different lengths: per-row clip
+    L2 = L * 3 // 4
+    bt2 = bt.repeat(2, 1)
+    sl2 = torch.tensor([L, L2], dtype=torch.int32, device=dev)
+    q_abs2 = torch.tensor([L - 1, L2 - 1], dtype=torch.int32, device=dev)
+    kv_start2_2 = torch.tensor([max(0, L - W), max(0, L2 - W)],
+                               dtype=torch.int32, device=dev)
+    q2 = torch.randn(2, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    outb = fa.forward_paged_direct(
+        q2, kc, vc, bt2, sl2, scale, None, q_abs2, W, kv_start2_2)
+    ref0 = _windowed_ref(q2[0, :, 0], Kf, Vf, scale, L - 1, W)
+    ref1 = _windowed_ref(q2[1, :, 0], Kf, Vf, scale, L2 - 1, W)
+    assert ((outb[0, 0] - ref0).norm() / ref0.norm()).item() < 5e-2
+    assert ((outb[1, 0] - ref1).norm() / ref1.norm()).item() < 5e-2

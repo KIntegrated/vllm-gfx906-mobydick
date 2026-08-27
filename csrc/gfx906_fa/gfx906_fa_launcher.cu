@@ -419,6 +419,7 @@ static hipError_t gfx906_fa_launch_paged_impl(
     int32_t            mask_seq_kv_padded,
     const int32_t *    Q_ABS_OFFSET_d,
     int                window,
+    const int32_t *    KV_START_d,
     int                batch,
     int                heads_q,
     int                heads_kv,
@@ -433,7 +434,8 @@ static hipError_t gfx906_fa_launch_paged_impl(
     int64_t            v_token_stride,
     int64_t            v_head_stride,
     float              scale,
-    hipStream_t        stream
+    hipStream_t        stream,
+    int                kv_split
 );
 
 // ============================================================================
@@ -457,6 +459,7 @@ extern "C" hipError_t gfx906_fa_launch_paged(
     int32_t            mask_seq_kv_padded,
     const int32_t *    Q_ABS_OFFSET_d,
     int                window,
+    const int32_t *    KV_START_d,
     int                batch,
     int                heads_q,
     int                heads_kv,
@@ -472,11 +475,12 @@ extern "C" hipError_t gfx906_fa_launch_paged(
     int64_t            v_token_stride,
     int64_t            v_head_stride,
     float              scale,
-    hipStream_t        stream
+    hipStream_t        stream,
+    int                kv_split
 ) {
-    if      (head_dim == 128) return gfx906_fa_launch_paged_impl<128>(Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream);
-    else if (head_dim == 256) return gfx906_fa_launch_paged_impl<256>(Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream);
-    else if (head_dim == 64)  return gfx906_fa_launch_paged_impl<64> (Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream);
+    if      (head_dim == 128) return gfx906_fa_launch_paged_impl<128>(Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream, kv_split);
+    else if (head_dim == 256) return gfx906_fa_launch_paged_impl<256>(Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream, kv_split);
+    else if (head_dim == 64)  return gfx906_fa_launch_paged_impl<64> (Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream, kv_split);
     fprintf(stderr, "[gfx906_fa_paged] Unsupported head_dim=%d (supported: 64, 128, 256)\n", head_dim);
     return hipErrorInvalidValue;
 }
@@ -494,6 +498,7 @@ static hipError_t gfx906_fa_launch_paged_impl(
     int32_t            mask_seq_kv_padded,
     const int32_t *    Q_ABS_OFFSET_d,
     int                window,
+    const int32_t *    KV_START_d,
     int                batch,
     int                heads_q,
     int                heads_kv,
@@ -508,12 +513,23 @@ static hipError_t gfx906_fa_launch_paged_impl(
     int64_t            v_token_stride,
     int64_t            v_head_stride,
     float              scale,
-    hipStream_t        stream
+    hipStream_t        stream,
+    int                kv_split
 ) {
     if (heads_q % heads_kv != 0) {
         fprintf(stderr, "[gfx906_fa_paged] heads_q=%d not divisible by heads_kv=%d\n",
                 heads_q, heads_kv);
         return hipErrorInvalidValue;
+    }
+    // KV-split (GFX906_FA_KVSPLIT, gridDim.y): same strided-split +
+    // split_combine machinery as the gather path. The paged kernel's k-loop
+    // already strides by gridDim.y*nbatch_fa and stores unscaled partials
+    // [rows, y, D] + meta (m, l) when gridDim.y>1 — only the host plumbing
+    // was missing (grid was pinned to y=1), which left every block with the
+    // FULL kv k-loop as its critical path (B=4 Muse decode: 5.4x step time
+    // for 4x the work, DEVLOG-muse-glimmer.md 2026-08-27).
+    if (kv_split < 1) {
+        kv_split = 1;
     }
     if (block_size != 16) {
         fprintf(stderr, "[gfx906_fa_paged] Only block_size=16 supported, got %d\n", block_size);
@@ -556,7 +572,7 @@ static hipError_t gfx906_fa_launch_paged_impl(
 
         dim3 grid(
             /*x=*/ grid_x,
-            /*y=*/ 1,
+            /*y=*/ kv_split,
             /*z=*/ batch * ntiles_z
         );
         dim3 block(32, nthreads / 32, 1);
@@ -570,6 +586,7 @@ static hipError_t gfx906_fa_launch_paged_impl(
             /*KV_max=*/ kv_max_d,
             Q_ABS_OFFSET_d,
             window,
+            KV_START_d,
             block_table,
             O_fp32,
             O_meta,
