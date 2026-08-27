@@ -48,8 +48,16 @@ def main():
         os.environ.get("BENCH_BATCHED_TOKENS", "4096")
     )
     attn_backend = os.environ.get("BENCH_ATTN_BACKEND")
-    if attn_backend:
-        extra["attention_config"] = {"backend": attn_backend}
+    attn_backend_kind = os.environ.get("BENCH_ATTN_BACKEND_KIND")  # JSON
+    if attn_backend or attn_backend_kind:
+        cfg = {}
+        if attn_backend:
+            cfg["backend"] = attn_backend
+        if attn_backend_kind:
+            # e.g. '{"sliding_window": "ROCM_ATTN"}' — pins one KV-cache
+            # kind while the rest keep auto-selection.
+            cfg["backend_per_kind"] = json.loads(attn_backend_kind)
+        extra["attention_config"] = cfg
     # BENCH_MOE_BACKEND (e.g. triton) overrides the MoE backend selection
     # for A/B runs (default auto picks the gfx906 W4A16 kernel where gated).
     moe_backend = os.environ.get("BENCH_MOE_BACKEND")
@@ -60,6 +68,14 @@ def main():
     spec_config = os.environ.get("BENCH_SPEC_CONFIG")
     if spec_config:
         extra["speculative_config"] = json.loads(spec_config)
+    # BENCH_KV_MEM (bytes) caps the KV pool explicitly. Needed when the
+    # warm-cache profiling peak underestimates runtime inductor/prefill
+    # buffers and gpu_memory_utilization alone OOMs the first request
+    # (e.g. 30B-class models whose 532 MiB prefill buffer exceeds the
+    # util-0.93 headroom); also makes A/B arms use an identical pool.
+    kv_mem = os.environ.get("BENCH_KV_MEM")
+    if kv_mem:
+        extra["kv_cache_memory_bytes"] = int(kv_mem)
     # BENCH_NREQS (default 1) runs that many identical prompts concurrently
     # (prefix caching is off, so prefills are real); totals are aggregated.
     nreqs = int(os.environ.get("BENCH_NREQS", "1"))
