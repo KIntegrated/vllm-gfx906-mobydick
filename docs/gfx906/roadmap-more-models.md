@@ -99,14 +99,15 @@ shape-specific measurement. Follow the procedure above and the open items in
 ## Muse-Glimmer-30B (`MuseGlimmerForCausalLM`) — post-onboarding follow-ups
 
 **Status: onboarded + window-FA shipped (2026-08-27, `feat/muse-glimmer`,
-not yet in main); LEGACY=0 (direct-paged) validated, LEGACY=1 remains the
-serving default.** Onboarding and all gate numbers: `DEVLOG-muse-glimmer.md`.
-Knobs: `README.md` table. The independent review
-`muse_glimmer_opt2_code_rev_qwen.md` (repo root, untracked) is kept until
-M3/M4 below close its open findings; its siblings
-(`muse_glimmer_opt2_code_rev_claude.md`,
-`docs/gfx906/muse_glimmer_opt2_code_rev_ds4.md`) are kept too — their
-residuals are M1/M2.
+not yet in main); LEGACY=0 (Q8 side-view read) validated, LEGACY=1
+remains the serving default; the read pattern (gather vs direct-paged)
+is an *orthogonal* auto-gate — direct-paged + Phase C clip fire on the
+B≥2 decode dispatch in both LEGACY modes (README erratum 2026-08-27).**
+Onboarding and all gate numbers: `DEVLOG-muse-glimmer.md`. Knobs:
+`README.md` table. The three independent review files
+(`muse_glimmer_opt2_code_rev_{qwen,claude,ds4}.md`) were deleted
+2026-08-27 after their findings were folded into M1–M4 below; M3's
+items carry the surviving qwen text inline.
 
 ### M1 — window clip on the gather path (B=1 decode)
 
@@ -129,8 +130,8 @@ prefill/TTFT A/B.
 
 ### M3 — kernel hygiene batch (one rebuild)
 
-From `muse_glimmer_opt2_code_rev_qwen.md`, bundle into one build/test
-cycle:
+From the (now-deleted) qwen review — items carry their text inline —
+bundle into one build/test cycle:
 - **#8**: device-side `k0_base = max(0, kv_start[sequence])` clamp in
   `fattn-q8-paged.cuh` — a negative start would walk the k-loop into
   pages before token 0 (illegal access / wedge, not a wrong number).
@@ -156,9 +157,15 @@ long context.
 
 ### M5 — default read-path decision after a bake
 
-LEGACY=0 (Q8-aliased direct-paged read) is validated (46/46 suite,
+LEGACY=0 (Q8 pre-quantized read) is validated (46/46 suite,
 default-config + prefix-cache smokes, clip +3.6% / KVSPLIT +1.8%
-gates) but stays experimental: B=1 still runs gather, and the
-default LEGACY=1 records predate it. Flip the default only after a
-serving bake on the target workload. Gate: B=1 + B=4 A/B with the
-degradation canary green.
+gates) but stays experimental: B=1 still runs gather (no clip, inline
+quantize — LEGACY=0 changes nothing at B=1 until M1 lands), the
+LEGACY=1 TP=2 serving records (boot K, 2026-08-27: 114.6/79.1/57.0
+@2k/8k/16k) postdate it, and two e2e gaps are open: (a) the LEGACY=1 +
+direct-paged + clip combination (what auto-gating selects at B≥2 under
+default LEGACY) has never been separately e2e-gated — the clip A/B ran
+LEGACY=0; (b) the boot K B=4 grid point ran at ctx ≤2k where the clip
+is a no-op — a B=4 long-context (8k+) clip on/off e2e is missing. Flip
+the default only after a serving bake on the target workload. Gate: B=1
++ B=4 A/B (8k ctx) with the degradation canary green, plus (a)+(b).
