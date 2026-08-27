@@ -1390,3 +1390,88 @@ def test_forward_kv_split_gqa_pack_vs_fp32_ref(nc2, ys, sk, kv_max, hq, hkv):
          str(sk), str(kv_max), str(hq), str(hkv)],
         env=env, capture_output=True, text=True, timeout=300)
     assert r.returncode == 0, f"stdout: {r.stdout}\nstderr: {r.stderr[-2000:]}"
+
+
+# ---------------------------------------------------------------------------
+# Sliding-window masking (window arg, Muse Glimmer iRoPE track).
+# Unmasked keys per query row r: [max(0, r - W + 1), r] (window + causal).
+# q_abs_offset is required for the window to apply (the backend always
+# passes it for windowed batches, decode included).
+# ---------------------------------------------------------------------------
+
+def _windowed_ref(q_row, K, V, scale, r, W):
+    """Torch reference for one query row at absolute position r.
+
+    q_row: [Hq, D]; K/V: [HKV, L, D] fp32. Window W in tokens (W=None ->
+    plain causal).
+    """
+    lo = max(0, r - W + 1) if W else 0
+    hi = r + 1
+    hkv = K.shape[1]
+    g = q_row.shape[0] // hkv
+    qg = q_row.view(hkv, g, -1)
+    s = torch.einsum("gjd,lgd->gjl", qg, K[lo:hi]) * scale
+    o = torch.einsum("gjl,lgd->gjd", torch.softmax(s, -1), V[lo:hi])
+    return o.reshape(q_row.shape[0], -1)
+
+
+@pytest.mark.parametrize("d, hq, hkv, L, W", [
+    (128, 32, 2, 512, 128),   # Muse Glimmer shape (Hq 32 / Hkv 2, D 128)
+    (128, 32, 2, 512, 64),    # smaller window
+    (128, 32, 2, 96, 128),    # W > L: window must be inert
+    (256, 16, 2, 512, 128),   # D=256 path
+])
+def test_forward_sliding_window_vs_torch_ref(d, hq, hkv, L, W):
+    dev = "cuda"
+    torch.manual_seed(3)
+    n_blocks = L // BLOCK
+    kc = torch.zeros(n_blocks, BLOCK, hkv, (d // 32) * 34,
+                     dtype=torch.uint8, device=dev)
+    kv = torch.zeros(n_blocks, 2, BLOCK, hkv, d,
+                     dtype=torch.float16, device=dev)
+    K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    slot = torch.arange(L, dtype=torch.int64, device=dev)
+    fa.reshape_and_cache_q8(K, slot, kc)
+    staging = torch.zeros_like(kv[:, 1])
+    staging.view(-1, hkv, d)[:L].copy_(V)
+    kv[:, 1].copy_(staging)
+    vc = kv.unbind(1)[1]
+
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, n_blocks)
+    sl = torch.tensor([L], dtype=torch.int32, device=dev)
+    scale = 1.0 / math.sqrt(d)
+    sk_pad = (L + 31) // 32 * 32
+    k_q8, v_b = fa.gather_paged_kv_q8(kc, vc, bt, sl, sk_pad)
+    Kf, Vf = K.float(), V.float()
+
+    # decode (Sq=1): q_abs_offset = L-1; window clips to [L-W, L-1]
+    q = torch.randn(1, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    q_abs = torch.tensor([L - 1], dtype=torch.int32, device=dev)
+    out = fa.forward(q, k_q8, v_b, scale, kv_max=sl,
+                     q_abs_offset=q_abs, window=W)[0, 0]
+    ref = _windowed_ref(q[0, :, 0], Kf, Vf, scale, L - 1, W)
+    assert ((out - ref).norm() / ref.norm()).item() < 5e-2
+    if L > W:
+        # window must actually bite: differs from no-window attention
+        out_nw = fa.forward(q, k_q8, v_b, scale, kv_max=sl,
+                            q_abs_offset=q_abs)[0, 0]
+        assert (out - out_nw).norm().item() > 1e-3
+    else:
+        # W >= L: windowed output matches no-window (inert)
+        out_nw = fa.forward(q, k_q8, v_b, scale, kv_max=sl,
+                            q_abs_offset=q_abs)[0, 0]
+        assert ((out - out_nw).norm() / out.norm()).item() < 5e-2
+
+    # prefill (Sq=L): per-row causal + window
+    qf = torch.randn(1, hq, L, d, device=dev, dtype=torch.float32) * 0.5
+    q_abs0 = torch.tensor([0], dtype=torch.int32, device=dev)
+    outf = fa.forward(qf, k_q8, v_b, scale, kv_max=sl,
+                      q_abs_offset=q_abs0, window=W)[0]
+    assert outf.shape == (L, hq, d)
+    qtok = qf[0].permute(1, 0, 2).float()  # [L, hq, d]
+    rows = sorted({t for t in (0, W - 1, W, L - W, L - 1) if 0 <= t < L})
+    for t in rows:
+        ref = _windowed_ref(qtok[t], Kf, Vf, scale, t, W)
+        assert ((outf[t] - ref).norm() / ref.norm()).item() < 5e-2, \
+            f"row {t}"

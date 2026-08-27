@@ -578,6 +578,12 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter(
         // absolute k-position > q_abs_for_row is forced to -INF before softmax,
         // eliminating the need to materialise a [B, Sq_pad, Sk_pad] fp16 mask.
         const int32_t * const __restrict__ q_abs_offset,
+        // Sliding-window extension: when > 0, also force -INF on scores whose
+        // absolute k-position < q_abs_for_row - window + 1 (keys older than the
+        // per-row window). Inert when q_abs_offset is null; the backend passes
+        // q_abs_offset for every windowed batch (decode included), so the
+        // per-row formula covers decode rows (seq_len - 1) too.
+        const int window,
         const int sequence,
         const int col_Q_0_iter) {
     constexpr int cpy_ne = ggml_cuda_get_max_cpy_bytes() / 4;
@@ -660,10 +666,12 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter(
 
                 // Level 3a: inline causal — overrides KQ_acc with -INF for
                 // positions past the per-row absolute cutoff. Works lane-by-lane
-                // (k_pos_abs is per-thread, q_abs_row is per-jc0).
+                // (k_pos_abs is per-thread, q_abs_row is per-jc0). window>0
+                // adds the sliding cutoff (keys older than the window).
                 if (q_abs_offset) {
                     const int q_abs_row = q_abs_base + j;
-                    if (k_pos_abs > q_abs_row) {
+                    if (k_pos_abs > q_abs_row ||
+                        (window > 0 && k_pos_abs < q_abs_row - window + 1)) {
                         KQ_acc[jc0] = -INFINITY;
                     }
                 }
@@ -693,7 +701,8 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter(
                     if (q_abs_offset) {
                         const int q_abs_row = q_abs_base + j;
                         const int k_pos_abs = k_VKQ_0 + i_KQ;
-                        if (k_pos_abs > q_abs_row) {
+                        if (k_pos_abs > q_abs_row ||
+                            (window > 0 && k_pos_abs < q_abs_row - window + 1)) {
                             KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = -INFINITY;
                         }
                     }
@@ -863,6 +872,9 @@ static __global__ void flash_attn_tile_q8(
         //   q_abs_offset[sequence] + col_Q_0 + j  (j = local row inside tile).
         // Must be nullptr if the caller passes a real mask tensor.
         const int32_t * __restrict__ q_abs_offset,
+        // Sliding-window size in tokens (0 = plain causal / no window).
+        // See the tile-iter doc; inert when q_abs_offset is null.
+        const int window,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -881,7 +893,7 @@ static __global__ void flash_attn_tile_q8(
 #ifdef FLASH_ATTN_AVAILABLE
 
     if (use_logit_softcap && !(DV == 128 || DV == 256)) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, q_abs_offset, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, q_abs_offset, window, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -966,7 +978,7 @@ static __global__ void flash_attn_tile_q8(
             flash_attn_tile_q8_q8_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_values, Q_scales, K_q8, V_h2, maskh, logit_softcap, slope, KQ, K_values, K_scales, KV_tmp,
                 stride_K_q8, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max,
-                q_abs_offset, sequence, col_Q_0);
+                q_abs_offset, window, sequence, col_Q_0);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
@@ -974,7 +986,7 @@ static __global__ void flash_attn_tile_q8(
             flash_attn_tile_q8_q8_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_values, Q_scales, K_q8, V_h2, maskh, logit_softcap, slope, KQ, K_values, K_scales, KV_tmp,
                 stride_K_q8, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max,
-                q_abs_offset, sequence, col_Q_0);
+                q_abs_offset, window, sequence, col_Q_0);
         }
     } else {
         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
@@ -984,13 +996,13 @@ static __global__ void flash_attn_tile_q8(
                 flash_attn_tile_q8_q8_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                     (Q_values, Q_scales, K_q8, V_h2, maskh, logit_softcap, slope, KQ, K_values, K_scales, KV_tmp,
                     stride_K_q8, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max,
-                    q_abs_offset, sequence, col_Q_0);
+                    q_abs_offset, window, sequence, col_Q_0);
             } else {
                 constexpr bool oob_check = false;
                 flash_attn_tile_q8_q8_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                     (Q_values, Q_scales, K_q8, V_h2, maskh, logit_softcap, slope, KQ, K_values, K_scales, KV_tmp,
                     stride_K_q8, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max,
-                    q_abs_offset, sequence, col_Q_0);
+                    q_abs_offset, window, sequence, col_Q_0);
             }
         }
     }

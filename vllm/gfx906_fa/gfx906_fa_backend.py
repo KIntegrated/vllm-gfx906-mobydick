@@ -246,6 +246,14 @@ class Gfx906FABackend(AttentionBackend):
         return head_size in (64, 128, 256)
 
     @classmethod
+    def supports_sliding_window(cls) -> bool:
+        # Per-row window cutoff in the tile kernel (window arg, Muse
+        # Glimmer iRoPE 2048). Gated on q_abs_offset, which
+        # forward_paged supplies for every windowed batch (decode
+        # included).
+        return True
+
+    @classmethod
     def supports_mm_prefix(cls) -> bool:
         return False
 
@@ -346,9 +354,6 @@ class Gfx906FAImpl(AttentionImpl):
     ) -> None:
         if alibi_slopes is not None:
             raise NotImplementedError("GFX906_FA: alibi_slopes unsupported")
-        if sliding_window is not None:
-            raise NotImplementedError(
-                "GFX906_FA: sliding_window unsupported")
         if logits_soft_cap not in (None, 0, 0.0):
             raise NotImplementedError(
                 "GFX906_FA: logits_soft_cap unsupported")
@@ -361,6 +366,11 @@ class Gfx906FAImpl(AttentionImpl):
 
         self.num_heads = num_heads
         self.head_size = head_size
+        # Sliding-window size in tokens (0 for full-attention layers).
+        # The FA kernel masks keys older than the per-row window when
+        # window > 0; forward_paged passes q_abs_offset for every
+        # windowed batch (decode included) so the per-row formula holds.
+        self.sliding_window = sliding_window or 0
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
@@ -789,6 +799,7 @@ class Gfx906FAImpl(AttentionImpl):
             q_pad_decode_buf=self._q_pad_decode_buf,
             k_gather_buf=k_gather_buf,
             v_gather_buf=v_gather_buf,
+            window=self.sliding_window,
         )  # [num_tokens, Hq*D] fp32
 
         # Write the result into output in-place (it is either

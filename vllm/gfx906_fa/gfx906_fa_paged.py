@@ -318,6 +318,7 @@ def forward_paged(
     q_pad_decode_buf: torch.Tensor | None = None,  # [B,Hq,2,D] fp32, Sq=1 only
     k_gather_buf: torch.Tensor | None = None,  # [B,Hkv,Sk_pad,bytes_per_row] uint8
     v_gather_buf: torch.Tensor | None = None,  # [B,Hkv,Sk_pad,D]             fp16
+    window: int = 0,  # sliding-window size in tokens (0 = off)
 ) -> torch.Tensor:
     """vLLM-совместимый paged-attention forward.
 
@@ -411,8 +412,10 @@ def forward_paged(
                     q_seq = query[cu[s]:cu[s] + n]
                     q_padded[s, :, :n, :] = q_seq.permute(1, 0, 2)
 
-        # Inline causal (same as gather path).
-        need_causal = max_seqlen_q > 1
+        # Inline causal (same as gather path). window > 0 needs the offset on
+        # decode batches too (the causal check is a no-op there; the
+        # per-row window cutoff is not).
+        need_causal = max_seqlen_q > 1 or window > 0
         q_abs_offset_tensor = None
         if need_causal:
             sl_i64 = sl_i32.to(torch.int64)
@@ -437,6 +440,7 @@ def forward_paged(
                 float(scale),
                 None,                     # mask
                 q_abs_offset_tensor,      # inline causal
+                window=window,
             )
             if _DBG:
                 torch.cuda.synchronize()
@@ -692,9 +696,12 @@ def forward_paged(
     #
     # q_abs_offset[s] = seq_lens[s] - n_q[s] — абс. позиция query-chunk в
     # sequence. Kernel считает: k_pos > (q_abs_offset[s] + col_Q_0 + j) → -INF.
+    # window > 0: kernel also masks k < (q_abs_offset[s] + col_Q_0 + j)
+    # - window + 1; decode rows (n_q=1) need the offset too, hence the
+    # `or window > 0` below.
     kv_max_tensor = seq_lens.to(torch.int32).contiguous()
 
-    need_causal = max_seqlen_q > 1
+    need_causal = max_seqlen_q > 1 or window > 0
     q_abs_offset_tensor = None
     if need_causal:
         sl_i64 = seq_lens.to(torch.int64) if seq_lens.dtype != torch.int64 else seq_lens
@@ -724,6 +731,7 @@ def forward_paged(
             kv_max=kv_max_tensor,
             mask=None,
             q_abs_offset=q_abs_offset_tensor,
+            window=window,
         )
         global _dump_n
         if _DUMP_DIR and _dump_n < 40:

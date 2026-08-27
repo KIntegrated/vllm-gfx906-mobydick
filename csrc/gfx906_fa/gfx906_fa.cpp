@@ -51,6 +51,7 @@ extern "C" hipError_t gfx906_fa_launch(
     // Level 3a: если non-null, kernel использует inline causal вместо mask
     // (mask_ptr тогда ДОЛЖЕН быть nullptr). q_abs_offset[b] = seq_len_total[b] - n_q[b].
     const int32_t * Q_ABS_OFFSET_d,
+    int window,
     int batch, int heads_q, int heads_kv,
     int seq_q, int seq_kv, int head_dim,
     float scale,
@@ -151,6 +152,7 @@ extern "C" hipError_t gfx906_fa_launch_paged(
     const __half *  MASK_f16,
     int32_t         mask_seq_kv_padded,
     const int32_t * Q_ABS_OFFSET_d,
+    int             window,
     int             batch,
     int             heads_q,
     int             heads_kv,
@@ -260,7 +262,12 @@ torch::Tensor gfx906_fa_forward(
     //   При non-nullopt kernel сам выкидывает k > (q_abs_offset[b] + col_Q_0 + j).
     // Избавляет от материальной [B, Sq_pad, Sk_pad] fp16 маски, критично для
     // prefill chunks >16K (mask был бы 100+ MB на GPU и приводил к OOM).
-    c10::optional<torch::Tensor> q_abs_offset = c10::nullopt
+    c10::optional<torch::Tensor> q_abs_offset = c10::nullopt,
+    // Sliding-window size in tokens (0 = off). Only takes effect when
+    // q_abs_offset is provided (the backend always does for windowed
+    // layers); the kernel then also masks k-positions older than the
+    // per-row window.
+    int64_t window = 0
 ) {
     TORCH_CHECK_CUDA(q);
     TORCH_CHECK_CUDA(k_q8);
@@ -398,6 +405,7 @@ torch::Tensor gfx906_fa_forward(
         mask_ptr,
         mask_seq_kv_padded,
         q_abs_offset_ptr,
+        window,
         batch, heads_q, heads_kv, seq_q, seq_kv, head_dim,
         (float) scale,
         stream,
@@ -1007,7 +1015,8 @@ torch::Tensor gfx906_fa_forward_paged_direct(
     torch::Tensor seq_lens,        // int32 [num_seqs]
     double scale,
     c10::optional<torch::Tensor> mask         = c10::nullopt,
-    c10::optional<torch::Tensor> q_abs_offset = c10::nullopt
+    c10::optional<torch::Tensor> q_abs_offset = c10::nullopt,
+    int64_t window = 0
 ) {
     TORCH_CHECK_CUDA(q);
     TORCH_CHECK_CUDA(key_cache_q8);
@@ -1132,6 +1141,7 @@ torch::Tensor gfx906_fa_forward_paged_direct(
         mask_ptr,
         mask_seq_kv_padded,
         q_abs_offset_ptr,
+        window,
         batch, heads_q, heads_kv, seq_q, max_seq_kv, head_dim,
         block_size, max_blocks_per_seq,
         k_block_stride, k_token_stride, k_head_stride,
@@ -1152,7 +1162,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q"), py::arg("k_q8"), py::arg("v_fp16"), py::arg("scale"),
           py::arg("kv_max")        = c10::nullopt,
           py::arg("mask")          = c10::nullopt,
-          py::arg("q_abs_offset")  = c10::nullopt);
+          py::arg("q_abs_offset")  = c10::nullopt,
+          py::arg("window")        = 0);
     m.def("quantize_q8_0", &quantize_q8_0,
           "Quantize fp16 tensor (last dim D) → block_q8_0 uint8 (device-side)",
           py::arg("k_fp16"));
@@ -1204,5 +1215,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q"), py::arg("key_cache_q8"), py::arg("value_cache"),
           py::arg("block_table"), py::arg("seq_lens"), py::arg("scale"),
           py::arg("mask")         = c10::nullopt,
-          py::arg("q_abs_offset") = c10::nullopt);
+          py::arg("q_abs_offset") = c10::nullopt,
+          py::arg("window")       = 0);
 }
