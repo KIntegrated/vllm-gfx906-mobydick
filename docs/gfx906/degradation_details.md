@@ -976,3 +976,36 @@ pp4096 long-context bench launches also loaded clean.
 clang) during a 20 GB weight load raise the launch-failure rate? One
 data point; if weight-load failures recur under concurrent builds,
 serialize builds and loads.
+
+## 2026-08-27 14:19–14:32Z (boot I): OOM teardown → 2 consecutive weight-load/init `hipErrorLaunchFailure` — burst, session stopped
+
+**Context.** Review-round-2 session: the LEGACY=0 Q8-side-buffer smoke
+(first one with an *uncapped* KV pool on this model) OOM'd at
+14:19:25Z — `aten::empty` in `gptq_gemm` inside the AOT/inductor
+runtime (the 104k-token pool + ~1.5 GiB Q8 side buffer + inductor
+headroom exceeds 32 GiB; allocator-level, not HW). The same smoke with
+a 0.375 GiB KV cap then ran to completion (garbage output = the
+expected side-buffer desync finding).
+
+**The wedge.** ~11 min after the OOM teardown, the standard
+LEGACY=1 smoke SIGABRT'd at weight-load shard 2/5
+(`c10::AcceleratorError: CUDA error: unspecified launch failure`,
+`hipErrorLaunchFailure`, raised in SetDevice) — `/local/tmp/muse/
+smoke_final.log`. rocm-smi remained fully responsive throughout
+(both cards VRAM 0%, 33/31 °C, SCLK 938 MHz) — the silent-wedge
+variant: the device answers management queries but rejects launches.
+The one permitted retry (14:32Z) also SIGABRT'd, at engine init before
+any weight load — `/local/tmp/muse/smoke_final2.log`.
+
+**Classification.** The OOM-teardown collateral pattern (precedents:
+2026-08-26 22:41, ~23:38, ~23:59; 2026-08-23 08:51) — both failures
+follow the 14:19:25 teardown with no other GPU work between. But two
+consecutive failures = **burst per house recipe**: GPU work stopped;
+reboot (root) required before further inference.
+
+**What completed before the wedge.** All of review round 2's
+verification: the pre-fix repro of the P1 clip bug (old .so), the
+post-fix verification (new .so), 45/45 suite, the LEGACY=0 garbage
+smoke (desync blocker), the window-check rejection probes, and the
+pp8192 clip A/B (later identified as a null test — both arms ran the
+gather path). Nothing GPU-dependent is pending.

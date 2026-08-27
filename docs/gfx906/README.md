@@ -231,9 +231,11 @@ targets matrix cores; gfx906 has none).
 | `GFX906_FA_LEGACY` | 1 | fp16 KV cache + in-kernel Q8 quantize; `0` = Q8 side buffer (desyncs on warmup/COW — do not use) |
 | `GFX906_FA_FUSED_QUANT` | 1 | fuse quantize into the decode KV gather (bit-equal); `0` kill switch |
 | `GFX906_FA_NC2` | 8 (auto-downgrade) | GQA heads packed per KV block; instantiated {1,2,8}; invalid explicit value = error |
-| `GFX906_FA_KVSPLIT` | 16 | decode KV-split factor (B=1 parallelism); `1` disables |
+| `GFX906_FA_KVSPLIT` | gather 16; direct-paged `clamp(16/B,2,8)` | decode KV-split factor; the batch-aware direct-paged default is tuned to the Muse shape (Hq=32/D=128); `1` disables; `0` is NOT the unset default (it clamps to 1) |
 | `GFX906_FA_CG` | UNIFORM_SINGLE_TOKEN_DECODE | FA cudagraph-support mode |
 | `GFX906_FA_DIRECT_PAGED` / `_MIN_BATCH` / `_MAX_SQ` | auto / 2 / 16 | direct-paged decode path gating |
+| `GFX906_FA_WINDOW_CLIP` | 1 | Phase C: windowed decode (direct-paged, B≥2) starts the KV scan at `max(0, L-W)`; bit-identical (kernel floors to the KV tile boundary); `0` kill switch. Only reachable via the direct-paged path, i.e. `GFX906_FA_LEGACY=0` — currently broken (Q8 side-buffer desync, see LEGACY row), so inert in default serving |
+| `GFX906_FA_NO_WINDOW` | 0 | truthy = disable sliding-window masking on all layers (wrong output beyond the window; warns; perf A/B arm only) |
 | `VLLM_GFX906_DENSE_GEMV` | 1 | M=1 dense GEMV dispatch; `0` kill switch |
 | `GFX906_GDN_EMPTY_CORE_OUT` | 1 | skip the dead GDN core_attn_out zero-fill |
 | `GFX906_FA_GATHER_V` | auto | gather-kernel V handling variant |

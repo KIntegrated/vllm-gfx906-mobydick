@@ -431,15 +431,20 @@ def forward_paged(
         # Phase C: sliding-window KV clip. A decode row only attends to
         # [max(0, L-W), L), so the kernel k-loop starts there instead of
         # scanning (and masking) the prefix. Bit-identical output (the
-        # prefix keys are window-masked to -INF anyway); the HBM reads
-        # drop to ~W/L of the full scan. Decode rows only — prefill rows
-        # have per-row windows [max(0, t-W+1), t] and the shared scan
-        # must start at 0 (that clip is still open work).
+        # prefix keys are window-masked to -INF anyway, and the kernel
+        # floors the clip start to the KV tile boundary so the fp16
+        # reduction order matches the full scan); the HBM reads drop to
+        # ~W/L of the full scan. Decode rows only — prefill rows have
+        # per-row windows [max(0, t-W+1), t] and the shared scan must
+        # start at 0 (that clip is still open work). Direct-paged (B>=2
+        # decode dispatch) only; B=1 decode routes to the gather path,
+        # which doesn't clip yet.
         kv_start_tensor = None
         if _WINDOW_CLIP and window > 0 and max_seqlen_q == 1:
-            # kv_start = max(0, q_abs + 1 - window), reuse the offset.
-            kv_start_tensor = (q_abs_offset_tensor.to(torch.int64)
-                               - window + 1).clamp_(min=0).to(torch.int32)
+            # kv_start = max(0, q_abs + 1 - window); int32 throughout
+            # (q_abs is bounded by the context length).
+            kv_start_tensor = (q_abs_offset_tensor + (1 - window)).clamp_(
+                min=0)
             kv_start_tensor = kv_start_tensor.contiguous()
 
         if _DBG:

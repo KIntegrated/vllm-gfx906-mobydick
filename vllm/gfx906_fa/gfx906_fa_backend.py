@@ -260,6 +260,14 @@ class Gfx906FABackend(AttentionBackend):
         # shape-independent (absolute-position cutoff on k), but an
         # untested head_dim/window/batch combo landing on this backend
         # runs unverified — extend the tests before claiming new shapes.
+        #
+        # Phase C KV-scan clip scope (perf, not correctness): the clip
+        # only fires on the direct-paged decode path (B>=2 dispatch), so
+        # a workload mixing B=1 decode (gather path, no clip yet) with
+        # B>=2 windowed decode gets the HBM savings on one class of
+        # request and the full scan on the other — correct in both cases,
+        # but the perf of "windowed decode" here depends on the dispatch
+        # path a request happens to hit.
         return True
 
     @classmethod
@@ -379,12 +387,17 @@ class Gfx906FAImpl(AttentionImpl):
         # The FA kernel masks keys older than the per-row window when
         # window > 0; forward_paged passes q_abs_offset for every
         # windowed batch (decode included) so the per-row formula holds.
-        # GFX906_FA_NO_WINDOW=1 forces 0 for every layer — perf-only A/B
-        # arm that separates the CUSTOM-vs-ROCM_ATTN kernel-family speedup
-        # from the window-mask cost (numerically wrong for windowed
-        # layers; DEVLOG-muse-glimmer.md gate, control arm).
-        if _os.environ.get("GFX906_FA_NO_WINDOW", "0") == "1":
+        # GFX906_FA_NO_WINDOW (truthy = anything except "0", matching the
+        # sibling knobs) forces 0 for every layer — perf-only A/B arm that
+        # separates the CUSTOM-vs-ROCM_ATTN kernel-family speedup from the
+        # window-mask cost (numerically WRONG for windowed layers; warn,
+        # like the GFX906_FA_LEGACY precedent).
+        if _os.environ.get("GFX906_FA_NO_WINDOW", "0") != "0":
             self.sliding_window = 0
+            logger.warning(
+                "GFX906_FA_NO_WINDOW is set: sliding-window masking is "
+                "disabled on all layers — output is WRONG for windowed "
+                "layers beyond the window (perf A/B arm only).")
         else:
             self.sliding_window = sliding_window or 0
         self.scale = float(scale)

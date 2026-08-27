@@ -86,6 +86,9 @@ static int get_fa_nc2() {
 // default: the gather path defaults to 16 (the B=1-decode tuning), the
 // direct-paged path to a batch-aware value (see gfx906_fa_forward_paged_
 // direct — the optimum there moves with the grid-z block count).
+// Note: 0 is NOT the same as unset — 0 passes through and the launcher
+// clamps it to 1 (the unset defaults above are the way to select a
+// path's default).
 static int get_fa_kv_split() {
     static int v = [] {
         const char *e = std::getenv("GFX906_FA_KVSPLIT");
@@ -269,12 +272,15 @@ torch::Tensor gfx906_fa_forward(
     // Избавляет от материальной [B, Sq_pad, Sk_pad] fp16 маски, критично для
     // prefill chunks >16K (mask был бы 100+ MB на GPU и приводил к OOM).
     c10::optional<torch::Tensor> q_abs_offset = c10::nullopt,
-    // Sliding-window size in tokens (0 = off). Only takes effect when
-    // q_abs_offset is provided (the backend always does for windowed
-    // layers); the kernel then also masks k-positions older than the
-    // per-row window.
+    // Sliding-window size in tokens (0 = off). REQUIRES q_abs_offset —
+    // without the absolute query position the window mask cannot be
+    // evaluated (the kernel silently degrades to full attention if it is
+    // missing, so we error instead).
     int64_t window = 0
 ) {
+    TORCH_CHECK(window == 0 || q_abs_offset.has_value(),
+        "window > 0 requires q_abs_offset (the window mask needs absolute "
+        "query positions)");
     TORCH_CHECK_CUDA(q);
     TORCH_CHECK_CUDA(k_q8);
     TORCH_CHECK_CUDA(v_fp16);
@@ -1026,6 +1032,9 @@ torch::Tensor gfx906_fa_forward_paged_direct(
     int64_t window = 0,
     c10::optional<torch::Tensor> kv_start = c10::nullopt
 ) {
+    TORCH_CHECK(window == 0 || q_abs_offset.has_value(),
+        "window > 0 requires q_abs_offset (the window mask needs absolute "
+        "query positions)");
     TORCH_CHECK_CUDA(q);
     TORCH_CHECK_CUDA(key_cache_q8);
     TORCH_CHECK_CUDA(value_cache);

@@ -11,6 +11,7 @@ that allocation path exactly.
 """
 
 import math
+import os
 import sys
 
 import pytest
@@ -1637,3 +1638,171 @@ def test_forward_paged_direct_sliding_window_clip_vs_torch_ref(d, hq, hkv, L, W)
     ref1 = _windowed_ref(q2[1, :, 0], Kf, Vf, scale, L2 - 1, W)
     assert ((outb[0, 0] - ref0).norm() / ref0.norm()).item() < 5e-2
     assert ((outb[1, 0] - ref1).norm() / ref1.norm()).item() < 5e-2
+
+
+@pytest.mark.parametrize("d, hq, hkv, L, W",
+                         [(128, 32, 2, 513, 128),
+                          (128, 32, 2, 1025, 256),
+                          (128, 32, 2, 4353, 2048)])
+def test_forward_paged_direct_clip_unaligned_bit_identical(d, hq, hkv, L, W):
+    """The clip must stay bit-identical to the masked full scan for
+    UNALIGNED starts (kv_start % nbatch_fa != 0 — the normal production
+    case, e.g. L=4353/W=2048 -> start=2305). An unaligned start makes the
+    first tile partial, repacking which lane holds each surviving score
+    and re-associating the fp16 reduction (~5e-4 relative before the
+    kernel floors k0_base to the tile boundary). Pre-fix this failed at
+    rel 5.2e-4/5.4e-4/7.2e-4 on the three shapes; post-fix <= 1e-7.
+    L is deliberately NOT a multiple of BLOCK (paged tail + unaligned
+    start at once)."""
+    dev = "cuda"
+    torch.manual_seed(7)
+    d = 128
+    n_blocks = (L + BLOCK - 1) // BLOCK
+    kc = torch.zeros(n_blocks, BLOCK, hkv, (d // 32) * 34,
+                     dtype=torch.uint8, device=dev)
+    kv = torch.zeros(n_blocks, 2, BLOCK, hkv, d,
+                     dtype=torch.float16, device=dev)
+    K = torch.randn(n_blocks * BLOCK, hkv, d, device=dev,
+                    dtype=torch.float16) * 0.5
+    V = torch.randn(n_blocks * BLOCK, hkv, d, device=dev,
+                    dtype=torch.float16) * 0.5
+    slot = torch.arange(n_blocks * BLOCK, dtype=torch.int64, device=dev)
+    fa.reshape_and_cache_q8(K, slot, kc)
+    staging = torch.zeros_like(kv[:, 1])
+    staging.view(-1, hkv, d)[: n_blocks * BLOCK].copy_(V)
+    kv[:, 1].copy_(staging)
+    vc = kv.unbind(1)[1]
+    K = K[:L]
+    V = V[:L]
+
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, -1)
+    sl = torch.tensor([L], dtype=torch.int32, device=dev)
+    scale = 1.0 / math.sqrt(d)
+
+    q = torch.randn(1, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    q_abs = torch.tensor([L - 1], dtype=torch.int32, device=dev)
+    kv_start = torch.tensor([max(0, L - W)], dtype=torch.int32, device=dev)
+    out_full = fa.forward_paged_direct(
+        q, kc, vc, bt, sl, scale, None, q_abs, W)[0, 0]
+    out_clip = fa.forward_paged_direct(
+        q, kc, vc, bt, sl, scale, None, q_abs, W, kv_start)[0, 0]
+    # The skipped prefix is fully window-masked; bit-identity holds
+    # (<=1e-7 catches split-combine fp32 roundoff; the pre-fix failure
+    # was ~500x larger).
+    assert (out_clip - out_full).abs().max().item() < 1e-7
+
+
+def test_forward_paged_level_direct_branch_window_clip_b2():
+    """Review #10: one level up from the binding — forward_paged's
+    dispatch -> direct branch -> Python clip math -> binding, at B=2
+    (the dispatch's min_batch) with window on. Catches wiring/regression
+    in the direct branch itself (which the binding-level tests bypass)
+    and exercises an unaligned clip start end-to-end (L=513/W=128 ->
+    385, the kernel floors it). B=2 default KVSPLIT=8, so split-K +
+    window + clip are all active together."""
+    from vllm.gfx906_fa.gfx906_fa_paged import forward_paged
+    dev = "cuda"
+    torch.manual_seed(17)
+    hq, hkv, d = 32, 2, 128
+    L0, L1, W = 513, 480, 128
+    n0 = (L0 + BLOCK - 1) // BLOCK   # row 0: blocks [0, n0)
+    n1 = (L1 + BLOCK - 1) // BLOCK   # row 1: blocks [n0, n0+n1) (disjoint)
+    n_blocks = n0 + n1
+    kc = torch.zeros(n_blocks, BLOCK, hkv, (d // 32) * 34,
+                     dtype=torch.uint8, device=dev)
+    kv = torch.zeros(n_blocks, 2, BLOCK, hkv, d,
+                     dtype=torch.float16, device=dev)
+    K = torch.randn(n_blocks * BLOCK, hkv, d, device=dev,
+                    dtype=torch.float16) * 0.5
+    V = torch.randn(n_blocks * BLOCK, hkv, d, device=dev,
+                    dtype=torch.float16) * 0.5
+    slot = torch.arange(n_blocks * BLOCK, dtype=torch.int64, device=dev)
+    fa.reshape_and_cache_q8(K, slot, kc)
+    staging = torch.zeros_like(kv[:, 1])
+    staging.view(-1, hkv, d)[: n_blocks * BLOCK].copy_(V)
+    kv[:, 1].copy_(staging)
+    vc = kv.unbind(1)[1]
+    Kf, Vf = K.float(), V.float()
+
+    # block_table rows are equal-width; the tail past ceil(L/16) is never
+    # indexed (the kernel walks blocks < ceil(seq_len/16)) but must hold a
+    # valid block id.
+    width = max(n0, n1)
+    bt0 = torch.zeros(width, dtype=torch.int32, device=dev)
+    bt0[:n0] = torch.arange(n0, dtype=torch.int32, device=dev)
+    bt1 = torch.zeros(width, dtype=torch.int32, device=dev)
+    bt1[:n1] = torch.arange(n0, n0 + n1, dtype=torch.int32, device=dev)
+    bt = torch.stack([bt0, bt1]).contiguous()
+    sl = torch.tensor([L0, L1], dtype=torch.int32, device=dev)
+    cu = torch.tensor([0, 1, 2], dtype=torch.int32, device=dev)
+    scale = 1.0 / math.sqrt(d)
+
+    q = (torch.randn(2, hq, d, device=dev, dtype=torch.float16) * 0.5)
+    # key_cache (fp16, 4D) is unused on the direct branch; value_cache is
+    # read as [num_blocks, 16, Hkv, D] (the unbound half of the 5D cache)
+    out = forward_paged(
+        q, kv[:, 0], vc, bt, sl, cu, 1, max(L0, L1), scale,
+        key_cache_q8=kc, window=W)  # [num_tokens, Hq*D]
+    # row i attends to its own block range: tokens
+    # [BLOCK * (n0 if i else 0), ... + L_i)
+    offs = [0, n0 * BLOCK]
+    for i, L in enumerate((L0, L1)):
+        row = out[i].view(hq, d).float()
+        ref = _windowed_ref(q[i].float(), Kf[offs[i]:offs[i] + L],
+                            Vf[offs[i]:offs[i] + L], scale, L - 1, W)
+        assert ((row - ref).norm() / ref.norm()).item() < 5e-2
+
+
+def test_paged_direct_fully_masked_row_no_nan():
+    """A row whose scores are ALL masked (KQ_sum == 0) must not produce
+    NaN on the non-split (KVSPLIT=1) store path: 1.0/0 = inf times the
+    zero VKQ accumulator gives inf*0 = NaN. The row is zero; its sibling
+    is unaffected. (forward_paged slices padding rows out in production,
+    so this is a latent hazard, not a serving bug.)"""
+    dev = "cuda"
+    torch.manual_seed(11)
+    hq, hkv, L, W = 32, 2, 256, 64
+    d = 128
+    n_blocks = L // BLOCK
+    kc = torch.zeros(n_blocks, BLOCK, hkv, (d // 32) * 34,
+                     dtype=torch.uint8, device=dev)
+    kv = torch.zeros(n_blocks, 2, BLOCK, hkv, d,
+                     dtype=torch.float16, device=dev)
+    K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    slot = torch.arange(L, dtype=torch.int64, device=dev)
+    fa.reshape_and_cache_q8(K, slot, kc)
+    staging = torch.zeros_like(kv[:, 1])
+    staging.view(-1, hkv, d)[:L].copy_(V)
+    kv[:, 1].copy_(staging)
+    vc = kv.unbind(1)[1]
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(2, -1)
+    sl = torch.tensor([L, L], dtype=torch.int32, device=dev)
+    scale = 1.0 / math.sqrt(d)
+    Kf, Vf = K.float(), V.float()
+
+    # row 0: normal in-window decode; row 1: q_abs far past its KV, so
+    # every score is window-masked (-INF) and the clip start is past L
+    # (empty scan) -> KQ_sum == 0 on that row.
+    q = torch.randn(2, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    q_abs = torch.tensor([L - 1, L + 100000], dtype=torch.int32, device=dev)
+    kv_start = torch.tensor([L - W, L + 100000 + 1 - W],
+                            dtype=torch.int32, device=dev)
+
+    old = os.environ.get("GFX906_FA_KVSPLIT")
+    os.environ["GFX906_FA_KVSPLIT"] = "1"  # force the non-split path
+    try:
+        out = fa.forward_paged_direct(
+            q, kc, vc, bt, sl, scale, None, q_abs, W, kv_start)
+    finally:
+        if old is None:
+            del os.environ["GFX906_FA_KVSPLIT"]
+        else:
+            os.environ["GFX906_FA_KVSPLIT"] = old
+
+    assert not torch.isnan(out).any()
+    # fully-masked row attends to nothing -> exact zero
+    assert out[1].abs().max().item() == 0.0
+    # sibling row is the correct windowed decode
+    ref0 = _windowed_ref(q[0, :, 0], Kf, Vf, scale, L - 1, W)
+    assert ((out[0, 0] - ref0).norm() / ref0.norm()).item() < 5e-2

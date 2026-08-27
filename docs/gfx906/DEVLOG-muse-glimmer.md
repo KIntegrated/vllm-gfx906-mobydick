@@ -255,10 +255,41 @@ step-time tuning this entry flagged is done in the next entry (split-K
 
 ## 2026-08-27 — perf follow-ups: direct-paged split-K + Phase C window clip
 
-**VERDICT:** SHIPPED (split-K +2.7% @ B=4; Phase C correct, e2e win
-below noise at pp4096) · **GATE:** B=4 pp2048 serving A/B (S=1 vs
-batch-aware default, same session) + pp4096 clip on/off A/B +
-kernel micro-bench.
+**VERDICT:** SHIPPED with ERRATUM (see below — both gates ran on the
+GATHER path, not the direct-paged path they were attributed to; the
+direct-paged path is unreachable in default serving). · **GATE:** B=4
+pp2048 serving A/B (S=1 vs batch-aware default, same session) +
+pp4096 clip on/off A/B + kernel micro-bench.
+
+## ERRATUM (2026-08-27, review round 2)
+
+The direct-paged branch of `forward_paged` is gated on
+`key_cache_q8 is not None` — which the backend only passes when
+`GFX906_FA_LEGACY=0`, and that mode is still broken on this tree
+(Q8 side-buffer desync → garbage output; smoke-verified 2026-08-27,
+see the review-round-2 entry). Default serving (LEGACY=1) therefore
+runs EVERYTHING on the gather path, so:
+
+- The **B=4 split-K gate was a GATHER-path measurement**: arm 1
+  (KVSPLIT=1) vs arm 2 (unset → gather default 16). The +2.7% is real
+  but is the gather kernel's existing S=16-vs-S=1 knob, not the new
+  direct-paged plumbing. The batch-aware `clamp(16/B, 2, 8)` default
+  is dead code in default serving (it only applies to the
+  direct-paged path).
+- The **pp4096 clip A/B (and the later pp8192 A/B) were NULL TESTS**:
+  with LEGACY=1 the clip code (direct branch) never executes, so both
+  arms ran identical gather-path code. The "below the noise floor"
+  reading was a comparison of two identical configurations. Phase C's
+  e2e serving benefit has NEVER been measured; the kernel-level −48%
+  (L=4352) / −71% (L=8448) micro-bench numbers stand (binding level),
+  but they only apply when LEGACY=0 works.
+- Unchanged by the erratum: the window-mask gates (B=1 1.59×, B=4
+  1.23× — the mask runs in the gather kernel), the q_pad fix (shared
+  backend buffer code), and the direct-paged code itself (plumbing is
+  real and binding-tested; it just can't be reached from serving yet).
+
+Re-gate Phase C (and the batch-aware KVSPLIT) once the LEGACY=0
+Q8-side-buffer desync is fixed.
 
 ## HYPOTHESIS
 
@@ -366,7 +397,109 @@ recorded, not diagnosed).
   kernel's work list to start per-row at `max(0, L-W)` + compacted
   store + shifted q_abs_offset); prefill-row clip (per-row windows
   [max(0, t-W+1), t] — a 2D per-(row, k) problem, not a per-row
-  start); B=4 pp4096 clip e2e at L=8k+.
+  start); **fix the LEGACY=0 Q8-side-buffer desync** — the only path
+  to the direct-paged kernel (split-K, batch-aware KVSPLIT, Phase C
+  clip); re-gate Phase C e2e at L≥8k after that.
+
+## 2026-08-27 — review round 2: clip bit-identity fix (P1), NaN guard, checks, null-test exposure
+
+**VERDICT:** SHIPPED (P1 clip floor fix reproduced + verified on
+hardware; NaN guard + symmetric checks in; both prior e2e clip gates
+exposed as null tests by the LEGACY=1 dispatch reality — see the
+erratum in the perf-follow-ups entry). · **GATE:** pre/post-fix
+unaligned clip-vs-full diff on hardware + 44/44 suite + LEGACY=0
+smoke.
+
+## HYPOTHESIS
+
+(Review P1) The Phase C clip is NOT bit-identical to the masked full
+scan when `kv_start` is not a multiple of `nbatch_fa` (the normal
+production case, e.g. L=4353/W=2048 → 2305): an unaligned start makes
+the first tile partial, repacking which lane holds each surviving
+score and re-associating the fp16 VKQ reduction. Flooring the clip
+start to the tile boundary — only when the keys the floor gains are
+window-masked — restores exactness at the cost of ≤ nbatch_fa−1 extra
+keys. (Review P3) A fully-masked row (KQ_sum==0) writes inf*0=NaN on
+the non-split (gridDim.y==1) store path in BOTH kernels; guard it like
+the split-combine l_star guard.
+
+## What was done
+
+- **Clip floor (P1)**: `fattn-q8-paged.cuh` floors `k0_base` to
+  `nbatch_fa` when `k0_base <= max(0, q_abs + 1 - window)` (the
+  production clip passes exactly that; the guard was found when an
+  unconditional floor broke the inert-window test subcase, where the
+  clip emulates a window and the gained keys are NOT masked).
+- **NaN guard (P3)**: `scale_out = KQ_sum>0 ? 1/KQ_sum : 0` in the
+  non-split store of both `fattn-q8-paged.cuh` and `fattn-q8.cuh`
+  (the gather copy had the identical pattern — fixed by inspection).
+- **Symmetric checks**: `window > 0` now requires `q_abs_offset` in
+  BOTH bindings (previously the window mask silently degraded to full
+  attention without the offset, while `kv_start` had the check).
+  Verified: both bindings reject the malformed call.
+- **Nits**: clip math int32-only (no int64 round-trip);
+  `GFX906_FA_NO_WINDOW` truthy-parsed like the sibling knobs + warns
+  (was `== "1"`, silent); KVSPLIT "0 ≠ unset" note; README knob table
+  (KVSPLIT batch-aware row, WINDOW_CLIP, NO_WINDOW); `BENCH_PREFIX_CACHE`
+  default flipped to 0 (AGENTS.md local-serving recipe);
+  `supports_sliding_window` envelope note: the clip only fires on the
+  direct-paged (B≥2) dispatch.
+- **Tests**: +3 unaligned bit-identity shapes (513/128, 1025/256,
+  4353/2048 — L deliberately not a multiple of BLOCK) + 1 NaN-guard
+  test (B=2, fully-masked row, KVSPLIT=1, no-NaN + zero-row + correct
+  sibling) + 1 forward_paged-LEVEL test (review #10: dispatch →
+  direct branch → Python clip math → binding, B=2, two different
+  seq lens, unaligned starts 385/352 — split-K + window + clip all
+  active together) → suite 45/45.
+
+## Gate result
+
+Pre-fix (old .so) vs post-fix, clip vs masked full scan:
+
+| shape (L/W→start) | pre-fix rel | post-fix max-abs |
+|---|---|---|
+| 513/128→385 | 5.2e-4 | 0.0 |
+| 1025/256→769 | 5.4e-4 | 3.0e-8 |
+| 4353/2048→2305 | 7.2e-4 | 5.6e-9 |
+| 512/128→384 (aligned) | 0.0 | 0.0 |
+
+(Review's independent numbers 4.7e-4/5.3e-4/6.8e-4 — same shapes,
+seed noise.) The old suite's "unaligned" shape (512/64→448,
+448%128=64) was accidentally bit-exact: the 64-key window fills the
+half tile on a chunk boundary — the suite's 40/40 never saw the bug.
+(The review's "448 is a multiple of 128" is arithmetic wrong —
+448%128=64 — but its conclusion that the old test missed the bug is
+right.)
+
+**LEGACY=0 smoke (fresh, 2026-08-27)**: 4-prompt greedy → incoherent
+prompt-echo garbage ("to=self<prompt>…" + meta-reasoning) with a
+capped 0.375 GiB KV pool (an uncapped pool OOMs on the ~1.5 GiB Q8
+side buffer + inductor headroom). The Q8 side-buffer desync is still
+live → the direct-paged path (split-K, batch-aware KVSPLIT, Phase C
+clip) is unreachable in any working serving config; the pp4096 and
+pp8192 clip A/Bs were null tests (both arms gather). Blocking item:
+fix the desync before any direct-paged e2e claim.
+
+## Evidence — FOR / AGAINST
+
+FOR: pre/post hardware repro of the P1 bug + fix (3 shapes); 45/45
+(incl. the forward_paged-level direct-branch test); window-check
+rejection on both bindings; LEGACY=0 garbage smoke (blocker
+established, not assumed). AGAINST: no new e2e serving numbers
+(nothing to re-gate until the desync fix); Phase C serving benefit
+remains unmeasured at every context.
+
+## Notes
+
+- `_fwdlog` (GFX906_FA_FWD_DEBUG) writes to
+  `/tmp/gfx906_fa_debug/fwd-<pid>.log` and silently no-ops if the dir
+  doesn't exist — `mkdir -p` before trusting an empty log. The
+  gather-branch dispatch log's `path=FUSED/FAST/LEGACY` labels the Q8
+  K-buffer SOURCE, not direct-vs-gather; the direct branch logs
+  `forward_paged DIRECT_PAGED:`.
+- The review's ds4 "40/40 miscount" claim was re-checked:
+  `pytest --collect-only` collects exactly 40 (now 45) — the devlog
+  counts were literal all along.
 
 
 ---

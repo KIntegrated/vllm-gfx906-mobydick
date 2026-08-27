@@ -415,11 +415,17 @@ static __global__ void flash_attn_tile_q8_paged(
         const int32_t * __restrict__ q_abs_offset,
         const int window,
         // Per-row KV scan start (sliding-window clip, phase C): the k-loop
-        // walks [k0_base, k_VKQ_max) instead of [0, k_VKQ_max). Numerically
-        // identical to scanning [0, k0_base) when k0_base >= q_abs_row -
-        // window + 1 (those keys are window-masked to -INF anyway); the
-        // win is skipping the HBM reads. split-K still covers the clipped
-        // range exactly: slice y visits k0_base + (y+i*gridDim.y)*nbatch_fa.
+        // walks [k0_base, k_VKQ_max) instead of [0, k_VKQ_max). Bit-identical
+        // to scanning [0, k0_base) when k0_base >= q_abs_row - window + 1
+        // (those keys are window-masked to -INF anyway, and fully-masked
+        // tiles are exact no-ops); the win is skipping the HBM reads.
+        // When the keys a tile-boundary floor would add are window-masked
+        // (production clip: k0_base == max(0, q_abs + 1 - window)), k0_base
+        // is floored to an nbatch_fa tile boundary — an unaligned start
+        // would make the first tile partial, repacking the lanes and
+        // re-associating the fp16 reduction (~5e-4..2e-3 relative, not
+        // bit-identical). split-K still covers the clipped range exactly:
+        // slice y visits k0_base + (y+i*gridDim.y)*nbatch_fa.
         const int32_t * __restrict__ kv_start,
         const int32_t * __restrict__ block_table,
         float      * __restrict__ dst,
@@ -533,8 +539,22 @@ static __global__ void flash_attn_tile_q8_paged(
         Q_f, Q_values, Q_scales, col_Q_0, int(ne01.z), head0, ne02, nb01, nb02, scale);
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
-    // Sliding-window clip start (0 = full scan; see param comment).
-    const int k0_base = kv_start ? kv_start[sequence] : 0;
+    // Sliding-window clip start (0 = full scan; see param comment). Floor
+    // to the nbatch_fa tile boundary so every tile visited is the same
+    // aligned tile the full scan visits (bit-identity — an unaligned start
+    // makes the first tile partial, repacking lanes and re-associating the
+    // fp16 reduction, ~5e-4 relative). Only floor when the keys gained by
+    // the floor, [floor, k0_base), are window-masked (pos < q_abs + 1 -
+    // window) — the production clip passes exactly k0_base = max(0, q_abs
+    // + 1 - window); other kv_start callers (tests emulating a window via
+    // the clip) keep their exact start.
+    int k0_base = kv_start ? kv_start[sequence] : 0;
+    if (k0_base > 0 && window > 0 && q_abs_offset) {
+        const int win_start = q_abs_offset[sequence] + 1 - window;
+        if (k0_base <= (win_start > 0 ? win_start : 0)) {
+            k0_base -= k0_base % nbatch_fa;
+        }
+    }
     if (ncols2 == 1) {
         int k_VKQ_0 = k0_base + blockIdx.y*nbatch_fa;
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
@@ -648,7 +668,12 @@ static __global__ void flash_attn_tile_q8_paged(
             continue;
         }
 
-        const float scale_out = gridDim.y == 1 ? 1.0f/KQ_sum[jc0] : 1.0f;
+        // Fully-masked rows (KQ_sum == 0, e.g. a padded row's q_abs far
+        // past its KV) would give inf*0 = NaN; the split-combine path has
+        // the analogous l_star guard.
+        const float scale_out = gridDim.y == 1
+            ? (KQ_sum[jc0] > 0.0f ? 1.0f/KQ_sum[jc0] : 0.0f)
+            : 1.0f;
 
         const int j_dst_unrolled = ((sequence*int(ne01.z) + col_Q_0 + j)*ne02 + head0 + c)*gridDim.y + blockIdx.y;
 

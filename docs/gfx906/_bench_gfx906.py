@@ -76,12 +76,13 @@ def main():
     kv_mem = os.environ.get("BENCH_KV_MEM")
     if kv_mem:
         extra["kv_cache_memory_bytes"] = int(kv_mem)
-    # BENCH_PREFIX_CACHE (default 1): the local-serving bench default is
-    # prefix caching OFF (AGENTS.md — it poisons TTFT-derived numbers);
-    # the harness historically left the vLLM default (on), so the knob
-    # defaults to preserving that for comparability with old runs.
+    # BENCH_PREFIX_CACHE (default 0): the local-serving bench default is
+    # prefix caching OFF (AGENTS.md — it poisons TTFT-derived numbers).
+    # The harness historically left the vLLM default (on); pre-flip
+    # DEVLOG numbers used that, gate re-runs use BENCH_PREFIX_CACHE=0
+    # explicitly.
     extra["enable_prefix_caching"] = \
-        os.environ.get("BENCH_PREFIX_CACHE", "1") == "1"
+        os.environ.get("BENCH_PREFIX_CACHE", "0") == "1"
     # BENCH_NREQS (default 1) runs that many identical prompts concurrently
     # (prefix caching is off, so prefills are real); totals are aggregated.
     nreqs = int(os.environ.get("BENCH_NREQS", "1"))
