@@ -1475,3 +1475,88 @@ def test_forward_sliding_window_vs_torch_ref(d, hq, hkv, L, W):
         ref = _windowed_ref(qtok[t], Kf, Vf, scale, t, W)
         assert ((outf[t] - ref).norm() / ref.norm()).item() < 5e-2, \
             f"row {t}"
+
+
+# ---------------------------------------------------------------------------
+# Same window semantics, DIRECT-PAGED kernel (forward_paged_direct,
+# fattn-q8-paged.cuh) — the kernel the serving gate actually runs:
+# _should_use_direct_paged is "auto" (min_batch=2), so every decode batch
+# >= 2 (incl. the BENCH_MAX_SEQS=4 gate config) routes here, and the
+# window formula is hand-duplicated in this file. Both files must match
+# the torch reference.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("d, hq, hkv, L, W", [
+    (128, 32, 2, 512, 128),   # Muse Glimmer shape (Hq 32 / Hkv 2, D 128)
+    (128, 32, 2, 512, 64),    # smaller window
+    (128, 32, 2, 96, 128),    # W > L: window must be inert
+    (256, 16, 2, 512, 128),   # D=256 path
+])
+def test_forward_paged_direct_sliding_window_vs_torch_ref(d, hq, hkv, L, W):
+    dev = "cuda"
+    torch.manual_seed(4)
+    n_blocks = L // BLOCK
+    kc = torch.zeros(n_blocks, BLOCK, hkv, (d // 32) * 34,
+                     dtype=torch.uint8, device=dev)
+    kv = torch.zeros(n_blocks, 2, BLOCK, hkv, d,
+                     dtype=torch.float16, device=dev)
+    K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    slot = torch.arange(L, dtype=torch.int64, device=dev)
+    fa.reshape_and_cache_q8(K, slot, kc)
+    staging = torch.zeros_like(kv[:, 1])
+    staging.view(-1, hkv, d)[:L].copy_(V)
+    kv[:, 1].copy_(staging)
+    vc = kv.unbind(1)[1]  # production layout: unbind(1), non-contiguous
+
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, n_blocks)
+    sl = torch.tensor([L], dtype=torch.int32, device=dev)
+    scale = 1.0 / math.sqrt(d)
+    Kf, Vf = K.float(), V.float()
+
+    # decode B=1 (Sq=1): q_abs_offset = L-1; window clips to [L-W, L-1]
+    q = torch.randn(1, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    q_abs = torch.tensor([L - 1], dtype=torch.int32, device=dev)
+    out = fa.forward_paged_direct(
+        q, kc, vc, bt, sl, scale, None, q_abs, W)[0, 0]
+    ref = _windowed_ref(q[0, :, 0], Kf, Vf, scale, L - 1, W)
+    assert ((out - ref).norm() / ref.norm()).item() < 5e-2
+    if L > W:
+        # window must actually bite: differs from no-window attention
+        out_nw = fa.forward_paged_direct(
+            q, kc, vc, bt, sl, scale, None, q_abs)[0, 0]
+        assert (out - out_nw).norm().item() > 1e-3
+    else:
+        # W >= L: windowed output matches no-window (inert)
+        out_nw = fa.forward_paged_direct(
+            q, kc, vc, bt, sl, scale, None, q_abs)[0, 0]
+        assert ((out - out_nw).norm() / out.norm()).item() < 5e-2
+
+    # decode B=2, different lengths (the production direct mode): per-row
+    # q_abs_offset/window must hold per batch element. seq1 reuses the
+    # same physical blocks with a shorter kv_max.
+    L2 = L * 3 // 4
+    bt2 = bt.repeat(2, 1)
+    sl2 = torch.tensor([L, L2], dtype=torch.int32, device=dev)
+    q_abs2 = torch.tensor([L - 1, L2 - 1], dtype=torch.int32, device=dev)
+    q2 = torch.randn(2, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    out2 = fa.forward_paged_direct(
+        q2, kc, vc, bt2, sl2, scale, None, q_abs2, W)
+    assert out2.shape == (2, 1, hq, d)
+    ref0 = _windowed_ref(q2[0, :, 0], Kf, Vf, scale, L - 1, W)
+    ref1 = _windowed_ref(q2[1, :, 0], Kf, Vf, scale, L2 - 1, W)
+    assert ((out2[0, 0] - ref0).norm() / ref0.norm()).item() < 5e-2
+    assert ((out2[1, 0] - ref1).norm() / ref1.norm()).item() < 5e-2
+
+    # prefill (Sq=L): per-row causal + window
+    qf = torch.randn(1, hq, L, d, device=dev, dtype=torch.float32) * 0.5
+    q_abs0 = torch.tensor([0], dtype=torch.int32, device=dev)
+    outf = fa.forward_paged_direct(
+        qf, kc, vc, bt, sl, scale, None, q_abs0, W)[0]
+    assert outf.shape == (L, hq, d)
+    qtok = qf[0].permute(1, 0, 2).float()  # [L, hq, d]
+    rows = sorted({t for t in (0, W - 1, W, L - W, L - 1) if 0 <= t < L})
+    for t in rows:
+        ref = _windowed_ref(qtok[t], Kf, Vf, scale, t, W)
+        assert ((outf[t] - ref).norm() / ref.norm()).item() < 5e-2, \
+            f"row {t}"

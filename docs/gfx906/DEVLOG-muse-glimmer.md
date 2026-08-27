@@ -114,6 +114,10 @@ group): all-CUSTOM shows both groups → CUSTOM, hybrid shows full → CUSTOM
 --attention-backend" log path). The Qwen3.8-27B all-CUSTOM reference on
 the same harness is ~25.2 t/s — Muse 30B now runs ahead of it.
 
+Note: that gate ran B=1 (single repeated request) with prefix caching on
+the harness default. Both gaps closed by the 2026-08-27 review-follow-up
+entry below (B=4 re-run, prefix cache off, window=0 control arm).
+
 ## HYPOTHESIS
 
 If the Q8 FA tile kernel gets a per-row sliding cutoff (mask keys older
@@ -183,6 +187,72 @@ output), and/or a worker-shared prefill q_pad arena.
 FOR: 32/32 FA suite (4 new window tests green); gate A/B above (1.59×);
 all-CUSTOM smoke coherent + correct (4 prompts, thinking ON, 7.4 s for
 4 completions vs 12.7 s hybrid). AGAINST: (none).
+
+## 2026-08-27 — review follow-ups: direct-paged window coverage, B=4 gate, control arm
+
+**VERDICT:** SHIPPED · **GATE:** same A/B at B=4 (BENCH_NREQS=4,
+BENCH_PREFIX_CACHE=0 per the local-serving default) + a window=0-on-
+CUSTOM control arm, per `muse_glimmer_opt_code_rev_claude.md` #1/#7/#8/#9.
+
+## HYPOTHESIS
+
+If the direct-paged kernel's hand-duplicated window formula is correct
+and the window mask is ~free, then (a) a `forward_paged_direct` window
+test matches the torch reference, (b) the all-CUSTOM win persists at
+B=4 — where the sliding layers actually run the direct-paged kernel
+(auto mode, min_batch=2 — not the B=1 gather path the first gate
+exercised) — and (c) forcing window=0 (unbounded causal, perf-only) on
+all-CUSTOM moves the t/s by ~0.
+
+## What was done
+
+- **Direct-paged window test** (#1): `test_forward_paged_direct_
+  sliding_window_vs_torch_ref` ×4 — same shapes as the gather test,
+  calling the `forward_paged_direct` binding directly (block_size=16,
+  unbind(1) V layout): decode B=1, decode B=2 with different seq lens
+  (per-row q_abs_offset/window), and per-row prefill. Suite 36/36.
+- **`GFX906_FA_NO_WINDOW=1`** control knob (#9): forces
+  `sliding_window=0` for every layer (numerically wrong for windowed
+  layers, perf-representative) — the third bench arm.
+- **`BENCH_PREFIX_CACHE`** harness hook (#7): defaults to the old
+  behavior (on) for comparability; gate re-runs use 0.
+- Comments: spec-decode caveat on the q_pad decode heuristic (#10 —
+  verify steps DO read q_pad_buf but their Sq_pad is bounded by the spec
+  depth, so the 14 GiB pathology stays prefill-only); validated envelope
+  on `supports_sliding_window` (#11); LOCKSTEP notes on the duplicated
+  cutoff formula in both .cuh files (#2).
+
+## Gate result (B=4, pp2048/tg256, 4 samples, prefix cache OFF, 0.75 GiB
+KV, bt1024)
+
+| arm | B=1 (prev) | B=4 (this) |
+|---|---|---|
+| hybrid (sliding→ROCM_ATTN, full→CUSTOM) | 17.54 | 16.75 (16.78/16.74/16.71) |
+| all-CUSTOM, window=2048 | 27.90 | 20.59 (20.73/20.59/20.19) |
+| all-CUSTOM, window=0 (control) | — | 20.64 (20.73/20.64/20.64) |
+
+- **1.23×** at B=4 vs 1.59× at B=1 — the win persists, smaller: hybrid
+  decodes 4.5% slower at B=4 (Triton per-seq sliding attention batches
+  worse) while all-CUSTOM drops 26% (B=4 direct-paged steps cost 5.4×
+  the B=1 step time for 4× the work — grid-z/occupancy tuning headroom,
+  not a regression: B=1 is unchanged).
+- **Window-mask cost ≈ 0**: control 20.64 vs windowed 20.59 (−0.2%,
+  within run noise) — at B=4 the win is entirely the kernel family on
+  the 39 sliding layers; the per-row window branch is free.
+- Logs: `/local/tmp/muse/bench_b4_{hybrid,allcustom,nowindow}.log`.
+
+## Evidence — FOR / AGAINST
+
+FOR: 36/36 FA suite; B=4 gate 1.23×; control arm isolates the window
+cost at ~0; both kernel copies now reference-tested. AGAINST: (none).
+
+## Interactions / superseded-by
+
+Supersedes the B=1-only gate framing of the 2026-08-26 entry (numbers
+there stand; this entry adds the B=4 + control data). Open: B=4
+all-CUSTOM direct-paged step-time tuning (NC2/KVSPLIT knob sweep) if
+longer-context serving matters.
+
 
 ---
 Copyright Kevin Read <me@kevin-read.com>

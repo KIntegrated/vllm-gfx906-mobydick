@@ -123,6 +123,10 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter_paged(
         // Sliding-window extension: when > 0, also force -INF on scores whose
         // absolute k-position < q_abs_for_row - window + 1. Inert when
         // q_abs_offset is null (same contract as the contiguous kernel).
+        // LOCKSTEP: the cutoff formula below is duplicated verbatim in
+        // fattn-q8.cuh (two call sites per file); change both together
+        // (tests cover both via test_forward_sliding_window* /
+        // test_forward_paged_direct_sliding_window*).
         const int window,
         const int sequence,
         const int col_Q_0_iter) {

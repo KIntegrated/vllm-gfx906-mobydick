@@ -583,6 +583,10 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter(
         // per-row window). Inert when q_abs_offset is null; the backend passes
         // q_abs_offset for every windowed batch (decode included), so the
         // per-row formula covers decode rows (seq_len - 1) too.
+        // LOCKSTEP: the cutoff formula below is duplicated verbatim in
+        // fattn-q8-paged.cuh (two call sites per file); change both
+        // together (tests cover both via test_forward_sliding_window* /
+        // test_forward_paged_direct_sliding_window*).
         const int window,
         const int sequence,
         const int col_Q_0_iter) {

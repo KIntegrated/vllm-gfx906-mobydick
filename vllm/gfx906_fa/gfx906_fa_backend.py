@@ -251,6 +251,15 @@ class Gfx906FABackend(AttentionBackend):
         # Glimmer iRoPE 2048). Gated on q_abs_offset, which
         # forward_paged supplies for every windowed batch (decode
         # included).
+        #
+        # Validated envelope (tests/kernels/attention/test_gfx906_fa.py,
+        # test_forward_sliding_window* x8): W in {64..L, 2048-serving},
+        # head_dim 128 (GQA 16:1) and 256 (GQA 8:1), decode B=1/B=2 and
+        # per-row prefill, on BOTH kernel copies (gather fattn-q8.cuh and
+        # direct-paged fattn-q8-paged.cuh). The mask math itself is
+        # shape-independent (absolute-position cutoff on k), but an
+        # untested head_dim/window/batch combo landing on this backend
+        # runs unverified — extend the tests before claiming new shapes.
         return True
 
     @classmethod
@@ -370,7 +379,14 @@ class Gfx906FAImpl(AttentionImpl):
         # The FA kernel masks keys older than the per-row window when
         # window > 0; forward_paged passes q_abs_offset for every
         # windowed batch (decode included) so the per-row formula holds.
-        self.sliding_window = sliding_window or 0
+        # GFX906_FA_NO_WINDOW=1 forces 0 for every layer — perf-only A/B
+        # arm that separates the CUSTOM-vs-ROCM_ATTN kernel-family speedup
+        # from the window-mask cost (numerically wrong for windowed
+        # layers; DEVLOG-muse-glimmer.md gate, control arm).
+        if _os.environ.get("GFX906_FA_NO_WINDOW", "0") == "1":
+            self.sliding_window = 0
+        else:
+            self.sliding_window = sliding_window or 0
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
@@ -458,6 +474,16 @@ class Gfx906FAImpl(AttentionImpl):
         # otherwise balloon every layer's prefill buffer to (8, Hq, 2048,
         # 128) fp32 = 268 MB (Muse 30B: x52 layers = 14 GiB, first-request
         # OOM on the inductor prefill buffer, 2026-08-26).
+        #
+        # Spec-decode note: a verify step carries num_speculative_tokens+1
+        # rows per sequence, so max_seqlen_q > 1 and it DOES read
+        # q_pad_buf (forward_paged's Sq=1 fast paths are gated on
+        # max_seqlen_q == 1). That is correct, and its Sq_pad is bounded
+        # by the spec depth (small: (n_spec+1) up to the ncols1 tile), so
+        # the decode-time dim0 growth it triggers stays ~B x 128 KB/layer
+        # — the 14 GiB pathology required a prefill-sized Sq_pad, which
+        # only real prefill rows produce. If a spec-decode config ever
+        # shows q_pad growth again, this comment is where to start.
         qpad_num_seqs = num_seqs if max_seqlen_q > 1 else 1
 
         # Q buffer: [B, Hq, Sq_pad, D] fp32 (the kernel takes fp32 q; the
