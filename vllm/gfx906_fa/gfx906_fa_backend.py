@@ -346,6 +346,24 @@ class Gfx906FAImpl(AttentionImpl):
     # been retired (capture-order coupling or repeated captures — see
     # _ensure_gather_buffers).
     _gather_retired_warned: ClassVar[bool] = False
+    # ------------------------------------------------------------------
+    # q_pad buffers: SHARED across all layer impls (ClassVar), one set
+    # per worker. Per-impl (instance) buffers were the boot J/K
+    # first-prefill OOM: v1 creates one impl per attention layer, so a
+    # prefill-sized grow allocated (N_layers x 256 MiB) of duplicate
+    # [B, Hq, Sq_pad, D] fp32 buffers (Muse 30B: 52 x 256 MiB = 13.3
+    # GiB at bt4096; the same shape is Sq_pad-proportional, which is
+    # why the OOM "scaled with the chunk" and bt2048 survived). Same
+    # pattern as the gather buffers above (which had the identical bug
+    # fixed earlier). See DEVLOG-muse-glimmer.md round 4.
+    # ------------------------------------------------------------------
+    _q_pad_buf: ClassVar[torch.Tensor | None] = None
+    _q_pad_decode_buf: ClassVar[torch.Tensor | None] = None
+    # Buffers referenced by captured CUDA graphs: freed-then-realloc
+    # would leave the graphs pointing at freed VAs (use-after-free on
+    # replay), so retired captured buffers stay alive here.
+    _q_pad_retired: ClassVar[list[torch.Tensor]] = []
+    _q_pad_captured: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -417,22 +435,13 @@ class Gfx906FAImpl(AttentionImpl):
         self._legacy = _os.environ.get("GFX906_FA_LEGACY", "1") == "1"
 
         # ------------------------------------------------------------------
-        # Pre-allocated buffers for forward_paged. The sizes would come
-        # from vLLM max_num_seqs x max_model_len, but those are not
-        # reachable in this context, so we use lazy grow.
+        # q_pad buffers for forward_paged are CLASS-level (see the
+        # ClassVar block above): ONE shared set per worker, lazily
+        # grown by _ensure_forward_buffers. They must NOT be instance
+        # attributes — v1 creates one impl per attention layer, and a
+        # per-impl prefill-sized grow is N_layers x 256 MiB of
+        # duplicates (the boot J/K first-prefill OOM).
         # ------------------------------------------------------------------
-        self._q_pad_buf: torch.Tensor | None = None
-        # Sq=1 decode: dedicated [B, Hq, 2, D] fp32 buffer. The growing
-        # _q_pad_buf slice [:B, :Hq, :2, :D] is non-contiguous after a
-        # prefill-sized grow (dim2=512) and costs a copy per layer; the
-        # [:num_seqs] prefix slice of this exact-shape buffer is always
-        # contiguous, so the decode path needs no copy at all.
-        self._q_pad_decode_buf: torch.Tensor | None = None
-        # Buffers referenced by captured CUDA graphs: freed-then-realloc
-        # would leave the graphs pointing at freed VAs (use-after-free on
-        # replay), so retired captured buffers stay alive here.
-        self._q_pad_retired: list[torch.Tensor] = []
-        self._q_pad_captured: bool = False
         # Level 3a: mask_buf removed — causal is inlined in the kernel.
 
     def fused_output_quant_supported(self, quant_key):
@@ -496,19 +505,21 @@ class Gfx906FAImpl(AttentionImpl):
         # (attention seq_lens only cover written slots), so the fill buys
         # nothing.
 
+    @classmethod
     def _ensure_forward_buffers(
-        self,
+        cls,
+        num_heads: int,
+        head_size: int,
         num_seqs: int,
         max_seqlen_q: int,
         max_seqlen_k: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
-        """Lazy/grow-allocate the q_pad buffer.
-
-        Level 3a: mask_buf removed — causality is inlined in the kernel.
-        For a 60K prefill this saves ~480 MB of fp16 mask.
-        """
+        """Lazy/grow-allocate the q_pad buffers (shared across all
+        layer impls — see the ClassVar block). Level 3a: mask_buf
+        removed — causality is inlined in the kernel. For a 60K
+        prefill this saves ~480 MB of fp16 mask."""
         ncols1 = _pick_ncols1(max_seqlen_q)
         Sq_pad = ((max_seqlen_q + ncols1 - 1) // ncols1) * ncols1
 
@@ -543,53 +554,53 @@ class Gfx906FAImpl(AttentionImpl):
         #
         # The capture-state poll runs only until the first capture is
         # detected (_q_pad_captured latches); steady state costs nothing.
-        if self._q_pad_buf is None:
-            self._q_pad_buf = torch.empty(
-                (qpad_num_seqs, self.num_heads, Sq_pad, self.head_size),
+        if cls._q_pad_buf is None:
+            cls._q_pad_buf = torch.empty(
+                (qpad_num_seqs, num_heads, Sq_pad, head_size),
                 dtype=dtype, device=device,
             )
-            self._q_pad_captured = torch.cuda.is_current_stream_capturing()
-        elif (self._q_pad_buf.shape[0] < qpad_num_seqs
-                or self._q_pad_buf.shape[2] < Sq_pad
-                or self._q_pad_buf.dtype != dtype):
+            cls._q_pad_captured = torch.cuda.is_current_stream_capturing()
+        elif (cls._q_pad_buf.shape[0] < qpad_num_seqs
+                or cls._q_pad_buf.shape[2] < Sq_pad
+                or cls._q_pad_buf.dtype != dtype):
             capturing = torch.cuda.is_current_stream_capturing()
-            cur = self._q_pad_buf
+            cur = cls._q_pad_buf
             new_shape = (
                 max(qpad_num_seqs, cur.shape[0]),
-                self.num_heads,
+                num_heads,
                 max(Sq_pad, cur.shape[2]),
-                self.head_size,
+                head_size,
             )
-            if self._q_pad_captured or capturing:
-                self._q_pad_retired.append(cur)
-            self._q_pad_buf = torch.empty(new_shape, dtype=dtype, device=device)
-            self._q_pad_captured = self._q_pad_captured or capturing
-        elif not self._q_pad_captured:
+            if cls._q_pad_captured or capturing:
+                cls._q_pad_retired.append(cur)
+            cls._q_pad_buf = torch.empty(new_shape, dtype=dtype, device=device)
+            cls._q_pad_captured = cls._q_pad_captured or capturing
+        elif not cls._q_pad_captured:
             # No grow: latch the flag the first time we serve a forward
             # during capture (the buffer VA is being baked into a graph).
-            self._q_pad_captured = torch.cuda.is_current_stream_capturing()
+            cls._q_pad_captured = torch.cuda.is_current_stream_capturing()
 
         # Sq=1 decode buffer [B, Hq, 2, D] fp32 (Sq_pad=2 for Sq=1).
         # Grows dim0 only; capture-safe via the shared retired list.
         if max_seqlen_q == 1:
-            if self._q_pad_decode_buf is None:
-                self._q_pad_decode_buf = torch.empty(
-                    (num_seqs, self.num_heads, 2, self.head_size),
+            if cls._q_pad_decode_buf is None:
+                cls._q_pad_decode_buf = torch.empty(
+                    (num_seqs, num_heads, 2, head_size),
                     dtype=torch.float32, device=device,
                 )
-                self._q_pad_captured = (
-                    self._q_pad_captured
+                cls._q_pad_captured = (
+                    cls._q_pad_captured
                     or torch.cuda.is_current_stream_capturing())
-            elif self._q_pad_decode_buf.shape[0] < num_seqs:
+            elif cls._q_pad_decode_buf.shape[0] < num_seqs:
                 capturing = torch.cuda.is_current_stream_capturing()
-                if self._q_pad_captured or capturing:
-                    self._q_pad_retired.append(self._q_pad_decode_buf)
-                self._q_pad_decode_buf = torch.empty(
-                    (num_seqs, self.num_heads, 2, self.head_size),
+                if cls._q_pad_captured or capturing:
+                    cls._q_pad_retired.append(cls._q_pad_decode_buf)
+                cls._q_pad_decode_buf = torch.empty(
+                    (num_seqs, num_heads, 2, head_size),
                     dtype=torch.float32, device=device,
                 )
-                self._q_pad_captured = (
-                    self._q_pad_captured or capturing)
+                cls._q_pad_captured = (
+                    cls._q_pad_captured or capturing)
 
     @classmethod
     def _ensure_gather_buffers(
@@ -843,6 +854,8 @@ class Gfx906FAImpl(AttentionImpl):
         # Lazy-grow the forward buffers (q_pad / mask).
         num_seqs = attn_metadata.seq_lens.shape[0]
         self._ensure_forward_buffers(
+            num_heads=self.num_heads,
+            head_size=self.head_size,
             num_seqs=num_seqs,
             max_seqlen_q=attn_metadata.max_query_len,
             max_seqlen_k=attn_metadata.max_seq_len,

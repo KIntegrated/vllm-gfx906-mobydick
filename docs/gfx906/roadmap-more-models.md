@@ -109,15 +109,66 @@ Onboarding and all gate numbers: `DEVLOG-muse-glimmer.md`. Knobs:
 2026-08-27 after their findings were folded into M1–M4 below; M3's
 items carry the surviving qwen text inline.
 
-### M1 — window clip on the gather path (B=1 decode)
+### M0 — per-impl q_pad buffers: the first-prefill OOM root cause — FIXED 2026-08-27 (probe verification + bt4096 serving re-validation PENDING POST-REBOOT)
+
+The boot J/K first-prefill OOM (>10.6 GiB/GPU transient; "scales with
+the chunk"; bt2048 workaround) was NOT inductor: the 3-arm
+attribution probe (DEVLOG-muse-glimmer round 4) put 2.75 GiB of the
+3.785 GiB TP=1 transient on the custom FA path, and per-layer
+`memory_allocated()` hooks showed the exact shape: **the q_pad buffer
+was per-impl, and v1 creates one impl per attention layer** — 52
+impls × 256 MiB `[num_seqs, Hq, Sq_pad, D]` fp32 (metadata pads
+num_seqs to max_num_seqs=4) grown on each impl's first prefill call
+and kept alive by the capture-latch retire policy = 13.3 GiB (TP=2:
+16 heads/GPU → 6.7 GiB/GPU). Buffer ∝ Sq_pad ∝ chunk = the
+"linear-in-chunk" signature. The gather buffers had the identical
+bug fixed earlier (ClassVar pattern); q_pad was missed. **Fix
+shipped** (Python-only, no rebuild): `_q_pad_buf` /
+`_q_pad_decode_buf` / `_q_pad_retired` / `_q_pad_captured` →
+ClassVar, `_ensure_forward_buffers` → @classmethod(num_heads,
+head_size, …); the q_pad lifecycle test rewritten with the
+class-state snapshot/restore pattern. Unit gate: 51/51.
+**Pending (post-reboot — boot K burst-wedged both probe attempts,
+degradation.md 21:58/22:06):** (1) the attribution-probe custom arm
+re-run (expect: one-time 256 MiB grow, survival at the 0.5 GiB cap,
+transient ≈ 1.5 GiB vs 3.785 pre-fix); (2) bt4096 TP=2 serving
+re-validation — drop `--max-num-batched-tokens 2048`, shrink the 6
+GiB KV cap if prefill clears; update the README TP=2 row. This item
+subsumes the old "reduce the custom FA prefill transient" lever.
+
+### M1 — window clip on the gather path (B=1 decode) — IMPLEMENTED 2026-08-27 (e2e gate pending)
 
 The Phase C clip fires only on the direct-paged (B≥2) dispatch; B=1
 decode (the gather path — the model's B=1 hot path) and all prefill
 scan the full KV. The gather path materializes `[B, Hkv, L, bpr]` K/V
 in HBM before the FA kernel, so this is a gather-side change (per-row
-gather start), not just a kernel loop start. Gate: bit-identity unit
-test + pp8192/B=1 A/B; the FA share of the B=1 step is large enough
-that the kernel micro-bench's −48% should show up e2e.
+gather start), not just a kernel loop start.
+
+**Implementation (Option A, absolute-position layout):** the persistent
+gather writes only rows `[kv_start, seq_len)` at absolute positions
+(buffer index == absolute token position; a 128-row margin
+`GATHER_CLIP_MARGIN` ≥ max nbatch_fa=128 covers the kernel's
+nbatch_fa tile-boundary floor) and the FA kernel (fattn-q8.cuh)
+starts its k-loop at the floored `kv_start` — no mask changes, rows
+`[0, floor)` never written or read. `kv_start = max(0, q_abs + 1 -
+window)` per seq (conservative: the first query row's window start;
+later rows' windows are subsets — covers Sq=1 decode, ngram Sq=6,
+prefill alike). Kill switch `GFX906_FA_GATHER_CLIP` (default 1).
+Files: fattn-q8.cuh (kv_start param + floor block LOCKSTEP with the
+paged Phase C), gfx906_fa_gather.cu (persistent kernel + launcher),
+gfx906_fa_launcher.cu / gfx906_fa.cpp (signatures/bindings),
+gfx906_fa_paged.py (kv_start math + dispatch). M1 v1 = persistent
+sub-path only (B≤16, all Sk = all current-server traffic); the other
+gather sub-paths pass kv_start=None (full gather, still correct).
+
+**Unit gate: PASS** — 5 new bit-identity tests (clip ON vs OFF via
+`_GATHER_CLIP` monkeypatch, direct dispatch forced off so B=2 really
+uses gather): Sq=1/6 × B=1/2 at L=4353/W=2048 (unaligned start
+2305/2300) + short-ctx inert case; full suite 51/51. Kernel-level
+sanity: rows [2305, L) bit-identical, rows [0, 2305) skipped.
+**E2E gate: PENDING** — pp8192/B=1 tg256 A/B (`GFX906_FA_GATHER_CLIP`
+1 vs 0) on the record recipe; the FA share of the B=1 step is large
+enough that the kernel micro-bench's −48% should show up e2e.
 
 ### M2 — per-row (2D) prefill clip
 
@@ -169,3 +220,48 @@ LEGACY=0; (b) the boot K B=4 grid point ran at ctx ≤2k where the clip
 is a no-op — a B=4 long-context (8k+) clip on/off e2e is missing. Flip
 the default only after a serving bake on the target workload. Gate: B=1
 + B=4 A/B (8k ctx) with the degradation canary green, plus (a)+(b).
+
+### Housekeeping — drop the legacy `~/env-rocm-7.14-gfx906.sh` sourcing
+
+The machine has a single ROCm toolchain now (/opt/rocm is the default),
+so `source ~/env-rocm-7.14-gfx906.sh` (PATH/LD_LIBRARY_PATH to
+/opt/rocm) is presumably unnecessary — remove it from the ACTIVE
+recipes: `/local/git/AGENTS.md` (single-card bench recipe),
+`docs/gfx906/running.md` (×2), `docs/gfx906/README.md`,
+`docs/gfx906/degradation_details.md`. Dev logs keep their lines
+(historical record). Gate: run the single-card bench recipe once
+verbatim WITHOUT the source and confirm the harness works (boot K,
+2026-08-27).
+
+### TODO — write a personal skill: MI50 vLLM memory attribution / snapshots
+
+Once the in-progress OOM-attribution memory-snapshot work (boot K,
+2026-08-27; probe `/local/tmp/muse/probe_oom_attribution.py`) is
+complete and its verdict recorded in `DEVLOG-muse-glimmer.md`, write a
+skill for future sessions at
+`/home/kread/.agents/skills/gfx906-mem-attribution/SKILL.md`
+(format per the existing `hf-cli` skill: frontmatter description +
+when-to-use, then the recipe). It should capture what this hunt
+actually learned, not the plan:
+
+- the probe design: arms (custom / rocm-attn / eager) × TP 1/2,
+  explicit small `kv_cache_memory_bytes`, PP sized so the first
+  prefill chunk is the OOM site, in-process `max_memory_allocated`
+  peak-transient measurement (TP=1 only; TP=2 workers are separate
+  processes → survive/OOM + last-straw alloc instead), raw
+  memory-snapshot dump for the attribution.
+- the env traps found: `VLLM_USE_AOT_COMPILE=0` (AOT mode is ON by
+  default on torch ≥2.10 and its out-of-process workers fail with
+  “Could not find an active GPU backend” on this box), the
+  inductor async-compile worker HSA failures (FORK pool default;
+  SPAWN children also failed to init HSA on a wedged-adjacent boot —
+  parent HSA works, children don’t), and how to instrument
+  (`generate_and_run_autotune_block` patch + `os.fork` trace +
+  worker initializer patch, all picklable/top-level for spawn).
+- the interpretation matrix (which arm surviving/OOMing implicates
+  what: our FA vs inductor/model shapes vs KV sizing) and the
+  recording protocol (HYPOTHESIS/GATE/VERDICT in the dev log,
+  degradation table if a wedge is involved).
+- gate for the skill itself: the next time an OOM needs attributing,
+  a fresh session following the skill should reach the probe-launch
+  stage without re-deriving the env traps.

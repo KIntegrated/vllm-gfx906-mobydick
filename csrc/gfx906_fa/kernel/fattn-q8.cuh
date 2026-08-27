@@ -879,6 +879,21 @@ static __global__ void flash_attn_tile_q8(
         // Sliding-window size in tokens (0 = plain causal / no window).
         // See the tile-iter doc; inert when q_abs_offset is null.
         const int window,
+        // Per-sequence KV scan start (gather-path sliding-window clip,
+        // M1): the k-loop walks [k0_base, k_VKQ_max) instead of
+        // [0, k_VKQ_max). LOCKSTEP with flash_attn_tile_q8_paged
+        // (fattn-q8-paged.cuh, phase C) — the floor block below is
+        // duplicated verbatim; change both together (tests cover both
+        // via test_forward_sliding_window* / test_forward_paged_direct_
+        // sliding_window*). In the gather layout the contiguous buffer
+        // is indexed at ABSOLUTE positions (the gather materializes
+        // [start, seq_len) in-place), so k_pos_abs stays
+        // k_VKQ_0 + i_KQ and the mask math is unchanged — only the
+        // loop start moves. The gather kernel (gfx906_fa_gather.cu)
+        // covers [start - GATHER_CLIP_MARGIN, seq_len) with
+        // GATHER_CLIP_MARGIN >= the max nbatch_fa in the config table,
+        // so the floored k0_base is always materialized.
+        const int32_t * __restrict__ kv_start,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -897,7 +912,7 @@ static __global__ void flash_attn_tile_q8(
 #ifdef FLASH_ATTN_AVAILABLE
 
     if (use_logit_softcap && !(DV == 128 || DV == 256)) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, q_abs_offset, window, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, q_abs_offset, window, kv_start, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -975,8 +990,26 @@ static __global__ void flash_attn_tile_q8(
         Q_f, Q_values, Q_scales, col_Q_0, int(ne01.z), head0, ne02, nb01, nb02, scale);
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    // Sliding-window clip start (0 = full scan; see param comment).
+    // LOCKSTEP with fattn-q8-paged.cuh phase C — duplicated verbatim;
+    // change both together. Floor to the nbatch_fa tile boundary so
+    // every tile visited is the same aligned tile the full scan visits
+    // (bit-identity — an unaligned start makes the first tile partial,
+    // repacking lanes and re-associating the fp16 reduction, ~5e-4
+    // relative). Only floor when the keys gained by the floor,
+    // [floor, k0_base), are window-masked (pos < q_abs + 1 - window) —
+    // the production clip passes exactly k0_base = max(0, q_abs + 1 -
+    // window); other kv_start callers (tests emulating a window via the
+    // clip) keep their exact start.
+    int k0_base = kv_start ? kv_start[sequence] : 0;
+    if (k0_base > 0 && window > 0 && q_abs_offset) {
+        const int win_start = q_abs_offset[sequence] + 1 - window;
+        if (k0_base <= (win_start > 0 ? win_start : 0)) {
+            k0_base -= k0_base % nbatch_fa;
+        }
+    }
     if (ncols2 == 1) {
-        int k_VKQ_0 = blockIdx.y*nbatch_fa;
+        int k_VKQ_0 = k0_base + blockIdx.y*nbatch_fa;
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_q8_q8_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
@@ -993,7 +1026,7 @@ static __global__ void flash_attn_tile_q8(
                 q_abs_offset, window, sequence, col_Q_0);
         }
     } else {
-        for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+        for (int k_VKQ_0 = k0_base + blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
             if (k_VKQ_0 + nbatch_fa > k_VKQ_max) {
                 // Tail strided tile crossing k_VKQ_max: mask OOB rows.
                 constexpr bool oob_check = true;

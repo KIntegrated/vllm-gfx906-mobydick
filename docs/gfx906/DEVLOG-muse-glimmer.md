@@ -662,5 +662,195 @@ withdrawn (it is reachable and gated).
   split 8 vs 1) + per-call `o_part` allocation / dead `o_meta`.
 
 
+## 2026-08-27 — round 4: OOM-attribution probe — the first-prefill transient is OUR FA's prefill path, not inductor
+
+## HYPOTHESIS
+
+The >10.6 GiB/GPU transient that OOMed the first 4096-token prefill
+chunk under TP=2 serving (boot J 17:40, boot K 18:41; 254 MiB
+last-straw `aten::empty` in a `gptq_gemm` inductor segment, free: 0)
+is owned by the **inductor piecewise-compiled prefill graph** (the
+failing allocation sits in an inductor segment), not the custom
+gfx906 FA backend.
+
+## GATE
+
+Three-arm in-process probe (`/local/tmp/muse/probe_oom_attribution.py`,
+TP=1, 0.5 GiB explicit KV cap, PP=4097 so the first prefill chunk is
+4096 = the OOM site; peak transient = `max_memory_allocated` delta
+around the cold first prefill):
+
+| arm | attention | compile | peak transient | outcome |
+|---|---|---|---|---|
+| custom | our gfx906 FA | inductor | **3.785 GiB** | OOM (last straw 508 MiB, free: 0) |
+| rocm | ROCM_ATTN (Triton FA) | inductor | **1.035 GiB** | survived (4.77 GiB free after) |
+| eager | our gfx906 FA | eager | **4.506 GiB** | OOM (0.37 GiB free after) |
+
+## VERDICT
+
+**HYPOTHESIS REJECTED as stated.** Compile held at inductor: swapping
+our FA for Triton FA removes **2.75 GiB** of the transient (3.785 →
+1.035) — the custom FA's prefill path is the **dominant owner**. FA
+held constant: inductor is **0.72 GiB smaller** than eager (3.785 vs
+4.506) — inductor's memory planner reuses activation memory; eager
+materializes more. The boot J/K “inductor gptq_gemm” OOM frame was
+where the memory ran **out**, not the owner: the 508 MiB Exllama fp16
+M×N output (508 = exactly 2× the TP=2 254 MiB last straw; N TP-split,
+~[4096, 32512] fp16 = 254×128 cols) is the model's own GEMM output
+landing last on an exhausted allocator. (Resolves the boot-I “532 MiB
+inductor OOM” datum: 532,676,608 B is this same 508 MiB alloc,
+misread as 532 MiB.)
+
+**Root cause FOUND (per-layer instrumentation, `attr_tp1_custom15/17`):
+the q_pad buffer was per-IMPL, and v1 creates one backend impl per
+attention layer.** `_ensure_forward_buffers` grew `self._q_pad_buf`
+([num_seqs, Hq, Sq_pad, D] fp32 = **256 MiB** at the 4096-chunk:
+metadata pads num_seqs to max_num_seqs=4) on each impl's FIRST
+prefill call and the capture-latched retire policy keeps every
+generation alive → 52 impls × 256 MiB = **13.3 GiB** of duplicate
+buffers (TP=2: 16 heads/GPU → 6.7 GiB/GPU). The per-layer probe
+showed exactly +256.0 MiB net at EVERY attention call (monotone
+23.389 → 25.690 over 9 calls; OOM at ~call 10), while the C++
+binding itself is clean (+64 MiB churn, same out_ptr reused —
+`probe_fa_reuse.py`: 52 calls, flat) and the Python wrapper is clean
+(+64 MiB `out_flat`, freed). This also explains the boot J/K
+signatures: "transient ~linear in the chunk" (buffer ∝ Sq_pad ∝
+chunk), bt2048 surviving (64 MiB/impl → 3.35 GiB total), and the
+2026-08-26 comment that already noted the "x52 layers = 14 GiB,
+first-request OOM" pathology (that fix only stopped the DECODE-time
+dim0 growth; the per-impl prefill duplication remained).
+
+**Fix: q_pad buffers are now ClassVar (shared across all impls, one
+set per worker — the pattern the gather buffers already use, which
+had the identical bug fixed earlier).** `vllm/gfx906_fa/
+gfx906_fa_backend.py`: `_q_pad_buf` / `_q_pad_decode_buf` /
+`_q_pad_retired` / `_q_pad_captured` → ClassVar; `_ensure_forward_
+buffers` → @classmethod (num_heads/head_size now parameters). The
+q_pad lifecycle test was rewritten with the class-state
+snapshot/restore pattern (the gather-buffer tests' pattern) so the
+grow sequence starts from a clean shared buffer.
+
+**Verification status:** unit gate **PASS — 51/51** (incl. the
+rewritten `test_q_pad_buffer_survives_capture_then_prefill_grow`
+capture→grow→retire→replay sequence). Probe verification (custom
+arm re-run: expect one-time 256 MiB grow, then flat, survival at the
+0.5 GiB KV cap, transient ≈ model core + 0.26 + churn) is
+**DEFERRED POST-REBOOT**: both attempts hit the boot-K burst wedge
+(custom18_fixed 21:58, retry custom19 22:06 — 2nd consecutive launch
+failure, GPU0 left 24.9 GB zombie VRAM; degradation.md 21:58/22:06,
+GPU work stopped). It is the first post-reboot step.
+
+Ruled out along the way: `o_part` KVSPLIT partials (the binding
+forces `kv_split=1` for `seq_q>2` — no such alloc at prefill),
+per-call binding/wrapper churn (flat; same buffer VA reused), Q8
+side view (alias, 0 bytes), gather buffers (already class-level,
++0.0 MiB per call). Dead ends recorded: this torch build's memory-
+snapshot stack capture returns only `?:0` unwind frames (no user
+frames) and kineto records no device-memory events on this ROCm
+stack — the per-layer `memory_allocated()` hook + segment-snapshot
+diff is what worked.
+
+## Evidence — the host-crash detour (cost a session; keep for the skill)
+
+Fresh in-process compiles on this box (torch 2.10-dev venv) die in
+order, before ever reaching the OOM site:
+
+1. **AOT is ON by default on torch ≥ 2.10** (`use_aot_compile()` in
+   `vllm/envs.py`): its out-of-process compile workers die with
+   “Could not find an active GPU backend” on every fresh compile.
+   Servers are unaffected (compile once on a clean boot, then warm AOT
+   cache). Fix: `VLLM_USE_AOT_COMPILE=0`.
+2. **Inductor writes `async_compile.wait()` into every generated
+   wrapper** (this torch) and its pool defaults to the FORK
+   SubprocPool (`TORCHINDUCTOR_WORKER_START=subprocess`) — HSA is not
+   fork-safe after the parent initialized HSA → same GPU-backend error
+   in the child.
+3. **`TORCHINDUCTOR_WORKER_START=spawn` also failed** — but
+   differently: the spawned child could not init HSA at all while the
+   parent's HSA was healthy (at the failing exec: parent
+   `is_available=True, bad_fork=False, devcount=1`, triton backends
+   fine, `_is_backend_active("amd")` True in parent). A standalone
+   spawn child DID init — state-dependent (boot K had 3 GPU incidents
+   by then; degradation.md 20:40). Workaround: replace
+   `AsyncCompile.process_pool` with a `ThreadPoolExecutor` (parent
+   threads; HSA already up) — also keeps compile transients inside the
+   measured process.
+4. **`TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` required**: the rblock
+   variant-compile path (`_dynamic_scale_rblock` → direct
+   `triton.compile`) crashes in our triton-gfx906 fork with
+   `AttributeError: 'NoneType' object has no attribute '__code__'`
+   (`get_jit_fn_file_line` → `JITCallable.fn is None`) — first compile
+   fine, the *variant* compile broken.
+
+## Notes / pending
+
+- Post-OOM segment snapshot (`oom_snap_custom_tp1_pp4097.json`):
+  31.30 GiB reserved / 26.47 allocated, 589 segments; top blocks
+  2×2566 MiB + 256 MiB weight shards. History-armed re-run
+  (`attr_tp1_custom11_hist.log`) reproduced the OOM byte-for-byte
+  (3.785 GiB / 532,676,608 B last straw) but the snapshot frames
+  are empty unwind-only stacks — stack capture is broken in this
+  torch build, and kineto records no device-memory events on this
+  ROCm stack either. The working instruments: per-layer /
+  per-binding `memory_allocated()` hooks + segment-snapshot diff.
+- The >10.6 GiB/GPU TP=2 serving OOM (boot J/K) is the same bug at
+  16 heads/GPU (6.7 GiB q_pad growth + inductor buffers > 10.6
+  headroom). The ClassVar fix should let bt4096 serve under the 6
+  GiB KV cap — **re-validate the boot K launch recipe (bt2048
+  workaround droppable, 6 GiB cap shrinkable) post-reboot, after the
+  probe verification passes** (pending list in degradation_details.md
+  22:06).
+
+## 2026-08-27 — round 5: M1 window clip on the gather path (B=1 decode) — implemented + unit-gated, e2e pending
+
+## HYPOTHESIS
+
+Extending the Phase C window clip to the gather path — via an
+absolute-position gather layout (gather writes only rows
+`[kv_start, seq_len)` at buffer index == absolute position) plus the
+FA kernel starting its k-loop at the floored `kv_start` — is
+**bit-identical** (no mask changes; the floored start matches the
+existing paged Phase C floor block) and cuts the gather + FA work for
+B=1 long-context decode (the kernel micro-bench showed −48% FA time
+at L=8k/W=2k).
+
+## What was done
+
+- `fattn-q8.cuh`: new `kv_start` param (after `window`);
+k0_base floor block **LOCKSTEP-copied** from the paged Phase C floor
+  (floor is for bit-identity: an unaligned first tile re-associates
+  the fp16 reduction, ~5e-4); both loop starts shifted to
+  `k0_base + blockIdx.y*nbatch_fa`.
+- `gfx906_fa_gather.cu`: persistent gather takes `kv_start` (int32
+  [B], optional); per-seq gather start + 128-row margin
+  (`GATHER_CLIP_MARGIN`, ≥ max nbatch_fa=128 so the floored start is
+  always materialized); grid-stride kernel → no host row-count change.
+- `gfx906_fa_launcher.cu` / `gfx906_fa.cpp`: signatures + bindings
+  (`py::arg("kv_start") = nullopt`; int32 [B] validation mirroring
+  paged-direct).
+- `gfx906_fa_paged.py`: `GFX906_FA_GATHER_CLIP` kill switch (default
+  1); `kv_start = max(0, q_abs + 1 − window)` per seq, int32
+  contiguous, computed in the persistent sub-path and passed to both
+  the persistent gather and `forward`; `_DOUBLE_CHECK` requires
+  `kv_start is None` (the double-check kernel's window test assumed
+  full-gather positions — keep the invariant explicit).
+- M1 v1 = **persistent sub-path only** (B≤16, all Sk = all current
+  server traffic); other gather sub-paths pass `kv_start=None`
+  (full gather, still correct).
+
+## GATE
+
+Bit-identity unit tests (clip ON vs OFF, direct dispatch forced off
+so B=2 really uses gather) + full suite + e2e pp8192/B=1 tg256 A/B
+(`GFX906_FA_GATHER_CLIP` 1 vs 0, record recipe).
+
+## VERDICT
+
+**Unit gate PASS** (e2e pending — GPU0 busy with the round-4 probe):
+5/5 new tests (Sq=1/6 × B=1/2 at L=4353/W=2048 unaligned starts
+2305/2300 + short-ctx inert L=513<W) + full suite 51/51. Kernel-level
+sanity: rows `[2305, L)` bit-identical, rows `[0, 2305)` skipped by
+gather. E2e A/B queued.
+
 ---
 Copyright Kevin Read <me@kevin-read.com>

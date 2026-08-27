@@ -526,12 +526,25 @@ extern "C" __global__ void gather_paged_kv_quant_kernel(
 // per-seq counts (Hkv × (seq_len + margin)) are prefix-summed in registers
 // (num_seqs <= 16). Each 64-thread workgroup grid-strides the flat row
 // space; all lanes compute the same (uniform) mapping per row.
+//
+// M1 gather-path window clip: with non-null kv_start, per-seq rows
+// [0, start) are skipped, start = max(0, kv_start[s] - GATHER_CLIP_MARGIN)
+// (clamped to seq_len). The FA kernel (fattn-q8.cuh) floors its clip
+// start to an nbatch_fa tile boundary — the max nbatch_fa in the config
+// table is 128, so the margin guarantees the floored start is always
+// materialized; if the table's max grows, grow the margin too (the
+// bit-identity unit tests catch the drift). Rows are written at ABSOLUTE
+// token indices, so the FA k-loop start (floor(kv_start)) indexes this
+// buffer directly — no compaction, no reindexing.
 // ---------------------------------------------------------------------------
+constexpr int GATHER_CLIP_MARGIN = 128;
+
 extern "C" __global__ void gather_paged_kv_quant_persistent_kernel(
     const __half  * __restrict__ key_cache,
     const __half  * __restrict__ value_cache,
     const int32_t * __restrict__ block_table,
     const int32_t * __restrict__ seq_lens,
+    const int32_t * __restrict__ kv_start,
     uint8_t       * __restrict__ k_q8_out,
     __half        * __restrict__ v_out,
     int num_seqs,
@@ -557,18 +570,27 @@ extern "C" __global__ void gather_paged_kv_quant_persistent_kernel(
     const int Hkv = num_kv_heads;
 
     // Per-seq row counts (uniform across the wavefront; B is small).
-    //   rph[s] = min(seq_len[s], Sk) + margin, margin =
+    //   gstart[s] = clip start (see kernel doc; 0 without kv_start)
+    //   rph[s] = (min(seq_len[s], Sk) - gstart[s]) + margin, margin =
     //            min(margin_zeros, Sk - min(seq_len[s], Sk))
     //   cnt[s] = Hkv * rph[s]
     int rph[16];
+    int gstart[16];
     int total = 0;
     #pragma unroll 4
     for (int s = 0; s < B; ++s) {
         int sl = seq_lens[s];
         if (sl > Sk) sl = Sk;
+        int st = 0;
+        if (kv_start && kv_start[s] > 0) {
+            st = kv_start[s] - GATHER_CLIP_MARGIN;
+            if (st < 0) st = 0;
+            if (st > sl) st = sl;
+        }
+        gstart[s] = st;
         int extra = margin_zeros;
         if (extra > Sk - sl) extra = Sk - sl;
-        rph[s] = sl + extra;
+        rph[s] = (sl - st) + extra;
         total += Hkv * rph[s];
     }
 
@@ -587,7 +609,7 @@ extern "C" __global__ void gather_paged_kv_quant_persistent_kernel(
         }
         const int rows_per_head = rph[seq_idx];
         const int head_idx = rem / rows_per_head;
-        const int tok      = rem - head_idx * rows_per_head;
+        const int tok      = gstart[seq_idx] + rem - head_idx * rows_per_head;
 
         int sl = seq_lens[seq_idx];
         if (sl > Sk) sl = Sk;
@@ -660,6 +682,7 @@ extern "C" hipError_t launch_gather_paged_kv_quant_persistent(
     const __half  * value_cache,
     const int32_t * block_table,
     const int32_t * seq_lens,
+    const int32_t * kv_start,
     uint8_t       * k_q8_out,
     __half        * v_out,
     int num_seqs,
@@ -688,7 +711,7 @@ extern "C" hipError_t launch_gather_paged_kv_quant_persistent(
     dim3 grid_d(grid, 1, 1);
    hipLaunchKernelGGL(( gather_paged_kv_quant_persistent_kernel), dim3(grid_d), dim3(block), 0, stream, 
         key_cache, value_cache,
-        block_table, seq_lens,
+        block_table, seq_lens, kv_start,
         k_q8_out, v_out,
         num_seqs, num_kv_heads, Sk, D, bytes_per_row, block_size,
         max_blocks_per_seq, margin_zeros,

@@ -52,6 +52,10 @@ extern "C" hipError_t gfx906_fa_launch(
     // (mask_ptr тогда ДОЛЖЕН быть nullptr). q_abs_offset[b] = seq_len_total[b] - n_q[b].
     const int32_t * Q_ABS_OFFSET_d,
     int window,
+    // M1 gather-path window clip start [B] (nullptr = full scan); the K
+    // buffer must contain rows [kv_start[b], seq_len[b]) (see
+    // launch_gather_paged_kv_quant_persistent).
+    const int32_t * KV_START_d,
     int batch, int heads_q, int heads_kv,
     int seq_q, int seq_kv, int head_dim,
     float scale,
@@ -211,6 +215,12 @@ extern "C" hipError_t launch_gather_paged_kv_quant_persistent(
     const __half  * value_cache,
     const int32_t * block_table,
     const int32_t * seq_lens,
+    // M1 gather-path window clip start [B] (nullptr = gather from 0).
+    // Non-null: sequence s gathers rows [start[s], seq_len[s]) into buffer
+    // rows [start[s], Sk) — buffer index == absolute position, so the FA
+    // kernel's inline causal/window masks (keyed on absolute position) stay
+    // valid unmodified; rows [0, start[s]) are left stale (never read).
+    const int32_t * kv_start,
     uint8_t       * k_q8_out,
     __half        * v_out,
     int num_seqs,
@@ -276,7 +286,12 @@ torch::Tensor gfx906_fa_forward(
     // without the absolute query position the window mask cannot be
     // evaluated (the kernel silently degrades to full attention if it is
     // missing, so we error instead).
-    int64_t window = 0
+    int64_t window = 0,
+    // M1 gather-path window clip start [B] (abs position; see the paged
+    // binding of the same name). The K buffer must contain rows
+    // [kv_start[b], seq_len[b]); the backend pairs it with the
+    // kv_start-aware persistent gather.
+    c10::optional<torch::Tensor> kv_start = c10::nullopt
 ) {
     TORCH_CHECK(window == 0 || q_abs_offset.has_value(),
         "window > 0 requires q_abs_offset (the window mask needs absolute "
@@ -408,6 +423,21 @@ torch::Tensor gfx906_fa_forward(
         q_abs_offset_ptr = q_abs_offset_contig.data_ptr<int32_t>();
     }
 
+    // M1 gather-path window clip start (mirrors the paged-direct check).
+    const int32_t * kv_start_ptr = nullptr;
+    torch::Tensor kv_start_c;
+    if (kv_start.has_value()) {
+        TORCH_CHECK(q_abs_offset.has_value() && window > 0,
+            "kv_start requires q_abs_offset and window > 0");
+        auto ks = kv_start.value();
+        TORCH_CHECK_CUDA(ks);
+        TORCH_CHECK(ks.dtype() == torch::kInt32, "kv_start must be int32");
+        TORCH_CHECK(ks.dim() == 1 && ks.size(0) == batch,
+            "kv_start must be [batch]");
+        kv_start_c = ks.contiguous();
+        kv_start_ptr = kv_start_c.data_ptr<int32_t>();
+    }
+
     hipError_t err = gfx906_fa_launch(
         q.data_ptr<float>(),
         k_q8.data_ptr<uint8_t>(),
@@ -419,6 +449,7 @@ torch::Tensor gfx906_fa_forward(
         mask_seq_kv_padded,
         q_abs_offset_ptr,
         window,
+        kv_start_ptr,
         batch, heads_q, heads_kv, seq_q, seq_kv, head_dim,
         (float) scale,
         stream,
@@ -915,7 +946,12 @@ std::vector<torch::Tensor> gather_paged_kv_quant_persistent(
     torch::Tensor seq_lens,      // int32 [num_seqs]
     int64_t Sk,
     c10::optional<torch::Tensor> k_out_opt = c10::nullopt,  // uint8 [B,Hkv,Sk,bytes]
-    c10::optional<torch::Tensor> v_out_opt = c10::nullopt   // fp16  [B,Hkv,Sk,D]
+    c10::optional<torch::Tensor> v_out_opt = c10::nullopt,  // fp16  [B,Hkv,Sk,D]
+    // M1 gather-path window clip start [B] (abs position). Non-null:
+    // sequence s gathers rows [start[s], seq_len[s]) into buffer rows
+    // [start[s], Sk) (buffer index == absolute position; see the launcher
+    // comment). start[s] >= Sk is rejected — the clipped rows would not fit.
+    c10::optional<torch::Tensor> kv_start = c10::nullopt
 ) {
     TORCH_CHECK_CUDA(key_cache);
     TORCH_CHECK_CUDA(value_cache);
@@ -948,6 +984,18 @@ std::vector<torch::Tensor> gather_paged_kv_quant_persistent(
     TORCH_CHECK(seq_lens.size(0) == num_seqs, "seq_lens vs block_table batch mismatch");
     TORCH_CHECK(Sk > 0 && (Sk % 32) == 0, "Sk must be positive multiple of 32, got ", Sk);
     TORCH_CHECK(num_seqs <= 16, "num_seqs must be <= 16, got ", num_seqs);
+
+    const int32_t * kv_start_ptr = nullptr;
+    torch::Tensor kv_start_c;
+    if (kv_start.has_value()) {
+        auto ks = kv_start.value();
+        TORCH_CHECK_CUDA(ks);
+        TORCH_CHECK(ks.dtype() == torch::kInt32, "kv_start must be int32");
+        TORCH_CHECK(ks.dim() == 1 && ks.size(0) == num_seqs,
+            "kv_start must be [num_seqs]");
+        kv_start_c = ks.contiguous();
+        kv_start_ptr = kv_start_c.data_ptr<int32_t>();
+    }
 
     const int bytes_per_row = (D / 32) * 34;
 
@@ -988,6 +1036,7 @@ std::vector<torch::Tensor> gather_paged_kv_quant_persistent(
         reinterpret_cast<const __half*>(value_cache.data_ptr<at::Half>()),
         block_table.data_ptr<int32_t>(),
         seq_lens.data_ptr<int32_t>(),
+        kv_start_ptr,
         k_out.data_ptr<uint8_t>(),
         reinterpret_cast<__half*>(v_out.data_ptr<at::Half>()),
         num_seqs, num_kv_heads, (int)Sk, D, bytes_per_row, block_size,
@@ -1242,7 +1291,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("kv_max")        = c10::nullopt,
           py::arg("mask")          = c10::nullopt,
           py::arg("q_abs_offset")  = c10::nullopt,
-          py::arg("window")        = 0);
+          py::arg("window")        = 0,
+          py::arg("kv_start")      = c10::nullopt);
     m.def("quantize_q8_0", &quantize_q8_0,
           "Quantize fp16 tensor (last dim D) → block_q8_0 uint8 (device-side)",
           py::arg("k_fp16"));
@@ -1272,11 +1322,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "fixed grid (GFX906_FA_PERSIST_GRID), work bounded by the live "
           "seq_lens tensor, valid at every Sk. K bit-equal to "
           "quantize_q8_0(gather_paged_kv_fp16(x)); rows >= seq_len are not "
-          "written except GFX906_FA_PERSIST_MARGIN V-zero rows.",
+          "written except GFX906_FA_PERSIST_MARGIN V-zero rows. kv_start "
+          "(M1 clip): per-seq absolute start; rows [0, start) are skipped.",
           py::arg("key_cache"), py::arg("value_cache"),
           py::arg("block_table"), py::arg("seq_lens"), py::arg("Sk"),
           py::arg("k_out") = c10::nullopt,
-          py::arg("v_out") = c10::nullopt);
+          py::arg("v_out") = c10::nullopt,
+          py::arg("kv_start") = c10::nullopt);
     m.def("gather_paged_kv_quantized", &gather_paged_kv_quantized,
           "Stage-2 LEGACY-path fused gather: paged fp16 K + V -> K quantized "
           "in-kernel to q8_0 (bit-equal to quantize_q8_0 of the fp16 gather) "

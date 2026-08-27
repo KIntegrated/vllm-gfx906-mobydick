@@ -470,6 +470,13 @@ def test_q_pad_buffer_survives_capture_then_prefill_grow():
     decode must stay numerically correct. Drives the real Gfx906FAImpl
     (not hand-fed buffers) in the hazardous production order: small
     decode → capture → large prefill → decode replay.
+
+    The q_pad buffers are CLASS-level (shared across all layer impls —
+    the per-impl version was the boot J/K first-prefill OOM, see
+    DEVLOG-muse-glimmer.md round 4), so this test snapshots/restores
+    the class state like the gather-buffer lifecycle tests: the grow
+    sequence must start from a clean shared buffer, and nothing leaks
+    into other tests.
     """
     dev = "cuda"
     torch.manual_seed(7)
@@ -484,75 +491,89 @@ def test_q_pad_buffer_survives_capture_then_prefill_grow():
         kv_cache_dtype="float16",
     )
     assert impl._legacy  # this test targets the default serving path
+    cls = type(impl)
 
-    n_blocks = 16  # 256 tokens
-    _, vc, kv = _make_paged_cache(n_blocks, dev)
-    k16 = kv[:, 0]
-    K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
-                    dtype=torch.float16) * 0.5
-    V = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
-                    dtype=torch.float16) * 0.5
-    k16.copy_(K.view(n_blocks, BLOCK, HKV, D))
-    _write_v(kv, V)
+    saved = (cls._q_pad_buf, cls._q_pad_decode_buf, cls._q_pad_retired,
+             cls._q_pad_captured)
+    cls._q_pad_buf = None
+    cls._q_pad_decode_buf = None
+    cls._q_pad_retired = []
+    cls._q_pad_captured = False
+    try:
+        n_blocks = 16  # 256 tokens
+        _, vc, kv = _make_paged_cache(n_blocks, dev)
+        k16 = kv[:, 0]
+        K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                        dtype=torch.float16) * 0.5
+        V = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                        dtype=torch.float16) * 0.5
+        k16.copy_(K.view(n_blocks, BLOCK, HKV, D))
+        _write_v(kv, V)
 
-    def meta(num_tokens, sq, sk, bt_, sl_, cu_):
-        return Gfx906FAMetadata(
-            num_actual_tokens=num_tokens,
-            max_query_len=sq,
-            max_seq_len=sk,
-            query_start_loc=cu_,
-            seq_lens=sl_,
-            block_table=bt_,
-            slot_mapping=torch.empty(0, dtype=torch.int64, device=dev),
-        )
+        def meta(num_tokens, sq, sk, bt_, sl_, cu_):
+            return Gfx906FAMetadata(
+                num_actual_tokens=num_tokens,
+                max_query_len=sq,
+                max_seq_len=sk,
+                query_start_loc=cu_,
+                seq_lens=sl_,
+                block_table=bt_,
+                slot_mapping=torch.empty(0, dtype=torch.int64,
+                                         device=dev),
+            )
 
-    layer = None  # impl.forward does not touch the layer object
-    s = torch.cuda.Stream()
+        layer = None  # impl.forward does not touch the layer object
+        s = torch.cuda.Stream()
 
-    # (1) small decode (eager): allocates the small q_pad (Sq_pad=2)
-    bt_d = torch.arange((100 + BLOCK - 1) // BLOCK, dtype=torch.int32,
-                        device=dev).view(1, -1)
-    sl_d = torch.tensor([100], dtype=torch.int32, device=dev)
-    cu_d = torch.arange(2, dtype=torch.int32, device=dev)
-    q_d = torch.randn(1, HQ, D, device=dev, dtype=torch.float16) * 0.5
-    out_d = torch.zeros(1, HQ, D, device=dev, dtype=torch.float16)
-    m_d = meta(1, 1, 100, bt_d, sl_d, cu_d)
-    with torch.cuda.stream(s):
-        for _ in range(2):
+        # (1) small decode (eager): allocates the small q_pad (Sq_pad=2)
+        bt_d = torch.arange((100 + BLOCK - 1) // BLOCK, dtype=torch.int32,
+                            device=dev).view(1, -1)
+        sl_d = torch.tensor([100], dtype=torch.int32, device=dev)
+        cu_d = torch.arange(2, dtype=torch.int32, device=dev)
+        q_d = torch.randn(1, HQ, D, device=dev, dtype=torch.float16) * 0.5
+        out_d = torch.zeros(1, HQ, D, device=dev, dtype=torch.float16)
+        m_d = meta(1, 1, 100, bt_d, sl_d, cu_d)
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                impl.forward(layer, q_d, q_d, q_d, kv, m_d, output=out_d)
+        torch.cuda.current_stream().wait_stream(s)
+        ref_d = out_d.clone()
+        small_buf = impl._q_pad_buf
+        assert small_buf.shape[2] == 2
+
+        # (2) capture the decode graph (bakes small_buf's VA in)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
             impl.forward(layer, q_d, q_d, q_d, kv, m_d, output=out_d)
-    torch.cuda.current_stream().wait_stream(s)
-    ref_d = out_d.clone()
-    small_buf = impl._q_pad_buf
-    assert small_buf.shape[2] == 2
+        assert impl._q_pad_captured
+        assert impl._q_pad_buf is small_buf
 
-    # (2) capture the decode graph (bakes small_buf's VA in)
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        impl.forward(layer, q_d, q_d, q_d, kv, m_d, output=out_d)
-    assert impl._q_pad_captured
-    assert impl._q_pad_buf is small_buf
+        # (3) eager prefill with larger Sq_pad → grow branch
+        q_p = torch.randn(64, HQ, D, device=dev, dtype=torch.float16) * 0.5
+        out_p = torch.zeros(64, HQ, D, device=dev, dtype=torch.float16)
+        m_p = meta(64, 64, 64,
+                   torch.arange(4, dtype=torch.int32, device=dev).view(
+                       1, -1),
+                   torch.tensor([64], dtype=torch.int32, device=dev),
+                   torch.tensor([0, 64], dtype=torch.int32, device=dev))
+        impl.forward(layer, q_p, q_p, q_p, kv, m_p, output=out_p)
+        assert impl._q_pad_buf is not small_buf
+        assert impl._q_pad_buf.shape[2] == 64
+        assert bool(torch.isfinite(out_p.float()).all())
 
-    # (3) eager prefill with larger Sq_pad → grow branch
-    q_p = torch.randn(64, HQ, D, device=dev, dtype=torch.float16) * 0.5
-    out_p = torch.zeros(64, HQ, D, device=dev, dtype=torch.float16)
-    m_p = meta(64, 64, 64,
-               torch.arange(4, dtype=torch.int32, device=dev).view(1, -1),
-               torch.tensor([64], dtype=torch.int32, device=dev),
-               torch.tensor([0, 64], dtype=torch.int32, device=dev))
-    impl.forward(layer, q_p, q_p, q_p, kv, m_p, output=out_p)
-    assert impl._q_pad_buf is not small_buf
-    assert impl._q_pad_buf.shape[2] == 64
-    assert bool(torch.isfinite(out_p.float()).all())
+        # (4) the captured buffer was retired, not freed
+        assert any(t is small_buf for t in impl._q_pad_retired)
+        assert small_buf.data_ptr() != impl._q_pad_buf.data_ptr()
 
-    # (4) the captured buffer was retired, not freed
-    assert any(t is small_buf for t in impl._q_pad_retired)
-    assert small_buf.data_ptr() != impl._q_pad_buf.data_ptr()
-
-    # (5) replay: the graph writes q_pad through the retired-but-alive VA
-    out_d.zero_()
-    g.replay()
-    torch.cuda.synchronize()
-    assert ((out_d - ref_d).norm() / ref_d.norm()).item() < 2e-2
+        # (5) replay: the graph writes q_pad through the retired-but-alive
+        # VA
+        out_d.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        assert ((out_d - ref_d).norm() / ref_d.norm()).item() < 2e-2
+    finally:
+        (cls._q_pad_buf, cls._q_pad_decode_buf, cls._q_pad_retired,
+         cls._q_pad_captured) = saved
 
 
 def test_gather_buffers_lifecycle_postfix():
@@ -1874,3 +1895,115 @@ def test_paged_direct_fully_masked_row_no_nan():
     # sibling row is the correct windowed decode
     ref0 = _windowed_ref(q[0, :, 0], Kf, Vf, scale, L - 1, W)
     assert ((out[0, 0] - ref0).norm() / ref0.norm()).item() < 5e-2
+
+
+# ---------------------------------------------------------------------------
+# M1: gather-path window clip (persistent gather + FA k-loop shift).
+#
+# With _GATHER_CLIP on, windowed forward_paged through the persistent
+# (legacy-path) gather gathers only [kv_start, L) per seq and the FA kernel
+# starts its k-loop at floor(kv_start, nbatch_fa) — rows [0, floor) are left
+# stale in the gather buffer and must never be read. This must be
+# bit-identical to _GATHER_CLIP off (full gather + full scan): the skipped
+# prefix is fully window-masked in both arms (the clip start is the first
+# query row's window start; later rows' windows are subsets). Direct-paged
+# dispatch is forced off so the B=2 shapes exercise the GATHER path (their
+# Phase C direct clip would otherwise make the A/B a no-op).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("nq, B, L, W",
+                         [(1, 1, 4353, 2048),   # decode, unaligned start
+                          (1, 2, 4353, 2048),   # decode, gather-forced B=2
+                          (6, 1, 4353, 2048),   # ngram n=5 (Sq=6)
+                          (6, 2, 4353, 2048)])
+def test_forward_paged_gather_window_clip_bit_identical(nq, B, L, W):
+    from vllm.gfx906_fa import gfx906_fa_paged as paged
+    dev = "cuda"
+    torch.manual_seed(11)
+    scale = 1.0 / math.sqrt(D)
+
+    # Disjoint per-seq block ranges (B=2 must not share rows).
+    nb = (L + BLOCK - 1) // BLOCK
+    n_blocks = B * nb
+    _, vc, kv = _make_paged_cache(n_blocks + 4, dev)
+    k16 = torch.zeros(n_blocks + 4, BLOCK, HKV, D, dtype=torch.float16,
+                      device=dev)
+    K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    V = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    for b in range(B):
+        k16[b * nb:(b + 1) * nb].view(-1, HKV, D)[:L].copy_(
+            K[b * nb * BLOCK:b * nb * BLOCK + L])
+        stag = torch.zeros_like(kv[b * nb:(b + 1) * nb, 1])
+        stag.view(-1, HKV, D)[:L].copy_(V[b * nb * BLOCK:b * nb * BLOCK + L])
+        kv[b * nb:(b + 1) * nb, 1].copy_(stag)
+
+    bt = torch.stack([torch.arange(b * nb, (b + 1) * nb, dtype=torch.int32)
+                      for b in range(B)]).contiguous().to(dev)
+    sl = torch.full((B,), L, dtype=torch.int32, device=dev)
+    cu = torch.arange(0, B * nq + 1, nq, dtype=torch.int32, device=dev)
+    q = torch.randn(B * nq, HQ, D, device=dev, dtype=torch.float32) * 0.5
+
+    old_clip, old_mode = paged._GATHER_CLIP, paged._DIRECT_PAGED_MODE
+    try:
+        paged._DIRECT_PAGED_MODE = "0"   # force the gather path
+        paged._GATHER_CLIP = False
+        out_off = paged.forward_paged(
+            q, k16, vc, bt, sl, cu,
+            max_seqlen_q=nq, max_seqlen_k=L, scale=scale, window=W)
+        paged._GATHER_CLIP = True
+        out_on = paged.forward_paged(
+            q, k16, vc, bt, sl, cu,
+            max_seqlen_q=nq, max_seqlen_k=L, scale=scale, window=W)
+    finally:
+        paged._GATHER_CLIP, paged._DIRECT_PAGED_MODE = old_clip, old_mode
+    # The skipped prefix is fully window-masked; the clip must not change
+    # a single bit (the direct-paged unaligned test documents the ~500x
+    # pre-floor failure this would catch).
+    assert (out_on - out_off).abs().max().item() < 1e-7
+
+
+def test_forward_paged_gather_window_clip_short_ctx():
+    """L < window: kv_start = 0 everywhere (clip inert) — the gather must
+    still be a full gather and the output bit-identical to the clip-off
+    arm (guards against the clip math firing on clamped-zero starts)."""
+    from vllm.gfx906_fa import gfx906_fa_paged as paged
+    dev = "cuda"
+    torch.manual_seed(13)
+    B, L, W, nq = 2, 513, 2048, 1
+    scale = 1.0 / math.sqrt(D)
+    nb = (L + BLOCK - 1) // BLOCK
+    n_blocks = B * nb
+    _, vc, kv = _make_paged_cache(n_blocks + 4, dev)
+    k16 = torch.zeros(n_blocks + 4, BLOCK, HKV, D, dtype=torch.float16,
+                      device=dev)
+    K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    V = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    for b in range(B):
+        k16[b * nb:(b + 1) * nb].view(-1, HKV, D)[:L].copy_(
+            K[b * nb * BLOCK:b * nb * BLOCK + L])
+        stag = torch.zeros_like(kv[b * nb:(b + 1) * nb, 1])
+        stag.view(-1, HKV, D)[:L].copy_(V[b * nb * BLOCK:b * nb * BLOCK + L])
+        kv[b * nb:(b + 1) * nb, 1].copy_(stag)
+    bt = torch.stack([torch.arange(b * nb, (b + 1) * nb, dtype=torch.int32)
+                      for b in range(B)]).contiguous().to(dev)
+    sl = torch.full((B,), L, dtype=torch.int32, device=dev)
+    cu = torch.arange(0, B * nq + 1, nq, dtype=torch.int32, device=dev)
+    q = torch.randn(B * nq, HQ, D, device=dev, dtype=torch.float32) * 0.5
+    old_clip, old_mode = paged._GATHER_CLIP, paged._DIRECT_PAGED_MODE
+    try:
+        paged._DIRECT_PAGED_MODE = "0"
+        paged._GATHER_CLIP = False
+        out_off = paged.forward_paged(
+            q, k16, vc, bt, sl, cu,
+            max_seqlen_q=nq, max_seqlen_k=L, scale=scale, window=W)
+        paged._GATHER_CLIP = True
+        out_on = paged.forward_paged(
+            q, k16, vc, bt, sl, cu,
+            max_seqlen_q=nq, max_seqlen_k=L, scale=scale, window=W)
+    finally:
+        paged._GATHER_CLIP, paged._DIRECT_PAGED_MODE = old_clip, old_mode
+    assert (out_on - out_off).abs().max().item() < 1e-7

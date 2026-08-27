@@ -1118,3 +1118,91 @@ capture all clean on the retry. The one remaining validation is the
 Pending with the operator-relaunched server: sanity request (pp4096) →
 the prefill grid (`docs/gfx906/_bench_serve_grid_gfx906.py`) → the
 README serving row.
+
+## 2026-08-27 20:40–20:42Z (boot K): in-process OOM-attribution probe wedges GPU0 mid weight-load; driver self-recovers
+
+**What ran.** The OOM-attribution probe for the boot-J/K first-prefill
+OOM (`/local/tmp/muse/probe_oom_attribution.py`, custom arm = our
+GFX906_FA backend, TP=1, in-process, 0.5 GiB explicit KV cap, PP=4097
+so the first prefill chunk is 4096 = the OOM site,
+`VLLM_USE_AOT_COMPILE=0` after the AOT-worker crash, see
+DEVLOG-muse-glimmer.md round 3 for the inductor-host-crash chase).
+
+**Timeline.**
+1. **~20:40:59Z** — model load starts (5th in-process probe launch on
+   boot K: custom3/4/6 died earlier in host-level inductor crashes,
+   custom5 in an import-time AttributeError — none of those touched a
+   GPU kernel launch hard, but the boot has also carried the 17:40/17:52
+   boot-J relaunch failures and the 18:23 GPU1 reset).
+2. **~20:41:0xZ** — at 20% into weight load (shard 1/5→2 boundary):
+   `terminate called after throwing an instance of 'c10::AcceleratorError'
+   what(): CUDA error: unspecified launch failure` — the **7th
+   occurrence** of the chronic weight-load hang across boots (same
+   family: 08-26 06:03/06:52, 08-27 08:2x ×2, 17:40/17:52, 18:23).
+   kern.log/journal unreadable (no root), so the reset type is
+   inferred, not observed.
+3. **~20:42Z** — rocm-smi: both cards back at the 10.8 MB VRAM
+   baseline, 0% util. The driver completed its own reset and the GPU
+   is usable again — an *isolated* wedge with self-recovery.
+
+**Assessment.** Isolated per the house recipe → one retry of the probe.
+If the retry wedges again that is a burst (2 consecutive launch
+failures on this boot's tail) → stop GPU work, reboot (root). Note the
+boot has now accumulated 3 GPU-side incidents (18:23 GPU1, 20:40 GPU0,
+plus the boot-J carry-over); the degradation-onset question (when does
+a boot enter the state where weight loads wedge?) stays open — see the
+Open questions section.
+
+## 2026-08-27 21:57–21:59Z (boot K): OOM-attribution probe (q_pad-fix verification run) wedges GPU0; driver self-recovers
+
+**Context.** Boot K's 4th GPU-side incident (after 18:23 GPU1, 20:40
+GPU0, plus the 21:0x/21:1x/21:2x in-process probe launches that ran
+clean). The run was the post-fix verification of the q_pad ClassVar
+change (DEVLOG-muse-glimmer round 4 root cause;
+`attr_tp1_custom18_fixed.log`): in-process custom arm, TP=1, 0.5 GiB
+KV cap, PP=4097, weight load started ~20 s in.
+
+**Timeline.**
+1. **21:57:28Z** — engine init: backend registered, weight load
+   begins (GPU0).
+2. **~21:58:3xZ** — `terminate called after throwing an instance of
+   'c10::AcceleratorError' what(): CUDA error: unspecified launch
+   failure` — the 8th occurrence of the chronic launch-failure
+   family across boots. kern.log/journal unreadable (no root).
+3. **~22:00Z** — rocm-smi: GPU0 back at the 11.2 MB VRAM baseline,
+   0% util; the driver completed its own reset (self-recovery, same
+   pattern as 20:40). GPU1 unaffected (a test suite ran on it
+   throughout).
+
+**4. ~22:03Z** — a 30 s torch canary on GPU0 (200 fp16 matmuls)
+passed: 3.01 s, clean. GPU1 unaffected throughout (the 51/51
+q_pad-fix test suite completed on it at ~22:06).
+5. **~22:06Z** — the ONE allowed retry of the probe
+(`attr_tp1_custom19_fixed_retry.log`) wedged GPU0 again — 2nd
+consecutive launch failure, same `unspecified launch failure`
+signature. And after this one the driver did NOT self-recover: GPU0
+stuck at **24.9 GB zombie VRAM**, 0% util (the 20:40 and 21:58
+crashes both released to the ~11 MB baseline; this one held the
+reservation).
+
+**Assessment.** **BURST per house recipe (2 consecutive launch
+failures) → all GPU work stopped; the host needs a reboot (root)** —
+BACO reset also needs root, and the 2nd-failure rule stops short of
+even attempting it. Boot K's GPU incident count: 18:23 (GPU1), 20:40
+(GPU0, self-recovered), 21:58 (GPU0, self-recovered), 22:06 (GPU0,
+ZOMBIE VRAM). This boot is done for GPU work.
+
+**Pending post-reboot** (in order): (1) canary (Qwen3.8-27B mtp2,
+expect 38–47 t/s); (2) q_pad-ClassVar fix verification — re-run the
+OOM-attribution custom arm (expect: one-time 256 MiB grow, survival
+at the 0.5 GiB KV cap, transient ≈ model core + 0.26 + churn, i.e.
+~1.5 GiB vs the 3.785 pre-fix); (3) M1 gather-clip e2e A/B
+(pp8192/B=1 tg256, `GFX906_FA_GATHER_CLIP` 1 vs 0, record recipe);
+(4) bt4096 TP=2 serving re-validation — the fix removes the
+6.7 GiB/GPU q_pad growth that forced the bt2048 workaround, so the
+boot K launch recipe can drop `--max-num-batched-tokens 2048` (and
+the 6 GiB KV cap can shrink) if prefill clears; (5) write the
+gfx906-mem-attribution skill (roadmap Housekeeping) with the
+validated recipe (3-arm matrix + per-layer `memory_allocated()`
+hooks + the env traps: `VLLM_USE_AOT_COMPILE=0`, thread compile
+pool, `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0`).

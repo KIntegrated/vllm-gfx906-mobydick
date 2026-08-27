@@ -88,6 +88,13 @@ _DIRECT_PAGED_MAX_SQ = int(_os.environ.get("GFX906_FA_DIRECT_PAGED_MAX_SQ", "16"
 # kv_start so windowed decode scans the FULL history and the window MASK
 # does all the work (numerically identical, slower at long context).
 _WINDOW_CLIP = _os.environ.get("GFX906_FA_WINDOW_CLIP", "1") != "0"
+# M1 gather-path window clip: with the persistent (legacy-path) gather,
+# gather only [start, seq_len) per seq and shift the FA kernel's k-loop
+# start (fattn-q8.cuh) instead of masking the skipped history. 0 = old
+# full gather + full scan (numerically identical, slower at long ctx).
+# Only the persistent sub-path clips; the other gather sub-paths pass
+# kv_start=None and keep the full-scan semantics.
+_GATHER_CLIP = _os.environ.get("GFX906_FA_GATHER_CLIP", "1") != "0"
 # Diagnostics for the LEGACY=0 corruption hunt (P3-3).
 _ZERO_KTAIL = (_os.environ.get("GFX906_FA_ZERO_KTAIL", "0") == "1"
                or _FA_DEBUG)
@@ -547,6 +554,10 @@ def forward_paged(
             kbuf, vbuf, Sk_arg = k_cap, v_cap, k_cap.shape[2]
         else:
             kbuf, vbuf, Sk_arg = None, None, Sk_pad
+    # M1: per-seq clip start for the gather path (None unless the
+    # persistent sub-path activates the clip; passed to both the gather
+    # kernel and the FA kernel below).
+    kv_start_tensor = None
     if key_cache_q8 is not None and _FUSED:
         # Level 1 fused path: gather K_q8 + V_fp16 одним HIP kernel'ом.
         # Возвращает tensors с Sk=Sk_pad (хвост в V уже обнулён, K — мусор).
@@ -604,11 +615,31 @@ def forward_paged(
                 # (FA cuts at kv_max; margin zeros per
                 # GFX906_FA_PERSIST_MARGIN). num_seqs > _PERSIST_MAX_SEQS
                 # falls through to the fused/two-kernel paths below.
+                if _GATHER_CLIP and window > 0:
+                    # M1: conservative per-seq start = the FIRST query
+                    # row's window start (later rows' windows are
+                    # subsets). q_abs = seq_len - n_q (see the
+                    # q_abs_offset computation below; same formula).
+                    sl_i64 = (seq_lens.to(torch.int64)
+                              if seq_lens.dtype != torch.int64 else seq_lens)
+                    cu_i64 = (cu_seqlens_q.to(torch.int64)
+                              if cu_seqlens_q.dtype != torch.int64
+                              else cu_seqlens_q)
+                    n_q_per_seq = cu_i64[1:num_seqs + 1] - cu_i64[:num_seqs]
+                    q_abs = sl_i64 - n_q_per_seq
+                    kv_start_tensor = ((q_abs + (1 - window))
+                                       .clamp_(min=0)
+                                       .to(torch.int32).contiguous())
                 K_q8, V_bhsd = gfx906_fa.gather_paged_kv_quant_persistent(
                     key_cache, value_cache, bt_i32, sl_i32, Sk_arg,
                     k_out=kbuf, v_out=vbuf,
+                    kv_start=kv_start_tensor,
                 )
-                if _DOUBLE_CHECK:
+                if _DOUBLE_CHECK and kv_start_tensor is None:
+                    # Clipped gather leaves rows [0, start) stale BY
+                    # DESIGN (the FA k-loop never reaches them) — the
+                    # full-range torch comparison would false-fail.
+
                     # Torch reference, per-seq in-range rows only (the
                     # persistent kernel does not write rows >= seq_len,
                     # unlike the fused/two-kernel paths which zero the V
@@ -757,6 +788,7 @@ def forward_paged(
             mask=None,
             q_abs_offset=q_abs_offset_tensor,
             window=window,
+            kv_start=kv_start_tensor,
         )
         global _dump_n
         if _DUMP_DIR and _dump_n < 40:
