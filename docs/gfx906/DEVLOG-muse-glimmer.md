@@ -603,6 +603,20 @@ withdrawn (it is reachable and gated).
 
 ## Notes / open items
 
+- **TP=2 serving (2026-08-27, boot J)**: the uncapped util-0.82 config
+  OOM'd the first real 4096-chunk prefill (`gptq_gemm` `aten::empty`):
+  the 9.02 GiB/GPU pool (1.36M tok) + 14.48 GiB steady state left
+  <7.2 GiB of the 31.98 GiB physical, and the runtime bt4096 inductor
+  prefill buffer exceeded it (profiled peak only 2.73 GiB — the
+  warm/cold gap is far larger than the 27B 0.16 GiB case at this
+  model size). Serving needs `--kv-cache-memory-bytes 6442450944`
+  (6 GiB/GPU ≈ 900k tok, still 3.5× the 256k max). The OOM teardown
+  force-killed the TP=2 workers mid-P2P op; the next two relaunches
+  failed with `hipErrorLaunchFailure` (the documented TP=2 SIGKILL
+  wedge; TP=1 canary healthy between) → session stopped, reboot
+  required (degradation.md boot J, 17:40–17:52). Pending there:
+  ngram serving numbers + the pp2048/8192/16384 × tg256/512 prefill
+  grid (`/local/tmp/muse/bench_serve_grid.py`).
 - LEGACY=0 is validated but stays **experimental**; the default
   remains LEGACY=1 (gather, the validated serving mode). Flipping
   the default is a roadmap decision after a longer bake.

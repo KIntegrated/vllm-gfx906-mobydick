@@ -1009,3 +1009,58 @@ post-fix verification (new .so), 45/45 suite, the LEGACY=0 garbage
 smoke (desync blocker), the window-check rejection probes, and the
 pp8192 clip A/B (later identified as a null test — both arms ran the
 gather path). Nothing GPU-dependent is pending.
+
+## 2026-08-27 17:40–17:52Z (boot J): TP=2 serving OOM (pool sizing) → force-kill → 2 consecutive `hipErrorLaunchFailure` relaunches — stopped, reboot required
+
+**Timeline.**
+
+1. **17:30Z** — Muse-Glimmer-30B **TP=2** ngram serving launched clean
+   (first TP=2 launch this boot; official-driver stack). Weights 12.68
+   GiB/GPU, KV pool **9.02 GiB/GPU** (1,358,787 tokens; util 0.82, no cap),
+   graphs 1.28 GiB. Single-request checks + a 4-parallel batch (short
+   prompts, all <100 tokens) + tool/reasoning parser checks all clean.
+2. **17:40:33Z** — first request with a real 4096-token prefill (bench
+   sanity, pp4097): OOM `aten::empty` in `gptq_gemm` (AOT runtime).
+   Budget math from the engine log: steady state 14.48 (weights +
+   non-torch) + 1.28 (graphs) + 9.02 (KV) = 24.78 GiB of 31.98 physical
+   → <7.2 GiB headroom; the runtime bt4096 inductor prefill buffer
+   exceeded it (profiled peak activation was only 2.73 GiB — the
+   warm/cold gap is much larger than the documented 0.16 GiB 27B case
+   at this model size/batch). Allocator-level, the same class as the
+   TP=1 532 MiB case (boot I 22:30) — the pool was simply oversized.
+   **The engine force-killed the surviving worker** (`force killing
+   remaining process EngineCore`) — a SIGKILL mid TP=2 P2P op.
+3. **17:45:49Z** — relaunch (with `--kv-cache-memory-bytes 6 GiB` cap):
+   `hipErrorLaunchFailure` at worker init/SetDevice, both ranks.
+4. **~17:49Z** — TP=1 mtp2-27B canary: **38.4 t/s, healthy** (no P2P).
+5. **17:52:06Z** — retry: `hipErrorLaunchFailure` again, both ranks,
+   22 s into weight load. Journal unreadable (no root) — BACO/reset
+   status unknown. rocm-smi clean after (both 0%/0%, 32–33 °C, 938 MHz),
+   no stale processes.
+
+**Classification.** Two components, both matching documented patterns:
+
+- The OOM itself is pure pool-sizing (SW): fixed by the explicit KV cap
+  (`--kv-cache-memory-bytes 6442450944` → ~900k-token pool, ~10 GiB
+  headroom/GPU). The uncapped 0.82 config is NOT usable for this
+  model at bt4096 — the README row must carry the cap.
+- The two consecutive `hipErrorLaunchFailure`s after a mid-P2P SIGKILL
+  match the AGENTS.md TP=2 teardown note exactly ("SIGKILL leaves the
+  driver mid-P2P-op and the next init wedges GPU1 … BACO reset + retry
+  needs root"). The healthy TP=1 canary between the two failures argues
+  against host degradation (which would slow TP=1 spec decode too);
+  this is a P2P-path stall. Per house recipe, 2 consecutive launch
+  failures = stop; a BACO reset (root) or a reboot is required before
+  further TP=2 work on this boot.
+
+**Pending on next clean boot (reboot, then canary first).**
+
+- Muse TP=2 ngram serving validation + benchmark grid
+  (`/local/tmp/muse/bench_serve_grid.py`: pp2048/8192/16384 ×
+  tg256/512, B=1 streaming TTFT/decode split + one B=4 point at
+  pp2048/tg256) with the capped pool; server args preserved in
+  `/local/tmp/muse/muse_tp2_ngram3.log` (header).
+- README model-row numbers for the serving config (decode t/s per
+  context + prefill t/s) — see the DEVLOG-muse-glimmer round-3 notes.
+- Optional: greedy (no-spec) baseline B=1 for the ngram-lift number
+  (needs a spec-off server).
