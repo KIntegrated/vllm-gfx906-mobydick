@@ -452,6 +452,14 @@ class Gfx906FAImpl(AttentionImpl):
         ncols1 = _pick_ncols1(max_seqlen_q)
         Sq_pad = ((max_seqlen_q + ncols1 - 1) // ncols1) * ncols1
 
+        # q_pad_buf is only READ on multi-token forwards (Sq=1 decode uses
+        # q_pad_decode_buf in both the gather and direct-paged branches),
+        # so decode batches must not grow its dim0: a capture at B=8 would
+        # otherwise balloon every layer's prefill buffer to (8, Hq, 2048,
+        # 128) fp32 = 268 MB (Muse 30B: x52 layers = 14 GiB, first-request
+        # OOM on the inductor prefill buffer, 2026-08-26).
+        qpad_num_seqs = num_seqs if max_seqlen_q > 1 else 1
+
         # Q buffer: [B, Hq, Sq_pad, D] fp32 (the kernel takes fp32 q; the
         # caller passes dtype=torch.float32).
         # Capture-safety: a CUDA graph bakes in the VA of the buffer that
@@ -467,17 +475,17 @@ class Gfx906FAImpl(AttentionImpl):
         # detected (_q_pad_captured latches); steady state costs nothing.
         if self._q_pad_buf is None:
             self._q_pad_buf = torch.empty(
-                (num_seqs, self.num_heads, Sq_pad, self.head_size),
+                (qpad_num_seqs, self.num_heads, Sq_pad, self.head_size),
                 dtype=dtype, device=device,
             )
             self._q_pad_captured = torch.cuda.is_current_stream_capturing()
-        elif (self._q_pad_buf.shape[0] < num_seqs
+        elif (self._q_pad_buf.shape[0] < qpad_num_seqs
                 or self._q_pad_buf.shape[2] < Sq_pad
                 or self._q_pad_buf.dtype != dtype):
             capturing = torch.cuda.is_current_stream_capturing()
             cur = self._q_pad_buf
             new_shape = (
-                max(num_seqs, cur.shape[0]),
+                max(qpad_num_seqs, cur.shape[0]),
                 self.num_heads,
                 max(Sq_pad, cur.shape[2]),
                 self.head_size,
