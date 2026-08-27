@@ -480,6 +480,11 @@ clip) is unreachable in any working serving config; the pp4096 and
 pp8192 clip A/Bs were null tests (both arms gather). Blocking item:
 fix the desync before any direct-paged e2e claim.
 
+> **RESOLVED** by the round-3 entry below — and partly misdiagnosed:
+> the "incoherent garbage" was the model's normal greedy style (see
+> the round-3 erratum); the real defects were side-buffer sizing and,
+> in the first alias fix, per-call re-alias zeroing.
+
 ## Evidence — FOR / AGAINST
 
 FOR: pre/post hardware repro of the P1 bug + fix (3 shapes); 45/45
@@ -498,8 +503,117 @@ remains unmeasured at every context.
   K-buffer SOURCE, not direct-vs-gather; the direct branch logs
   `forward_paged DIRECT_PAGED:`.
 - The review's ds4 "40/40 miscount" claim was re-checked:
-  `pytest --collect-only` collects exactly 40 (now 45) — the devlog
+  `pytest --collect-only` collects exactly 40 (now 46) — the devlog
   counts were literal all along.
+
+---
+
+## 2026-08-27 — round 3: LEGACY=0 Q8 side buffer aliased into the fp16 K half (desync blocker resolved)
+
+**VERDICT:** SHIPPED (LEGACY=0 now serves coherent output at the
+default uncapped config with zero extra KV memory; the direct-paged
+e2e gates are now real measurements: Phase C clip +3.6% @
+pp8192/B=2, B=4 KVSPLIT +1.8%). · **GATE:** 46/46 suite (new
+alias-layout test) + LEGACY=0 default smoke + prefix-cache smoke +
+LEGACY=1 regression smoke + pp8192 clip A/B (8 samples) + B=4
+KVSPLIT S=1/2/4 (12 samples).
+
+## HYPOTHESIS
+
+The "Q8 side-buffer desync" that blocked LEGACY=0 is a misdiagnosis:
+the boot-I "incoherent prompt-echo garbage" is this model's *normal*
+greedy output style — the persisted logs of the clean hybrid/
+all-CUSTOM gate runs are word-identical in style (to=self echo +
+meta-reasoning) to the run we declared broken. The real defects:
+(1) the Q8 side buffer was a separate lazy `torch.empty` (~17% of KV
+bytes) allocated after profiling → outside the pool budget → OOM on
+uncapped high-util runs; (2) it could be derived against the
+profile/dummy cache geometry (1890 vs 471 blocks observed in a
+probe); (3) the first alias fix introduced its own bug: the alias
+identity check used `is` on the per-call `kv_cache.unbind(1)` view
+(a fresh object every call, never equal) → re-alias + zero-fill of
+the whole K half on *every* `do_kv_cache_update` (52×/step) → the
+Q8 bytes of all previously written slots wiped after each triton K
+write (the Q8 write only restores the current step's slots) → fully
+degenerate "to the the the same same…" loops.
+
+## What was done
+
+- **Alias, not allocation** (`gfx906_fa_backend.py`): `_k_cache_q8`
+  is a strided uint8 view of the fp16 K half
+  (`key_cache.view(uint8)[:, :, :, :bytes_per_row]` — the 88 B Q8
+  row fits the 256 B fp16 row). Zero extra KV memory: in LEGACY=0
+  the fp16 K half is written but never read, so its bytes double as
+  Q8 storage. Page copies (prefix-cache COW) move the Q8 bytes with
+  the page → the fail-closed prefix-cache guard in
+  `get_cudagraph_support` removed (now a warning). All consumer
+  kernels (`reshape_and_cache_q8`, `gather_paged_kv_q8`,
+  `forward_paged_direct`) are fully stride-parameterized — verified
+  against the real backend tensor, including the 2D-byte head
+  stride of the unbind view.
+- **Memory-based identity**: re-derive the alias only when
+  (data_ptr, shape, strides) change (profile dummy → live pool,
+  layout re-slices); never per-call.
+- **No zero-fill, ever**: zeroing the Q8 region of a re-derived
+  alias clobbers in-use context (re-derivation can happen mid-run
+  on live memory). Unwritten slots are never read — attention
+  seq_lens only cover written slots — so the fill buys nothing.
+- **Test**: +`test_paged_direct_and_gather_on_q8_aliased_into_fp16_khalf`
+  — mirrors the backend alias exactly (strided view, production
+  write order fp16-K-then-Q8), checks `forward_paged_direct` (B=2,
+  window + clip, unaligned starts) and the fused
+  `gather_paged_kv_q8` against torch refs → suite 46/46.
+- **Docs**: README LEGACY/KVSPLIT/WINDOW_CLIP rows rewritten
+  (no more "desyncs — do not use"; per-path safe KVSPLIT values),
+  supported-models table gains the Muse-Glimmer row,
+  `supports_sliding_window` envelope note updated (W=2048 covered
+  by the direct-paged clip tests + e2e, not a gather unit case).
+
+## Gate result
+
+| run | config | result |
+|---|---|---|
+| suite | `test_gfx906_fa.py` | 46/46 |
+| LEGACY=0 default smoke | graph, util 0.93, **uncapped** (95,012 pool), maxlen 8192 | coherent, no OOM; 4 completions in 12.7 s (boot-I: this config OOM'd) |
+| LEGACY=0 + prefix cache ON | same; shared prefix, 2 divergent tails (COW fork) | coherent in both branches (COW alias invariant) |
+| LEGACY=1 regression smoke | default | coherent (391 correct) |
+| Phase C clip A/B (direct-paged) | pp8192/B=2/tg256, prefix off, LEGACY=0, 0.75 GiB KV cap + bt1024 | ON 5.758/5.721/5.710/5.693 → **5.72** vs OFF 5.537/5.518/5.508/5.505 → **5.52** = **+3.6%** |
+| B=4 KVSPLIT (direct-paged) | pp2048/tg256, B=4, prefix off, LEGACY=0 | S=1 **20.16** → S=2 **20.50** / S=4 (default) **20.53** (+1.8%); at parity with the gather record 20.59 |
+
+The clip ON/OFF delta is itself the evidence the direct-paged path
+executed (the clip exists only there) — the first non-null
+direct-paged e2e measurement on this model. B=4: the batch-aware
+default (S=4) is already optimal at this batch (S=2 within noise);
+the e2e split-K gain is small because FA is ~5–8% of the GEMM-bound
+B=4 step. Cross-session drift note: these run in boot J, a different
+boot than the gather 20.59 record — compare trends, not absolute
+values.
+
+## ERRATUM (round 2)
+
+The round-2 entry's "LEGACY=0 smoke (fresh)" paragraph — "incoherent
+prompt-echo garbage … the Q8 side-buffer desync is still live" —
+rests on a misdiagnosis: that text is the model's normal greedy
+style (boot-I clean-run logs match it word for word). The garbage
+seen before this fix ("to the the the same same…") is a *different*
+failure — the per-call re-alias zeroing above — not a "desync".
+Round 2's "blocking item: fix the desync" is closed by this entry;
+"direct-paged unreachable in any working serving config" is
+withdrawn (it is reachable and gated).
+
+## Notes / open items
+
+- LEGACY=0 is validated but stays **experimental**; the default
+  remains LEGACY=1 (gather, the validated serving mode). Flipping
+  the default is a roadmap decision after a longer bake.
+- Direct-paged is B-gated: B=1 decode is gather (no clip,
+  KVSPLIT=16); B≥2 is direct-paged. Window clip on the gather path
+  (B=1) and per-row prefill clip remain open — recorded in
+  `roadmap-more-models.md`.
+- `muse_glimmer_opt2_code_rev_qwen.md` open items → roadmap:
+  #8 device-side `kv_start` clamp, #10 overflow-free cutoff form
+  (4 LOCKSTEP sites), #4 long-context split-K accuracy (L=16k–32k,
+  split 8 vs 1) + per-call `o_part` allocation / dead `o_meta`.
 
 
 ---

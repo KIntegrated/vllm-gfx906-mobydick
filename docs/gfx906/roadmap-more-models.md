@@ -95,3 +95,70 @@ topk=8, hidden=2048, and expert dimensions that may fit the M=1 tile. Its
 routing (E=128), dense attention, and shared-expert dimensions still require
 shape-specific measurement. Follow the procedure above and the open items in
 `moe-decode-roadmap.md`.
+
+## Muse-Glimmer-30B (`MuseGlimmerForCausalLM`) — post-onboarding follow-ups
+
+**Status: onboarded + window-FA shipped (2026-08-27, `feat/muse-glimmer`,
+not yet in main); LEGACY=0 (direct-paged) validated, LEGACY=1 remains the
+serving default.** Onboarding and all gate numbers: `DEVLOG-muse-glimmer.md`.
+Knobs: `README.md` table. The independent review
+`muse_glimmer_opt2_code_rev_qwen.md` (repo root, untracked) is kept until
+M3/M4 below close its open findings; its siblings
+(`muse_glimmer_opt2_code_rev_claude.md`,
+`docs/gfx906/muse_glimmer_opt2_code_rev_ds4.md`) are kept too — their
+residuals are M1/M2.
+
+### M1 — window clip on the gather path (B=1 decode)
+
+The Phase C clip fires only on the direct-paged (B≥2) dispatch; B=1
+decode (the gather path — the model's B=1 hot path) and all prefill
+scan the full KV. The gather path materializes `[B, Hkv, L, bpr]` K/V
+in HBM before the FA kernel, so this is a gather-side change (per-row
+gather start), not just a kernel loop start. Gate: bit-identity unit
+test + pp8192/B=1 A/B; the FA share of the B=1 step is large enough
+that the kernel micro-bench's −48% should show up e2e.
+
+### M2 — per-row (2D) prefill clip
+
+Prefill rows need only `[q_abs+1-W, q_abs]`; today the per-sequence
+`k0_base` covers the whole q-tile, so early rows in a prefill chunk
+still scan (and the gather materializes) out-of-window keys. A
+conservative per-q-tile start (smallest row's window start) is
+implementable without per-row loops. Gate: bit-identity + pp4096
+prefill/TTFT A/B.
+
+### M3 — kernel hygiene batch (one rebuild)
+
+From `muse_glimmer_opt2_code_rev_qwen.md`, bundle into one build/test
+cycle:
+- **#8**: device-side `k0_base = max(0, kv_start[sequence])` clamp in
+  `fattn-q8-paged.cuh` — a negative start would walk the k-loop into
+  pages before token 0 (illegal access / wedge, not a wrong number).
+- **#10**: overflow-free cutoff `q_abs_row - k_pos_abs >= window` at
+  all four LOCKSTEP sites (the current `k < q_abs_row - window + 1`
+  overflows for absurd windows → UB + silently disabled mask). Must
+  preserve the unaligned bit-identity tests.
+- **#4b/c**: allocate only the meta buffer actually used (`o_meta` is
+  dead when `kv_split > 1`); note the `o_part`/`o_meta_split` per-call
+  cliff at `_DIRECT_PAGED_MAX_SQ=16` (~35 MiB/layer) — shared arena
+  only if a real workload hits Sq>2 direct-paged.
+- Test hardening: amplified-V window-boundary case (probe-B trick,
+  ~400× discriminative, 3 lines).
+
+### M4 — long-context split-K accuracy point (qwen #4a)
+
+Direct-paged split-K stores unscaled fp16 partials per split; the
+partial magnitude grows with keys-per-slice × |V|. Tests cover
+L ≤ 512 (plus the 4353/2048 clip case). One accuracy point at
+L=16k–32k, split 8 vs split 1 vs fp32 torch ref (cheap, no server)
+closes the claim that the default `clamp(16/B,2,8)` is safe at
+long context.
+
+### M5 — default read-path decision after a bake
+
+LEGACY=0 (Q8-aliased direct-paged read) is validated (46/46 suite,
+default-config + prefix-cache smokes, clip +3.6% / KVSPLIT +1.8%
+gates) but stays experimental: B=1 still runs gather, and the
+default LEGACY=1 records predate it. Flip the default only after a
+serving bake on the target workload. Gate: B=1 + B=4 A/B with the
+degradation canary green.

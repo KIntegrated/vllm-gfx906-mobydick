@@ -93,27 +93,17 @@ class Gfx906FAMetadataBuilder(
     def get_cudagraph_support(
         cls, vllm_config: VllmConfig, kv_cache_spec: AttentionSpec
     ) -> AttentionCGSupport:
-        # RC2 (sub-plan): the LEGACY=0 Q8 K side-buffer stays consistent
-        # only if every KV write goes through do_kv_cache_update. Prefix
-        # caching (COW'd blocks) and FULL cudagraph capture (dummy/replay
-        # writes) bypass that invariant → corrupt attention output.
+        # LEGACY=0 (Q8 side-view path): the Q8 view aliases the fp16 K
+        # half, so the old desync class is structural-impossible (page
+        # copies and captured writes move both halves at once). Kept as a
+        # separate env-gated mode because it is a different read path
+        # (experimental status until the serving gates say otherwise).
         if _os.environ.get("GFX906_FA_LEGACY", "1") != "1":
-            if getattr(vllm_config.cache_config,
-                       "enable_prefix_caching", False):
-                # Fail closed: this combination corrupts the attention
-                # output (the side-buffer misses COW'd prefix blocks), so
-                # refusing to start beats logging an error and serving
-                # wrong tokens.
-                raise RuntimeError(
-                    "GFX906_FA_LEGACY=0 with prefix caching enabled: the "
-                    "Q8 K side-buffer misses COW'd prefix blocks and the "
-                    "attention output will be CORRUPT. Disable prefix "
-                    "caching or use the default GFX906_FA_LEGACY=1.")
             logger.warning(
-                "GFX906_FA_LEGACY=0 (Q8 side-buffer path) is experimental: "
-                "inconsistent with FULL cudagraph decode capture and with "
-                "prefix caching. Use the default LEGACY=1 unless you know "
-                "why.")
+                "GFX906_FA_LEGACY=0: K is read from the Q8 side view "
+                "aliased into the fp16 K half (zero extra KV memory). "
+                "Experimental read path — the default LEGACY=1 "
+                "(inline-quantize) is the validated serving mode.")
         mode = _os.environ.get("GFX906_FA_CG", "decode").lower()
         if mode == "always":
             return AttentionCGSupport.ALWAYS
@@ -252,13 +242,16 @@ class Gfx906FABackend(AttentionBackend):
         # forward_paged supplies for every windowed batch (decode
         # included).
         #
-        # Validated envelope (tests/kernels/attention/test_gfx906_fa.py,
-        # test_forward_sliding_window* x8): W in {64..L, 2048-serving},
-        # head_dim 128 (GQA 16:1) and 256 (GQA 8:1), decode B=1/B=2 and
-        # per-row prefill, on BOTH kernel copies (gather fattn-q8.cuh and
-        # direct-paged fattn-q8-paged.cuh). The mask math itself is
-        # shape-independent (absolute-position cutoff on k), but an
-        # untested head_dim/window/batch combo landing on this backend
+        # Validated envelope (tests/kernels/attention/test_gfx906_fa.py):
+        # W in {64, 128, >L} and the 2048 serving value, head_dim 128
+        # (GQA 16:1) and 256 (GQA 8:1), decode B=1/B=2 and per-row
+        # prefill, on BOTH kernel copies (gather fattn-q8.cuh and
+        # direct-paged fattn-q8-paged.cuh). W=2048 is covered by the
+        # direct-paged clip tests (L=4353/W=2048 unaligned-start
+        # bit-identity + the Python-level B=2 window+clip+split-K test) and
+        # the e2e gates, not by a gather-kernel unit case. The mask math
+        # itself is shape-independent (absolute-position cutoff on k), but
+        # an untested head_dim/window/batch combo landing on this backend
         # runs unverified — extend the tests before claiming new shapes.
         #
         # Phase C KV-scan clip scope (perf, not correctness): the clip
@@ -408,19 +401,19 @@ class Gfx906FAImpl(AttentionImpl):
         self.num_queries_per_kv = num_heads // num_kv_heads
 
         # ------------------------------------------------------------------
-        # Q8_0 side-buffer for K.
+        # Q8_0 side buffer for K (LEGACY=0 mode only).
         #
-        # vLLM allocates the primary K/V cache in fp16 (shape from
-        # get_kv_cache_shape). We keep a side-buffer in block_q8_0 format
-        # in parallel so forward does not re-quantize every step.
-        #
-        # Allocation is lazy in the first do_kv_cache_update (that is when
-        # kv_cache.shape is known). Live layout:
-        #   [num_blocks, block_size, Hkv, (D/32)*34]  uint8
-        # Size: num_blocks * block_size * Hkv * D * 34/32 bytes
-        #       = K_fp16_bytes * (34/32) / 2 ~= 0.53 x K_fp16 bytes.
+        # In LEGACY=0 mode attention reads K from a block_q8_0 view
+        # instead of re-quantizing the fp16 K on every read. The Q8 row
+        # ((D/32)*34 bytes) fits inside the fp16 K row (2D bytes), so the
+        # "side buffer" is an ALIASED VIEW into the K half of the kv
+        # cache itself — see _ensure_q8_sidebuffer for the invariants.
         # ------------------------------------------------------------------
         self._k_cache_q8: torch.Tensor | None = None
+        # The fp16 K-cache tensor the alias was derived from; a different
+        # tensor (e.g. the profile-run dummy cache vs the live pool) means
+        # the alias must be re-derived.
+        self._k_cache_q8_src: torch.Tensor | None = None
         self._legacy = _os.environ.get("GFX906_FA_LEGACY", "1") == "1"
 
         # ------------------------------------------------------------------
@@ -450,20 +443,58 @@ class Gfx906FAImpl(AttentionImpl):
     # forward_includes_kv_cache_update=False)
     # ------------------------------------------------------------------
     def _ensure_q8_sidebuffer(self, key_cache: torch.Tensor) -> None:
-        """Lazy-allocate the Q8 side-buffer to match the K-cache size."""
-        if self._k_cache_q8 is not None:
+        """Keep the Q8 side view aliased to the live fp16 K cache.
+
+        key_cache shape: [num_blocks, block_size, Hkv, D]  fp16.
+
+        The Q8_0 row ((D/32)*34 bytes, e.g. 88 for D=128) fits inside
+        the fp16 K row (2D bytes, e.g. 256), so the side buffer is a
+        strided uint8 view of the K half itself:
+
+          * ZERO extra KV memory — in LEGACY=0 mode the fp16 K half is
+            written by do_kv_cache_update but never read, so its bytes
+            double as Q8 storage. No pool-sizing headroom needed (the
+            old separate allocation added ~17% of the KV bytes and OOM'd
+            uncapped high-util runs; it also had to be re-derived against
+            the profile-run dummy cache geometry).
+          * do_kv_cache_update's write order (triton fp16 K write, then
+            the Q8 write to the same bytes) leaves the Q8 bytes as the
+            final state of every written slot.
+          * Block-manager page copies (prefix-cache COW) copy the fp16
+            page, Q8 bytes included — the view cannot desync from the
+            fp16 cache (the old separate allocation missed COW'd blocks
+            and any write that landed on a different cache tensor).
+        """
+        # Identity is on the MEMORY, not the view object: key_cache is a
+        # fresh kv_cache.unbind(1) view on every call, so `is` would
+        # re-alias (and clobber) 52x per step. Re-derive only when the
+        # underlying storage/layout actually changed (profile-run dummy
+        # cache -> live pool, layout re-slices).
+        src = self._k_cache_q8_src
+        if (self._k_cache_q8 is not None and src is not None
+                and src.data_ptr() == key_cache.data_ptr()
+                and src.shape == key_cache.shape
+                and src.stride() == key_cache.stride()):
             return
-        # key_cache shape: [num_blocks, block_size, Hkv, D]  fp16
         num_blocks, block_size, Hkv, D = key_cache.shape
         assert D % 32 == 0, f"D={D} must be multiple of 32"
         bytes_per_row = (D // 32) * 34
-        self._k_cache_q8 = torch.empty(
-            (num_blocks, block_size, Hkv, bytes_per_row),
-            dtype=torch.uint8,
-            device=key_cache.device,
-        )
-        # Zero explicitly — in Q8_0, zeros decode to 0.
-        self._k_cache_q8.zero_()
+        assert bytes_per_row <= 2 * D, (
+            f"Q8 row ({bytes_per_row} B) must fit in the fp16 K row "
+            f"({2 * D} B)")
+        # key_cache is kv_cache.unbind(1) of [num_blocks, 2, bs, Hkv, D]
+        # — non-contiguous, last dim stride 1, so the uint8 view and the
+        # last-dim slice below are legal (verified: strides come from the
+        # real tensor and every consumer kernel is stride-parameterized).
+        self._k_cache_q8 = \
+            key_cache.view(torch.uint8)[:, :, :, :bytes_per_row]
+        self._k_cache_q8_src = key_cache
+        # NOTE: no zero-fill here, ever. The alias may be re-derived while
+        # the cache holds live data (layout re-slices mid-run); zeroing
+        # the Q8 region would wipe the in-use context (the Q8 bytes of
+        # slots written in earlier steps). Unwritten slots are never read
+        # (attention seq_lens only cover written slots), so the fill buys
+        # nothing.
 
     def _ensure_forward_buffers(
         self,
@@ -743,17 +774,19 @@ class Gfx906FAImpl(AttentionImpl):
             layer._v_scale,
         )
 
-        # 2) In parallel into the Q8 side-buffer for K (fast-path
+        # 2) In parallel into the Q8 side view for K (fast-path
         #    forward). Skipped in LEGACY mode — forward quantizes on the
         #    fly.
-        # IMPORTANT (RC2, sub-plan plan-gfx906fa-serving.md): the Q8
-        # side-buffer path (LEGACY=0) is inconsistent whenever the fp16
-        # kv_cache holds data written OUTSIDE our do_kv_cache_update
-        # (vLLM warmup / profile_run / dummy forwards, torch.compile
-        # captures, COW'd prefix-cache blocks, graph replay writes).
-        # _k_cache_q8 then lags the fp16 cache -> forward reads Q8=0 and
-        # produces garbage. Until fixed, LEGACY=1 (inline-quantize) is
-        # the default.
+        # Invariant (LEGACY=0): the Q8 view aliases the fp16 K half, so
+        # this call's write order (triton fp16 K write above, then the Q8
+        # write) leaves the Q8 bytes as the final state of every written
+        # slot — the same memory, nothing to keep in sync. Writes that
+        # bypass do_kv_cache_update (warmup/profile forwards) go through
+        # it too (verified: they reach this method), and block-manager
+        # page copies (prefix-cache COW) move the Q8 bytes with the
+        # page. The Q8 bytes are NEVER read for a slot whose fp16 K has
+        # not been written in this same call or an earlier one (attention
+        # seq_lens only cover written slots).
         if not self._legacy:
             self._ensure_q8_sidebuffer(key_cache)
             from vllm import _gfx906_fa_C as gfx906_fa

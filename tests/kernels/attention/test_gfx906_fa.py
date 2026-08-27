@@ -352,7 +352,6 @@ def test_persistent_gather_bit_equal_to_fused_at_batch_bound():
     dev = "cuda"
     torch.manual_seed(11)
     b, sk = 16, 1024
-    max_len = 1000
     n_blocks = b * (sk // BLOCK)
     kv = torch.zeros(n_blocks, 2, BLOCK, HKV, D,
                      dtype=torch.float16, device=dev)
@@ -1561,6 +1560,75 @@ def test_forward_paged_direct_sliding_window_vs_torch_ref(d, hq, hkv, L, W):
         ref = _windowed_ref(qtok[t], Kf, Vf, scale, t, W)
         assert ((outf[t] - ref).norm() / ref.norm()).item() < 5e-2, \
             f"row {t}"
+
+
+# ---------------------------------------------------------------------------
+# LEGACY=0 serving layout: the Q8 "side buffer" is NOT a separate
+# allocation — it is a strided uint8 view of the K half of the fp16
+# kv cache (key_cache.view(uint8)[:, :, :, :bytes_per_row]). The head
+# stride is 2D bytes, not bytes_per_row, and the write order is
+# triton-fp16-K-then-Q8 on the same memory. Both consumer kernels must
+# be stride-generic enough to read this layout.
+# ---------------------------------------------------------------------------
+
+def test_paged_direct_and_gather_on_q8_aliased_into_fp16_khalf():
+    dev = "cuda"
+    torch.manual_seed(7)
+    d, hq, hkv, L, W = 128, 32, 2, 512, 128
+    n_blocks = L // BLOCK
+    bytes_per_row = (d // 32) * 34
+    kv = torch.zeros(n_blocks, 2, BLOCK, hkv, d, dtype=torch.float16, device=dev)
+    key_cache, value_cache = kv.unbind(1)  # production layout
+    # EXACT backend alias (gfx906_fa_backend._ensure_q8_sidebuffer):
+    kc = key_cache.view(torch.uint8)[:, :, :, :bytes_per_row]
+    assert kc.stride(2) == 2 * d, "alias must keep the 2D-byte head stride"
+
+    K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    slot = torch.arange(L, dtype=torch.int64, device=dev)
+    # Production write order: fp16 K write first (clobbers the aliased Q8
+    # bytes), then the Q8 write to the same memory. (Staging-copy into the
+    # strided K half stands in for the triton kernel's scattered write.)
+    staging_k = torch.zeros_like(kv[:, 0])
+    staging_k.view(-1, hkv, d)[:L].copy_(K)
+    kv[:, 0].copy_(staging_k)
+    fa.reshape_and_cache_q8(K, slot, kc)
+    staging = torch.zeros_like(kv[:, 1])
+    staging.view(-1, hkv, d)[:L].copy_(V)
+    kv[:, 1].copy_(staging)
+    vc = value_cache
+
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, n_blocks)
+    sl = torch.tensor([L], dtype=torch.int32, device=dev)
+    scale = 1.0 / math.sqrt(d)
+    Kf, Vf = K.float(), V.float()
+
+    # direct-paged B=2 decode, window + Phase C clip (production B>=2 path)
+    L2 = L * 3 // 4
+    bt2 = bt.repeat(2, 1)
+    sl2 = torch.tensor([L, L2], dtype=torch.int32, device=dev)
+    q_abs2 = torch.tensor([L - 1, L2 - 1], dtype=torch.int32, device=dev)
+    kv_start2 = (q_abs2 + 1 - W).clamp_(min=0).contiguous()
+    q2 = torch.randn(2, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    out2 = fa.forward_paged_direct(
+        q2, kc, vc, bt2, sl2, scale, None, q_abs2, W, kv_start2)
+    ref0 = _windowed_ref(q2[0, :, 0], Kf, Vf, scale, L - 1, W)
+    ref1 = _windowed_ref(q2[1, :, 0], Kf, Vf, scale, L2 - 1, W)
+    assert ((out2[0, 0] - ref0).norm() / ref0.norm()).item() < 5e-2
+    assert ((out2[1, 0] - ref1).norm() / ref1.norm()).item() < 5e-2
+
+    # fused gather (production B=1 / prefill path)
+    sk_pad = (L + 31) // 32 * 32
+    k_q8, v_b = fa.gather_paged_kv_q8(kc, vc, bt, sl, sk_pad)
+    from vllm.gfx906_fa.gfx906_fa_paged import _gather_kv_q8
+    k_ref, v_ref = _gather_kv_q8(kc, vc, bt, sl, L)
+    assert torch.equal(k_q8[:, :, :L], k_ref)
+    assert torch.equal(v_b[:, :, :L], v_ref)
+    q1 = torch.randn(1, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    out1 = fa.forward(q1, k_q8, v_b, scale, kv_max=sl,
+                      q_abs_offset=q_abs2[:1], window=W)[0, 0]
+    ref1g = _windowed_ref(q1[0, :, 0], Kf, Vf, scale, L - 1, W)
+    assert ((out1 - ref1g).norm() / ref1g.norm()).item() < 5e-2
 
 
 # ---------------------------------------------------------------------------
