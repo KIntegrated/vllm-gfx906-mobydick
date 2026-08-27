@@ -889,3 +889,60 @@ TP2 smoke therefore has no clean exit gate; further dual-card inference is
 stopped pending the normal reboot/recovery procedure. Persistent copies of
 all session logs and the TP2 probe script are in
 `/local/tmp/gfx906-promotion-2026-08-26/`.
+
+## 2026-08-26 22:30–23:59Z (boot I, 20:56:19): Muse-Glimmer onboarding — 2 allocator OOMs + 2 collateral weight-load launch-failures
+
+Boot I (20:56:19) started with a clean TP=2 promotion-validation window
+(20:05–20:5x, see the section above for the 20:05 GPU1 half-wedge), then
+the Muse-Glimmer-30B-AWQ-INT4 onboarding session (TP=1, GPU0, local venv,
+branch `feat/muse-glimmer`):
+
+**Timeline (all GPU0):**
+
+1. **22:30Z — util-0.95 OOM abort.** First graph-mode bench attempt
+   (`gpu_memory_utilization=0.95`, no explicit KV cap): warm-cache
+   profiling peak undershot the runtime inductor prefill buffer (532 MiB,
+   `aten::empty` in the piecewise inductor graph) → OOM on the first
+   request. Process aborted.
+2. **22:41:28Z — weight-load `hipErrorLaunchFailure` → GPU reset(1).**
+   The next launch (util 0.93, still no cap) wedged at weight-load shard
+   1/5→2 → `Fence fallback timer expired on ring comp_1.0.0` → BACO →
+   `GPU reset(1) succeeded` on 0000:0b:00.0; VRAM 0% / rocm-smi clean
+   after. ~11 min after the OOM abort → **OOM-teardown collateral**
+   (cf. 2026-08-23 ~08:51 precedent), not an independent wedge. Retry
+   per house recipe.
+3. **22:55:42Z — warm-cache OOM abort again** (util 0.93): booted clean
+   (load 58 s, capture 0.71 GiB, KV pool 5.17 GiB from profiling) then
+   OOM'd on the first prefill (same 532 MiB buffer, free: 0 ×2) → HSA
+   `HSA_STATUS_ERROR_OUT_OF_RESOURCES` abort in `_fwd_kernel`
+   (rocdevice.cpp:4207), no kernel reset in journal. Root cause:
+   profiling-based KV sizing vs the 532 MiB runtime buffer (the 532 MiB
+   buffer is larger than Qwen3.8-27B's 356 MiB, so 0.93 — which works for
+   27B — is too tight here). Fix: explicit `kv_cache_memory_bytes` cap +
+   `BENCH_KV_MEM` harness hook. SIGTERM teardown, VRAM 0%.
+4. **~23:38Z — weight-load `hipErrorLaunchFailure` (eager probe, 2 GiB
+   KV cap).** SIGABRT at shard 3/5; journal clean (no BACO/reset this
+   time), rocm-smi 0% after. ~60 s after the previous run's OOM-teardown
+   exit (23:37) → same collateral pattern.
+5. **~23:59Z — weight-load `hipErrorLaunchFailure` (graph run, 0.75 GiB
+   KV).** SIGABRT at shard 3/5; journal clean, rocm-smi 0% after. Again
+   immediately after an OOM-teardown exit (23:57) → collateral pattern.
+6. **~00:0xZ (08-27) — retry clean.** Weights loaded 100%, capture OK;
+   at this KV cap the first prefill still OOMed (free 128–132 MiB —
+   allocator-level; the all-CUSTOM arm's per-layer buffers are ~2.6 GiB
+   larger than the hybrid's — see `DEVLOG-muse-glimmer.md`, memory
+   forensics). A `BENCH_BATCHED_TOKENS=1024` re-run then loaded clean
+   and completed the full gate bench.
+
+**Assessment:** two allocator-level OOM aborts (expected — the model's
+first-request memory profile exceeded the profiling-based KV sizing) and
+two weight-load launch-failures, both within a minute or two of an
+OOM-teardown exit. No independent wedge signature (no unexplained BACO,
+no full wedge, journal otherwise clean). Both cards clean at session
+end; no vllm procs left. If weight-load failures start appearing WITHOUT
+a preceding OOM abort, treat as independent wedges and apply the burst
+rule.
+
+Logs: `/local/tmp/muse/` (`bench_hybrid_graph*.log`,
+`bench_allcustom*.log`, `smoke_*.log`, `probe_allcustom*.log`); dev log:
+`DEVLOG-muse-glimmer.md`.
