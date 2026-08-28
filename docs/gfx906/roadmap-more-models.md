@@ -211,35 +211,33 @@ L=16k–32k, split 8 vs split 1 vs fp32 torch ref (cheap, no server)
 closes the claim that the default `clamp(16/B,2,8)` is safe at
 long context.
 
-### M5 — default read-path decision after a bake
+### M5 — default read-path decision after a bake — **DONE 2026-08-28: keep LEGACY=1**
 
-LEGACY=0 (Q8 pre-quantized read) is validated (suite green incl. the
-round-6 fused-clip tests, default-config + prefix-cache smokes, clip
-+3.6% / KVSPLIT +1.8% gates) but stays experimental. As of round 6
-(2026-08-28, post-promotion) the M1 clip covers BOTH gather paths —
-the fused Q8 gather (LEGACY=0) and the persistent fp16 gather
-(LEGACY=1) — so the pre-port "B=1 has no clip under LEGACY=0" gap is
-closed at unit level (57/57; DEVLOG-muse-glimmer.md round 6). What
-keeps it experimental: the LEGACY=1 TP=2 serving records (boot K/L:
-111.5/99/46.7 @2k/8k/B=4) postdate the fix and no LEGACY=0 serving
-track record exists, and two e2e gaps remain open: (a) the B≥2
-decode combination the DEFAULT (LEGACY=1) auto-gating actually selects
-— persistent GATHER + M1 clip (ERRATUM 2026-08-28: direct-paged is
-reachable only with key_cache_q8 non-None, i.e. LEGACY=0 — so the
-original "LEGACY=1 + direct-paged + clip" gap was vacuous; the clip
-A/B that ran LEGACY=0 gated the LEGACY=0 direct-paged path) — still
-needs its own GATHER_CLIP on/off A/B at B=2/8k; (b) the boot K B=4
-grid point ran at ctx ≤2k where the clip is a no-op — a B=4
-long-context (8k+) clip on/off e2e is missing. **Status 2026-08-28
-(boot L, pre-reboot): (a') and (b) CLOSED** — GATHER_CLIP on/off A/Bs
-at pp8192/tg256: B=2 +12.1% (6.394 vs 5.706), B=4 +22.1% (6.081 vs
-4.982) (DEVLOG-muse-glimmer round 7); the G3 LEGACY=0 TP=2 bake
-caught + fixed a latent capture-unsafe D2H sync in the direct-paged
-Sq>1 loops (round 8; first production hit = LEGACY=0 + ngram spec +
-B≥2 under FULL capture), and is PENDING the reboot the 3rd boot-L
-wedge burst requires. Flip the default only after a serving bake on
-the target workload. Gate: B=1 + B=4 A/B (8k ctx) with the
-degradation canary green, plus (a')+(b) [done] and G3 [pending].
+**Gate executed (DEVLOG-muse-glimmer rounds 6–9), decision: `GFX906_FA_LEGACY` stays `1`.**
+Sequence: (1) round 6 — M1 clip ported to the fused Q8 gather, 57/57
+unit bit-identity; (2) round 7 — e2e clip gates closed: the original
+gap (a) ("LEGACY=1 + direct-paged + clip") proved VACUOUS (direct-
+paged is reachable only under LEGACY=0), and the real gates —
+GATHER_CLIP on/off at pp8192/tg256 on the default path — showed real
+deltas: B=2 **+12.1%** (6.394 vs 5.706), B=4 **+22.1%** (6.081 vs
+4.982); (3) round 8 — the G3 LEGACY=0 TP=2 bake caught + fixed a
+latent capture-unsafe D2H sync in the direct-paged Sq>1 loops (first
+production hit = LEGACY=0 + ngram spec + B≥2 under FULL capture);
+(4) round 9 — **G3 executed on boot M (canary 38.9 t/s): LEGACY=0
+LOSES to the LEGACY=1 control at every controlled point** — B=1
+decode −2.5…−3.7 % (107.4 vs 111.5 @2k; ~96.5 vs ~99 @8k), B=4
+@2k aggregate −27…−31 % (35.8/32.1 vs 46.7), prefill a wash (495
+vs 496.9 @8k). Reading: gfx906 FA has no int8 matrix path, so the
+Q8 dot is fp32-ALU where fp16 uses FMA — the attention inner loop is
+compute-bound and the 10%-leaner HBM read is invisible (B=1), and
+direct-paged's strided paged reads add a second penalty at B=4. Per
+the flip rule (a wash already keeps LEGACY=1; only a win justifies
+flipping), **D1 is not executed**. LEGACY=0 remains an experimental
+opt-in (zero-extra-KV-memory alias, COW-safe); the gate re-opens if
+a future FA kernel closes the Q8-dot compute gap (M2/M3 territory).
+Boot L closed out with a 3rd wedge burst → boot M (this bake); boot
+M's own 15:00Z weight-load wedge (isolated, self-recovered) made the
+bake attempt 2.
 
 ### Housekeeping — drop the legacy `~/env-rocm-7.14-gfx906.sh` sourcing
 

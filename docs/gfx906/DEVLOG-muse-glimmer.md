@@ -1090,5 +1090,77 @@ G3: LEGACY=0 TP=2 grid ≥ the LEGACY=1 records at every point (a wash
 **Capture bug: FIXED (57/57). G3: BLOCKED (host reboot pending).**
 Flip decision (D1) remains gated on G3.
 
+## 2026-08-28 — round 9: G3 executed (boot M) — LEGACY=0 LOSES to LEGACY=1; default stays 1, no flip
+
+## HYPOTHESIS
+
+The LEGACY=0 Q8 pre-quantized read path (fused Q8 gather + clip at
+B=1, direct-paged + Phase C at B≥2) is at least a wash against the
+LEGACY=1 gather+re-quantize path in TP=2 ngram serving — the per-row
+HBM read is 10% leaner (392 vs 512 B at D=128), and the clip now
+matches on both paths, so the flip gate (≥ control at every grid
+point) should pass.
+
+## What was done
+
+- Boot M (~14:52Z, post burst-reboot): clean arrival (both cards
+  0%/0%, 33 °C), canary **38.9 t/s** (healthy band 38.4–38.9) — host
+  clear. G3 attempt 1 wedged at weight load (10th chronic weight-
+  load hang; canary was green 2 min prior) — isolated, self-
+  recovered, retry per protocol.
+- **G3 attempt 2: clean** (ready in ~108 s — warm inductor/AOT cache
+  from attempt 1; weights + 4-size FULL capture all passed, incl.
+  the round-8 uniform fast paths under ngram B≥2; spec acceptance
+  6.00 throughout). Grid ×3, same recipe as the control (bt4096,
+  6 GiB KV cap, ngram n=5, capture [6,12,18,24], prefix cache off,
+  filler prompts):
+
+  | point | LEGACY=0 (this run) | LEGACY=1 (boot L control) | Δ |
+  |---|---|---|---|
+  | 2k/B=1 decode | 107.44/107.41/107.43 | 111.5 | **−3.7 %** |
+  | 8k/B=1 decode (tg256) | 93.69/97.81/97.96 | ~99 | **−2.5 %** |
+  | 8k/B=1 decode (tg512) | 95.58/97.76/97.89 | — (no control) | — |
+  | 16k/B=1 decode | 88.03/88.13/88.07 | — (no control) | — |
+  | B=4 @2k aggregate (s1/s2) | 35.79 / 32.08 | 46.7 | **−27…−31 %** |
+  | 8k prefill (warm, tg256 s1/s2) | 495.3 / 495.5 | 496.9 | wash |
+
+  B=4 s0 (27.96) is the session's first B=4 sample (cold); s1/s2
+  are the stable readings. TTFT/queuing structure identical to the
+  control run (ttft_max ~16 s at B=4/2k from the 4096-token
+  serialization).
+- **Interpretation:** the per-row HBM-leaner argument does not
+  transfer to wall clock on the MI50. FA at D=128 on gfx906 has no
+  int8 matrix path — the Q8 dot runs as fp32 ALU (dequant +
+  multiply) where the fp16 path uses fp16 FMA, so the attention
+  inner loop is COMPUTE-bound and the 10% HBM saving is invisible
+  (B=1: small ALU penalty shows as −2.5…−3.7 %). At B=4 the
+  direct-paged kernel's block-strided paged reads add a second,
+  larger penalty (−27…−31 %) vs LEGACY=1's gather-materialize-
+  then-contiguous-read. Prefill (gather-bound, not FA-bound) is a
+  wash — consistent with the same reading at the B=1 in-process
+  A/Bs (round 7: the LEGACY=1 gather+clip path was already
+  competitive there).
+
+## GATE
+
+LEGACY=0 TP=2 grid ≥ LEGACY=1 records at every point.
+
+## VERDICT
+
+**FAIL — LEGACY=0 is slower at every controlled point (−2.5 %…−3.7 %
+B=1 decode, −27…−31 % B=4 aggregate; prefill wash). Per the flip
+rule (a wash already keeps LEGACY=1; only a win justifies flipping),
+D1 is NOT executed: `GFX906_FA_LEGACY` stays `1`.** The LEGACY=0
+path remains an experimental opt-in (zero-extra-KV-memory alias,
+COW-safe) — useful if/when a gfx906 FA kernel gains a fast Q8 dot
+(e.g. a packed-ALU dequant that closes the fp16-FMA gap), at which
+point the M5 gate re-opens. Roadmap M5: gate executed → closed
+with the keep-LEGACY=1 decision. The round-8 capture fix stands on
+its own (it made any future LEGACY=0 ngram serving possible).
+
+**M5 outcome (for the roadmap): M5 = DONE (decision made; default
+unchanged). Residual M5-adjacent work: none blocking — the LEGACY=0
+Q8-FA compute gap is an M2/M3 kernel-hygiene topic, not a gate.
+
 ---
 Copyright Kevin Read <me@kevin-read.com>

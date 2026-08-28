@@ -1298,3 +1298,14 @@ pool, `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0`).
    untested by design (TP=2 IS two cards), and boot L is ~8 h in
    with 3 wedges accumulated — consistent with the degradation-onset
    model (enough half-wedge resets in one boot degrade the host).
+10. **~15:00Z (boot M)** — **1st boot-M wedge: G3 LEGACY=0 TP=2
+    attempt 1, `hipErrorLaunchFailure` both ranks at weight load**
+    (~5.5 min in; evidence: `/tmp/g3_legacy0_serve.log` boot-M
+    write, boot-volatile; signatures quoted here). Context: fresh
+    boot (uptime ~8 min), canary **38.9 t/s** at ~14:58Z (2 min
+    prior) — host healthy at launch. Chronic weight-load-hang
+    family, 10th occurrence across boots; the TP=2 two-rank weight
+    load is the usual trigger (cf. boot K 18:23:30, 7th). Driver
+    self-recovered to the 10.8 MB baseline within ~4 min; no zombie
+    VRAM. Protocol state: isolated → 1 retry; a 2nd launch failure
+    on boot M = burst → stop + reboot (root).
