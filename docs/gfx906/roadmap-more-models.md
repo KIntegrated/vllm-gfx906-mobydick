@@ -222,13 +222,24 @@ the fused Q8 gather (LEGACY=0) and the persistent fp16 gather
 closed at unit level (57/57; DEVLOG-muse-glimmer.md round 6). What
 keeps it experimental: the LEGACY=1 TP=2 serving records (boot K/L:
 111.5/99/46.7 @2k/8k/B=4) postdate the fix and no LEGACY=0 serving
-track record exists, and two e2e gaps remain open: (a) the LEGACY=1 +
-direct-paged + clip combination (what auto-gating selects at B≥2 under
-default LEGACY) has never been separately e2e-gated — the clip A/B ran
-LEGACY=0; (b) the boot K B=4 grid point ran at ctx ≤2k where the clip
-is a no-op — a B=4 long-context (8k+) clip on/off e2e is missing. Flip
-the default only after a serving bake on the target workload. Gate: B=1
-+ B=4 A/B (8k ctx) with the degradation canary green, plus (a)+(b).
+track record exists, and two e2e gaps remain open: (a) the B≥2
+decode combination the DEFAULT (LEGACY=1) auto-gating actually selects
+— persistent GATHER + M1 clip (ERRATUM 2026-08-28: direct-paged is
+reachable only with key_cache_q8 non-None, i.e. LEGACY=0 — so the
+original "LEGACY=1 + direct-paged + clip" gap was vacuous; the clip
+A/B that ran LEGACY=0 gated the LEGACY=0 direct-paged path) — still
+needs its own GATHER_CLIP on/off A/B at B=2/8k; (b) the boot K B=4
+grid point ran at ctx ≤2k where the clip is a no-op — a B=4
+long-context (8k+) clip on/off e2e is missing. **Status 2026-08-28
+(boot L, pre-reboot): (a') and (b) CLOSED** — GATHER_CLIP on/off A/Bs
+at pp8192/tg256: B=2 +12.1% (6.394 vs 5.706), B=4 +22.1% (6.081 vs
+4.982) (DEVLOG-muse-glimmer round 7); the G3 LEGACY=0 TP=2 bake
+caught + fixed a latent capture-unsafe D2H sync in the direct-paged
+Sq>1 loops (round 8; first production hit = LEGACY=0 + ngram spec +
+B≥2 under FULL capture), and is PENDING the reboot the 3rd boot-L
+wedge burst requires. Flip the default only after a serving bake on
+the target workload. Gate: B=1 + B=4 A/B (8k ctx) with the
+degradation canary green, plus (a')+(b) [done] and G3 [pending].
 
 ### Housekeeping — drop the legacy `~/env-rocm-7.14-gfx906.sh` sourcing
 

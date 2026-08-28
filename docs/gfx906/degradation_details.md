@@ -1236,3 +1236,65 @@ pool, `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0`).
    (`docs/gfx906/_probe_mem_attribution_gfx906.py`). All boot-K
    post-reboot pending items complete. Boot L clean throughout
    (canary 38.8 t/s; no wedges).
+7. **~12:43Z** — **1st wedge of boot L: dual weight-load launch
+   failures (GPU0 + GPU1 simultaneous)**. Two in-process harness runs
+   (G1 B=2 / G2 B=4 `GFX906_FA_WINDOW_CLIP` A/B for the LEGACY=0
+   default-flip gate, Muse-Glimmer, default LEGACY=1) both aborted at
+   weight load — `terminate called after throwing an instance of
+   'c10::AcceleratorError' ... CUDA error: unspecified launch
+   failure` (`hipErrorLaunchFailure`), in the Exllama load path
+   (checkpoint stats logged, then terminate — before any FA kernel
+   ran, so the round-6 fused-clip rebuild is not implicated by the
+   crash site). Both cards affected in the same ~30 s window ~6.5 h
+   into boot L; rocm-smi self-recovered (0%/0% both cards, no zombie
+   VRAM) within ~1 min of the crashes — matches the chronic
+   weight-load-hang family (9th occurrence across boots) and the
+   host-degradation signature (sync-cadence-heavy load work dies,
+   driver recovers). Evidence: `/tmp/g1_clipon_b2.log`,
+   `/tmp/g2_clipon_b4.log` (boot-volatile; signatures quoted here).
+   **Canary skipped on operator instruction** ("card was working just
+   now") — if the retry loads but t/s land low, the host is the
+   suspect. Protocol state: isolated → 1 retry (G1 on GPU0); a 2nd
+   launch failure = burst → stop all GPU work + reboot (root).
+8. **~12:54Z** — **2nd boot-L wedge pair: concurrent G1(n=2)/G2(n=4)
+   relaunch, both cards, same weight-load `unspecified launch
+   failure`** (evidence: `/tmp/g1_clipon_b2_n2.log`,
+   `/tmp/g2_clipon_b4_n4.log`; self-recovered to 10.8 MB both).
+   Context: the 12:43 pair's single-card retry (G1, ~12:52) loaded
+   clean and ran to completion at **6.06 t/s** (B=1/pp8192/tg256 vs
+   the 6.042 pre-wedge record — host healthy mid-interval). Pattern
+   so far on boot L: every double wedge followed a CONCURRENT
+   two-card launch; every clean run was single-card. Hypothesis
+   (unverified): two heavy HSA loads in the same ~30 s window race a
+   host/driver resource on this dual-root-port topology. Mitigation
+   from here: serialize all GPU work (one in-process or one TP=2 job
+   at a time). Protocol state: 2nd observation, chain was broken by
+   the 12:52 success → G1 retried once; a 3rd observation or a retry
+   failure = burst → stop + reboot (root).
+9. **~14:38Z** — **3rd boot-L wedge: G3 LEGACY=0 TP=2 bake retry,
+   `hipErrorLaunchFailure` in weight `copy_`→SetDevice (Worker_TP1,
+   both ranks; evidence: `/tmp/g3_legacy0_serve.log` 2nd write, boot-
+   volatile; signatures quoted here).** First G3 attempt (~14:20)
+   died with a CODE error instead — a capture-unsafe D2H sync
+   (`int(cu[s+1]-cu[s])`) in the direct-paged branch's Sq>1 Q-pad
+   loop, hit for the first time in production (LEGACY=0 + ngram spec
+   + B≥2 decode = Sq=6 direct-paged under FULL decode capture);
+   fixed in-tree (uniform-batch fast paths, mirroring the gather
+   branch's capture-safe idiom; 57/57 suite incl. the nq=6/B=2
+   bit-identity A/B now exercising them). The retry then wedged at
+   weight load — the 14:20 code death had already torn down both
+   workers, so the wedge may be collateral to that teardown (cf. the
+   documented SIGKILL-mid-P2P → next-init wedge), or a 3rd
+   accumulation. Either way: **3rd wedge observation of boot L =
+   BURST per the protocol recorded at 12:54Z → ALL GPU WORK STOPPED;
+   host needs a REBOOT (root).** Pending post-reboot: the G3 LEGACY=0
+   TP=2 serving bake (recipe: `HIP_VISIBLE_DEVICES=0,1
+   GFX906_FA_LEGACY=0` + README TP=2 flags; grid
+   `_bench_serve_grid_gfx906.py` default ×3; control = the boot L
+   LEGACY=1 records 111.5/99/46.7 @2k/8k/B=4). Pattern note: all 3
+   boot-L wedges involved two-card launches; all 6 single-card
+   in-process runs (incl. the post-wedge A/Bs, 13:0x–14:3x) were
+   clean — the concurrent-two-card race hypothesis from 12:54Z is
+   untested by design (TP=2 IS two cards), and boot L is ~8 h in
+   with 3 wedges accumulated — consistent with the degradation-onset
+   model (enough half-wedge resets in one boot degrade the host).

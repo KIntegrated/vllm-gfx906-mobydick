@@ -972,5 +972,123 @@ e2e result (the persistent twin was e2e-gated at pp8192 with the
 identical kv_start contract); a fused-path prefill A/B is folded into
 the M5 serving bake.
 
+## 2026-08-28 — round 7: M5 gate e2e — gaps (a)/(b) closed (with an erratum on what gap (a) actually was)
+
+## HYPOTHESIS
+
+The two remaining M5 e2e gaps — (a) "the LEGACY=1 + direct-paged +
+clip combination has never been separately e2e-gated" and (b) "no
+B=4 long-context (8k+) clip on/off e2e" — are closable with in-
+process harness A/Bs at pp8192/tg256 (B=2 for (a), B=4 for (b)), and
+both will show the clip's expected delta (the round-3 Phase C A/B
+showed +3.6% e2e at the same shape).
+
+## What was done
+
+- **Erratum on gap (a):** direct-paged dispatch is gated on
+  `key_cache_q8 is not None` (gfx906_fa_paged.py) — i.e. **LEGACY=0
+  only**. Under the default LEGACY=1, B≥2 decode auto-gating selects
+  the persistent GATHER path with the M1 clip (`GFX906_FA_GATHER_CLIP`),
+  never direct-paged. The original gap (a) ("LEGACY=1 + direct-paged +
+  clip") was therefore VACUOUS — that combination does not exist in
+  production; the round-3 +3.6% A/B (run LEGACY=0) had already gated
+  the LEGACY=0 direct-paged + Phase C path. The real gap (a') is:
+  the LEGACY=1 B≥2 gather + M1-clip combination (what the default
+  actually dispatches) needed its own GATHER_CLIP on/off A/B. Roadmap
+  M5 text corrected.
+- A/Bs run (harness record recipe, pp8192/tg256, 4 samples, prefix
+  off, GPU0, boot L; launches serialized after the 12:43/12:54
+  double-wedge pairs — see degradation.md):
+  - (a') B=2 (nreqs=2): GATHER_CLIP=1 **6.410/6.394/6.386/6.385** vs
+    =0 **5.710/5.706/5.705/5.702** → **+12.1%**.
+  - (b) B=4 (nreqs=4): GATHER_CLIP=1 **6.093/6.086/6.077/6.068** vs
+    =0 **4.982/4.982/4.983/4.982** → **+22.1%**.
+  - (context) B=1 clip A/B was the round-5 M1 e2e: +8.1% (6.042 vs
+    5.587). The delta grows with batch (gather HBM scales with B, the
+    per-step GEMM/launch overhead does not) — the expected shape.
+  - A first B=2 A/B toggling `GFX906_FA_WINDOW_CLIP` (the Phase C
+    flag) showed 0.1% — consistent with the erratum: under LEGACY=1
+    that flag is a no-op at B≥2 (direct-paged unreachable). Both of
+    its arms ran the gather+clip-ON config: **6.38 t/s is the
+    current-default B=2/8k in-process record** (6.39 on the
+    GATHER_CLIP=1 re-run).
+- G3 (LEGACY=0 TP=2 serving bake) attempted; it caught a real bug
+  (below), which was fixed; the re-run then hit the boot-L wedge
+  burst — G3 is PENDING post-reboot.
+
+## GATE
+
+(a') + (b) A/B deltas above (both must be a real positive delta, not
+a no-op — the 0.1% WINDOW_CLIP A/B is the counter-example that
+caught the erratum); unit bit-identity already in place (57/57,
+round 6).
+
+## VERDICT
+
+**PASS — gaps (a') and (b) closed.** The default (LEGACY=1) B≥2
+combination is e2e-gated with a real clip delta at 8k (+12.1% B=2,
++22.1% B=4); the LEGACY=0 direct-paged + Phase C path was already
+gated in round 3 (+3.6%). What remains for the flip decision: the
+G3 LEGACY=0 TP=2 serving bake vs the boot L LEGACY=1 records
+(111.5/99/46.7 @2k/8k/B=4).
+
+## 2026-08-28 — round 8: G3 caught a latent capture-unsafe sync in the direct-paged branch; fixed; G3 itself blocked by the boot-L wedge burst
+
+## HYPOTHESIS
+
+The LEGACY=0 TP=2 ngram serving bake (G3) boots and serves — the
+LEGACY=0 path (fused Q8 gather + clip, direct-paged + Phase C) is
+cudagraph-capture-safe in serving, as the persistent path was.
+
+## What was done
+
+- G3 attempt 1 (~14:20Z, TP=2, capture [6,12,18,24]) died during the
+  **FULL decode capture** with `hipErrorStreamCaptureUnsupported`
+  ("operation not permitted when stream is capturing") at
+  `gfx906_fa_paged.py:447` — `n = int(cu[s+1] - cu[s])`, a D2H sync in
+  the direct-paged branch's Q-pad **and** output-unpad fallback loops
+  (the Sq>1 case). **Pre-existing latent bug, not a round-6
+  regression:** those loops only run when Sq>1, and direct-paged is
+  reachable only under LEGACY=0 (round-7 erratum) — under the
+  default LEGACY=1 the B≥2 decode never entered this branch, and the
+  in-process harness never used spec decode (Sq=1 decode → fast
+  path; Sq>1 prefill → gather). First production hit = LEGACY=0 +
+  ngram (Sq=6 per seq) + B≥2 under FULL capture.
+- **Fix (in-tree, this commit):** added the gather branch's existing
+  capture-safe **uniform-batch fast paths** to the direct-paged
+  branch (both Q-pad and output-unpad): `num_tokens == num_seqs *
+  max_seqlen_q` is a host-integer check, so no sync; spec batches
+  are always uniform (n_q = 1 + num_spec). The sync loops remain
+  only in the non-uniform fallback (eager-only reachability: prefill
+  chunks are piecewise/EAGER at the attention split op, so capture
+  never sees them).
+- Validation: 57/57 suite — the `nq=6/B=2` cases of
+  `test_forward_paged_fusedq8_window_clip_bit_identical` now
+  dispatch to direct-paged (auto mode, B≥2) and assert bit-identity
+  vs the gather path, so the new idioms are exercised and match.
+- G3 attempt 2 (~14:38Z) wedged at weight load
+  (`hipErrorLaunchFailure`, Worker_TP1 both ranks) — 3rd boot-L wedge
+  observation = BURST per the 12:54Z protocol → **all GPU work
+  stopped; reboot (root) required** (degradation.md +
+  degradation_details.md item 9). Possible collateral to attempt 1's
+  teardown; unresolvable without the reboot.
+- G3 recipe (post-reboot): `HIP_VISIBLE_DEVICES=0,1
+  GFX906_FA_LEGACY=0` + the README TP=2 flags (bt4096, 6 GiB KV cap,
+  ngram n=5, capture [6,12,18,24]); grid
+  `_bench_serve_grid_gfx906.py` default ×3; control = the boot L
+  LEGACY=1 records (111.5/99/46.7 @2k/8k/B=4 — same boot, same
+  recipe; tree delta since is LEGACY=0-path-only, re-validated by
+  today's clean single-card runs).
+
+## GATE
+
+G3: LEGACY=0 TP=2 grid ≥ the LEGACY=1 records at every point (a wash
+= keep LEGACY=1 per the flip rule). Blocked on the reboot.
+
+## VERDICT
+
+**Capture bug: FIXED (57/57). G3: BLOCKED (host reboot pending).**
+Flip decision (D1) remains gated on G3.
+
 ---
 Copyright Kevin Read <me@kevin-read.com>
