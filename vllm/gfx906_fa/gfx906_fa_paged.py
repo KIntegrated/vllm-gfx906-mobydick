@@ -498,9 +498,12 @@ def forward_paged(
         # reduction order matches the full scan); the HBM reads drop to
         # ~W/L of the full scan. Decode rows only — prefill rows have
         # per-row windows [max(0, t-W+1), t] and the shared scan must
-        # start at 0 (that clip is still open work). Direct-paged (B>=2
-        # decode dispatch) only; B=1 decode routes to the gather path,
-        # which doesn't clip yet.
+        # start at 0 (that clip is still open work). This Phase C clip
+        # is specific to the direct-paged dispatch (LEGACY=0-only, and
+        # opt-in via GFX906_FA_DIRECT_PAGED_Q8=1 since round 10); the
+        # gather paths — the LEGACY=1 default, and LEGACY=0 B>=2 since
+        # round 10 — clip via _GATHER_CLIP / _gather_clip_start below,
+        # at every batch size.
         kv_start_tensor = None
         if _WINDOW_CLIP and window > 0 and max_seqlen_q == 1:
             # kv_start = max(0, q_abs + 1 - window); int32 throughout
