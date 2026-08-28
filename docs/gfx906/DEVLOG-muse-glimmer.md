@@ -1174,7 +1174,8 @@ its own (it made any future LEGACY=0 ngram serving possible).
 
 **M5 outcome (for the roadmap): M5 = DONE (decision made; default
 unchanged). Residual M5-adjacent work: none blocking — the LEGACY=0
-Q8-FA compute gap is an M2/M3 kernel-hygiene topic, not a gate.
+read-layout gap (not a compute gap, corrected 2026-08-28) is M6
+territory; the unrelated P·V dot2 lever is an M3 kernel-hygiene topic.
 
 ---
 Copyright Kevin Read <me@kevin-read.com>

@@ -67,6 +67,16 @@ below reflects that.
 - Not fixing M2 (per-row prefill clip) or M4 (long-context split-K
   accuracy) — separate roadmap items, may share a rebuild window but
   are not part of this plan.
+- Not the FA-Q8 P·V `v_dot2_f32_f16` rewrite (M3 candidate, added
+  2026-08-28 by `12ac1b7e94` after a backend-verified ISA probe:
+  `v_dot2_f32_f16` is runtime-clean, `vdst = acc + a_lo·b_lo +
+  a_hi·b_hi`, matching the production dense-GEMV/MoE path; P·V
+  currently runs `v_pk_mul_f16`+`v_pk_add_f16`, 2 instr/2 MAC fp16-acc,
+  vs 1 instr/2 MAC fp32-acc for the dot2 form). Genuinely adjacent —
+  same kernel family, same probe — but it speeds **both** LEGACY modes
+  equally, so it cannot move the LEGACY=0-vs-1 comparison and doesn't
+  belong in an M6 salvage plan. See `roadmap-more-models.md` M3 for the
+  gate (kernel A/B + PPL invariance + bit-identity reference updates).
 - **Superseded — do not implement:** the original Part A of this plan
   (batching the per-block fp16 rescale in the KQ loop) is a dead end.
   It targets ALU cost on a path that measurement shows is HBM-bound,

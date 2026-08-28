@@ -252,7 +252,8 @@ paged reads (memory access pattern, not an FA ALU gap); the
 (a wash already keeps LEGACY=1; only a win justifies flipping),
 **D1 is not executed**. LEGACY=0 remains an experimental
 opt-in (zero-extra-KV-memory alias, COW-safe); the gate re-opens if
-a future FA kernel closes the Q8-dot compute gap (M2/M3 territory).
+a future FA change closes the read-layout gap measured above (M6
+territory — see below; NOT a Q8-dot compute gap, corrected 2026-08-28).
 Boot L closed out with a 3rd wedge burst → boot M (this bake); boot
 M's own 15:00Z weight-load wedge (isolated, self-recovered) made the
 bake attempt 2.
