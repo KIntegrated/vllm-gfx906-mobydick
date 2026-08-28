@@ -175,14 +175,19 @@ pp8192/B=1/tg256): **6.042 vs 5.587 t/s = +8.1%**
 time × ~17% FA share of the B=1 step at 8k. See
 DEVLOG-muse-glimmer.md round 5.
 
-### M2 — per-row (2D) prefill clip
+### M2 — per-row (2D) prefill clip — DONE at q-tile granularity on branch `feat/fa-m2-tile-clip` 2026-08-28 (unmerged for review; log: DEVLOG-fa-attention.md 2026-08-28 M2 entry; 64/64 suite; A/B 3.19× fwd / 2.80× direct at pp4096/full-context)
 
 Prefill rows need only `[q_abs+1-W, q_abs]`; today the per-sequence
 `k0_base` covers the whole q-tile, so early rows in a prefill chunk
 still scan (and the gather materializes) out-of-window keys. A
 conservative per-q-tile start (smallest row's window start) is
 implementable without per-row loops. Gate: bit-identity + pp4096
-prefill/TTFT A/B.
+prefill/TTFT A/B. Implemented as two bit-identical per-q-tile scan
+bounds (window raise of `k0_base` + causal cap of `k_VKQ_max`, knob
+`GFX906_FA_TILE_CLIP` default on) + the DIRECT_PAGED clip gate
+extended to prefill; per-row granularity (within a 64-row tile) left
+open — the residual is <= ncols1-1 rows of masked keys per tile, a
+~1/32 effect of what M2 removes.
 
 ### M3 — kernel hygiene batch (one rebuild)
 

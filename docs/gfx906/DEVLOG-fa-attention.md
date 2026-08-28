@@ -685,3 +685,102 @@ the only instruction-level upside left is a Q4-KV format change that
 unlocks native `v_dot8_i32_i4` (2× dot4 MAC rate at half the operand
 bytes, no unpack ALU) — roadmap M6 (rewritten), PPL-gated. Rates
 recorded in `dequant-instructions.md`.
+
+## 2026-08-28 — M2 per-q-tile prefill clip: per-tile k0_base window raise + per-tile causal kv_max cap in both FA kernels; DIRECT_PAGED window clip extended to prefill chunks
+
+## HYPOTHESIS
+
+If the skipped k-tiles are provably fully masked (window or causal) for
+every row of the q-tile, then moving each q-tile's scan to its own
+window start and capping it at its own last row's position is
+bit-identical to the full scan, and cuts the sliding-window prefill
+scan cost from ~chunk to ~window per q-tile (the roadmap M2 "per-row
+(2D) prefill clip", realized at q-tile granularity — per-row would
+need per-row k-loops, per-tile needs none).
+
+## What was done
+
+Branch `feat/fa-m2-tile-clip` (unmerged, for review):
+
+- **Kernel (LOCKSTEP, fattn-q8.cuh + fattn-q8-paged.cuh)**, gated by
+  the new `GFX906_FA_TILE_CLIP` host knob (default 1; 0 = A/B arm,
+  read per call):
+  - **(1) Per-q-tile window raise**: with kv_start set + window>0,
+    `k0_base = max(k0_base, floor16(q_abs + col_Q_0 + 1 - window))`.
+    The tile's first row has the smallest window start in the tile;
+    keys before it are window-masked to -INF for every tile row, so
+    the raised (floored, same bit-identity rule as M1) start skips
+    exactly the fully-masked prefix. Clip mode only — without
+    kv_start the scan starts at 0 by contract (the clip-vs-no-clip
+    bit-identity tests).
+  - **(2) Per-q-tile causal cap**: with q_abs_offset set,
+    `k_VKQ_max = min(k_VKQ_max, q_abs + min(col_Q_0 + ncols1,
+    ne01.z))`. Keys at/past the tile's last VALID row +1 are
+    causally masked (k > q_abs_row) for every tile row — exactly as
+    in the full scan — so the cap skips the causally dead tail
+    k-tiles (the oob-tail logic handles the partial capped tile).
+    Sq<=2 (ncols1=2): cap = q_abs + ne01.z = seq_len — decode is
+    bit-for-bit unchanged.
+- **Backend (gfx906_fa_paged.py)**: the DIRECT_PAGED window clip gate
+  dropped `max_seqlen_q == 1` — prefill chunks now get the
+  conservative chunk-start clip (kv_start = max(0, chunk_first + 1 -
+  window), the existing formula). The LEGACY gather path already
+  passed kv_start for prefill (gate was only `_GATHER_CLIP and
+  window > 0`), so the kernel raise applies there with no change.
+- **Tests (4 new)**: tile_clip on/off bit-identical for a mid-context
+  Sq=256 prefill chunk (4 q-tiles, per-tile raise active) and Sq=64
+  (1 q-tile, cap only) on both kernels + torch windowed reference on
+  boundary rows; causal cap in isolation (window=0) on/off
+  bit-identical + plain-causal reference + the Sq=1 no-op corner;
+  backend-level DIRECT_PAGED prefill clip on/off bit-identical AND
+  bit-identical to the LEGACY gather path's clip (cross-path
+  agreement, guards the backend gate change).
+- **Bench** (`benchmarks/kernels/gfx906/bench_gfx906_fa_tile_clip.py`):
+  Muse geometry (Hq=32/Hkv=2/D=128), L=131072, Sq=4096, W=2048
+  (the pp4096-at-full-context shape), both kernels, clip 0 vs 1.
+
+## GATE
+
+Roadmap M2: bit-identity + pp4096 prefill/TTFT A/B. Bit-identity:
+the full suite (60 existing — every clip/window test runs with
+tile_clip=1 by default — + 4 new = 64) must pass unchanged, plus the
+explicit on/off `torch.equal` arms. A/B: kernel-level prefill timing
+at the 4096-chunk/full-context sliding-window shape (the FA
+component of TTFT; an end-to-end pp4096 serving A/B is not needed if
+the kernel-level win is large and the bit-identity holds).
+
+## Evidence
+
+- Suite: 64/64 (boot M; build after a full FA build-state wipe —
+  see the M3 entry's contamination countermeasure).
+- A/B (in-process, GPU0, 3 warmup + 8 iters):
+  - fwd (gather path): clip=0 62.286 ms → clip=1 19.519 ms = **3.19×**
+  - direct (paged): clip=0 83.791 ms → clip=1 29.892 ms = **2.80×**
+  - Theory: without M2 every q-tile scans [kv_start=124929, 131072)
+    = 6143 keys (384 k-tiles); with M2 tile t scans
+    [floor(124929+64t), 126976+64t) ≈ 2047 keys (128 k-tiles) — a
+    3.0× k-iteration reduction, matching the measured 2.8–3.2×.
+- Cross-path: DIRECT_PAGED prefill clip-on vs LEGACY gather clip-on
+  max|diff| = 0.0 (bit-identical); on/off = 0.0.
+- The two cap halves are independently verified: the window-raise
+  test (Sq=256, raise moves tiles 1–3) and the cap-isolation test
+  (window=0, cap only, incl. the unaligned partial last tile Sq=200).
+
+## VERDICT
+
+**SHIPPED (branch, unmerged for review).** M2 closed at q-tile
+granularity: sliding-window prefill attention scan drops from
+~chunk to ~window per q-tile — 2.8–3.2× on the FA kernel at the
+pp4096/full-context shape, i.e. the per-layer attention cost of a
+4096-token chunk on the 39 Muse sliding-window layers at long
+context. The win scales with context length (at short context the
+window already covers the chunk and the clip is ~inert) and with
+chunk size (Sq > W is the regime; for Sq <= W only the causal cap
+bites). Bit-identity is structural (fully-masked tiles are exact
+no-ops: P=0, KQ_max unchanged, VKQ += 0) and held at 0.0 across all
+arms including the cross-path check. Kill switches:
+`GFX906_FA_TILE_CLIP=0` (both caps), `_WINDOW_CLIP=0` (backend clip),
+`GFX906_FA_GATHER_CLIP=0` (LEGACY gather clip). Decode is provably
+unchanged (cap = seq_len, raise = the existing floor).
+
+Co-authored-by: pi (coding agent)
