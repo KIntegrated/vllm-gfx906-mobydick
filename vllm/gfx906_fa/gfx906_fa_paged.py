@@ -69,6 +69,12 @@ _FUSED = _os.environ.get("GFX906_FA_FUSED", "1") != "0"
 #     * B=2: direct быстрее на ~4-7%.
 #     * B≥3: direct быстрее на 7-35%.
 #     * B=8, Sk=61K: gather → CUDA OOM (24 GiB peak); direct работает (~13 ms/step).
+#       [Pre-2026-08-20 observation, before the gather buffers became
+#       ClassVar-shared (one pair/worker, not one per layer) and the
+#       gather-lifecycle grow-only-capacity fix (21c69a8ead). Today
+#       this shape is ~0.2 GiB, one-time, shared with LEGACY=1's
+#       gather (already exercised at B=8 in the N=8 concurrent-decode
+#       records) — the 24 GiB figure no longer applies.]
 #   Prefill (bench_prefill.py, occupancy-fix применён):
 #     * B=1 Sq=16 (ncols1=16): direct WIN -5..-27% (0 spill).
 #     * B=2 Sq=32 (ncols1=32): direct LOSS +13% даже при 0 spill
