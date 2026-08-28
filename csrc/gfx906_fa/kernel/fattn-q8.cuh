@@ -10,15 +10,29 @@
 
 #pragma once
 #include "ggml_shim.cuh"
+#include "gfx906-config.h"
 
 // Uses v_dot4_i32_i8 for INT8 dot products
 
 
+// nbatch_fa is capped at GFX906_FA_GATHER_CLIP_MARGIN (not just the 256
+// hardware ceiling below): the M1 gather-path window clip
+// (gfx906_fa_gather.cu, GATHER_CLIP_MARGIN) only materializes enough
+// history for the FA kernel's tile-boundary floor (this file, k0_base -=
+// k0_base % nbatch_fa) to stay in-bounds if nbatch_fa never exceeds the
+// margin. Raising nbatch_fa past GFX906_FA_GATHER_CLIP_MARGIN here without
+// also raising the margin would silently under-cover it at runtime (stale
+// gather-buffer rows read as K); this assert turns that into a build
+// failure instead.
 #define GGML_CUDA_FATTN_TILE_CONFIG_CASE(DKQ_, DV_, ncols_, nthreads, occupancy, nbatch_fa, nbatch_K) \
     if (DKQ == (DKQ_) && DV == (DV_) && ncols == (ncols_)) {                                          \
         static_assert((nthreads)          <= 512, "bad nthreads");                                    \
         static_assert((occupancy)         <=   8, "bad occupancy");                                   \
         static_assert((nbatch_fa)         <= 256, "bad nbatch_fa");                                   \
+        static_assert((nbatch_fa)         <= GFX906_FA_GATHER_CLIP_MARGIN,                            \
+            "nbatch_fa exceeds GFX906_FA_GATHER_CLIP_MARGIN (gfx906-config.h) — "                     \
+            "the M1 gather-path clip's margin no longer covers this tile's "                          \
+            "boundary floor; raise GFX906_FA_GATHER_CLIP_MARGIN to match");                           \
         static_assert((nbatch_K)          <= 256, "bad nbatch_K");                                    \
         return ((nthreads) << 0) | ((occupancy) << 10) | ((nbatch_fa) << 14) | ((nbatch_K) << 23);    \
     }

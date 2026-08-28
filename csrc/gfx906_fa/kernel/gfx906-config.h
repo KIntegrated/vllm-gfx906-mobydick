@@ -30,4 +30,19 @@
 // ============================================
 #define GFX906_ROPE_ENABLED 1
 
+// ============================================
+// M1 gather-path window clip margin
+// ============================================
+// GATHER_CLIP_MARGIN (gfx906_fa_gather.cu): the persistent gather writes
+// rows [kv_start - GATHER_CLIP_MARGIN, seq_len) so the FA kernel's
+// tile-boundary floor (fattn-q8.cuh, k0_base -= k0_base % nbatch_fa) never
+// floors past what was actually materialized. This is only correct if
+// GATHER_CLIP_MARGIN >= every nbatch_fa the FA config table
+// (GGML_CUDA_FATTN_TILE_CONFIG_CASE) can return — the floor can move the
+// start left by at most nbatch_fa - 1. Defined once here (not in either
+// consumer file) so a config-table edit that raises nbatch_fa past this
+// value fails to compile in fattn-q8.cuh instead of silently
+// under-covering the margin at runtime.
+#define GFX906_FA_GATHER_CLIP_MARGIN 128
+
 #endif // GGML_HIP_GFX906

@@ -52,6 +52,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include "kernel/q8_0_quantize.cuh"
+#include "kernel/gfx906-config.h"
 
 // ---------------------------------------------------------------------------
 // Fused gather K_q8 + V_fp16 → contiguous BHSD.
@@ -530,14 +531,16 @@ extern "C" __global__ void gather_paged_kv_quant_kernel(
 // M1 gather-path window clip: with non-null kv_start, per-seq rows
 // [0, start) are skipped, start = max(0, kv_start[s] - GATHER_CLIP_MARGIN)
 // (clamped to seq_len). The FA kernel (fattn-q8.cuh) floors its clip
-// start to an nbatch_fa tile boundary — the max nbatch_fa in the config
-// table is 128, so the margin guarantees the floored start is always
-// materialized; if the table's max grows, grow the margin too (the
-// bit-identity unit tests catch the drift). Rows are written at ABSOLUTE
-// token indices, so the FA k-loop start (floor(kv_start)) indexes this
-// buffer directly — no compaction, no reindexing.
+// start to an nbatch_fa tile boundary — GATHER_CLIP_MARGIN (defined once
+// in kernel/gfx906-config.h as GFX906_FA_GATHER_CLIP_MARGIN, shared with
+// fattn-q8.cuh's config-table static_assert) guarantees the floored start
+// is always materialized: a config-table edit that raises nbatch_fa past
+// this value fails to compile in fattn-q8.cuh instead of silently
+// under-covering the margin here. Rows are written at ABSOLUTE token
+// indices, so the FA k-loop start (floor(kv_start)) indexes this buffer
+// directly — no compaction, no reindexing.
 // ---------------------------------------------------------------------------
-constexpr int GATHER_CLIP_MARGIN = 128;
+constexpr int GATHER_CLIP_MARGIN = GFX906_FA_GATHER_CLIP_MARGIN;
 
 extern "C" __global__ void gather_paged_kv_quant_persistent_kernel(
     const __half  * __restrict__ key_cache,

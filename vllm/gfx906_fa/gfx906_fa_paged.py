@@ -599,6 +599,30 @@ def forward_paged(
         # gather_paged_kv_fp16 + quantize_q8_0 (GFX906_FA_FUSED_QUANT=0).
         # Both: V tail zeroed; K tail unmasked — FA kernel cuts it via
         # kv_max. GFX906_FA_TORCH_GATHER=1 reverts to the torch path.
+        #
+        # INVARIANT (LEGACY=0 aliasing, see gfx906_fa_backend._ensure_q8_
+        # sidebuffer): this branch reads raw fp16 `key_cache` and MUST stay
+        # unreachable whenever the caller is in LEGACY=0 mode. LEGACY=0's
+        # Q8 buffer is a strided view aliased into the fp16 K cache's own
+        # bytes (not a separate allocation) — only bytes [0, bytes_per_row)
+        # of each row hold valid Q8 data; a raw fp16 read of that same
+        # memory under LEGACY=0 would silently reinterpret those bytes and
+        # corrupt every row's leading K values with no error raised (the
+        # old prefix-caching fail-closed that would have caught a related
+        # desync was removed when the alias made that specific desync
+        # structurally impossible; this branch is what stayed unguarded).
+        # The backend enforces this by only ever passing a non-None
+        # key_cache_q8 in LEGACY=0 (do_kv_cache_update calls
+        # _ensure_q8_sidebuffer, forward passes self._k_cache_q8, both
+        # gated on `not self._legacy`) — if that coupling ever breaks, this
+        # assert is the last line of defense.
+        assert key_cache_q8 is None, (
+            "forward_paged: reached the raw-fp16 K gather branch with "
+            "key_cache_q8 set — this must never happen under "
+            "GFX906_FA_LEGACY=0 (the Q8 side view is aliased into the "
+            "fp16 K cache; a raw fp16 read here would silently corrupt "
+            "the first bytes of every K row). Check the LEGACY dispatch "
+            "in Gfx906FAImpl.forward/do_kv_cache_update.")
         if _TORCH_GATHER:
             K_bhsd, V_bhsd = _gather_kv(
                 key_cache, value_cache, block_table, seq_lens, max_seqlen_k
