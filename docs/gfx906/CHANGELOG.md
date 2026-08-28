@@ -29,15 +29,17 @@ the date an investigation began.
   `52ff21f9d9`.
 - **M6 Part B: LEGACY=0 B≥2 default route flipped to the fused-Q8
   gather (2026-08-28, round 10).** The M5 bake's B=4 @2k
-  −27…−31 % deficit was direct-paged's strided Q8-slice reads (the
-  loss is specific to the ngram spec-decode serving regime — the
-  in-process Sq=1 A/B was a wash). `GFX906_FA_DIRECT_PAGED_Q8`
+  −27…−31 % deficit was Sq>1-specific (the in-process Sq=1 A/B on
+  the identical strided-read path was a wash; mechanism — strided
+  Q8-slice reads leading but unconfirmed, Sq>1 machinery at least a
+  co-contributor — round-10 erratum). `GFX906_FA_DIRECT_PAGED_Q8`
   (default `0` since the flip) routes LEGACY=0 B≥2 through the
   fused-Q8 gather: B=4 @2k aggregate 35.7 → 46.3 t/s (parity with
-  the 46.7 LEGACY=1 control; B=1 and prefill unchanged; 60/60 suite).
-  A no-op under the production LEGACY=1 default; direct-paged stays
-  opt-in (=1). The M5 LEGACY-flip gate's B=4 half is now green; the
-  flip itself still needs the B=1 same-boot adjudication.
+  the 46.7 LEGACY=1 control within cross-boot uncertainty; B=1 and
+  prefill unchanged; 60/60 suite). A no-op under the production
+  LEGACY=1 default; direct-paged stays opt-in (=1). The M5
+  LEGACY-flip gate's B=4 half is now green; the flip itself still
+  needs the B=1 same-boot adjudication.
 
 ## 2026-08-14–16
 

@@ -1257,5 +1257,68 @@ would settle it. Deferred: boot M is at 3 wedge observations in
 ~2.5 h (15:00Z, 17:18Z + the boot-L pattern) — the next two-card
 launch belongs on a fresh boot.
 
+**Erratum (2026-08-28, post-review — F1/F3 of
+`fa-legacy-m0-m6-code-rev.md`): the mechanism as committed does not
+survive this round's own data.** The "What was done" / "VERDICT"
+text above states the B=4 loss as "direct-paged's strided Q8-slice
+reads", escalating the 2026-08-28 `DEVLOG-fa-attention.md`
+inference ("code-level attribution") to settled fact. This round's
+own in-process A/B contradicts the claim as stated: arm 1
+(LEGACY=0 direct-paged — the IDENTICAL strided-read path) at B=4/
+Sq=1 came back a WASH vs the round-7 LEGACY=1 record (6.064 vs
+≈6.08). Dilution arithmetic: at Sq=1 the attention tile work is ~1/6
+of a spec step (n=5 draft + 1 verify row), so if direct-paged's
+attention step were 2–3× slower from misaligned reads, Sq=1 should
+show ~−10…−18 %, not a wash; K-tile reads are also amortized across
+a tile's Q rows, so a pure read-layout penalty should still surface
+at Sq=1. The loss is therefore Sq>1-specific, which points at the
+direct-paged Sq>1 machinery itself (round-8's capture-safe Q-pad/
+unpad fast paths, per-layer copies, graph-capture interaction) as at
+least a co-contributor — a path with prior form for exactly this
+kind of surprise (round 8 found its capture-unsafe D2H sync in
+precisely this configuration: LEGACY=0 + ngram + B≥2 + FULL
+capture). Corrected statement: the B=4 loss is *associated with the
+direct-paged Sq>1 serving path*; strided Q8-slice reads remain the
+**leading but unconfirmed** hypothesis. The README (LEGACY row,
+DIRECT_PAGED_Q8 row), roadmap M6 paragraph, and CHANGELOG entry
+have been softened accordingly; the `6b46d2a2e0` commit message is
+immutable post-merge and stands as written (its mechanism clause is
+the pre-erratum framing).
+
+**F3 framing fix:** the B=4 "parity" (46.3 vs 46.7) is a
+**cross-boot** comparison (boot M vs boot L); the ~11 % M5 sample
+spread (35.79/32.08) cited to justify it came from a looser-
+conditioned session (s0-cold-contaminated), while this round's
+same-boot arm spreads were far tighter (arm 1 ≈4 %, arm 2 ≈0.5 %).
+Honest framing, applied in all updated docs: "parity within
+cross-boot uncertainty, same-boot adjudication pending" — the same
+hedge the B=1 question already carried. Also: arm 2's B=1 @8k
+first sample (93.5 vs 97.8/97.8) is unremarked in the original text
+— treat it as suspected-cold-start (the M5 s0 contamination class),
+not a real −5.5 % point; the arm's representative value is 97.8.
+
+**F2 (the missing cheap measurement, run 2026-08-28):** in-process
+B=4/Sq=1 head-to-head — LEGACY=0 fused-Q8 gather (post-Part-B
+reroute) vs LEGACY=1 fp16 gather — record recipe
+(BENCH_EAGER=0, pp8192/tg256, BENCH_NREQS=4, 4 samples, GPU0, boot
+M):
+
+| arm | samples (t/s) | mean |
+|---|---|---|
+| LEGACY=1 (fp16 gather) | 6.091 / 6.080 / 6.075 / 6.078 | **6.081** |
+| LEGACY=0 (fused-Q8 gather) | 6.097 / 6.094 / 6.087 / 6.086 | **6.091** |
+
+**Wash** (+0.16 % for Q8, inside run-to-run noise; the LEGACY=1
+mean reproduces the round-7 record 6.081 on this boot). Corollary:
+against round 10's arm-1 in-process number (LEGACY=0 direct-paged,
+same config: 6.064), the rerouted gather is ≥ the direct-paged
+route at B=4 even in-process (+0.45 %). Per the plan's open
+question (`plan_fa_part_A.md`, "Arm B outcome"): the B=4
+gather-vs-gather question is closed at parity, so the B=1 gap is
+the entire remaining LEGACY=0 deficit — consistent with the M6
+regime (B=1 is gather-dominated; B=4 is GEMM-dominated, so a B=4
+wash is expected even if the B=1 layout gap is real). Proceed per
+the plan's test plan.
+
 ---
 Copyright Kevin Read <me@kevin-read.com>

@@ -267,7 +267,13 @@ opt-in =1).** Gate: M5-recipe TP=2 serving bake, B=4 @2k ngram
 35.7 → **46.3 t/s** (+29.7 %, parity with the 46.7 LEGACY=1 control,
 B=1/prefill unchanged, 60/60 suite). The in-process Sq=1 A/B was a
 wash — the loss was specific to the spec-decode (Sq=6) serving
-regime. Under the production LEGACY=1 default the flip is a no-op.
+regime. Mechanism (review-softened 2026-08-28, F1): the strided
+Q8-slice reads are the leading but UNCONFIRMED hypothesis — a pure
+read-layout story cannot explain the Sq=1 wash (dilution would
+predict ~−10…−18 % there), so the direct-paged Sq>1 machinery
+(round-8 Q-pad/unpad fast paths, graph-capture interaction) is at
+least a co-contributor; round-10 erratum in the devlog. Under the
+production LEGACY=1 default the flip is a no-op.
 M5's B=4 flip gate is now GREEN; the LEGACY flip itself still needs
 the B=1 same-boot adjudication (107.2 boot M vs 111.5 boot L,
 −3.9 % cross-boot; next two-card launch belongs on a fresh boot —
@@ -294,7 +300,13 @@ actually measure — confirmed at code level:
      plane (8 B/row); write-path quantize and gather/direct-paged
      readers updated together. Converts the nominal 512→392 B/row
      (1.31×) into an actual gather win instead of today's net loss;
-     grows with context (8k+ points gain the most).
+     grows with context (8k+ points gain the most). **Plan written
+     2026-08-28: `plan_fa_part_A.md`** — re-aimed at the B=1 gap
+     (per the round-10 F1 erratum the B=4 point is already fixed by
+     Part B and its mechanism is unconfirmed); audited diff scope is
+     intra-row only (row byte count `(D/32)×34` invariant → all
+     strides/buffers/alias contract unchanged); gate = same-boot M5
+     B=1 serving grid on a fresh boot.
   2. **B≥2: route LEGACY=0 through the fused-Q8 gather** (1:1 byte
      copy, half the fp16 gather's read) instead of direct-paged
      misaligned slices — recovers the −27…−31 % before the repack
