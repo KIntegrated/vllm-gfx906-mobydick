@@ -314,7 +314,15 @@ actually measure — confirmed at code level:
      flipped — the remaining M6 items are the repack (1) and Q4-KV
      (c), which target the B=1 long-context gap, not B=4.
 - **(c) Q4-KV via native `v_dot8_i32_i4` — the LEGACY=0-specific
-  instruction-level upside** (the P·V `v_dot2_f32_f16` rewrite in M3
+  instruction-level upside — SHELVED 2026-08-28 (user decision):
+  quality unproven — Q4 K *and* Q4 Q (or Q8→Q4 requant) quantization
+  accuracy is unvalidated on this model family, and the 7-level
+  q4_0 codebook (vs 127) roughly doubles the KQ quantization error
+  with no measured PPL evidence that attention output absorbs it.
+  Revisit only behind a dedicated accuracy gate (PPL probe bands on
+  the 442-token set, Q4-KV vs Q8-KV arms) that must pass *before* any
+  kernel work; the HBM-traffic arithmetic below is the motivation, not
+  the justification.** (the P·V `v_dot2_f32_f16` rewrite in M3
   is instruction-level too but benefits BOTH LEGACY modes equally and
   does not re-open this gate; 2026-08-28 `dot_isa_probe.py`
   confirmed the i8 dot8 forms are assembler-rejected — dot8 = the i4
