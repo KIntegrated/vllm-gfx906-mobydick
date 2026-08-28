@@ -84,6 +84,15 @@ _FUSED = _os.environ.get("GFX906_FA_FUSED", "1") != "0"
 _DIRECT_PAGED_MODE = _os.environ.get("GFX906_FA_DIRECT_PAGED", "auto").lower()
 _DIRECT_PAGED_MIN_BATCH = int(_os.environ.get("GFX906_FA_DIRECT_PAGED_MIN_BATCH", "2"))
 _DIRECT_PAGED_MAX_SQ = int(_os.environ.get("GFX906_FA_DIRECT_PAGED_MAX_SQ", "16"))
+# M6 Part B (roadmap-more-models.md M6, plan_fa_legacy0_impr_claude.md):
+# the direct-paged kernel reads the LEGACY=0 Q8-aliased K as misaligned
+# 136-of-256-B slices plus per-row page indirection — the M5 TP=2 bake
+# measured B=4 @2k aggregate -27…-31% vs the LEGACY=1 gather-routed
+# control. 0 routes LEGACY=0 batches to the fused-Q8 gather path (the
+# LEGACY=0 B=1 path; the M1 gather clip is dispatch-agnostic, so the
+# window-clip benefit is retained) instead of direct-paged.
+# "1" (default) = current behavior until the serving A/B gates.
+_DIRECT_PAGED_Q8 = _os.environ.get("GFX906_FA_DIRECT_PAGED_Q8", "1") != "0"
 # Phase C window-clip kill switch (A/B arms only): 0 disables the per-row
 # kv_start so windowed decode scans the FULL history and the window MASK
 # does all the work (numerically identical, slower at long context).
@@ -393,6 +402,8 @@ def forward_paged(
     # -------- Level 3c: Direct-paged FA (обходит gather полностью) --------
     # Работает только когда:
     #   * key_cache_q8 передан (есть side-buffer с Q8_0)
+    #   * _DIRECT_PAGED_Q8 (M6 Part B: 0 → LEGACY=0 batches go through
+    #     the fused-Q8 gather below instead)
     #   * block_size == 16 (захардкожено в kernel)
     #   * _should_use_direct_paged(num_seqs, max_seqlen_q):
     #       mode=1 или (mode=auto AND B≥min_batch AND Sq≤max_sq)
@@ -400,6 +411,7 @@ def forward_paged(
     # В этом режиме НЕ делаем gather/pad для K/V; kernel сам читает paged
     # cache по block_table. Только Q padding и q_abs_offset готовятся здесь.
     if (key_cache_q8 is not None
+            and _DIRECT_PAGED_Q8
             and _should_use_direct_paged(num_seqs, max_seqlen_q)
             and key_cache_q8.dim() == 4
             and key_cache_q8.shape[1] == 16):

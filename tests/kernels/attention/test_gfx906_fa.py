@@ -2129,6 +2129,94 @@ def test_forward_paged_fusedq8_window_clip_short_ctx():
     assert (out_on - out_off).abs().max().item() < 1e-7
 
 
+# ---------------------------------------------------------------------------
+# M6 Part B (roadmap-more-models.md M6 / plan_fa_legacy0_impr_claude.md):
+# GFX906_FA_DIRECT_PAGED_Q8=0 re-routes LEGACY=0 B>=2 from direct-paged
+# to the fused-Q8 gather (the LEGACY=0 B=1 path). The re-routed batch
+# must (1) be correct vs the torch windowed reference (the standard 5e-2
+# cross-path tolerance — the two FA variants differ in K/V read order,
+# so they are NOT bit-identical), (2) actually change dispatch (direct-
+# paged vs gather outputs differ), and (3) keep the M1 gather clip
+# consistent at B>=2 (clip on/off A/B bit-identical under the reroute —
+# the clip is dispatch-agnostic, so it must keep firing on the gather
+# path, not silently drop out).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("nq, B", [(1, 2), (1, 4), (6, 2)])
+def test_forward_paged_q8_direct_paged_q8_off_routes_gather(nq, B):
+    from vllm.gfx906_fa import gfx906_fa_paged as paged
+    dev = "cuda"
+    torch.manual_seed(23)
+    L, W = 4353, 2048   # unaligned clip start (2305 vs nbatch boundaries)
+    scale = 1.0 / math.sqrt(D)
+
+    nb = (L + BLOCK - 1) // BLOCK
+    n_blocks = B * nb
+    _, vc, kv = _make_paged_cache(n_blocks + 4, dev)
+    key_cache = kv[:, 0]
+    kc = key_cache.view(torch.uint8)[:, :, :, :BYTES]   # LEGACY=0 alias
+    K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    V = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    for b in range(B):
+        s0 = b * nb * BLOCK
+        stag = torch.zeros_like(kv[b * nb:(b + 1) * nb, 0])
+        stag.view(-1, HKV, D)[:L].copy_(K[s0:s0 + L])
+        kv[b * nb:(b + 1) * nb, 0].copy_(stag)
+        fa.reshape_and_cache_q8(
+            K[s0:s0 + L],
+            torch.arange(s0, s0 + L, dtype=torch.int64, device=dev), kc)
+        _write_v(kv[b * nb:(b + 1) * nb], V[s0:s0 + L])
+
+    bt = torch.stack([torch.arange(b * nb, (b + 1) * nb, dtype=torch.int32)
+                      for b in range(B)]).contiguous().to(dev)
+    sl = torch.full((B,), L, dtype=torch.int32, device=dev)
+    cu = torch.arange(0, B * nq + 1, nq, dtype=torch.int32, device=dev)
+    q = torch.randn(B * nq, HQ, D, device=dev, dtype=torch.float32) * 0.5
+
+    old = paged._DIRECT_PAGED_Q8, paged._GATHER_CLIP
+    try:
+        # Flag on (current behavior): direct-paged at B>=2.
+        paged._DIRECT_PAGED_Q8 = True
+        out_direct = paged.forward_paged(
+            q, key_cache, vc, bt, sl, cu,
+            max_seqlen_q=nq, max_seqlen_k=L, scale=scale, window=W,
+            key_cache_q8=kc)
+        # Flag off: rerouted to the fused-Q8 gather.
+        paged._DIRECT_PAGED_Q8 = False
+        paged._GATHER_CLIP = False
+        out_off = paged.forward_paged(
+            q, key_cache, vc, bt, sl, cu,
+            max_seqlen_q=nq, max_seqlen_k=L, scale=scale, window=W,
+            key_cache_q8=kc)
+        paged._GATHER_CLIP = True
+        out_on = paged.forward_paged(
+            q, key_cache, vc, bt, sl, cu,
+            max_seqlen_q=nq, max_seqlen_k=L, scale=scale, window=W,
+            key_cache_q8=kc)
+    finally:
+        paged._DIRECT_PAGED_Q8, paged._GATHER_CLIP = old
+
+    # (3) M1 gather clip stays consistent on the rerouted B>=2 path.
+    assert (out_on - out_off).abs().max().item() < 1e-7
+    # (2) The flag changes dispatch: the two FA variants are not
+    # bit-identical (different K/V read order).
+    assert (out_direct - out_on).abs().max().item() > 0
+    # (1) Correctness vs the torch windowed reference, every query row
+    # of every seq (spec rows are causal rows of the same seq).
+    for b in range(B):
+        s0 = b * nb * BLOCK
+        for i in range(nq):
+            r = L - nq + i
+            out_row = out_on[b * nq + i].view(HQ, D)
+            ref = _windowed_ref(q[b * nq + i],
+                                K[s0:s0 + L].float(), V[s0:s0 + L].float(),
+                                scale, r, W)
+            err = ((out_row - ref).norm() / ref.norm()).item()
+            assert err < 5e-2, f"seq {b} row {r}: {err:.4f}"
+
+
 def test_gather_paged_kv_q8_clip_skips_prefix():
     """Functional (not A/B): the fused Q8 gather with kv_start must leave
     rows [0, start) UNTOUCHED (sentinel preserved) and write rows
