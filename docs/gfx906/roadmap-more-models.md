@@ -229,7 +229,7 @@ long context.
 
 ### M5 — default read-path decision after a bake — **DONE 2026-08-28: keep LEGACY=1**
 
-**Gate executed (DEVLOG-muse-glimmer rounds 6–9), decision: `GFX906_FA_LEGACY` stays `1`.**
+**Gate executed (DEVLOG-muse-glimmer rounds 6–9), decision: `GFX906_FA_LEGACY` stays `1`.** *(2026-08-28, round 10: M6 Part B closed the B=4 half of the re-open condition — LEGACY=0 + gather-routed B=4 @2k reached LEGACY=1 parity, 46.3 vs 46.7 t/s; the flip gate now hinges on the B=1 same-boot adjudication, still open.)*
 Sequence: (1) round 6 — M1 clip ported to the fused Q8 gather, 57/57
 unit bit-identity; (2) round 7 — e2e clip gates closed: the original
 gap (a) ("LEGACY=1 + direct-paged + clip") proved VACUOUS (direct-
@@ -260,6 +260,19 @@ bake attempt 2.
 
 ### M6 — LEGACY=0 salvage: read-layout fix first, Q4-KV/dot8 as the ISA upside (M5 follow-up, re-opens the flip gate)
 
+**Part B (fix candidate 2) DONE 2026-08-28 (DEVLOG-muse-glimmer
+round 10): LEGACY=0 B≥2 now routes to the fused-Q8 gather by default
+(`GFX906_FA_DIRECT_PAGED_Q8` default flipped 1 → 0; direct-paged is
+opt-in =1).** Gate: M5-recipe TP=2 serving bake, B=4 @2k ngram
+35.7 → **46.3 t/s** (+29.7 %, parity with the 46.7 LEGACY=1 control,
+B=1/prefill unchanged, 60/60 suite). The in-process Sq=1 A/B was a
+wash — the loss was specific to the spec-decode (Sq=6) serving
+regime. Under the production LEGACY=1 default the flip is a no-op.
+M5's B=4 flip gate is now GREEN; the LEGACY flip itself still needs
+the B=1 same-boot adjudication (107.2 boot M vs 111.5 boot L,
+−3.9 % cross-boot; next two-card launch belongs on a fresh boot —
+boot M at 3 wedge observations in ~2.5 h).
+
 **Reframed 2026-08-28** after the ISA rate probe (`DEVLOG-fa-attention.md`
 2026-08-28 entry; rates in `dequant-instructions.md`): the original
 "close the Q8-dot compute gap" premise is wrong — `v_dot4_i32_i8` is
@@ -285,7 +298,9 @@ actually measure — confirmed at code level:
   2. **B≥2: route LEGACY=0 through the fused-Q8 gather** (1:1 byte
      copy, half the fp16 gather's read) instead of direct-paged
      misaligned slices — recovers the −27…−31 % before the repack
-     even lands.
+     even lands. **DONE 2026-08-28** (round 10): gate PASS, default
+     flipped — the remaining M6 items are the repack (1) and Q4-KV
+     (c), which target the B=1 long-context gap, not B=4.
 - **(c) Q4-KV via native `v_dot8_i32_i4` — the LEGACY=0-specific
   instruction-level upside** (the P·V `v_dot2_f32_f16` rewrite in M3
   is instruction-level too but benefits BOTH LEGACY modes equally and

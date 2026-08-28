@@ -1309,3 +1309,23 @@ pool, `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0`).
     self-recovered to the 10.8 MB baseline within ~4 min; no zombie
     VRAM. Protocol state: isolated → 1 retry; a 2nd launch failure
     on boot M = burst → stop + reboot (root).
+11. **~17:18Z (boot M)** — **2nd boot-M wedge: M6 Part B bake arm 1
+    (LEGACY=0 + `GFX906_FA_DIRECT_PAGED_Q8=1` TP=2 serve),
+    `hipErrorLaunchFailure` in `copy_`→SetDevice at weight-load
+    shard 4/5→5, Worker_TP0 (both ranks; evidence:
+    `/tmp/m6b_serve_l0_dpa1.log`, boot-volatile; signatures quoted
+    here)**. Kernel: `GPU reset(2) succeeded` on 0000:0e:00.0
+    (GPU1) + `GPU reset(1) succeeded` on 0000:0b:00.0 (GPU0) at
+    17:18:27Z, both "device wedged, but recovered through reset".
+    Chronic weight-load-hang family, 11th occurrence across boots.
+    Context: ~2 h clean single-card window since 15:00Z (unit suite
+    60/60, in-process B=4/pp8192 bench arm, canary **38.4 t/s** at
+    ~16:59Z) — the 15:10Z clean G3-attempt-2 success already broke
+    the 15:00 chain (boot L 12:52 precedent: a success resets the
+    consecutive-failure count), so this is a NEW isolated
+    observation, not the 15:00 chain's 2nd link. Pattern note: as
+    on boot L, both boot-M wedges are two-card (TP=2) launches;
+    all boot-M single-card work clean. Protocol state: isolated →
+    1 retry per house recipe; **a retry failure = burst → stop +
+    reboot (root)** (boot M would then be at 2 failures in the
+    retry chain, 3 wedge observations total ~2.4 h in).

@@ -86,13 +86,16 @@ _DIRECT_PAGED_MIN_BATCH = int(_os.environ.get("GFX906_FA_DIRECT_PAGED_MIN_BATCH"
 _DIRECT_PAGED_MAX_SQ = int(_os.environ.get("GFX906_FA_DIRECT_PAGED_MAX_SQ", "16"))
 # M6 Part B (roadmap-more-models.md M6, plan_fa_legacy0_impr_claude.md):
 # the direct-paged kernel reads the LEGACY=0 Q8-aliased K as misaligned
-# 136-of-256-B slices plus per-row page indirection — the M5 TP=2 bake
-# measured B=4 @2k aggregate -27…-31% vs the LEGACY=1 gather-routed
-# control. 0 routes LEGACY=0 batches to the fused-Q8 gather path (the
-# LEGACY=0 B=1 path; the M1 gather clip is dispatch-agnostic, so the
-# window-clip benefit is retained) instead of direct-paged.
-# "1" (default) = current behavior until the serving A/B gates.
-_DIRECT_PAGED_Q8 = _os.environ.get("GFX906_FA_DIRECT_PAGED_Q8", "1") != "0"
+# 136-of-256-B slices plus per-row page indirection. 0 (DEFAULT since
+# the 2026-08-28 serving A/B, DEVLOG-muse-glimmer round 10) routes
+# LEGACY=0 B>=2 batches to the fused-Q8 gather path (the LEGACY=0 B=1
+# path; the M1 gather clip is dispatch-agnostic, so the window-clip
+# benefit is retained) instead of direct-paged: B=4 @2k ngram spec
+# serving went 35.7 -> 46.3 t/s (parity with the 46.7 LEGACY=1
+# control) while B=1 and prefill were unchanged. =1 is the opt-in
+# experiment route (it also lost the M5 bake -27…-31% at B=4 @2k;
+# its in-process Sq=1 A/B was a wash — no measured advantage).
+_DIRECT_PAGED_Q8 = _os.environ.get("GFX906_FA_DIRECT_PAGED_Q8", "0") != "0"
 # Phase C window-clip kill switch (A/B arms only): 0 disables the per-row
 # kv_start so windowed decode scans the FULL history and the window MASK
 # does all the work (numerically identical, slower at long context).

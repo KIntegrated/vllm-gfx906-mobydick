@@ -1178,4 +1178,84 @@ read-layout gap (not a compute gap, corrected 2026-08-28) is M6
 territory; the unrelated P·V dot2 lever is an M3 kernel-hygiene topic.
 
 ---
+
+## 2026-08-28 — round 10: M6 Part B — LEGACY=0 B≥2 rerouted to the fused-Q8 gather; B=4 @2k loss RECOVERED; sub-flag default flipped
+
+## HYPOTHESIS
+
+If the LEGACY=0 B=4 @2k spec-serving loss (M5: −27…−31 % vs the
+LEGACY=1 gather control) is the direct-paged kernel's strided
+Q8-slice K reads (misaligned 136-of-256-B slices + per-row page
+indirection), then routing LEGACY=0 B≥2 through the fused-Q8 gather
+(the LEGACY=0 B=1 path, compact-tile reads) recovers B=4 @2k to
+LEGACY=1 parity without touching B=1 or prefill.
+
+## What was done
+
+- `gfx906_fa_paged.py`: new `GFX906_FA_DIRECT_PAGED_Q8` knob (commit
+  `50326f9b06`); `=0` makes the Level-3c direct-paged dispatch
+  condition fail, so LEGACY=0 B≥2 falls through to the fused-Q8
+  gather. The M1 gather clip is dispatch-agnostic
+  (`_gather_clip_start` from seq_lens/cu/window) — retained under the
+  reroute.
+- Unit: `test_forward_paged_q8_direct_paged_q8_off_routes_gather`
+  (nq×B ∈ {1×2, 1×4, 6×2}, L=4353/W=2048 unaligned clip, LEGACY=0
+  alias layout): rerouted output vs the torch windowed reference at
+  the 5e-2 cross-path tolerance, clip on/off A/B bit-identity at B≥2
+  (the clip stays active under the reroute), and a dispatch-change
+  check (direct vs gather outputs differ — the two FA variants are
+  not bit-identical). 60/60 suite.
+- In-process A/B (boot M, GPU0, pp8192/tg256/BENCH_NREQS=4, record
+  recipe, LEGACY=0, `GFX906_FA_DIRECT_PAGED_Q8=1`): 6.074/6.057/
+  6.061/6.062 — a WASH vs the round-7 LEGACY=1 B=4 in-process record
+  (≈6.08). **The M5 loss does not exist in the Sq=1 in-process
+  regime; it is specific to the ngram spec-decode (Sq=6) serving
+  regime**, so the serving bake is the gate (the in-process harness
+  cannot reproduce Sq>1).
+- Serving bake (boot M, TP=2, README M5 recipe verbatim: ngram n=5
+  prompt_lookup 2, bt4096, KV 6 GiB, capture [6,12,18,24],
+  `--max-model-len 131072`, grid `_bench_serve_grid_gfx906.py`
+  default ×3; canary 38.4 t/s at ~16:59Z; one 17:18Z weight-load
+  wedge on arm-1 launch — recorded in `degradation.md`/`_details`
+  item 11, self-recovered, retry clean):
+  - Arm 1 (LEGACY=0 + `=1`, current LEGACY=0 default):
+    B=1 @2k 107.6/107.6/107.4; **B=4 @2k 34.76/36.26/36.05**; B=1
+    @8k ≈97.7; B=1 @16k 88.0 → reproduces the M5 loss (35.7 vs 46.7
+    = −23 %).
+  - Arm 2 (LEGACY=0 + `=0`, the reroute): B=1 @2k 107.2/107.3/
+    107.2; **B=4 @2k 46.34/46.29/46.13**; B=1 @8k 93.5/97.8/97.8;
+    B=1 @16k 87.8. B=4 = **parity with the 46.7 LEGACY=1 control
+    (−0.9 %)**; B=1 and prefill unchanged (ttft_max 16.07 s vs
+    16.09 s; the B=4 prefill is Sq=2048 → never direct-paged, so
+    both arms ran the same gather there).
+
+## GATE
+
+Plan gate (plan_fa_legacy0_impr_claude.md Part B): B=4 @2k
+aggregate, M5-recipe serving bake vs the 46.7 t/s LEGACY=1 control.
+
+## VERDICT
+
+**SHIPPED — the reroute recovers the B=4 loss: 35.7 → 46.3 t/s
+(+29.7 %), parity with LEGACY=1 (−0.9 %, cross-boot; M5's own
+same-config sample spread was ~11 %, so 46.3 vs 46.7 is a wash,
+not a loss). `GFX906_FA_DIRECT_PAGED_Q8` default flipped 1 → 0:
+gather is the LEGACY=0 B≥2 default; direct-paged is opt-in (=1).
+Under the production LEGACY=1 default the flip is a no-op (direct-
+paged is LEGACY=0-only, round-7 erratum) — zero production risk.
+Direct-paged has no measured advantage anywhere (in-process Sq=1
+wash; spec-serving B=4 −23…−31 %) — it stays as an experiment
+route only.**
+
+**M5 impact:** the LEGACY flip's B=4 gate is now GREEN (LEGACY=0 +
+gather-routed B=4 at LEGACY=1 parity). The flip itself (roadmap M5
+re-open) still needs the B=1 same-boot adjudication: LEGACY=0
+B=1 @2k = 107.2 (boot M, this round) vs the LEGACY=1 control 111.5
+(boot L) — cross-boot −3.9 %, within the band M5's own numbers sat
+in (110.5/109 boot M vs 111.5 boot L); a same-boot LEGACY=1 arm
+would settle it. Deferred: boot M is at 3 wedge observations in
+~2.5 h (15:00Z, 17:18Z + the boot-L pattern) — the next two-card
+launch belongs on a fresh boot.
+
+---
 Copyright Kevin Read <me@kevin-read.com>
