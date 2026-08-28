@@ -456,7 +456,7 @@ class Gfx906FAImpl(AttentionImpl):
 
         key_cache shape: [num_blocks, block_size, Hkv, D]  fp16.
 
-        The Q8_0 row ((D/32)*34 bytes, e.g. 88 for D=128) fits inside
+        The Q8_0 row ((D/32)*34 bytes, e.g. 136 for D=128) fits inside
         the fp16 K row (2D bytes, e.g. 256), so the side buffer is a
         strided uint8 view of the K half itself:
 
@@ -488,9 +488,12 @@ class Gfx906FAImpl(AttentionImpl):
         num_blocks, block_size, Hkv, D = key_cache.shape
         assert D % 32 == 0, f"D={D} must be multiple of 32"
         bytes_per_row = (D // 32) * 34
-        assert bytes_per_row <= 2 * D, (
-            f"Q8 row ({bytes_per_row} B) must fit in the fp16 K row "
-            f"({2 * D} B)")
+        row_bytes = D * key_cache.element_size()
+        assert bytes_per_row <= row_bytes, (
+            f"Q8 row ({bytes_per_row} B) must fit in the K row "
+            f"({row_bytes} B at {key_cache.element_size()} B/elt) — "
+            "the uint8 slice [:, :, :, :bytes_per_row] would clamp to "
+            f"the row width and straddle into the next row")
         # key_cache is kv_cache.unbind(1) of [num_blocks, 2, bs, Hkv, D]
         # — non-contiguous, last dim stride 1, so the uint8 view and the
         # last-dim slice below are legal (verified: strides come from the
