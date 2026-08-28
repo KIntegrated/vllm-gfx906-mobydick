@@ -685,3 +685,107 @@ the only instruction-level upside left is a Q4-KV format change that
 unlocks native `v_dot8_i32_i4` (2× dot4 MAC rate at half the operand
 bytes, no unpack ALU) — roadmap M6 (rewritten), PPL-gated. Rates
 recorded in `dequant-instructions.md`.
+
+## 2026-08-28 — M3 kernel hygiene batch: #8 k0_base clamp, #10 overflow-free window cutoff, #4b o_meta allocation, amplified-V boundary test; the dot2 P·V rewrite's premise refuted by the ISA
+
+## HYPOTHESIS
+
+If the qwen-review M3 items are real gaps, then: (#8) a negative
+`kv_start[sequence]` could walk the paged/non-paged k-loop into
+token-negative space (illegal access / wedge, not a wrong number);
+(#10) the window cutoff `k_pos_abs < q_abs_row - window + 1` wraps
+for absurd windows (UB + silently disabled mask); (#4b) the
+`[B, Sq, Hq, 2]` o_meta buffer is allocated even when kv_split>1
+(where o_meta_split is the real target); and the P·V `v_dot2_f32_f16`
+rewrite halves the P·V instruction count (fp16-acc pk ops →
+fp32-acc dot2).
+
+## What was done
+
+Branch `feat/fa-m3-hygiene` (unmerged, for review):
+
+- **#8**: device-side clamp `k0_base = max(0, kv_start[sequence])` at
+  both LOCKSTEP entry sites (fattn-q8.cuh, fattn-q8-paged.cuh).
+  Defense in depth — the Python clip math already max(0, ·)-guards.
+- **#10**: all four LOCKSTEP cutoff sites rewritten to
+  `q_abs_row - k_pos_abs >= window` — provably equivalent for every
+  int32 window (both operands non-negative; the subtraction stays in
+  range) and wrapping-free by construction.
+- **#4b**: gfx906_fa.cpp (both forward paths): the `[B, Sq, Hq, 2]`
+  o_meta is allocated only for kv_split==1 (its only live regime);
+  kv_split>1 uses o_meta_split. Saves the dead allocation that scales
+  with Sq (~300 KB/layer at Sq=1568/Hq=24).
+- **Test hardening** (3 new tests in
+  tests/kernels/attention/test_gfx906_fa.py):
+  `test_m3_10_oversized_window_bit_identical_causal` (window=INT_MAX
+  is bit-identical to plain causal, decode + prefill, both kernels —
+  catches any wrap or silent mask disable);
+  `test_m3_8_negative_kv_start_clamps_to_zero` (kv_start=-L output
+  bit-identical to kv_start=0, both kernels);
+  `test_m3_window_boundary_amplified_v` (probe-B trick: the first
+  OUT-of-window key's V amplified ~400×; both kernels vs the torch
+  reference < 5e-2, and the amplified key is verified discriminating —
+  a wrong-cutoff output is >1.0 away from the shifted-window
+  reference).
+- **dot2 P·V (NOT implemented — premise refuted, see below).**
+
+## GATE
+
+Hygiene batch: unit suite (62 existing bit-identity/behavior tests +
+3 new = 65) must pass unchanged — the #10 rewrite is provably
+equivalent and the existing windowed tests (incl. the unaligned clip
+bit-identity set) are the regression gate. No perf claim, no serving
+slot (roadmap rule: hygiene rides along, not a standalone gate).
+
+## Evidence
+
+- Suite: 65/65 (incl. the new trio) on the M3 build. (The amplified-V
+  discrimination threshold settled at 0.5 after the first run: the
+  measured wrong-cutoff error is 0.9996, so the original >1.0 check
+  was one part in 10^4 above the true value.)
+- **Build-tree contamination incident (root cause of the first
+  "NaN kernel" scare, worth the record):** the first M3 build linked a
+  STALE `gfx906_fa_quant.hip.o` — hipify reported
+  "[skipped, already hipified]" for `gfx906_fa_quant.cu` even though
+  the build tree's .o had been compiled from the Part A branch's
+  version of that file (the planar quantizer, which writes a
+  different K-cache layout). Result: a Frankenstein .so (Part A
+  quantizer + main FA kernel) whose K layout mismatch produced all-NaN
+  FA outputs and the fused-gather bit-mismatch — while the sources on
+  disk were consistent. A clean recompile (quant .o rebuilt from the
+  current .hip) fixed everything; the M3 code was never at fault.
+  **Countermeasure: after switching branches that touch `csrc/`,
+  delete the extension's build state before building** (rm -rf
+  `build/temp.*/CMakeFiles/_gfx906_fa_C.dir` and the hipified
+  `build/temp.*/csrc/gfx906_fa/*.hip` + `kernel/*.cuh` copies), or
+  expect the hipify skip-check to lie.
+- **dot2 premise check (ISA, decode kernel
+  `flash_attn_tile_q8<128,128,2,1>`, Part A microbench build's .s
+  dump — identical P·V code path on main)**: the P·V accumulate
+  already compiles to `v_pk_fma_f16` (1 instr per 2 MACs, full packed
+  rate per dequant-instructions.md: 2 MAC/cyc, the probe's
+  13210-instr run) — NOT the roadmap's "v_pk_mul_f16 + v_pk_add_f16
+  = 2 instr per 2 MACs". `v_dot2_f32_f16` is ALSO 1 instr per 2 MACs
+  (full rate at ILP≥2, latency-sensitive). So the rewrite buys ZERO
+  instruction count and zero rate — only fp16→fp32 accumulation
+  (a precision change that would require the kernel's P·V row
+  ownership to be restructured for row-pair packing, plus new test
+  references). The roadmap's own decision rule ("worth it only if P·V
+  is measurably VOPC-issue-bound in the A/B") is not met: P·V is
+  already at 2 MACs/instruction.
+
+## VERDICT
+
+**SHIPPED (branch, unmerged for review) — the hygiene batch;
+DEAD-END (not implemented) — the dot2 rewrite as a perf item.**
+#8 closes a real latent wedge (negative tile index); #10 is a
+hardening/clarity rewrite — note the roadmap's "overflows for absurd
+windows" is itself not literally true for int32 (the expression's
+min is INT_MIN+2, no wrap possible); the new form is kept anyway
+(wrapping-free by construction, self-documenting); #4b drops a dead
+allocation; the amplified-V test makes a one-key window-boundary
+error unmissable. The dot2 item is reframed in the roadmap: if it is
+ever revisited it is a PRECISION change (fp32 P·V accumulation), not
+a perf one, and only if a numerics gate demands it.
+
+Co-authored-by: pi (coding agent)

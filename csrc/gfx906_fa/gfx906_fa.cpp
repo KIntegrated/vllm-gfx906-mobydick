@@ -340,10 +340,6 @@ torch::Tensor gfx906_fa_forward(
     auto opts_f32 = q.options().dtype(torch::kFloat32);
     torch::Tensor o_bshd = torch::empty({batch, seq_q, heads_q, head_dim}, opts_f32);
 
-    // meta buffer (для stream-k, gridDim.y; сейчас gridY=1 → не используется,
-    // но kernel может писать при прохождении dead branches — выделяем).
-    torch::Tensor o_meta = torch::empty({batch, seq_q, heads_q, 2}, opts_f32);
-
     // KV-split (GFX906_FA_KVSPLIT>1): kernel writes per-split partials
     // [B, Sq, Hq, y, D] + meta [B, Sq, Hq, y, 2] (unscaled, (m, l)); merged
     // into o_bshd by gfx906_fa_split_combine.
@@ -357,9 +353,17 @@ torch::Tensor gfx906_fa_forward(
         // Sq (588 MiB at Sq=1568, Hq=24, D=256, split=16) -- OOM on 32 GB.
         kv_split = 1;
     }
-    torch::Tensor o_part, o_meta_split;
+    // M3 #4b: the [B, Sq, Hq, 2] meta is the kv_split==1 dst_meta target
+    // (the kernel may write it through dead branches even at gridDim.y==1);
+    // with kv_split>1 the kernel writes o_meta_split instead, so skip the
+    // dead allocation (scales with Sq: ~300 KB/layer at Sq=1568/Hq=24).
+    torch::Tensor o_meta, o_part, o_meta_split;
     float * o_fp32_ptr = o_bshd.data_ptr<float>();
-    float2 * o_meta_ptr = reinterpret_cast<float2 *>(o_meta.data_ptr<float>());
+    float2 * o_meta_ptr = nullptr;
+    if (kv_split == 1) {
+        o_meta = torch::empty({batch, seq_q, heads_q, 2}, opts_f32);
+        o_meta_ptr = reinterpret_cast<float2 *>(o_meta.data_ptr<float>());
+    }
     if (kv_split > 1) {
         o_part = torch::empty({batch, seq_q, heads_q, kv_split, head_dim}, opts_f32);
         o_meta_split = torch::empty({batch, seq_q, heads_q, kv_split, 2}, opts_f32);
@@ -1176,7 +1180,6 @@ torch::Tensor gfx906_fa_forward_paged_direct(
     // Output allocation — тот же BSHD как в forward.
     auto opts_f32 = q.options().dtype(torch::kFloat32);
     torch::Tensor o_bshd = torch::empty({batch, seq_q, heads_q, head_dim}, opts_f32);
-    torch::Tensor o_meta = torch::empty({batch, seq_q, heads_q, 2}, opts_f32);
 
     // KV-split: gridDim.y partials merged by gfx906_fa_split_combine — same
     // machinery/guards as gfx906_fa_forward (the seq_q > 2 guard is the same
@@ -1198,9 +1201,15 @@ torch::Tensor gfx906_fa_forward_paged_direct(
     if (seq_q > 2) {
         kv_split = 1;
     }
-    torch::Tensor o_part, o_meta_split;
+    // M3 #4b (LOCKSTEP with gfx906_fa_forward): skip the dead [B, Sq, Hq, 2]
+    // meta allocation when kv_split>1 (o_meta_split is the real target).
+    torch::Tensor o_meta, o_part, o_meta_split;
     float * o_fp32_ptr = o_bshd.data_ptr<float>();
-    float2 * o_meta_ptr = reinterpret_cast<float2 *>(o_meta.data_ptr<float>());
+    float2 * o_meta_ptr = nullptr;
+    if (kv_split == 1) {
+        o_meta = torch::empty({batch, seq_q, heads_q, 2}, opts_f32);
+        o_meta_ptr = reinterpret_cast<float2 *>(o_meta.data_ptr<float>());
+    }
     if (kv_split > 1) {
         o_part = torch::empty({batch, seq_q, heads_q, kv_split, head_dim}, opts_f32);
         o_meta_split = torch::empty({batch, seq_q, heads_q, kv_split, 2}, opts_f32);

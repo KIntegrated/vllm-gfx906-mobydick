@@ -688,8 +688,12 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter(
                 // adds the sliding cutoff (keys older than the window).
                 if (q_abs_offset) {
                     const int q_abs_row = q_abs_base + j;
+                    // M3 #10: overflow-free window cutoff — equivalent to
+                    // `k_pos_abs < q_abs_row - window + 1` for all int32
+                    // window (both operands non-negative; the subtraction
+                    // stays in range), no wrapping for absurd windows.
                     if (k_pos_abs > q_abs_row ||
-                        (window > 0 && k_pos_abs < q_abs_row - window + 1)) {
+                        (window > 0 && q_abs_row - k_pos_abs >= window)) {
                         KQ_acc[jc0] = -INFINITY;
                     }
                 }
@@ -719,8 +723,11 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter(
                     if (q_abs_offset) {
                         const int q_abs_row = q_abs_base + j;
                         const int k_pos_abs = k_VKQ_0 + i_KQ;
+                        // M3 #10 (LOCKSTEP with the num_i_KQ_iters==1 site
+                        // above and fattn-q8-paged.cuh): overflow-free
+                        // window cutoff.
                         if (k_pos_abs > q_abs_row ||
-                            (window > 0 && k_pos_abs < q_abs_row - window + 1)) {
+                            (window > 0 && q_abs_row - k_pos_abs >= window)) {
                             KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = -INFINITY;
                         }
                     }
@@ -1015,7 +1022,12 @@ static __global__ void flash_attn_tile_q8(
     // the production clip passes exactly k0_base = max(0, q_abs + 1 -
     // window); other kv_start callers (tests emulating a window via the
     // clip) keep their exact start.
-    int k0_base = kv_start ? kv_start[sequence] : 0;
+    // M3 #8: device-side clamp — a negative kv_start would start the
+    // k-loop at a negative token index (illegal access / wedge, not a
+    // wrong number). The Python clip math already max(0, ·)-guards,
+    // this is defense in depth.
+    int k0_base = kv_start ? (int) kv_start[sequence] : 0;
+    if (k0_base < 0) k0_base = 0;
     if (k0_base > 0 && window > 0 && q_abs_offset) {
         const int win_start = q_abs_offset[sequence] + 1 - window;
         if (k0_base <= (win_start > 0 ? win_start : 0)) {

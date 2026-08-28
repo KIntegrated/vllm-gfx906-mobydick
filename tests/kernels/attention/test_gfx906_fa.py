@@ -2270,3 +2270,160 @@ def test_gather_paged_kv_q8_clip_skips_prefix():
     assert torch.equal(v_out[:, :, start:L], v_full[:, :, start:L])
     # [L, sk_pad): V zero tail as usual (the clip does not change it).
     assert (v_out[:, :, L:] == 0.0).all()
+
+
+# ---------------------------------------------------------------------------
+# M3 kernel hygiene batch (roadmap M3, 2026-08-28)
+#
+# #8  device-side k0_base clamp: a negative kv_start[sequence] must clamp
+#     to 0 (the old code walked the k-loop into token-negative space —
+#     illegal access / wedge, not a wrong number).
+# #10 overflow-free window cutoff `q_abs_row - k_pos_abs >= window`:
+#     for absurd windows (INT_MAX) the cutoff must be inert and the
+#     output bit-identical to plain causal (no wrapping, no silent mask).
+# Hardening: amplified-V window-boundary case (probe-B trick) — one key
+# misclassified at the window edge must move the output by O(400x).
+# ---------------------------------------------------------------------------
+
+def _m3_setup(dev, d, hq, hkv, L, W, v_amplify_boundary=False):
+    torch.manual_seed(11)
+    n_blocks = L // BLOCK
+    kc = torch.zeros(n_blocks, BLOCK, hkv, (d // 32) * 34,
+                     dtype=torch.uint8, device=dev)
+    kv = torch.zeros(n_blocks, 2, BLOCK, hkv, d,
+                     dtype=torch.float16, device=dev)
+    K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.25
+    if v_amplify_boundary and L > W:
+        # The key ONE before the window edge (index L-W-1 for the last row)
+        # is the one an off-by-one cutoff would wrongly include: make it
+        # ~400x larger so its (mis)inclusion is unmissable in the output.
+        V[L - W - 1] = (
+            torch.randn(1, hkv, d, device=dev, dtype=torch.float16)
+            * 100.0)
+    slot = torch.arange(L, dtype=torch.int64, device=dev)
+    fa.reshape_and_cache_q8(K, slot, kc)
+    staging = torch.zeros_like(kv[:, 1])
+    staging.view(-1, hkv, d)[:L].copy_(V)
+    kv[:, 1].copy_(staging)
+    vc = kv.unbind(1)[1]
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, n_blocks)
+    sl = torch.tensor([L], dtype=torch.int32, device=dev)
+    scale = 1.0 / math.sqrt(d)
+    sk_pad = (L + 31) // 32 * 32
+    return kc, vc, bt, sl, scale, sk_pad, K, V
+
+
+@pytest.mark.parametrize("d, hq, hkv, L, W", [
+    (128, 32, 2, 512, 128),
+    (256, 16, 2, 512, 128),
+])
+def test_m3_10_oversized_window_bit_identical_causal(d, hq, hkv, L, W):
+    """#10: window=INT_MAX must be exactly plain causal (inert cutoff,
+    no int32 wrap, no silently-disabled mask) — bit-identical outputs."""
+    dev = "cuda"
+    kc, vc, bt, sl, scale, sk_pad, K, V = _m3_setup(dev, d, hq, hkv, L, W)
+    k_q8, v_b = fa.gather_paged_kv_q8(kc, vc, bt, sl, sk_pad)
+    q = torch.randn(1, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    q_abs = torch.tensor([L - 1], dtype=torch.int32, device=dev)
+
+    out_causal = fa.forward(q, k_q8, v_b, scale, kv_max=sl,
+                            q_abs_offset=q_abs)[0, 0]
+    out_wmax = fa.forward(q, k_q8, v_b, scale, kv_max=sl,
+                          q_abs_offset=q_abs,
+                          window=2 ** 31 - 1)[0, 0]
+    assert torch.equal(out_causal, out_wmax), \
+        "window=INT_MAX must be bit-identical to causal (non-paged)"
+
+    out_causal_p = fa.forward_paged_direct(
+        q, kc, vc, bt, sl, scale, None, q_abs)[0, 0]
+    out_wmax_p = fa.forward_paged_direct(
+        q, kc, vc, bt, sl, scale, None, q_abs, 2 ** 31 - 1)[0, 0]
+    assert torch.equal(out_causal_p, out_wmax_p), \
+        "window=INT_MAX must be bit-identical to causal (paged)"
+
+    # Prefill: same claim per-row.
+    qf = torch.randn(1, hq, L, d, device=dev, dtype=torch.float32) * 0.5
+    q_abs0 = torch.tensor([0], dtype=torch.int32, device=dev)
+    outf_causal = fa.forward(qf, k_q8, v_b, scale, kv_max=sl,
+                             q_abs_offset=q_abs0)[0]
+    outf_wmax = fa.forward(qf, k_q8, v_b, scale, kv_max=sl,
+                           q_abs_offset=q_abs0,
+                           window=2 ** 31 - 1)[0]
+    assert torch.equal(outf_causal, outf_wmax), \
+        "prefill window=INT_MAX must be bit-identical to causal"
+
+
+@pytest.mark.parametrize("d, hq, hkv, L, W", [
+    (128, 32, 2, 512, 128),
+])
+def test_m3_8_negative_kv_start_clamps_to_zero(d, hq, hkv, L, W):
+    """#8: a negative kv_start must clamp to 0 — the k-loop may not walk
+    into token-negative space. Output must equal the kv_start=0 scan."""
+    dev = "cuda"
+    kc, vc, bt, sl, scale, sk_pad, K, V = _m3_setup(dev, d, hq, hkv, L, W)
+    k_q8, v_b = fa.gather_paged_kv_q8(kc, vc, bt, sl, sk_pad)
+    q = torch.randn(1, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    q_abs = torch.tensor([L - 1], dtype=torch.int32, device=dev)
+
+    out0 = fa.forward(q, k_q8, v_b, scale, kv_max=sl,
+                      q_abs_offset=q_abs, window=W,
+                      kv_start=torch.tensor([0],
+                                            dtype=torch.int32,
+                                            device=dev))[0, 0]
+    outneg = fa.forward(q, k_q8, v_b, scale, kv_max=sl,
+                        q_abs_offset=q_abs, window=W,
+                        kv_start=torch.tensor([-L],
+                                              dtype=torch.int32,
+                                              device=dev))[0, 0]
+    assert torch.equal(out0, outneg), \
+        "negative kv_start must clamp to 0 (non-paged)"
+
+    out0_p = fa.forward_paged_direct(
+        q, kc, vc, bt, sl, scale, None, q_abs, W,
+        torch.tensor([0], dtype=torch.int32, device=dev))[0, 0]
+    outneg_p = fa.forward_paged_direct(
+        q, kc, vc, bt, sl, scale, None, q_abs, W,
+        torch.tensor([-L], dtype=torch.int32, device=dev))[0, 0]
+    assert torch.equal(out0_p, outneg_p), \
+        "negative kv_start must clamp to 0 (paged)"
+
+
+@pytest.mark.parametrize("d, hq, hkv, L, W", [
+    (128, 32, 2, 512, 128),
+    (128, 32, 2, 512, 64),
+])
+def test_m3_window_boundary_amplified_v(d, hq, hkv, L, W):
+    """Hardening (probe-B trick): V at the first OUT-of-window key is
+    amplified ~400x — a one-key cutoff error would move the output by
+    O(400x the tolerance). Checks both kernels vs the torch reference."""
+    dev = "cuda"
+    kc, vc, bt, sl, scale, sk_pad, K, V = _m3_setup(
+        dev, d, hq, hkv, L, W, v_amplify_boundary=True)
+    k_q8, v_b = fa.gather_paged_kv_q8(kc, vc, bt, sl, sk_pad)
+    q = torch.randn(1, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    q_abs = torch.tensor([L - 1], dtype=torch.int32, device=dev)
+    ref = _windowed_ref(q[0, :, 0], K.float(), V.float(), scale, L - 1, W)
+
+    out = fa.forward(q, k_q8, v_b, scale, kv_max=sl,
+                     q_abs_offset=q_abs, window=W)[0, 0]
+    err = ((out - ref).norm() / ref.norm()).item()
+    assert err < 5e-2, f"non-paged boundary error {err}"
+
+    out_p = fa.forward_paged_direct(
+        q, kc, vc, bt, sl, scale, None, q_abs, W)[0, 0]
+    err_p = ((out_p - ref).norm() / ref.norm()).item()
+    assert err_p < 5e-2, f"paged boundary error {err_p}"
+
+    # The amplified key must actually be discriminating: including it
+    # (wrong cutoff) moves the output far beyond the tolerance.
+    # A correct-cutoff output is < 5e-2 from the right-window reference;
+    # with the boundary key amplified ~400x, a wrong cutoff lands at
+    # rel-err ~1.0 (the amplified V dominates one softmax weight). 0.5
+    # sits 10x above the correctness tolerance and 2x below the
+    # measured wrong-cutoff error.
+    ref_bad = _windowed_ref(q[0, :, 0], K.float(), V.float(), scale,
+                            L - 1, W + 1)
+    bad_err = ((out - ref_bad).norm() / ref_bad.norm()).item()
+    assert bad_err > 0.5, \
+        f"amplified boundary key not discriminating (err {bad_err})"

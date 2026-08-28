@@ -184,7 +184,7 @@ conservative per-q-tile start (smallest row's window start) is
 implementable without per-row loops. Gate: bit-identity + pp4096
 prefill/TTFT A/B.
 
-### M3 — kernel hygiene batch (one rebuild)
+### M3 — kernel hygiene batch (one rebuild) — DONE on branch `feat/fa-m3-hygiene` 2026-08-28 (unmerged for review; log: DEVLOG-fa-attention.md 2026-08-28 M3 entry; 65/65 suite)
 
 From the (now-deleted) qwen review — items carry their text inline —
 bundle into one build/test cycle:
@@ -192,27 +192,36 @@ bundle into one build/test cycle:
   `fattn-q8-paged.cuh` — a negative start would walk the k-loop into
   pages before token 0 (illegal access / wedge, not a wrong number).
 - **#10**: overflow-free cutoff `q_abs_row - k_pos_abs >= window` at
-  all four LOCKSTEP sites (the current `k < q_abs_row - window + 1`
-  overflows for absurd windows → UB + silently disabled mask). Must
-  preserve the unaligned bit-identity tests.
+  all four LOCKSTEP sites (hardening/clarity — the old form
+  `k < q_abs_row - window + 1` cannot actually wrap for int32; the
+  new form is wrapping-free by construction). Preserves the
+  unaligned bit-identity tests; new window=INT_MAX bit-identity test.
+  (DONE — see the header; the "overflows" premise was corrected in
+  the devlog.)
 - **#4b/c**: allocate only the meta buffer actually used (`o_meta` is
   dead when `kv_split > 1`); note the `o_part`/`o_meta_split` per-call
   cliff at `_DIRECT_PAGED_MAX_SQ=16` (~35 MiB/layer) — shared arena
   only if a real workload hits Sq>2 direct-paged.
 - Test hardening: amplified-V window-boundary case (probe-B trick,
   ~400× discriminative, 3 lines).
-- **FA-Q8 P·V via `v_dot2_f32_f16`** (2026-08-28, from the
-  dot-instruction analysis — `benchmarks/kernels/gfx906/dot_isa_probe.py`):
-  P·V currently accumulates in `half2` (`v_pk_mul_f16` +
-  `v_pk_add_f16` = 2 instr per 2 MAC, fp16-acc). The dot2 rewrite is
-  1 instr per 2 MAC with fp32-acc — the op is verified clean on this
-  toolchain (`vdst = acc + a_lo·b_lo + a_hi·b_hi`, identical to the
+- **FA-Q8 P·V via `v_dot2_f32_f16` — REFUTED 2026-08-28 (ISA), not
+  implemented.** The premise ("P·V currently accumulates in `half2`
+  (`v_pk_mul_f16` + `v_pk_add_f16` = 2 instr per 2 MAC, fp16-acc)")
+  is wrong against the current ISA: the compiler already emits
+  `v_pk_fma_f16` for the P·V accumulate (1 instr per 2 MACs, full
+  packed rate — dequant-instructions.md). `v_dot2_f32_f16` is also
+  1 instr per 2 MACs (full rate at ILP≥2, latency-sensitive), so the
+  rewrite buys ZERO instruction count / rate — only fp16→fp32
+  accumulation, at the cost of restructuring the P·V row ownership
+  for row-pair packing plus new test references. The item's own
+  decision rule ("worth it only if P·V is measurably VOPC-issue-bound
+  in the A/B") is not met. **Reframed: precision-only candidate
+  (fp32 P·V accumulation); revisit only if a numerics gate demands
+  it.** (The op itself is verified clean on this toolchain —
+  `vdst = acc + a_lo·b_lo + a_hi·b_hi`, identical to the
   `__ockl_fdot2`/`amd_mixed_dot` production path in
   `dense_gemv_gfx906.cu` / `moe_q_gemm_gfx906.cu`; see
-  `dequant-instructions.md`). NOT hygiene: fp16→fp32 accumulation
-  changes outputs, so the gate is its own — kernel-level A/B on
-  `bench_gfx906_fa_decode.py` + PPL invariance (6.6895 band) + update
-  the bit-identity suite's references. Benefits both LEGACY modes
+  `dequant-instructions.md`.) Benefits both LEGACY modes
   equally (does not re-open the M5 gate); worth it only if P·V is
   measurably VOPC-issue-bound in the A/B (the Q·K sdot4 side has no
   remaining instruction lever — dot4 is the only and the full-rate
