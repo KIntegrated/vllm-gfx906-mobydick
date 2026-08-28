@@ -201,6 +201,22 @@ bundle into one build/test cycle:
   only if a real workload hits Sq>2 direct-paged.
 - Test hardening: amplified-V window-boundary case (probe-B trick,
   ~400× discriminative, 3 lines).
+- **FA-Q8 P·V via `v_dot2_f32_f16`** (2026-08-28, from the
+  dot-instruction analysis — `benchmarks/kernels/gfx906/dot_isa_probe.py`):
+  P·V currently accumulates in `half2` (`v_pk_mul_f16` +
+  `v_pk_add_f16` = 2 instr per 2 MAC, fp16-acc). The dot2 rewrite is
+  1 instr per 2 MAC with fp32-acc — the op is verified clean on this
+  toolchain (`vdst = acc + a_lo·b_lo + a_hi·b_hi`, identical to the
+  `__ockl_fdot2`/`amd_mixed_dot` production path in
+  `dense_gemv_gfx906.cu` / `moe_q_gemm_gfx906.cu`; see
+  `dequant-instructions.md`). NOT hygiene: fp16→fp32 accumulation
+  changes outputs, so the gate is its own — kernel-level A/B on
+  `bench_gfx906_fa_decode.py` + PPL invariance (6.6895 band) + update
+  the bit-identity suite's references. Benefits both LEGACY modes
+  equally (does not re-open the M5 gate); worth it only if P·V is
+  measurably VOPC-issue-bound in the A/B (the Q·K sdot4 side has no
+  remaining instruction lever — dot4 is the only and the full-rate
+  int dot on gfx906).
 
 ### M4 — long-context split-K accuracy point (qwen #4a)
 
@@ -227,12 +243,14 @@ production hit = LEGACY=0 + ngram spec + B≥2 under FULL capture);
 LOSES to the LEGACY=1 control at every controlled point** — B=1
 decode −2.5…−3.7 % (107.4 vs 111.5 @2k; ~96.5 vs ~99 @8k), B=4
 @2k aggregate −27…−31 % (35.8/32.1 vs 46.7), prefill a wash (495
-vs 496.9 @8k). Reading: gfx906 FA has no int8 matrix path, so the
-Q8 dot is fp32-ALU where fp16 uses FMA — the attention inner loop is
-compute-bound and the 10%-leaner HBM read is invisible (B=1), and
-direct-paged's strided paged reads add a second penalty at B=4. Per
-the flip rule (a wash already keeps LEGACY=1; only a win justifies
-flipping), **D1 is not executed**. LEGACY=0 remains an experimental
+vs 496.9 @8k). Reading (corrected 2026-08-28): both arms ran the
+*identical* FA-Q8 `v_dot4_i32_i8` kernel — the LEGACY flag selects
+the KV-layout/gather strategy, not the FA dot — so the B=1 delta is
+the gather/read path and the B=4 delta is direct-paged's strided
+paged reads (memory access pattern, not an FA ALU gap); the
+10%-leaner HBM read is invisible at these sizes. Per the flip rule
+(a wash already keeps LEGACY=1; only a win justifies flipping),
+**D1 is not executed**. LEGACY=0 remains an experimental
 opt-in (zero-extra-KV-memory alias, COW-safe); the gate re-opens if
 a future FA kernel closes the Q8-dot compute gap (M2/M3 territory).
 Boot L closed out with a 3rd wedge burst → boot M (this bake); boot
@@ -267,8 +285,12 @@ actually measure — confirmed at code level:
      copy, half the fp16 gather's read) instead of direct-paged
      misaligned slices — recovers the −27…−31 % before the repack
      even lands.
-- **(c) Q4-KV via native `v_dot8_i32_i4` — the only instruction-level
-  upside left**: measured 49.6 T MAC/s (8.52× fp32, 2× dot4) with
+- **(c) Q4-KV via native `v_dot8_i32_i4` — the LEGACY=0-specific
+  instruction-level upside** (the P·V `v_dot2_f32_f16` rewrite in M3
+  is instruction-level too but benefits BOTH LEGACY modes equally and
+  does not re-open this gate; 2026-08-28 `dot_isa_probe.py`
+  confirmed the i8 dot8 forms are assembler-rejected — dot8 = the i4
+  variant only): measured 49.6 T MAC/s (8.52× fp32, 2× dot4) with
   packed-nibble operands on BOTH sides and zero unpack ALU in the dot
   loop. K q4_0-style = 72 B/row (vs 136 q8 / 256 fp16); with V→Q8
   (dot4, 136 B) or V→Q4 the row read drops to 208/144 B (2.5–3.6×

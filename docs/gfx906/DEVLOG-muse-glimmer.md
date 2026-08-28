@@ -1128,18 +1128,32 @@ point) should pass.
   are the stable readings. TTFT/queuing structure identical to the
   control run (ttft_max ~16 s at B=4/2k from the 4096-token
   serialization).
-- **Interpretation:** the per-row HBM-leaner argument does not
-  transfer to wall clock on the MI50. FA at D=128 on gfx906 has no
-  int8 matrix path — the Q8 dot runs as fp32 ALU (dequant +
-  multiply) where the fp16 path uses fp16 FMA, so the attention
-  inner loop is COMPUTE-bound and the 10% HBM saving is invisible
-  (B=1: small ALU penalty shows as −2.5…−3.7 %). At B=4 the
-  direct-paged kernel's block-strided paged reads add a second,
-  larger penalty (−27…−31 %) vs LEGACY=1's gather-materialize-
-  then-contiguous-read. Prefill (gather-bound, not FA-bound) is a
-  wash — consistent with the same reading at the B=1 in-process
-  A/Bs (round 7: the LEGACY=1 gather+clip path was already
-  competitive there).
+- **Interpretation (corrected 2026-08-28 — the original wording
+  mis-attributed the delta to an FA-dot ALU gap that this A/B never
+  measured):** both LEGACY modes run the *identical* FA-Q8 kernel —
+  `forward_paged_q8` with the `v_dot4_i32_i8` Q·K dot on both sides
+  (the LEGACY flag selects the KV-layout/gather strategy, not the FA
+  dot). So: (1) the B=1 delta (−2.5…−3.7 %) is in the gather kernel
+  + read path (fused per-token gather of pre-quantized 136 B rows vs
+  the persistent gather), not the FA inner loop; (2) the B=4 delta
+  (−27…−31 %) is the direct-paged kernel's block-strided paged
+  global reads (256 B-row stride, uncoalesced across pages) vs
+  LEGACY=1's gather-materialize-then-contiguous-read — a memory-
+  access-pattern penalty, not an instruction/ALU penalty; (3) the
+  10%-leaner per-row HBM read is invisible because none of these
+  points is HBM-bandwidth-bound at these context/batch sizes.
+  Prefill (gather-bound, not FA-bound) is a wash — consistent with
+  the B=1 in-process A/Bs (round 7: the LEGACY=1 gather+clip path
+  was already competitive there).
+  ISA follow-up (same date, `benchmarks/kernels/gfx906/dot_isa_probe.py` +
+  `dequant-instructions.md`): the Q·K dot already uses the only
+  full-rate int dot on gfx906 (`v_dot4_i32_i8`; dot4c/dot8_i8 are
+  assembler-rejected), so there is no int-dot upgrade for Q8. The one
+  unexploited dot-family lever is P·V (currently
+  `v_pk_mul_f16` + `v_pk_add_f16`, fp16-acc → `v_dot2_f32_f16` would
+  halve P·V instruction count with fp32-acc) — an M3 candidate that
+  would speed BOTH LEGACY modes equally, so it does not change this
+  A/B's outcome.
 
 ## GATE
 
@@ -1152,9 +1166,9 @@ B=1 decode, −27…−31 % B=4 aggregate; prefill wash). Per the flip
 rule (a wash already keeps LEGACY=1; only a win justifies flipping),
 D1 is NOT executed: `GFX906_FA_LEGACY` stays `1`.** The LEGACY=0
 path remains an experimental opt-in (zero-extra-KV-memory alias,
-COW-safe) — useful if/when a gfx906 FA kernel gains a fast Q8 dot
-(e.g. a packed-ALU dequant that closes the fp16-FMA gap), at which
-point the M5 gate re-opens. Roadmap M5: gate executed → closed
+COW-safe) — useful if/when a gfx906 FA change (e.g. the M3 P·V
+dot2 rewrite, or a cheaper direct-paged read pattern) closes the gap
+measured above, at which point the M5 gate re-opens. Roadmap M5: gate executed → closed
 with the keep-LEGACY=1 decision. The round-8 capture fix stands on
 its own (it made any future LEGACY=0 ngram serving possible).
 

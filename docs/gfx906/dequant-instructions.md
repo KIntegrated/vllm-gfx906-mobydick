@@ -50,7 +50,15 @@ Consequences for quantized kernels on this chip:
 
 ## Practical limits and caveats
 
-- dot4c/dot8c are not available on gfx906; only use dot4/dot8 forms.
+- The gfx906 int-dot set is `{v_dot4_i32_i8}`. Measured 2026-08-28
+  (`benchmarks/kernels/gfx906/dot_isa_probe.py`, backend-verified via
+  compile-to-object, which runs the llvm-mc validation that `-S` skips):
+  `v_dot4c_i32_i8` = "instruction not supported on this GPU (gfx906)",
+  `v_dot8_i32_i8` / `v_dot8c_i32_i8` = "invalid instruction" (all three
+  pass ISel but are rejected by the assembler — `-S` output is NOT an
+  availability answer). The table's `v_dot8_i32_i4` row is the *i4*
+  variant (packed-nibble operands); it exists but is irrelevant to Q8's
+  i8×i8 dot.
 - gfx906 dot instructions are available, but `v_mfma*` instructions are not
   listed for this target.
 - SDWA selects byte/word sublanes (BYTE_0..3, WORD_0..1, DWORD), not
@@ -59,3 +67,32 @@ Consequences for quantized kernels on this chip:
   data movement.
 - clamp behavior matters for integer dot/arith overflow paths; enable only
   when required.
+
+## v_dot2_f32_f16: clean fp16-2-pair dot, fp32 accumulate (2026-08-28)
+
+Runtime-verified (same probe): `v_dot2_f32_f16 vdst, a, b, vacc` computes
+**vdst = vacc + a_lo·b_lo + a_hi·b_hi** — the same op the production
+dense-GEMV / MoE Q-GEMM gfx906 kernels use via `__ockl_fdot2` /
+`amd_mixed_dot` (`csrc/rocm/dense_gemv_gfx906.cu`,
+`csrc/rocm/moe_q_gemm_gfx906.cu`). Raw inline asm and the builtin agree
+bit-for-bit in the probe.
+
+Lesson recorded from the probe's false-alarm round: the apparent
+"double-counted hi pair" / "weird 4th operand" readings were all wrong
+hand-derived f16 constants (0x3C00 is 1.0 not 1.5; 0x3800 is 0.5; 0x4600
+is 6.0; 0x5000 is 32.0). Verify f16 bit patterns with a runtime
+`__ushort_as_half` conversion, never by hand.
+
+**Open opportunity — FA-Q8 P·V.** The attention P·V inner loop still
+accumulates with `half2` (`v_pk_mul_f16` + `v_pk_add_f16`: 2 instructions
+per 2 MACs, fp16 accumulate). A `v_dot2_f32_f16` rewrite is 1 instruction
+per 2 MACs with fp32 accumulate — half the P·V instruction count, better
+rounding. (P·V reads both operands from LDS in the current kernel, so the
+inner loop is LDS-load + VOPC-issue — the instruction halving is the
+lever.) The Q·K side has no equivalent move: the dot is already the
+full-rate `v_dot4_i32_i8`, and the per-block dequant ALU (scale mult +
+cvt + fp32 FMA per 4-lane result) is intrinsic to consuming int dots in
+the fp32 softmax — no instruction upgrade exists for it. Gating before
+any attempt: kernel-level A/B (`bench_gfx906_fa_decode.py`) + PPL
+invariance (fp16-acc → fp32-acc changes outputs), so this is a roadmap M3
+candidate, not a drop-in (see `roadmap-more-models.md`).
