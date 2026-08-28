@@ -253,8 +253,12 @@ targets matrix cores; gfx906 has none).
 - **rocprofv3 finalization race**: dense-model traces consistently fail
   (ring buffer invalid at exit; EngineCore teardown races HSA). Use
   three-anchor inference or eager torch-profiler attribution instead.
-- **LEGACY=0** (Q8 side buffer) lags the fp16 cache during warmup/COW/
-  graph-replay writes → keep the LEGACY=1 default.
+- **LEGACY=0** (Q8 side view) had its warmup/COW/graph-replay desync
+  fixed 2026-08-27 (`b98bb329f0`) and is validated (46/46 suite,
+  default-config + prefix-cache smokes) but stays experimental — no
+  long-context soak / TP=2 bake / net win in a realistic config yet;
+  keep the LEGACY=1 default until the M5 bake gate
+  (`roadmap-more-models.md`) passes.
 - **Layer 0's routed experts ship fp16** (checkpoint
   `modules_to_not_convert`) → Triton `fused_moe`, 414 µs/step MoE. Options
   catalogued in `moe-decode-roadmap.md` (C4).
