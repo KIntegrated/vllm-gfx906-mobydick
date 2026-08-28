@@ -128,15 +128,18 @@ shipped** (Python-only, no rebuild): `_q_pad_buf` /
 ClassVar, `_ensure_forward_buffers` → @classmethod(num_heads,
 head_size, …); the q_pad lifecycle test rewritten with the
 class-state snapshot/restore pattern. Unit gate: 51/51.
-**Pending (post-reboot — boot K burst-wedged both probe attempts,
-degradation.md 21:58/22:06):** (1) the attribution-probe custom arm
-re-run (expect: one-time 256 MiB grow, survival at the 0.5 GiB cap,
-transient ≈ 1.5 GiB vs 3.785 pre-fix); (2) bt4096 TP=2 serving
-re-validation — drop `--max-num-batched-tokens 2048`, shrink the 6
-GiB KV cap if prefill clears; update the README TP=2 row. This item
-subsumes the old "reduce the custom FA prefill transient" lever.
+**Probe verification PASS (boot L, 2026-08-28, post-reboot)**:
+custom arm survives the 0.5 GiB-KV-cap 4097-token prefill,
+transient 1.285 GiB (vs 3.785 pre-fix), 4.89 GiB free after (vs
+0.00). **Serving re-validation PASS (boot L, 2026-08-28):** bt4096
+TP=2 launch (only change vs the boot K recipe) — first real 8192
+request cleared (cold 452 t/s), decode ~99 @8k/B=1 / 111.5 @2k /
+46.7 B=4 aggregate, 8.7 GiB headroom/GPU; **bt2048 workaround
+droppable, bt4096 is the new default** (README TP=2 row updated);
+6 GiB cap kept (plenty of margin). This item subsumes the old
+"reduce the custom FA prefill transient" lever — DONE.
 
-### M1 — window clip on the gather path (B=1 decode) — IMPLEMENTED 2026-08-27 (e2e gate pending)
+### M1 — window clip on the gather path (B=1 decode) — DONE 2026-08-27/28 (unit 51/51, e2e +8.1%)
 
 The Phase C clip fires only on the direct-paged (B≥2) dispatch; B=1
 decode (the gather path — the model's B=1 hot path) and all prefill
@@ -161,14 +164,15 @@ gfx906_fa_paged.py (kv_start math + dispatch). M1 v1 = persistent
 sub-path only (B≤16, all Sk = all current-server traffic); the other
 gather sub-paths pass kv_start=None (full gather, still correct).
 
-**Unit gate: PASS** — 5 new bit-identity tests (clip ON vs OFF via
+**Gates: PASS.** Unit: 5 new bit-identity tests (clip ON vs OFF via
 `_GATHER_CLIP` monkeypatch, direct dispatch forced off so B=2 really
 uses gather): Sq=1/6 × B=1/2 at L=4353/W=2048 (unaligned start
-2305/2300) + short-ctx inert case; full suite 51/51. Kernel-level
-sanity: rows [2305, L) bit-identical, rows [0, 2305) skipped.
-**E2E gate: PENDING** — pp8192/B=1 tg256 A/B (`GFX906_FA_GATHER_CLIP`
-1 vs 0) on the record recipe; the FA share of the B=1 step is large
-enough that the kernel micro-bench's −48% should show up e2e.
+2305/2300) + short-ctx inert case; full suite 51/51; rows [2305, L)
+bit-identical, [0, 2305) skipped. E2E (boot L, record recipe,
+pp8192/B=1/tg256): **6.042 vs 5.587 t/s = +8.1%**
+(`GFX906_FA_GATHER_CLIP` 1 vs 0) — matches the micro-bench's −48% FA
+time × ~17% FA share of the B=1 step at 8k. See
+DEVLOG-muse-glimmer.md round 5.
 
 ### M2 — per-row (2D) prefill clip
 
@@ -233,16 +237,16 @@ recipes: `/local/git/AGENTS.md` (single-card bench recipe),
 verbatim WITHOUT the source and confirm the harness works (boot K,
 2026-08-27).
 
-### TODO — write a personal skill: MI50 vLLM memory attribution / snapshots
+### DONE 2026-08-28 (boot L) — personal skill: MI50 vLLM memory attribution
 
-Once the in-progress OOM-attribution memory-snapshot work (boot K,
-2026-08-27; probe `/local/tmp/muse/probe_oom_attribution.py`) is
-complete and its verdict recorded in `DEVLOG-muse-glimmer.md`, write a
-skill for future sessions at
-`/home/kread/.agents/skills/gfx906-mem-attribution/SKILL.md`
-(format per the existing `hf-cli` skill: frontmatter description +
-when-to-use, then the recipe). It should capture what this hunt
-actually learned, not the plan:
+`/home/kread/.agents/skills/gfx906-mem-attribution/SKILL.md` written
+after the hunt's verdict landed (round 4): 3-arm probe + per-layer
+hooks + bisection recipe, the in-process fresh-compile env set, the
+confirmed dead ends (snapshot/kineto frames), and interpretation
+notes. The probe is persisted in-repo at
+`docs/gfx906/_probe_mem_attribution_gfx906.py` (the original
+`/local/tmp/muse/probe_oom_attribution.py` is reboot-volatile). The
+original plan the skill superseded, for reference:
 
 - the probe design: arms (custom / rocm-attn / eager) × TP 1/2,
   explicit small `kv_cache_memory_bytes`, PP sized so the first

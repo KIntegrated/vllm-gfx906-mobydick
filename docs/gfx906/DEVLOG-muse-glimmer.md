@@ -732,13 +732,32 @@ grow sequence starts from a clean shared buffer.
 
 **Verification status:** unit gate **PASS — 51/51** (incl. the
 rewritten `test_q_pad_buffer_survives_capture_then_prefill_grow`
-capture→grow→retire→replay sequence). Probe verification (custom
-arm re-run: expect one-time 256 MiB grow, then flat, survival at the
-0.5 GiB KV cap, transient ≈ model core + 0.26 + churn) is
-**DEFERRED POST-REBOOT**: both attempts hit the boot-K burst wedge
-(custom18_fixed 21:58, retry custom19 22:06 — 2nd consecutive launch
-failure, GPU0 left 24.9 GB zombie VRAM; degradation.md 21:58/22:06,
-GPU work stopped). It is the first post-reboot step.
+capture→grow→retire→replay sequence). Probe verification **PASS
+(boot L, post-reboot, `attr_tp1_custom20_bootL.log`)**: custom arm
+now **SURVIVES** the 0.5 GiB-KV-cap 4097-token prefill with peak
+transient **1.285 GiB** (vs 3.785 pre-fix; 4.89 GiB free after,
+vs 0.00) — the predicted model-core + one-time-256-MiB + churn
+shape, and the 2.75 GiB custom-vs-rocm gap is gone.
+
+**Serving re-validation (boot L, 2026-08-28, PASS)**: boot K TP=2
+recipe with **`--max-num-batched-tokens 4096`** (only change), 6 GiB
+KV cap kept, 128k max, ngram n=5, captures [6,12,18,24]. First real
+8192-token request (two 4096 chunks — the exact boot J/K OOM site)
+**cleared**: prefill 452.4 t/s (cold, ttft 18.1 s incl. first-use
+compile) / 496.9 t/s (warm); no OOM, no wedge; VRAM steady 23.4
+GiB/GPU (22.3 + ~1.1 runtime buffers, 8.7 GiB headroom/GPU). Decode
+(ngram ceiling, filler): 8k/B=1 **97.2 / 101.9 t/s** (boot K: 79.1 —
+includes M1 gather clip + the q_pad fix + warm cache; the clean
+isolated M1 contribution is the +8.1% harness A/B below), 2k/B=1
+111.5 (boot K: 114.6), 2k/B=4 46.7 aggregate (boot K: 45.3).
+**The bt2048 workaround is droppable; bt4096 is the new default**
+(preference: larger chunk = faster prefill; the 6 GiB cap keeps
+plenty of margin, so it stays).
+
+(Boot K note: the pre-reboot verification attempts both hit the
+boot-K burst wedge — custom18_fixed 21:58, retry custom19 22:06,
+2nd consecutive launch failure, GPU0 left 24.9 GB zombie VRAM;
+degradation.md 21:58/22:06.)
 
 Ruled out along the way: `o_part` KVSPLIT partials (the binding
 forces `kv_split=1` for `seq_q>2` — no such alloc at prefill),
@@ -846,11 +865,29 @@ so B=2 really uses gather) + full suite + e2e pp8192/B=1 tg256 A/B
 
 ## VERDICT
 
-**Unit gate PASS** (e2e pending — GPU0 busy with the round-4 probe):
-5/5 new tests (Sq=1/6 × B=1/2 at L=4353/W=2048 unaligned starts
-2305/2300 + short-ctx inert L=513<W) + full suite 51/51. Kernel-level
-sanity: rows `[2305, L)` bit-identical, rows `[0, 2305)` skipped by
-gather. E2e A/B queued.
+**PASS — both gates.**
+
+- **Unit:** 5/5 new tests (Sq=1/6 × B=1/2 at L=4353/W=2048 unaligned
+  starts 2305/2300 + short-ctx inert L=513<W) + full suite 51/51.
+  Kernel-level sanity: rows `[2305, L)` bit-identical, rows
+  `[0, 2305)` skipped by gather.
+- **E2E (boot L, 2026-08-28, record recipe: BENCH_EAGER=0
+  BENCH_GPU_UTIL=0.95 BENCH_SAMPLES=4 BENCH_PP=8192 BENCH_TG=256
+  BENCH_MAX_SEQS=32 BENCH_KV_MEM=805306368 BENCH_BATCHED_TOKENS=1024,
+  GPU0, `m1_e2e_clip{1,0}.log`):**
+
+  | `GFX906_FA_GATHER_CLIP` | samples (t/s) | mean |
+  |---|---|---|
+  | 1 (on) | 6.118 / 6.084 / 6.022 / 5.946 | **6.042** |
+  | 0 (off) | 5.706 / 5.573 / 5.547 / 5.522 | **5.587** |
+
+  **+8.1%** at pp8192/B=1/tg256 (no spec decode — the harness is
+  single-request). Matches the kernel micro-bench's −48% FA time at
+  L=8k/W=2k applied to the FA's ~17% share of the B=1 step at 8k
+  context (0.48 × 0.17 ≈ +8.2%). The clip's e2e win is largest at
+  B=1 long context (the gather hot path); the TP=2 serving decode
+  numbers (boot K grid: 114.6/79.1/57.0 @2k/8k/16k, ngram ceiling)
+  should move by the same relative amount once re-validated.
 
 ---
 Copyright Kevin Read <me@kevin-read.com>

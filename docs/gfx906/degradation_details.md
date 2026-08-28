@@ -1206,3 +1206,33 @@ gfx906-mem-attribution skill (roadmap Housekeeping) with the
 validated recipe (3-arm matrix + per-layer `memory_allocated()`
 hooks + the env traps: `VLLM_USE_AOT_COMPILE=0`, thread compile
 pool, `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0`).
+
+## 2026-08-28 ~06:14Z (boot L): post-reboot canary + q_pad-fix verification — clean
+
+1. **~06:14Z** — fresh boot (uptime 1 min at check); both GPUs at the
+   10.8 MB baseline, 0% util.
+2. **Canary** (Qwen3.8-27B mtp2, GPU0, `canary_bootL.log`): **38.8
+   t/s** — in the recent healthy band (38.4–38.9). Host clear.
+3. **q_pad-ClassVar fix verification** (pending list item 1; custom
+   attribution arm, TP=1, 0.5 GiB KV cap, PP=4097,
+   `attr_tp1_custom20_bootL.log`): **SURVIVED**, peak transient
+   **1.285 GiB** (vs 3.785 pre-fix on boot K), 4.89 GiB free after
+   (vs 0.00). The boot J/K first-prefill OOM root cause is confirmed
+   fixed (DEVLOG-muse-glimmer round 4). Remaining pending: M1
+   gather-clip e2e A/B, bt4096 TP=2 serving re-validation, the
+   gfx906-mem-attribution skill.
+4. **~06:40Z** — **M1 gather-clip e2e A/B: PASS, +8.1%** (harness
+   record recipe, pp8192/B=1/tg256, `GFX906_FA_GATHER_CLIP` 1 vs 0:
+   6.042 vs 5.587 t/s; DEVLOG-muse-glimmer round 5).
+5. **~06:55Z** — **bt4096 TP=2 serving re-validation: PASS** (boot K
+   recipe + `--max-num-batched-tokens 4096`; first real 8192 request
+   cleared — the exact boot J/K OOM site — cold prefill 452 t/s,
+   warm ~99 t/s decode @8k/B=1, 8.7 GiB headroom/GPU; clean SIGTERM
+   teardown to the 10.8 MB baseline; the bt2048 workaround is
+   droppable — README updated).
+6. **~07:05Z** — **gfx906-mem-attribution skill written**
+   (`/home/kread/.agents/skills/gfx906-mem-attribution/SKILL.md`);
+   the attribution probe persisted in-repo
+   (`docs/gfx906/_probe_mem_attribution_gfx906.py`). All boot-K
+   post-reboot pending items complete. Boot L clean throughout
+   (canary 38.8 t/s; no wedges).
