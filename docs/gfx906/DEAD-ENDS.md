@@ -30,12 +30,14 @@ DEVLOG). Pattern: **hypothesis → gate → verdict → commit/revert → commen
 | llama.cpp Q5_K_XL baseline | — | **IMPOSSIBLE** (36 GiB > 32 GB) | — | won't fit; used Q4_K_XL instead (70.3 t/s ref) | M0 |
 | FA V2 fused gather (416 WG, barriers) in serving | serving graph | **REJECTED** (V1 wins) | `GFX906_FA_GATHER_V=2` | V2 degrades 7× in serving (285 µs) vs V1 42 — wave-scheduling/low-WG effect | FA |
 | salvage LEGACY=0 via a better dot instruction (dp4a/dot2/dot8 swap in the KQ loop) | ISA rate probe + roofline (analytic) | **DEAD-END** (analysis) | — | dp4a/`v_dot4_i32_i8` already the inner loop and measured FULL-RATE (4.44× fp32, 2× packed fp16); B=1 decode is gather-HBM-bound ~2.7× so ALU swaps can't surface; expansion composites 0.17–0.24×. Q4/dot8 = format change, roadmap M6(c) | FA |
+| M6 Part A planar Q8 quants/scale repack closes the LEGACY=0 B=1 gap (flip re-open) | microbench hard stop-rule (ISA loader loads ≥2× AND step ≥2 %) | **DEAD-END** (flip question); code **NEUTRAL** on `feat/fa-legacy0-m6-partA` | commit on branch, merge-or-revert user call | ISA-verified loader 10→6 loads/tile-row = 1.67× < 2× (plan's ~17/block assumption was wrong — compiler already 4×8-B + 2-B); standalone B=1 step −2.4 % (disjoint bands) both LEGACY modes; bit-identical (64/64). B=1 gap is elsewhere (write path / Q-side / gather traffic) | MG, plan_fa_part_A.md |
 
 **Sources:** `M0`=DEVLOG-moe-opt.md · `FA`=DEVLOG-fa-attention.md ·
 `D`=DEVLOG-dense-decode.md · `M1`=DEVLOG-moe-m1-sprint.md ·
 `G1`=DEVLOG-moe-gemm1-retiling.md · `S`=DEVLOG-spec-decode.md ·
 `Q`=DEVLOG-qwen38.md (incident, not a dead-end) ·
-`GA`=DEVLOG-gemma4-*.md · `W1`=DEVLOG-gdn-mixed-decode.md.
+`GA`=DEVLOG-gemma4-*.md · `W1`=DEVLOG-gdn-mixed-decode.md ·
+`MG`=DEVLOG-muse-glimmer.md.
 
 ## OPEN / IN-FLIGHT (verdict not yet recorded)
 

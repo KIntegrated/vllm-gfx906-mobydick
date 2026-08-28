@@ -2270,3 +2270,144 @@ def test_gather_paged_kv_q8_clip_skips_prefix():
     assert torch.equal(v_out[:, :, start:L], v_full[:, :, start:L])
     # [L, sk_pad): V zero tail as usual (the clip does not change it).
     assert (v_out[:, :, L:] == 0.0).all()
+
+
+# ---------------------------------------------------------------------------
+# Part A layout pins (docs/gfx906/plan_fa_part_A.md): the Q8 K row is
+# PLANAR — [quants D bytes | scale (D/32) fp16] — in every buffer the FA
+# kernels read (the LEGACY=0 alias, the gather tile, the prefill
+# dense-quant output). These pins are byte-level: the forward tests assert
+# FA output correctness, which cannot distinguish "wrong layout read by a
+# matching wrong loader" from "right layout".
+# ---------------------------------------------------------------------------
+
+def _ref_q8_0_row(x):
+    """Bit-exact Python reference for the kernel Q8_0 quantizer
+    (csrc/gfx906_fa/kernel/q8_0_quantize.cuh): one fp16 row of D values
+    (D % 32 == 0) -> (quants, scale). quants: uint8 [D] (int8 bit
+    patterns); scale: uint8 [2*(D/32)] (per-block fp16 d, little-endian).
+    d = amax/127 (fp32); id = 1/d if d > 0 else 0; qi = clamp(rintf(v*id));
+    scale = fp16(d)."""
+    v = x.float().reshape(-1, 32)   # [nblocks, 32]
+    amax = v.abs().amax(dim=-1, keepdim=True)
+    d = amax / 127.0
+    id_ = torch.where(d > 0.0, 1.0 / d, 0.0)
+    qi = torch.round(v * id_).clamp_(-128, 127).to(torch.int8)
+    return (qi.view(torch.uint8).reshape(-1),
+            d.half().view(torch.uint8).reshape(-1))
+
+
+def _assert_planar_row(row_bytes, x_row):
+    """Assert row_bytes (uint8, (D//32)*34) is the PLANAR Q8_0 row of
+    x_row (fp16, D): quants plane = per-32-block int8 (bytes [0, D));
+    scale plane = per-block fp16 d (bytes [D, D + 2*(D//32)))."""
+    Dv = x_row.numel()
+    quants, scales = _ref_q8_0_row(x_row)
+    assert row_bytes.numel() == Dv + scales.numel()
+    assert torch.equal(row_bytes[:Dv], quants), "quants plane mismatch"
+    assert torch.equal(row_bytes[Dv:], scales), "scale plane mismatch"
+
+
+def test_q8_0_row_layout_planar_pin_reshape_alias():
+    """Writer 1: reshape_and_cache_q8 (the LEGACY=0 alias writer)."""
+    dev = "cuda"
+    torch.manual_seed(41)
+    kc, vc, kv = _make_paged_cache(4, dev)
+    n_rows = 4 * BLOCK
+    K = torch.randn(n_rows, HKV, D, device=dev, dtype=torch.float16) * 0.5
+    slot = torch.arange(n_rows, dtype=torch.int64, device=dev)
+    fa.reshape_and_cache_q8(K, slot, kc)
+    for r in list(range(0, n_rows, 7)) + [n_rows - 1]:
+        for h in range(HKV):
+            _assert_planar_row(kc[r // BLOCK, r % BLOCK, h], K[r, h])
+
+
+def test_q8_0_row_layout_planar_pin_dense_quant():
+    """Writer 3: quantize_q8_0 (two-kernel prefill fallback)."""
+    dev = "cuda"
+    torch.manual_seed(43)
+    N = 37
+    x = torch.randn(N, D, device=dev, dtype=torch.float16) * 0.5
+    y = fa.quantize_q8_0(x)
+    assert y.shape == (N, BYTES) and y.dtype == torch.uint8
+    for r in list(range(0, N, 5)) + [N - 1]:
+        _assert_planar_row(y[r], x[r])
+
+
+def test_q8_0_row_layout_planar_pin_fused_quant_gather():
+    """Writer 2 (LEGACY=1 production decode path): the fused
+    gather+quantize persistent kernel's tile rows must be planar."""
+    dev = "cuda"
+    torch.manual_seed(47)
+    B, L = 2, 100
+    nb = (L + BLOCK - 1) // BLOCK
+    n_blocks = B * nb
+    _, vc, kv = _make_paged_cache(n_blocks + 4, dev)
+    key_cache, value_cache = kv.unbind(1)
+    K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    V = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    for b in range(B):
+        s0 = b * nb * BLOCK
+        stag = torch.zeros_like(kv[b * nb:(b + 1) * nb, 0])
+        stag.view(-1, HKV, D)[:L].copy_(K[s0:s0 + L])
+        kv[b * nb:(b + 1) * nb, 0].copy_(stag)
+        _write_v(kv[b * nb:(b + 1) * nb], V[s0:s0 + L])
+    bt = torch.stack([torch.arange(b * nb, (b + 1) * nb, dtype=torch.int32)
+                      for b in range(B)]).contiguous().to(dev)
+    sl = torch.full((B,), L, dtype=torch.int32, device=dev)
+    sk_pad = (L + 31) // 32 * 32
+    k_out = torch.zeros(B, HKV, sk_pad, BYTES, dtype=torch.uint8, device=dev)
+    v_out = torch.zeros(B, HKV, sk_pad, D, dtype=torch.float16, device=dev)
+    k_tile, _ = fa.gather_paged_kv_quant_persistent(
+        key_cache, value_cache, bt, sl, sk_pad,
+        k_out=k_out, v_out=v_out)
+    assert k_tile.data_ptr() == k_out.data_ptr(), "k_out not reused"
+    for b in range(B):
+        for t in list(range(0, L, 13)) + [L - 1]:
+            for h in range(HKV):
+                blk = bt[b, t // BLOCK].item()
+                _assert_planar_row(k_tile[b, h, t],
+                                   key_cache[blk, t % BLOCK, h])
+
+
+def test_q8_0_row_layout_planar_pin_fused_q8_gather():
+    """The LEGACY=0 fused-Q8 gather (byte copy of the alias into the
+    tile): tile rows must equal the alias rows (and the reference planar
+    row — the copy is layout-transparent)."""
+    dev = "cuda"
+    torch.manual_seed(53)
+    B, L = 2, 100
+    nb = (L + BLOCK - 1) // BLOCK
+    n_blocks = B * nb
+    _, vc, kv = _make_paged_cache(n_blocks + 4, dev)
+    key_cache = kv[:, 0]
+    kc = key_cache.view(torch.uint8)[:, :, :, :BYTES]   # LEGACY=0 alias
+    K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    V = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    for b in range(B):
+        s0 = b * nb * BLOCK
+        stag = torch.zeros_like(kv[b * nb:(b + 1) * nb, 0])
+        stag.view(-1, HKV, D)[:L].copy_(K[s0:s0 + L])
+        kv[b * nb:(b + 1) * nb, 0].copy_(stag)
+        fa.reshape_and_cache_q8(
+            K[s0:s0 + L],
+            torch.arange(s0, s0 + L, dtype=torch.int64, device=dev), kc)
+        _write_v(kv[b * nb:(b + 1) * nb], V[s0:s0 + L])
+    bt = torch.stack([torch.arange(b * nb, (b + 1) * nb, dtype=torch.int32)
+                      for b in range(B)]).contiguous().to(dev)
+    sl = torch.full((B,), L, dtype=torch.int32, device=dev)
+    sk_pad = (L + 31) // 32 * 32
+    k_tile, _ = fa.gather_paged_kv_q8(kc, vc, bt, sl, sk_pad)
+    for b in range(B):
+        for t in list(range(0, L, 13)) + [L - 1]:
+            for h in range(HKV):
+                blk = bt[b, t // BLOCK].item()
+                alias_row = kc[blk, t % BLOCK, h]
+                assert torch.equal(k_tile[b, h, t], alias_row), \
+                    "tile row != alias row"
+                _assert_planar_row(k_tile[b, h, t],
+                                   K[b * nb * BLOCK + t, h])

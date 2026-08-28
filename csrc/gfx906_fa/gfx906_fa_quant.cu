@@ -46,7 +46,8 @@
 // Kernel 1: quantize_q8_0_dense
 //
 // Вход:  x_f16   [N, D]   — contiguous row-major, D кратно 32
-// Выход: y_q8    [N, D/32, 34 bytes]  — contiguous uint8
+// Выход: y_q8    [N, (D/32)*34 bytes]  — contiguous uint8, PLANAR row
+//         (plan_fa_part_A.md): [quants D bytes | scale (D/32) fp16]
 //
 // Grid: (ceil(N / rows_per_block), 1, 1)
 // Block: (64, rows_per_block, 1) — каждый wavefront = 1 row × (D/32 blocks).
@@ -76,9 +77,10 @@ extern "C" __global__ void quantize_q8_0_dense_kernel(
     for (int b0 = 0; b0 < blocks_per_row; b0 += 2) {
         const int b = b0 + half_id;
         if (b < blocks_per_row) {
-            quantize_block_q8_0_halfwarp(
+            quantize_block_q8_0_halfwarp_planar(
                 x_row + b * QK8_0_SZ,
-                y_row + b * Q8_0_BYTES,
+                y_row + b * QK8_0_SZ,
+                (uint16_t *)(y_row + D) + b,
                 lane_in
             );
         }
@@ -96,9 +98,11 @@ extern "C" __global__ void quantize_q8_0_dense_kernel(
 //   slot_mapping [num_tokens]                  int64 — физ. слот в paged cache
 //                                                      (или -1 для пропуска токена)
 // Выход:
-//   k_cache_q8 [num_blocks, block_size, Hkv, D/32, 34]  uint8
+//   k_cache_q8 [num_blocks, block_size, Hkv, (D/32)*34]  uint8
 //              layout: (slot = block_idx * block_size + block_offset)
 //              → k_cache_q8[block_idx, block_offset, h, :, :]
+//              PLANAR row (plan_fa_part_A.md): [quants D bytes | scale
+//              (D/32) fp16] — same row byte count as block_q8_0
 //
 // Одна строка = один token × один KV-head → D/32 блоков × 34 байта.
 // Grid: (num_tokens, Hkv)  — один workgroup = один (token, head) pair.
@@ -147,9 +151,10 @@ extern "C" __global__ void reshape_and_cache_q8_kernel(
     for (int b0 = 0; b0 < blocks_per_row; b0 += 2) {
         const int b = b0 + half_id;
         if (b < blocks_per_row) {
-            quantize_block_q8_0_halfwarp(
+            quantize_block_q8_0_halfwarp_planar(
                 x_row + b * QK8_0_SZ,
-                y_row + b * Q8_0_BYTES,
+                y_row + b * QK8_0_SZ,
+                (uint16_t *)(y_row + head_size) + b,
                 lane_in
             );
         }

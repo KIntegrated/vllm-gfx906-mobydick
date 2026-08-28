@@ -1320,5 +1320,104 @@ regime (B=1 is gather-dominated; B=4 is GEMM-dominated, so a B=4
 wash is expected even if the B=1 layout gap is real). Proceed per
 the plan's test plan.
 
+## 2026-08-28 — round 11: M6 Part A (planar Q8 quants/scale repack) — microbench hard-stop gate FIRED; flip question DEAD-END; code change NEUTRAL (kept on branch)
+
+## HYPOTHESIS
+
+If the LEGACY=0 B=1 deficit (−2.5…−3.7 % vs LEGACY=1, M5) is caused
+by the interleaved `block_q8_0` layout (34-B block strides at 2-mod-4
+tile offsets forcing narrow loader loads + scales scattered inside the
+structs), then repacking the same 136 B into a quants plane + scale
+plane recovers the B=1 gap — without changing the byte budget, row
+stride, alias contract, or numerics. Falsifiable per
+`plan_fa_part_A.md` (rev 2) via the pre-decided microbench stop-rule.
+
+## What was done
+
+- Implementation (`feat/fa-legacy0-m6-partA`, this round's commit):
+  all three tile writers (alias `reshape_and_cache_q8`, fused-Q8
+gather V1/V2, dense fallback `quantize_q8_0`) emit the planar layout;
+  both FA loaders (non-paged + paged) read it; 4 new bit-exact layout
+pins; suite 64/64. Intra-row only: row byte count `(D/32)×34`
+invariant — strides, buffers, alias contract, COW semantics untouched.
+- **Loader scale-offset bug found + fixed:** both rewritten loaders
+applied the tile column-block offset to the quants plane but not the
+scale plane (the old loader inherited it from the pre-offset struct
+base). Latent for D=128 (`k_col_block0=0` when `nbatch_K==D`),
+activated for D=256 prefill (`nbatch_K=128` → 2nd chunk at
+k_KQ_0=128) — caught by
+`test_forward_decode_prefill_vs_sdpa_on_unbind_cache` (t=63 err
+0.0519 vs 5e-2 tol); fixed in both
+loaders; suite 64/64; decode-vs-SDPA 0.43 % in BOTH LEGACY modes
+(D=128, k_KQ_0=64 path exercised). Builds `/tmp/partA_build_*.log`.
+- Gate microbench (`/tmp/microbench_partA.py`, standalone B=1 decode
+step, L=8192/W=2048/D=128/Muse geometry Hq=32/Hkv=2/BLOCK=16,
+record env, GPU0): OLD layout = csrc stashed + rebuilt
+(`build_old4.log`); NEW = this branch. 5 OLD / 6 NEW process runs.
+- ISA: launcher compiled `-S --offload-device-only` with the exact
+CMake flags (`/tmp/isa_dump.sh`); decode kernel
+`flash_attn_tile_q8<128,128,2,1>` (nbatch_fa=128, nbatch_K=64 → two
+K chunks) extracted from the .s (`/tmp/isa_{old,new}.s`,
+`/tmp/kern_{old,new}_decode.s`).
+
+## GATE
+
+`plan_fa_part_A.md` §Test-plan hard stop-rule (pre-decided rev 2):
+PROCEED only if (a) ISA-verified loader VMEM instruction count drops
+≥2× AND (b) standalone B=1 step time moves ≥2 %; either failing →
+DEAD-END for the flip question, no in-process/serving slot spent on
+the perf question.
+
+## Evidence (launch-regime — microbench, not the serving gate)
+
+| arm | OLD (interleaved) | NEW (planar) | Δ |
+|---|---|---|---|
+| LEGACY=0 gather+FA (ms) | 0.0831/0.0835/0.0829/0.0827/0.0832 → **0.08308** | 0.0814/0.0809/0.0811/0.0810/0.0812/0.0810 → **0.08110** | **−2.4 %** (bands disjoint) |
+| LEGACY=1 quant+FA (ms) | 0.0732/0.0736/0.0731/0.0752/0.0752 → 0.07406 | 0.0730/0.0706/0.0734/0.0731/0.0732/0.0728 → 0.07268 | −1.9 % |
+| LEG0/LEG1 ratio | 1.136 | 1.115 | gap narrows slightly |
+
+ISA loader loop per 32-value block (decode kernel, 4 inlined chunk
+copies each):
+
+| | OLD | NEW |
+|---|---|---|
+| loads/block | 1×`global_load_ushort` + 4×`global_load_dwordx2` (offs 2/10/18/26), address via `v_mad … 34` | 2×`global_load_dwordx4` (offs 0/16) + 1×`global_load_ushort` |
+| **loads/tile row** (J=64) | **10** | **6** → **1.67×** |
+
+## VERDICT
+
+**DEAD-END (flip question).** Stop-rule (a) FAILS: ISA-verified
+loader loads 10 → 6 per tile row = 1.67× < 2×; (b) passes (LEG0
+step −2.4 %, disjoint bands). Both were required. The plan's cost
+model assumed ~17 loads/block today (34-B struct at 2-B alignment)
+— the compiler already decomposed it into 4×8-B (GCN legal
+misaligned) + 1×2-B, so the achievable drop is 5→3, not 17→5. The
+mechanism is real but sub-threshold: the repack cannot single-handedly
+account for the B=1 deficit (−2.5…−3.7 %), and per the stop rule no
+in-process/serving slot is spent on the perf question. Per the
+plan's falsification clause the B=1 gap is elsewhere — the
+quantize write path, the FA Q-side, or the gather kernel's own
+traffic. **Defaults unchanged: `GFX906_FA_LEGACY=1`,
+`GFX906_FA_DIRECT_PAGED_Q8=0`.**
+
+**Code change: NEUTRAL — kept on the branch, merge-or-revert is the
+user's call.** The layout is bit-identical (64/64 suite incl. 4 new
+pins; decode-vs-SDPA 0.43 % in both LEGACY modes), ISA-verified 10→6
+loader loads with 16-B width (2×16-B + 2-B vs 2-B + 4×8-B, the ×34
+MAD leaves the hot path), and a measured −2.4 %/−1.9 % standalone
+B=1 decode step in the LEGACY=0/LEGACY=1 arms. If merged to main it
+is hygiene with a small win on the production path (LEGACY=1 uses
+the same loader); a serving regression arm was NOT run (stop rule:
+no perf slot) — the 64/64 bit-pins are the correctness record.
+Refrigerated: A2 (144-B padded stride) is moot for the flip
+question — A1 already measured below the 2× threshold. Part C
+(Q4-KV/`v_dot8_i32_i4`) remains the M6 instruction-level upside path.
+
+**M5 impact:** the B=1 same-boot adjudication for the LEGACY flip is
+now moot *via Part A* — the repack (the B=1 fix candidate) is closed
+as a dead end for the flip; the flip stays closed unless a future
+mechanism (Part C or a write-path fix) targets the residual B=1 gap
+and survives the serving gate.
+
 ---
 Copyright Kevin Read <me@kevin-read.com>

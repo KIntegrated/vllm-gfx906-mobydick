@@ -523,7 +523,8 @@ extern "C" __global__ void gather_paged_kv_quant_kernel(
     }
     phys_block = __shfl(phys_block, 0, 64);
 
-    // ---------- K: gather + quantize to q8_0 ----------
+    // ---------- K: gather + quantize to q8_0 (planar row) ----------
+    // Row layout (plan_fa_part_A.md): [quants D bytes | scale (D/32) fp16].
     const __half * k_src =
         key_cache
         + (int64_t)phys_block   * k_block_stride
@@ -537,9 +538,10 @@ extern "C" __global__ void gather_paged_kv_quant_kernel(
     for (int b0 = 0; b0 < blocks_per_row; b0 += 2) {
         const int b = b0 + half_id;
         if (b < blocks_per_row) {
-            quantize_block_q8_0_halfwarp(
+            quantize_block_q8_0_halfwarp_planar(
                 k_src + b * QK8_0_SZ,
-                k_dst + b * Q8_0_BYTES,
+                k_dst + b * QK8_0_SZ,
+                (uint16_t *)(k_dst + D) + b,
                 lane_in
             );
         }
@@ -717,15 +719,16 @@ extern "C" __global__ void gather_paged_kv_quant_persistent_kernel(
             + (((int64_t)seq_idx * Hkv + head_idx) * (int64_t)Sk + tok)
               * bytes_per_row;
 
-        // K: fp16 -> q8_0 (bit-equal to the dense/fused paths; each 32-
-        // value block is quantized independently, so row partitioning
-        // across workgroups does not change the result).
+        // K: fp16 -> q8_0 planar row (bit-equal to the dense/fused paths;
+        // each 32-value block is quantized independently, so row
+        // partitioning across workgroups does not change the result).
         for (int b0 = 0; b0 < blocks_per_row; b0 += 2) {
             const int b = b0 + half_id;
             if (b < blocks_per_row) {
-                quantize_block_q8_0_halfwarp(
+                quantize_block_q8_0_halfwarp_planar(
                     k_src + b * QK8_0_SZ,
-                    k_dst + b * Q8_0_BYTES,
+                    k_dst + b * QK8_0_SZ,
+                    (uint16_t *)(k_dst + D) + b,
                     lane_in
                 );
             }

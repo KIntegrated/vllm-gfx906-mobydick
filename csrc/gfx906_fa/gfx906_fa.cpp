@@ -11,12 +11,14 @@
 // Python-доступный API:
 //   gfx906_fa_forward(q, k_q8, v_fp16, scale) -> out
 //     q:      fp32  [B, Hq, Sq, D]    (contiguous)
-//     k_q8:   uint8 [B, Hkv, Skv, D*34/32] — pre-quantized block_q8_0 flat bytes
+//     k_q8:   uint8 [B, Hkv, Skv, D*34/32] — pre-quantized q8_0 flat bytes
+//              (planar row — docs/gfx906/plan_fa_part_A.md)
 //     v_fp16: fp16  [B, Hkv, Skv, D]  (contiguous)
 //     out:    fp32  [B, Sq, Hq, D]    (native BSHD — the kernel's store
 //                                       layout; no transpose copy)
 //
-// Квантизация K (из fp16 в block_q8_0) делается отдельной утилитой.
+// Квантизация K (из fp16 в q8_0, planar row — plan_fa_part_A.md) делается
+// отдельной утилитой.
 
 #include <torch/extension.h>
 #include <c10/hip/HIPStream.h>
@@ -305,7 +307,8 @@ torch::Tensor gfx906_fa_forward(
     TORCH_CHECK_CONTIG(v_fp16);
 
     TORCH_CHECK(q.dtype() == torch::kFloat32,  "q must be fp32");
-    TORCH_CHECK(k_q8.dtype() == torch::kUInt8, "k_q8 must be uint8 (block_q8_0 bytes)");
+    TORCH_CHECK(k_q8.dtype() == torch::kUInt8,
+                "k_q8 must be uint8 (planar q8_0 row bytes, plan_fa_part_A.md)");
     TORCH_CHECK(v_fp16.dtype() == torch::kFloat16, "v_fp16 must be fp16");
 
     TORCH_CHECK(q.dim() == 4,      "q must be 4D [B, Hq, Sq, D]");
@@ -322,7 +325,9 @@ torch::Tensor gfx906_fa_forward(
     TORCH_CHECK(v_fp16.size(0) == batch,    "v batch mismatch");
     TORCH_CHECK(v_fp16.size(3) == head_dim, "v head_dim mismatch");
 
-    // K — layout [B, Hkv, Skv, (D/QK8_0) * sizeof(block_q8_0)] уложенный uint8
+    // K — layout [B, Hkv, Skv, (D/QK8_0) * sizeof(block_q8_0)] уложенный
+    // uint8; row = planar q8_0 (plan_fa_part_A.md): quants D bytes + scale
+    // (D/32) fp16 — row byte count equals sizeof(block_q8_0) * (D/32).
     constexpr int QK8_0_SZ = 32;
     constexpr int BLOCK_SZ = 34;  // sizeof(block_q8_0) = fp16 scale + 32 int8
     TORCH_CHECK(head_dim % QK8_0_SZ == 0, "head_dim must be multiple of 32");
@@ -479,7 +484,7 @@ torch::Tensor gfx906_fa_forward(
 }
 
 // ============================================================================
-// Q8_0 quantization utility: fp16 K-tensor → block_q8_0 uint8 tensor
+// Q8_0 quantization utility: fp16 K-tensor → q8_0 uint8 tensor (planar row)
 //
 // Device-side (gfx906_fa_quant.cu). Работает с N-мерным contiguous тензором
 // чей последний dim = D (кратно 32). Выход: тот же layout с заменой D → D/32*34.

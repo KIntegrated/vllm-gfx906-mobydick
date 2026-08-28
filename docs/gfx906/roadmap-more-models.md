@@ -295,18 +295,33 @@ actually measure — confirmed at code level:
   consumer reads 136 B out of a 256-B stride (5 sectors fetched, ≤85 %
   efficiency; 34-B block strides break 16-B vector alignment; V2
   gather pays a uint2 tail every token). Fix candidates, in order:
-  1. **Repack the side view into aligned planes** — contiguous
-     16-B-aligned quants plane (128 B/row at D=128) + separate scale
-     plane (8 B/row); write-path quantize and gather/direct-paged
-     readers updated together. Converts the nominal 512→392 B/row
-     (1.31×) into an actual gather win instead of today's net loss;
-     grows with context (8k+ points gain the most). **Plan written
-     2026-08-28: `plan_fa_part_A.md`** — re-aimed at the B=1 gap
-     (per the round-10 F1 erratum the B=4 point is already fixed by
-     Part B and its mechanism is unconfirmed); audited diff scope is
-     intra-row only (row byte count `(D/32)×34` invariant → all
-     strides/buffers/alias contract unchanged); gate = same-boot M5
-     B=1 serving grid on a fresh boot.
+  1. **Repack the side view into aligned planes — CLOSED 2026-08-28
+     (round 11): microbench hard stop-gate FIRED; DEAD-END for the
+     flip question.** ISA-verified loader loads 10→6/tile-row
+     (1.67× < the 2× stop threshold; the plan's ~17 loads/block
+     assumption was wrong — the compiler already decomposed the 34-B
+     struct into 4×8-B + 2-B), standalone B=1 decode step −2.4 %
+     (disjoint bands), bit-identical (64/64). The repack cannot
+     single-handedly account for the B=1 deficit; per the plan's
+     falsification clause the gap is elsewhere (quantize write path,
+     FA Q-side, or gather traffic). Code change kept NEUTRAL on
+     `feat/fa-legacy0-m6-partA` (merge-or-revert user call); defaults
+     unchanged (`GFX906_FA_LEGACY=1`, `GFX906_FA_DIRECT_PAGED_Q8=0`);
+     the LEGACY flip stays closed. *(Plan: `plan_fa_part_A.md`; log:
+     DEVLOG-muse-glimmer round 11; index: DEAD-ENDS.md `MG` row.)*
+  1a. *(superseded, kept for the record) Repack the side view into
+     aligned planes — contiguous 16-B-aligned quants plane (128
+     B/row at D=128) + separate scale plane (8 B/row); write-path
+     quantize and gather/direct-paged readers updated together.
+     Converts the nominal 512→392 B/row (1.31×) into an actual
+     gather win instead of today's net loss; grows with context
+     (8k+ points gain the most). Plan written 2026-08-28:
+     `plan_fa_part_A.md` — re-aimed at the B=1 gap (per the round-10
+     F1 erratum the B=4 point is already fixed by Part B and its
+     mechanism is unconfirmed); audited diff scope is intra-row only
+     (row byte count `(D/32)×34` invariant → all strides/buffers/
+     alias contract unchanged); gate = same-boot M5 B=1 serving
+     grid on a fresh boot.*
   2. **B≥2: route LEGACY=0 through the fused-Q8 gather** (1:1 byte
      copy, half the fp16 gather's read) instead of direct-paged
      misaligned slices — recovers the −27…−31 % before the repack

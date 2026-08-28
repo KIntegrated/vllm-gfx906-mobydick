@@ -183,18 +183,29 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_load_tile(
     ggml_cuda_unroll<7>{}(load);
 }
 
+// Planar Q8 K-tile load (docs/gfx906/plan_fa_part_A.md). K_q8_row0 is a
+// byte pointer to the tile's first row start; k_col_block0 is the tile's
+// global column-block offset (blocks of 32). Per row:
+//   [quants: stride_K_q8*32 bytes] [scale: stride_K_q8 fp16]
+// Quants loads are 4 x 8 B (tile row stride (D/32)*34 is 8-aligned; only
+// 16-aligned when D % 256 == 0, so int4 is not used); each scale is a 2 B
+// load. Writes the same LDS planes (K_values int8, K_scales half) as the
+// old interleaved loader.
 template<int warp_size, int nwarps, int I, int J, int K_row_stride, bool oob_check>
 static __device__ __forceinline__ void flash_attn_tile_q8_q8_load_tile_q8(
-        const block_q8_0 * const __restrict__ K_q8,
+        const uint8_t * const __restrict__ K_q8_row0,
         int8_t * const __restrict__ K_values,
         half * const __restrict__ K_scales,
-        const int stride_K_q8,
+        const int stride_K_q8,    // blocks (of 32) per full K row
+        const int k_col_block0,   // global column-block offset of this tile
         const int i_sup) {
 
     if constexpr (J > 0) {
         constexpr int blocks_per_row = J / 32;
         const int tid = threadIdx.y * blockDim.x + threadIdx.x;
         const int total_blocks = I * blocks_per_row;
+        const int bytes_per_row = stride_K_q8 * (int)sizeof(block_q8_0);
+        const int quants_bytes  = stride_K_q8 * QK8_0;
 
         for (int block_idx = tid; block_idx < total_blocks; block_idx += blockDim.x * blockDim.y) {
             const int row = block_idx / blocks_per_row;
@@ -204,17 +215,19 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_load_tile_q8(
                 break;
             }
 
-            const int global_block_idx = row * stride_K_q8 + col_block;
-            const block_q8_0 src_block = K_q8[global_block_idx];
+            const uint8_t * row_base = K_q8_row0 + (int64_t)row * bytes_per_row;
 
-            K_scales[col_block * I + row] = src_block.d;
+            const int2 * src2 = reinterpret_cast<const int2 *>(
+                row_base + (k_col_block0 + col_block) * QK8_0);
+            int2 * dst2 = reinterpret_cast<int2 *>(
+                K_values + row * K_row_stride + col_block * QK8_0);
+            dst2[0] = src2[0];
+            dst2[1] = src2[1];
+            dst2[2] = src2[2];
+            dst2[3] = src2[3];
 
-            int8_t * dst = K_values + row * K_row_stride + col_block * 32;
-            const int4* src_int4 = (const int4*)src_block.qs;
-            int4* dst_int4 = (int4*)dst;
-
-            dst_int4[0] = src_int4[0];
-            dst_int4[1] = src_int4[1];
+            K_scales[col_block * I + row] = *reinterpret_cast<const half *>(
+                row_base + quants_bytes + (k_col_block0 + col_block) * 2);
         }
 
         __syncthreads();
@@ -250,19 +263,24 @@ static __device__ __forceinline__ const uint8_t * paged_token_ptr_bs16(
          + (int64_t) off_in_blk  * v.token_stride;
 }
 
+// Paged twin of flash_attn_tile_q8_q8_load_tile_q8 (planar row — see the
+// non-paged loader above). Per paged token row:
+//   [quants: stride_K_q8*32 bytes] [scale: stride_K_q8 fp16]
 template<int warp_size, int nwarps, int I, int J, int K_row_stride, bool oob_check>
 static __device__ __forceinline__ void flash_attn_tile_q8_q8_load_tile_q8_paged(
         const PagedCacheView paged_K,
         const int k_VKQ_0,          // global start token index for this tile
-        const int k_KQ_0_block,     // k_KQ_0 / 32 : offset in block_q8_0 units (head-relative col)
+        const int k_KQ_0_block,     // k_KQ_0 / 32 : global column-block offset (head-relative)
         int8_t * const __restrict__ K_values,
         half   * const __restrict__ K_scales,
+        const int stride_K_q8,      // blocks (of 32) per full K row
         const int i_sup) {
 
     if constexpr (J > 0) {
         constexpr int blocks_per_row = J / 32;
         const int tid = threadIdx.y * blockDim.x + threadIdx.x;
         const int total_blocks = I * blocks_per_row;
+        const int quants_bytes = stride_K_q8 * QK8_0;
 
         for (int block_idx = tid; block_idx < total_blocks; block_idx += blockDim.x * blockDim.y) {
             const int row       = block_idx / blocks_per_row;
@@ -275,17 +293,17 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_load_tile_q8_paged(
             const int global_token_idx = k_VKQ_0 + row;
             const uint8_t * tok_ptr    = paged_token_ptr_bs16(paged_K, global_token_idx);
 
-            const block_q8_0 * blk_base = reinterpret_cast<const block_q8_0 *>(tok_ptr);
-            const block_q8_0   src_block = blk_base[k_KQ_0_block + col_block];
+            const int2 * src2 = reinterpret_cast<const int2 *>(
+                tok_ptr + (k_KQ_0_block + col_block) * QK8_0);
+            int2 * dst2 = reinterpret_cast<int2 *>(
+                K_values + row * K_row_stride + col_block * QK8_0);
+            dst2[0] = src2[0];
+            dst2[1] = src2[1];
+            dst2[2] = src2[2];
+            dst2[3] = src2[3];
 
-            K_scales[col_block * I + row] = src_block.d;
-
-            int8_t * dst = K_values + row * K_row_stride + col_block * 32;
-            const int4 * src_int4 = (const int4 *) src_block.qs;
-            int4       * dst_int4 = (int4 *) dst;
-
-            dst_int4[0] = src_int4[0];
-            dst_int4[1] = src_int4[1];
+            K_scales[col_block * I + row] = *reinterpret_cast<const half *>(
+                tok_ptr + quants_bytes + (k_KQ_0_block + col_block) * 2);
         }
 
         __syncthreads();
@@ -422,7 +440,7 @@ template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int nbatch
 static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter_KQ(
         int8_t * const Q_values,
         half * const Q_scales,
-        const block_q8_0 * const __restrict__ K_q8,
+        const uint8_t * const __restrict__ K_q8,
         int8_t * const K_values,
         half * const K_scales,
         const int stride_K_q8,
@@ -436,8 +454,10 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter_KQ(
 
     constexpr int K_row_stride = nbatch_K + 16;
 
+    const uint8_t * k_q8_row0 =
+        K_q8 + int64_t(k_VKQ_0) * stride_K_q8 * (int)sizeof(block_q8_0);
     flash_attn_tile_q8_q8_load_tile_q8<warp_size, nwarps, nbatch_fa, nbatch_K, K_row_stride, oob_check>
-        (K_q8 + int64_t(k_VKQ_0)*stride_K_q8 + (k_KQ_0/32), K_values, K_scales, stride_K_q8, k_VKQ_sup);
+        (k_q8_row0, K_values, K_scales, stride_K_q8, k_KQ_0/32, k_VKQ_sup);
     __syncthreads();
 
     static_assert(nbatch_K % 4 == 0, "nbatch_K must be multiple of 4 for sdot4");
@@ -512,7 +532,7 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter_KQ_paged(
     constexpr int K_row_stride = nbatch_K + 16;
 
     flash_attn_tile_q8_q8_load_tile_q8_paged<warp_size, nwarps, nbatch_fa, nbatch_K, K_row_stride, oob_check>
-        (paged_K, k_VKQ_0, (k_KQ_0/32), K_values, K_scales, k_VKQ_sup);
+        (paged_K, k_VKQ_0, (k_KQ_0/32), K_values, K_scales, DKQ/32, k_VKQ_sup);
     __syncthreads();
 
     static_assert(nbatch_K % 4 == 0, "nbatch_K must be multiple of 4 for sdot4");
@@ -571,7 +591,7 @@ template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, in
 static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter(
         int8_t * const Q_values,
         half * const Q_scales,
-        const block_q8_0 * const __restrict__ K_q8,
+        const uint8_t * const __restrict__ K_q8,
         const half2 * const __restrict__ V_h2,
         const half  * const __restrict__ mask,
         const float logit_softcap,
@@ -957,7 +977,7 @@ static __global__ void flash_attn_tile_q8(
     const int head0 = zt * ncols2;
     const int gqa_ratio = ne02 / ne12;
     const float * Q_f  = (const float *) (Q + nb03*sequence + nb02* head0              + nb01*col_Q_0);
-    const block_q8_0 * K_q8 = (const block_q8_0 *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
+    const uint8_t * K_q8 = (const uint8_t *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
     const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*(head0 / gqa_ratio));
 
     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33) + nb31*col_Q_0) : nullptr;
