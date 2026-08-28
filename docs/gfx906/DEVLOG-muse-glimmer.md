@@ -890,4 +890,18 @@ so B=2 really uses gather) + full suite + e2e pp8192/B=1 tg256 A/B
   should move by the same relative amount once re-validated.
 
 ---
+
+## Promotion to main (2026-08-28)
+
+`feat/muse-glimmer` fast-forward-merged to `main` (branch point
+`284ce5ff6a`, tip `52ff21f9d9` + promotion docs). All gates in this
+log passed at merge time (unit 51/51 incl. the fix commit's rebuild;
+probe survival 3.785→1.285 GiB; M1 e2e +8.1%; bt4096 TP=2 prefill
+clear; canary 38.8 t/s healthy). Post-merge open items per
+`roadmap-more-models.md`: M2–M5 (long-context split-K accuracy, kernel
+hygiene, default read-path decision) and the residual review nits
+(F4/F5 class-buffer release + grow-shape checks; F2 seq_lens slice;
+F3 partial-range double-check). CHANGELOG 2026-08-27–28 entry added.
+
+---
 Copyright Kevin Read <me@kevin-read.com>

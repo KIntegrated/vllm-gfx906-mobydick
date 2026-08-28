@@ -98,18 +98,19 @@ shape-specific measurement. Follow the procedure above and the open items in
 
 ## Muse-Glimmer-30B (`MuseGlimmerForCausalLM`) — post-onboarding follow-ups
 
-**Status: onboarded + window-FA shipped (2026-08-27, `feat/muse-glimmer`,
-not yet in main); LEGACY=0 (Q8 side-view read) validated, LEGACY=1
-remains the serving default; the read pattern (gather vs direct-paged)
-is an *orthogonal* auto-gate — direct-paged + Phase C clip fire on the
-B≥2 decode dispatch in both LEGACY modes (README erratum 2026-08-27).**
+**Status: onboarded + window-FA + M1 gather clip shipped, merged to
+main 2026-08-28 (`feat/muse-glimmer`); LEGACY=0 (Q8 side-view read)
+validated, LEGACY=1 remains the serving default; the read pattern
+(gather vs direct-paged) is an *orthogonal* auto-gate — direct-paged +
+Phase C clip fire on the B≥2 decode dispatch in both LEGACY modes
+(README erratum 2026-08-27).**
 Onboarding and all gate numbers: `DEVLOG-muse-glimmer.md`. Knobs:
 `README.md` table. The three independent review files
 (`muse_glimmer_opt2_code_rev_{qwen,claude,ds4}.md`) were deleted
 2026-08-27 after their findings were folded into M1–M4 below; M3's
 items carry the surviving qwen text inline.
 
-### M0 — per-impl q_pad buffers: the first-prefill OOM root cause — FIXED 2026-08-27 (probe verification + bt4096 serving re-validation PENDING POST-REBOOT)
+### M0 — per-impl q_pad buffers: the first-prefill OOM root cause — DONE 2026-08-27/28 (fixed, probe-verified 1.285 GiB, bt4096 TP=2 re-validated)
 
 The boot J/K first-prefill OOM (>10.6 GiB/GPU transient; "scales with
 the chunk"; bt2048 workaround) was NOT inductor: the 3-arm

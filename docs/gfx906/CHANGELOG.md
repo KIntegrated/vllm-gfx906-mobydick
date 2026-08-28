@@ -7,6 +7,27 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-08-27–28
+
+- **Muse-Glimmer-30B-AWQ-INT4 onboarding + window FA + M1 gather clip
+  merged to `main` (2026-08-28, `feat/muse-glimmer` fast-forward).**
+  Sliding-window support in the custom Q8 FA (window arg, both kernel
+  copies; all-CUSTOM 1.59× vs hybrid at B=1), direct-paged split-K +
+  Phase C clip, LEGACY=0 Q8 side view aliased into the fp16 K half
+  (zero extra KV memory, COW-safe; prefix-cache fail-closed removed),
+  and the M1 gather-path window clip (absolute-position gather layout,
+  +8.1% e2e at pp8192/B=1). Root-caused and fixed the boot J/K
+  first-prefill OOM: the q_pad buffer was per-impl (v1 creates one
+  backend impl per attention layer) — 52 × 256 MiB = 13.3 GiB;
+  ClassVar share cut the transient 3.785 → 1.285 GiB and made bt4096
+  TP=2 serving viable (the bt2048 workaround is droppable). Records:
+  `DEVLOG-muse-glimmer.md` (rounds 1–5), `degradation*.md` boots I–L,
+  working TP=2 recipe in `README.md`. Review rounds 1–3 + the
+  post-boot-L review set (`fa_oom_fix_clip_code_rev_*.md`) closed;
+  the two robustness gaps they flagged (raw-fp16 branch assert,
+  GATHER_CLIP_MARGIN/config-table static_assert) landed in
+  `52ff21f9d9`.
+
 ## 2026-08-14–16
 
 - **Phase 3 gfx906 performance stack.** The custom W4A16 MoE grouped GEMM
