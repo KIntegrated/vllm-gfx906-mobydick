@@ -617,3 +617,71 @@ kill switch, clean 256k prefill + needle retrieval under the fix,
 flat decode A/B). Qwen3.8-27B TP=2 256k prefill now works at the run-4
 config; the 131k ceiling in `oom-256k-prefill.md` is lifted for this
 consumer.
+
+## 2026-08-28 — Q8-dot ISA rates measured: the M5 "fp32-ALU" premise is wrong; LEGACY=0 is not salvageable by an instruction swap (analysis, no code)
+
+## HYPOTHESIS
+
+If M5's architectural reading is right — "gfx906 has no int8 matrix
+path, so the Q8 FA dot runs as fp32 ALU where fp16 uses FMA" — then
+the KQ dot is compute-disadvantaged and LEGACY=0 could be salvaged by
+a better dot instruction (dp4a, v_dot2_f32_f16, or v_dot8_i32_i4).
+
+## What was done
+
+Analysis-only session (probe + roofline; no kernel code touched):
+
+1. **Instruction audit**: both LEGACY arms run the identical FA kernel
+   and the identical inner loop — `ggml_cuda_dp4a` →
+   `__builtin_amdgcn_sdot4` → `v_dot4_i32_i8` (ggml_shim.cuh:158,
+   fattn-q8.cuh KQ loop, 8 dp4a per 32-elem block). V is fp16 in-cache
+   and its product runs as packed half2 FMA. dp4a is *already in use*;
+   there is nothing to swap in.
+2. **Rate probe** (method + numbers: `dequant-instructions.md` "Measured
+   dot-instruction rates"): dot4 is **full rate on gfx906 — 4 int8
+   MAC/lane/cycle, 4.44× fp32 FMA, 2× packed fp16** (25.9 T MAC/s ≈
+   AMD's 53 TOPS INT8 for MI50). dot8 is full rate too (8.52×). The
+   expansion composites are dead (0.17×/0.24×). Launch-regime evidence
+   by construction (pure-ALU probe, no serving gate applicable).
+3. **Roofline (D=128, B=1 decode)**: per KV row the gather moves
+   512 B (LEGACY=1: K fp16 256 + V fp16 256) vs 392 B nominal
+   (LEGACY=0: K q8 136 + V 256); the FA kernel's ALU per (row, packed
+   col) is ~96 pipe-cycles (32 dot4 + 64 half2) + overheads. Machine
+   balance 800 GB/s ÷ ~5.8 T lane-cycles/s ⇒ the read path is
+   HBM-bound by ~2.7× even at NC2=8 — no ALU substitution can surface
+   at B=1 decode. (Analytic; the M5 serving A/B stays the gate for any
+   future flip.)
+4. **Read-layout attribution of the M5 deltas** (mechanism, code-level):
+   the Q8 alias packs 4×34 B q8_0 blocks into the first 136 B of every
+   256-B fp16 K row (`_ensure_q8_sidebuffer`, `key_cache.view(uint8)
+   [..., :136]`). The V2 fused-Q8 gather therefore reads 136 B out of
+   every 256-B stride (8×uint4 + 1×uint2 + 120 B gap per token):
+   5 sectors fetched per row for 136 B useful (≤85% efficiency,
+   416/512 = 1.23× effective lean, not the nominal 1.31×), plus tail
+   handling on every token. LEGACY=1's gather reads 16 aligned uint4
+   per row and quantizes — more bytes, more ALU, but clean bursts.
+   At B≥2 direct-paged reads the same misaligned slices straight from
+   pages with per-row indirection — the −27…−31% (vs LEGACY=1's
+   aligned fp16 slices through the same direct-paged path).
+
+## GATE
+
+Instruction-rate probe (SCEV-proof, native ISA verified) + roofline;
+the M5 serving A/B remains the only gate that can flip the default.
+
+## VERDICT
+
+**DEAD-END for the "salvage via a better dot instruction" hypothesis —
+refuted on both halves: the Q8 dot is already the chip's fastest dot
+(full-rate sdot4, 2× packed fp16), and the B=1 decode path is
+gather-HBM-bound (~2.7×), so no instruction change can surface.
+Nothing to revert (analysis-only).** The M5 *decision* (keep LEGACY=1)
+stands. The M6 framing is corrected: gap (a) (per-block rescale tax)
+cannot be the B=1 cause (ALU not on the critical path); gap (b) is
+confirmed and sharpened — the deficit is the aliased-Q8 *read layout*
+(136-of-256 B slices, 34-B block strides), not the dot. Salvage path
+is layout work (aligned quants/scale planes, or B≥2 via gather), and
+the only instruction-level upside left is a Q4-KV format change that
+unlocks native `v_dot8_i32_i4` (2× dot4 MAC rate at half the operand
+bytes, no unpack ALU) — roadmap M6 (rewritten), PPL-gated. Rates
+recorded in `dequant-instructions.md`.

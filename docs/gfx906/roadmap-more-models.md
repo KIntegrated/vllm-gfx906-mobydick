@@ -239,6 +239,53 @@ Boot L closed out with a 3rd wedge burst → boot M (this bake); boot
 M's own 15:00Z weight-load wedge (isolated, self-recovered) made the
 bake attempt 2.
 
+### M6 — LEGACY=0 salvage: read-layout fix first, Q4-KV/dot8 as the ISA upside (M5 follow-up, re-opens the flip gate)
+
+**Reframed 2026-08-28** after the ISA rate probe (`DEVLOG-fa-attention.md`
+2026-08-28 entry; rates in `dequant-instructions.md`): the original
+"close the Q8-dot compute gap" premise is wrong — `v_dot4_i32_i8` is
+full-rate on gfx906 (25.9 T MAC/s, 4.44× fp32 FMA, 2× packed fp16;
+AMD's 53 TOPS INT8 for MI50 is this instruction) and already in the
+inner loop; the B=1 decode path is gather-HBM-bound (~2.7× at D=128,
+NC2=8), so the old item (a) (per-block fp16-rescale batching) cannot
+surface at B=1 and is deprioritized to hygiene. What the M5 deltas
+actually measure — confirmed at code level:
+
+- **(b′) aliased-Q8 read layout (the B=1 −2.5…−3.7 % and the B=4
+  −27…−31 % share this root)**: the Q8 side view packs 4×34 B q8_0
+  blocks into the first 136 B of every 256-B fp16 K row, so every
+  consumer reads 136 B out of a 256-B stride (5 sectors fetched, ≤85 %
+  efficiency; 34-B block strides break 16-B vector alignment; V2
+  gather pays a uint2 tail every token). Fix candidates, in order:
+  1. **Repack the side view into aligned planes** — contiguous
+     16-B-aligned quants plane (128 B/row at D=128) + separate scale
+     plane (8 B/row); write-path quantize and gather/direct-paged
+     readers updated together. Converts the nominal 512→392 B/row
+     (1.31×) into an actual gather win instead of today's net loss;
+     grows with context (8k+ points gain the most).
+  2. **B≥2: route LEGACY=0 through the fused-Q8 gather** (1:1 byte
+     copy, half the fp16 gather's read) instead of direct-paged
+     misaligned slices — recovers the −27…−31 % before the repack
+     even lands.
+- **(c) Q4-KV via native `v_dot8_i32_i4` — the only instruction-level
+  upside left**: measured 49.6 T MAC/s (8.52× fp32, 2× dot4) with
+  packed-nibble operands on BOTH sides and zero unpack ALU in the dot
+  loop. K q4_0-style = 72 B/row (vs 136 q8 / 256 fp16); with V→Q8
+  (dot4, 136 B) or V→Q4 the row read drops to 208/144 B (2.5–3.6×
+  leaner than LEGACY=1's 512) and the KQ/V ALU halves again. Costs:
+  Q must be i4-packed too (per-forward Q8→Q4 requant or direct Q4
+  quantize), a new write-path quantizer + layout, and the accuracy
+  gate (PPL probe bands on the 442-token set; Q4 V is the risk item —
+  llama.cpp ships q8/q4 KV caches as precedent). Large-context models
+  (Qwen3.8-27B 256k, Muse-Glimmer 16k+) are the beneficiaries.
+
+Old M6 text (pre-reframe, kept for the record): two inferred causes —
+(a) per-block rescale tax around the (already-correct) dp4a dot, (b)
+direct-paged strided reads — neither measured; plan file
+`plan_fa_legacy0_impr_claude.md`. Non-blocking; re-opens the M5 flip
+gate only on a green B=1 **and** B=4 serving A/B — a B=1-only win does
+not justify a flip per the M5 rule.
+
 ### Housekeeping — drop the legacy `~/env-rocm-7.14-gfx906.sh` sourcing
 
 The machine has a single ROCm toolchain now (/opt/rocm is the default),

@@ -29,6 +29,7 @@ DEVLOG). Pattern: **hypothesis → gate → verdict → commit/revert → commen
 | GEMV V2 (RPT=2+kc=4096) for skinny dense | micro-bench | **NEUTRAL** | kept per-shape | qkv/router win, N=1024 pathological (−533%), based on shape rule | D |
 | llama.cpp Q5_K_XL baseline | — | **IMPOSSIBLE** (36 GiB > 32 GB) | — | won't fit; used Q4_K_XL instead (70.3 t/s ref) | M0 |
 | FA V2 fused gather (416 WG, barriers) in serving | serving graph | **REJECTED** (V1 wins) | `GFX906_FA_GATHER_V=2` | V2 degrades 7× in serving (285 µs) vs V1 42 — wave-scheduling/low-WG effect | FA |
+| salvage LEGACY=0 via a better dot instruction (dp4a/dot2/dot8 swap in the KQ loop) | ISA rate probe + roofline (analytic) | **DEAD-END** (analysis) | — | dp4a/`v_dot4_i32_i8` already the inner loop and measured FULL-RATE (4.44× fp32, 2× packed fp16); B=1 decode is gather-HBM-bound ~2.7× so ALU swaps can't surface; expansion composites 0.17–0.24×. Q4/dot8 = format change, roadmap M6(c) | FA |
 
 **Sources:** `M0`=DEVLOG-moe-opt.md · `FA`=DEVLOG-fa-attention.md ·
 `D`=DEVLOG-dense-decode.md · `M1`=DEVLOG-moe-m1-sprint.md ·
