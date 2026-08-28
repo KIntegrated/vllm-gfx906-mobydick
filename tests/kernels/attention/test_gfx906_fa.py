@@ -2007,3 +2007,178 @@ def test_forward_paged_gather_window_clip_short_ctx():
     finally:
         paged._GATHER_CLIP, paged._DIRECT_PAGED_MODE = old_clip, old_mode
     assert (out_on - out_off).abs().max().item() < 1e-7
+
+
+# ---------------------------------------------------------------------------
+# M1 clip on the FUSED Q8 gather (LEGACY=0 read path). Same A/B as
+# test_forward_paged_gather_window_clip_bit_identical, but the K half is
+# the production Q8 ALIAS of the fp16 cache (gfx906_fa_backend.
+# _ensure_q8_sidebuffer), so forward_paged dispatches to the fused
+# gather_paged_kv_q8 kernel instead of the persistent fp16 one. The
+# clipped output must be bit-identical to the clip-off arm: the skipped
+# prefix is fully window-masked in both arms (clip start = first query
+# row's window start; later rows' windows are subsets). Direct-paged
+# dispatch is forced off so B=2 exercises the GATHER path.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("nq, B, L, W",
+                         [(1, 1, 4353, 2048),   # decode, unaligned start
+                          (1, 2, 4353, 2048),   # decode, gather-forced B=2
+                          (6, 1, 4353, 2048),   # ngram n=5 (Sq=6)
+                          (6, 2, 4353, 2048)])
+def test_forward_paged_fusedq8_window_clip_bit_identical(nq, B, L, W):
+    from vllm.gfx906_fa import gfx906_fa_paged as paged
+    dev = "cuda"
+    torch.manual_seed(17)
+    scale = 1.0 / math.sqrt(D)
+
+    # Disjoint per-seq block ranges (B=2 must not share rows).
+    nb = (L + BLOCK - 1) // BLOCK
+    n_blocks = B * nb
+    _, vc, kv = _make_paged_cache(n_blocks + 4, dev)
+    key_cache = kv[:, 0]
+    # EXACT production LEGACY=0 alias: first BYTES of each fp16 K row.
+    kc = key_cache.view(torch.uint8)[:, :, :, :BYTES]
+    K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    V = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    for b in range(B):
+        s0 = b * nb * BLOCK
+        # Production write order: fp16 K write first (clobbers the
+        # aliased Q8 bytes), then the Q8 write to the same memory.
+        stag = torch.zeros_like(kv[b * nb:(b + 1) * nb, 0])
+        stag.view(-1, HKV, D)[:L].copy_(K[s0:s0 + L])
+        kv[b * nb:(b + 1) * nb, 0].copy_(stag)
+        fa.reshape_and_cache_q8(
+            K[s0:s0 + L],
+            torch.arange(s0, s0 + L, dtype=torch.int64, device=dev), kc)
+        _write_v(kv[b * nb:(b + 1) * nb], V[s0:s0 + L])
+
+    bt = torch.stack([torch.arange(b * nb, (b + 1) * nb, dtype=torch.int32)
+                      for b in range(B)]).contiguous().to(dev)
+    sl = torch.full((B,), L, dtype=torch.int32, device=dev)
+    cu = torch.arange(0, B * nq + 1, nq, dtype=torch.int32, device=dev)
+    q = torch.randn(B * nq, HQ, D, device=dev, dtype=torch.float32) * 0.5
+
+    old_clip, old_mode = paged._GATHER_CLIP, paged._DIRECT_PAGED_MODE
+    try:
+        paged._DIRECT_PAGED_MODE = "0"   # force the gather path
+        paged._GATHER_CLIP = False
+        out_off = paged.forward_paged(
+            q, key_cache, vc, bt, sl, cu,
+            max_seqlen_q=nq, max_seqlen_k=L, scale=scale, window=W,
+            key_cache_q8=kc)
+        paged._GATHER_CLIP = True
+        out_on = paged.forward_paged(
+            q, key_cache, vc, bt, sl, cu,
+            max_seqlen_q=nq, max_seqlen_k=L, scale=scale, window=W,
+            key_cache_q8=kc)
+    finally:
+        paged._GATHER_CLIP, paged._DIRECT_PAGED_MODE = old_clip, old_mode
+    # The skipped prefix is fully window-masked; the clip must not change
+    # a single bit (the persistent-path twin test documents the failure
+    # class this guards).
+    assert (out_on - out_off).abs().max().item() < 1e-7
+
+
+def test_forward_paged_fusedq8_window_clip_short_ctx():
+    """L < window on the fused Q8 path: kv_start = 0 everywhere (clip
+    inert) — the gather must still be a full gather and the output
+    bit-identical to the clip-off arm (guards against the clip math
+    firing on clamped-zero starts)."""
+    from vllm.gfx906_fa import gfx906_fa_paged as paged
+    dev = "cuda"
+    torch.manual_seed(19)
+    B, L, W, nq = 1, 513, 2048, 1
+    scale = 1.0 / math.sqrt(D)
+    nb = (L + BLOCK - 1) // BLOCK
+    n_blocks = B * nb
+    _, vc, kv = _make_paged_cache(n_blocks + 4, dev)
+    key_cache = kv[:, 0]
+    kc = key_cache.view(torch.uint8)[:, :, :, :BYTES]
+    K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    V = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    stag = torch.zeros_like(kv[:, 0])
+    stag.view(-1, HKV, D)[:L].copy_(K[:L])
+    kv[:, 0].copy_(stag)
+    fa.reshape_and_cache_q8(
+        K[:L], torch.arange(L, dtype=torch.int64, device=dev), kc)
+    _write_v(kv, V[:L])
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, -1)
+    sl = torch.full((B,), L, dtype=torch.int32, device=dev)
+    cu = torch.arange(0, B * nq + 1, nq, dtype=torch.int32, device=dev)
+    q = torch.randn(B * nq, HQ, D, device=dev, dtype=torch.float32) * 0.5
+    old_clip, old_mode = paged._GATHER_CLIP, paged._DIRECT_PAGED_MODE
+    try:
+        paged._DIRECT_PAGED_MODE = "0"
+        paged._GATHER_CLIP = False
+        out_off = paged.forward_paged(
+            q, key_cache, vc, bt, sl, cu,
+            max_seqlen_q=nq, max_seqlen_k=L, scale=scale, window=W,
+            key_cache_q8=kc)
+        paged._GATHER_CLIP = True
+        out_on = paged.forward_paged(
+            q, key_cache, vc, bt, sl, cu,
+            max_seqlen_q=nq, max_seqlen_k=L, scale=scale, window=W,
+            key_cache_q8=kc)
+    finally:
+        paged._GATHER_CLIP, paged._DIRECT_PAGED_MODE = old_clip, old_mode
+    assert (out_on - out_off).abs().max().item() < 1e-7
+
+
+def test_gather_paged_kv_q8_clip_skips_prefix():
+    """Functional (not A/B): the fused Q8 gather with kv_start must leave
+    rows [0, start) UNTOUCHED (sentinel preserved) and write rows
+    [start, L) bit-equal to the full gather — proving the skip is real
+    and the margin rows are materialized (the A/B bit-identity test
+    cannot distinguish 'clipped correctly' from 'clip silently inert').
+    start = kv_start - GATHER_CLIP_MARGIN (128); L=1025/W=256 ->
+    kv_start=769, start=641 (unaligned)."""
+    dev = "cuda"
+    torch.manual_seed(23)
+    B, L, W = 1, 1025, 256
+    nb = (L + BLOCK - 1) // BLOCK
+    _, vc, kv = _make_paged_cache(nb + 2, dev)
+    key_cache = kv[:, 0]
+    kc = key_cache.view(torch.uint8)[:, :, :, :BYTES]
+    K = torch.randn(nb * BLOCK, HKV, D, device=dev, dtype=torch.float16) * 0.5
+    V = torch.randn(nb * BLOCK, HKV, D, device=dev, dtype=torch.float16) * 0.5
+    stag = torch.zeros_like(kv[:, 0])
+    stag.view(-1, HKV, D)[:L].copy_(K[:L])
+    kv[:, 0].copy_(stag)
+    fa.reshape_and_cache_q8(
+        K[:L], torch.arange(L, dtype=torch.int64, device=dev), kc)
+    _write_v(kv, V[:L])
+    bt = torch.arange(nb, dtype=torch.int32, device=dev).view(1, -1)
+    sl = torch.tensor([L], dtype=torch.int32, device=dev)
+    sk_pad = (L + 31) // 32 * 32
+    kv_start = torch.tensor([L - W], dtype=torch.int32, device=dev)
+
+    # Reference: full gather into fresh buffers.
+    k_full, v_full = fa.gather_paged_kv_q8(kc, vc, bt, sl, sk_pad)
+
+    # Sentinel-filled grow-buffers; the clipped call must keep
+    # [0, start) exactly as the sentinel.
+    margin = 128  # GATHER_CLIP_MARGIN (kernel/gfx906-config.h)
+    start = max(0, kv_start.item() - margin)
+    k_out = torch.full((B, HKV, sk_pad, BYTES), 0xAB,
+                       dtype=torch.uint8, device=dev)
+    v_out = torch.full((B, HKV, sk_pad, D), 1.0,
+                       dtype=torch.float16, device=dev)
+    k_clipped, v_clipped = fa.gather_paged_kv_q8(
+        kc, vc, bt, sl, sk_pad, k_out=k_out, v_out=v_out,
+        kv_start=kv_start)
+    assert k_clipped.data_ptr() == k_out.data_ptr(), "buffer not reused"
+    # [0, start): untouched sentinel (K and V alike — LOCKSTEP with the
+    # persistent kernel, which writes nothing there either).
+    assert (k_out[:, :, :start] == 0xAB).all(), "K prefix was written"
+    assert (v_out[:, :, :start] == 1.0).all(), "V prefix was written"
+    # [start, L): bit-equal to the full gather (margin rows materialized,
+    # data rows exact).
+    assert torch.equal(k_out[:, :, start:L], k_full[:, :, start:L])
+    assert torch.equal(v_out[:, :, start:L], v_full[:, :, start:L])
+    # [L, sk_pad): V zero tail as usual (the clip does not change it).
+    assert (v_out[:, :, L:] == 0.0).all()

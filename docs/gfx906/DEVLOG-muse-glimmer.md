@@ -903,5 +903,74 @@ hygiene, default read-path decision) and the residual review nits
 (F4/F5 class-buffer release + grow-shape checks; F2 seq_lens slice;
 F3 partial-range double-check). CHANGELOG 2026-08-27–28 entry added.
 
+## 2026-08-28 — round 6: M1 clip ported to the fused Q8 gather (LEGACY=0 B=1/prefill) — unit-gated, serving A/B pending (M5)
+
+## HYPOTHESIS
+
+The fused Q8 gather kernels (V1 per-token, the default; V2 paged-
+block, auto-selected at Sk>65535) can take the M1 window clip
+verbatim — same kv_start/margin/absolute-layout contract as the
+persistent kernel — because their dst writes are already at absolute
+token indices. LEGACY=0's B=1 decode + prefill would then scan only
+`[kv_start, seq_len)` like LEGACY=1's, removing the last performance
+argument against flipping the default (M5): pre-port, at 8k ctx the
+unclipped LEGACY=0 fused gather moved ~3× the HBM traffic of the
+clipped LEGACY=1 persistent gather (1164 B × 8192 rows vs 1288 B ×
+2176 rows per sliding layer); post-port it is ~10 % leaner per row
+than LEGACY=1 at every context (no in-kernel quantize, 388 B/row
+K+V read).
+
+## What was done
+
+- `gfx906_fa_gather.cu`: V1 early-returns per token below the per-seq
+  clip start (no V-zero, no K write — LOCKSTEP with the persistent
+  kernel, which writes nothing in `[0, start)` either); V2 early-
+  returns whole paged blocks inside the clipped prefix + per-token
+  skip in all four copy loops; `GATHER_CLIP_MARGIN` moved to the top
+  of the file (visible to all three kernels; still sourced from
+  `kernel/gfx906-config.h`, whose static_assert ties it to the FA
+  table). No fattn-kernel changes (the k-loop floor + margin
+  contract is shared).
+- `gfx906_fa.cpp`: `kv_start` (optional int32 [B]) plumbed through
+  the `gather_paged_kv_q8` binding + launcher; the fp16 fallback
+  caller passes NULL (unclipped, unchanged).
+- `gfx906_fa_paged.py`: the kv_start formula moved to one helper
+  (`_gather_clip_start`), now used by BOTH the fused branch (new) and
+  the persistent branch (inline copy replaced — no formula drift
+  possible); the fused branch passes it to the gather binding, and
+  the existing FA call already receives it. Fallback sub-paths
+  (torch-gather / two-kernel / fused-quant) intentionally stay
+  unclipped (kv_start=None → FA full scan — unchanged behavior).
+- F1 (review): `_ensure_q8_sidebuffer` fit-assert now checks
+  `D * key_cache.element_size()` instead of `2 * D` (the fp8-KV +
+  D≤64 slice-clamp hole); stale "88 B" Q8-row docstring corrected
+  to 136.
+- Tests: fused-Q8 alias A/B bit-identity (clip on/off), Sq∈{1,6} ×
+  B∈{1,2} @ L=4353/W=2048 (unaligned start 2305); short-ctx inert
+  (L=513<W, kv_start=0); functional prefix-skip (sentinel buffer,
+  kv_start=769/margin=128: rows [0,641) untouched K and V, rows
+  [641,1025) bit-equal to the full gather, V tail still zeroed) —
+  the A/B form alone cannot distinguish "clipped correctly" from
+  "clip silently inert".
+
+## GATE
+
+Unit: the five new tests above + full suite (57). Serving: NOT this
+round — the M5 gate (LEGACY=0 vs LEGACY=1 TP=2 A/B, B=1 + B=4 @ 8k,
+canary green, plus the two remaining e2e gaps (a) LEGACY=1 +
+direct-paged + clip and (b) B=4 long-ctx clip on/off) decides the
+default flip separately.
+
+## VERDICT
+
+**PASS (unit level).** 57/57 on the rebuilt `_gfx906_fa_C` (boot L).
+V2's clip is covered by LOCKSTEP inspection only — `GFX906_FA_GATHER_V`
+is process-global (read once), so a V2 unit A/B is not expressible in
+the existing suite; flagged for the M2 hygiene batch (same as the
+other V2 gaps). Prefill-under-clip on the fused path inherits the M1
+e2e result (the persistent twin was e2e-gated at pp8192 with the
+identical kv_start contract); a fused-path prefill A/B is folded into
+the M5 serving bake.
+
 ---
 Copyright Kevin Read <me@kevin-read.com>

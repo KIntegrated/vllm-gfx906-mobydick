@@ -213,12 +213,16 @@ long context.
 
 ### M5 — default read-path decision after a bake
 
-LEGACY=0 (Q8 pre-quantized read) is validated (46/46 suite,
-default-config + prefix-cache smokes, clip +3.6% / KVSPLIT +1.8%
-gates) but stays experimental: B=1 still runs gather (no clip, inline
-quantize — LEGACY=0 changes nothing at B=1 until M1 lands), the
-LEGACY=1 TP=2 serving records (boot K, 2026-08-27: 114.6/79.1/57.0
-@2k/8k/16k) postdate it, and two e2e gaps are open: (a) the LEGACY=1 +
+LEGACY=0 (Q8 pre-quantized read) is validated (suite green incl. the
+round-6 fused-clip tests, default-config + prefix-cache smokes, clip
++3.6% / KVSPLIT +1.8% gates) but stays experimental. As of round 6
+(2026-08-28, post-promotion) the M1 clip covers BOTH gather paths —
+the fused Q8 gather (LEGACY=0) and the persistent fp16 gather
+(LEGACY=1) — so the pre-port "B=1 has no clip under LEGACY=0" gap is
+closed at unit level (57/57; DEVLOG-muse-glimmer.md round 6). What
+keeps it experimental: the LEGACY=1 TP=2 serving records (boot K/L:
+111.5/99/46.7 @2k/8k/B=4) postdate the fix and no LEGACY=0 serving
+track record exists, and two e2e gaps remain open: (a) the LEGACY=1 +
 direct-paged + clip combination (what auto-gating selects at B≥2 under
 default LEGACY) has never been separately e2e-gated — the clip A/B ran
 LEGACY=0; (b) the boot K B=4 grid point ran at ctx ≤2k where the clip

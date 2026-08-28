@@ -313,6 +313,32 @@ def _gather_kv_q8(
     return k_bhsd, v_bhsd
 
 
+def _gather_clip_start(seq_lens: torch.Tensor,
+                       cu_seqlens_q: torch.Tensor,
+                       window: int,
+                       num_seqs: int) -> torch.Tensor:
+    """M1: per-seq window-clip start for the gather path.
+
+    Conservative (safe) start: the FIRST query row's window start,
+    kv_start[s] = max(0, seq_lens[s] - n_q[s] + 1 - window). Later rows'
+    windows are subsets, so clipping the gather at this start never
+    skips a key any row needs. Returns int32 [num_seqs].
+
+    LOCKSTEP: single source of truth for the formula, used by both the
+    fused Q8 branch and the persistent fp16 branch of forward_paged;
+    the gather kernels re-derive the actual skip start with
+    GATHER_CLIP_MARGIN (see gfx906_fa_gather.cu).
+    """
+    sl_i64 = (seq_lens.to(torch.int64)
+              if seq_lens.dtype != torch.int64 else seq_lens)
+    cu_i64 = (cu_seqlens_q.to(torch.int64)
+              if cu_seqlens_q.dtype != torch.int64 else cu_seqlens_q)
+    n_q_per_seq = cu_i64[1:num_seqs + 1] - cu_i64[:num_seqs]
+    q_abs = sl_i64 - n_q_per_seq
+    return ((q_abs + (1 - window)).clamp_(min=0)
+            .to(torch.int32).contiguous())
+
+
 def forward_paged(
     query: torch.Tensor,            # [num_tokens, Hq, D] fp16 (cast into fp32 q_pad)
     key_cache: torch.Tensor,        # [num_blocks, block_size, Hkv, D]  fp16
@@ -567,12 +593,24 @@ def forward_paged(
                  else seq_lens.to(torch.int32))
         bt_i32 = bt_i32.contiguous()
         sl_i32 = sl_i32.contiguous()
+        if _GATHER_CLIP and window > 0:
+            # M1 (LOCKSTEP with the persistent branch below): per-seq
+            # clip start — the fused Q8 gather skips tokens [0, start)
+            # and the FA k-loop starts at floor(start); the gather
+            # margin guarantees the floored start is materialized.
+            kv_start_tensor = _gather_clip_start(
+                seq_lens, cu_seqlens_q, window, num_seqs)
         K_q8, V_bhsd = gfx906_fa.gather_paged_kv_q8(
             key_cache_q8, value_cache, bt_i32, sl_i32, Sk_pad,
             k_out=k_exact, v_out=v_exact,
+            kv_start=kv_start_tensor,
         )
         # K_q8: [B, Hkv, Sk_pad, bytes]; V_bhsd: [B, Hkv, Sk_pad, D] — уже padded.
-        if _DOUBLE_CHECK:
+        if _DOUBLE_CHECK and kv_start_tensor is None:
+            # Clipped gather leaves rows [0, start) stale BY DESIGN (the
+            # FA k-loop never reaches them) — the full-range torch
+            # comparison would false-fail (same gate as the persistent
+            # branch; the partial-range check stays deferred, review F3).
             k_ref, v_ref = _gather_kv_q8(
                 key_cache_q8, value_cache, block_table, seq_lens, max_seqlen_k)
             ke = torch.equal(k_ref, K_q8[:, :, :max_seqlen_k])
@@ -640,20 +678,11 @@ def forward_paged(
                 # GFX906_FA_PERSIST_MARGIN). num_seqs > _PERSIST_MAX_SEQS
                 # falls through to the fused/two-kernel paths below.
                 if _GATHER_CLIP and window > 0:
-                    # M1: conservative per-seq start = the FIRST query
-                    # row's window start (later rows' windows are
-                    # subsets). q_abs = seq_len - n_q (see the
-                    # q_abs_offset computation below; same formula).
-                    sl_i64 = (seq_lens.to(torch.int64)
-                              if seq_lens.dtype != torch.int64 else seq_lens)
-                    cu_i64 = (cu_seqlens_q.to(torch.int64)
-                              if cu_seqlens_q.dtype != torch.int64
-                              else cu_seqlens_q)
-                    n_q_per_seq = cu_i64[1:num_seqs + 1] - cu_i64[:num_seqs]
-                    q_abs = sl_i64 - n_q_per_seq
-                    kv_start_tensor = ((q_abs + (1 - window))
-                                       .clamp_(min=0)
-                                       .to(torch.int32).contiguous())
+                    # M1: conservative per-seq clip start (see
+                    # _gather_clip_start; LOCKSTEP with the fused Q8
+                    # branch above).
+                    kv_start_tensor = _gather_clip_start(
+                        seq_lens, cu_seqlens_q, window, num_seqs)
                 K_q8, V_bhsd = gfx906_fa.gather_paged_kv_quant_persistent(
                     key_cache, value_cache, bt_i32, sl_i32, Sk_arg,
                     k_out=kbuf, v_out=vbuf,

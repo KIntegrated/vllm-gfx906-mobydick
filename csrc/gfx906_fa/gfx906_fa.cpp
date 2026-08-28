@@ -248,6 +248,7 @@ extern "C" hipError_t launch_gather_paged_kv_q8(
     const __half  * value_cache,
     const int32_t * block_table,
     const int32_t * seq_lens,
+    const int32_t * kv_start,   // M1 clip, may be NULL
     uint8_t       * k_out,
     __half        * v_out,
     int num_seqs,
@@ -614,7 +615,8 @@ std::vector<torch::Tensor> gather_paged_kv_q8(
     torch::Tensor seq_lens,      // int32 [num_seqs]
     int64_t Sk,
     c10::optional<torch::Tensor> k_out_opt = c10::nullopt,  // uint8 [B,Hkv,Sk,bytes] — grow-buffer
-    c10::optional<torch::Tensor> v_out_opt = c10::nullopt   // fp16  [B,Hkv,Sk,D]
+    c10::optional<torch::Tensor> v_out_opt = c10::nullopt,   // fp16  [B,Hkv,Sk,D]
+    c10::optional<torch::Tensor> kv_start_opt = c10::nullopt // int32  [B], M1 clip
 ) {
     TORCH_CHECK_CUDA(key_cache_q8);
     TORCH_CHECK_CUDA(value_cache);
@@ -701,12 +703,27 @@ std::vector<torch::Tensor> gather_paged_kv_q8(
     TORCH_CHECK(key_cache_q8.stride(3) == 1 && value_cache.stride(3) == 1,
                 "gather_paged_kv_q8: last dim must be contiguous");
 
+    // M1 window clip: per-seq absolute start; tokens [0, start) are not
+    // written (the FA k-loop starts at floor(kv_start), which the gather
+    // margin keeps materialized — see the kernel docs in
+    // gfx906_fa_gather.cu). NULL = full gather (unchanged behavior).
+    const int32_t * kv_start_ptr = nullptr;
+    if (kv_start_opt.has_value()) {
+        const auto & ks = kv_start_opt.value();
+        TORCH_CHECK(ks.dtype() == torch::kInt32, "kv_start must be int32");
+        TORCH_CHECK(ks.is_contiguous(), "kv_start must be contiguous");
+        TORCH_CHECK(ks.dim() == 1 && ks.size(0) == num_seqs,
+                    "kv_start must be [num_seqs]");
+        kv_start_ptr = ks.data_ptr<int32_t>();
+    }
+
     auto stream = c10::hip::getCurrentHIPStream().stream();
     hipError_t err = launch_gather_paged_kv_q8(
         key_cache_q8.data_ptr<uint8_t>(),
         reinterpret_cast<const __half*>(value_cache.data_ptr<at::Half>()),
         block_table.data_ptr<int32_t>(),
         seq_lens.data_ptr<int32_t>(),
+        kv_start_ptr,
         k_out.data_ptr<uint8_t>(),
         reinterpret_cast<__half*>(v_out.data_ptr<at::Half>()),
         num_seqs, num_kv_heads, (int)Sk, D, bytes_per_row, block_size,
@@ -807,6 +824,7 @@ std::vector<torch::Tensor> gather_paged_kv_fp16(
         reinterpret_cast<const __half*>(value_cache.data_ptr<at::Half>()),
         block_table.data_ptr<int32_t>(),
         seq_lens.data_ptr<int32_t>(),
+        nullptr,   // no clip: the fp16 fallback path keeps full gather
         reinterpret_cast<uint8_t*>(k_out.data_ptr<at::Half>()),
         reinterpret_cast<__half*>(v_out.data_ptr<at::Half>()),
         num_seqs, num_kv_heads, (int)Sk, D, bytes_per_row, block_size,
@@ -1304,11 +1322,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused gather: paged K_q8 + paged V_fp16 → contiguous BHSD outputs. "
           "Returns [k_out, v_out]. V tail zeroed per seq_lens; K tail unmasked. "
           "k_out/v_out: optional pre-allocated buffers (exact shape match) to "
-          "avoid peak VRAM spikes on large Sk.",
+          "avoid peak VRAM spikes on large Sk. kv_start (M1 clip): per-seq "
+          "absolute start; tokens [0, start) are not written (LOCKSTEP with "
+          "the persistent gather kernel).",
           py::arg("key_cache_q8"), py::arg("value_cache"),
           py::arg("block_table"), py::arg("seq_lens"), py::arg("Sk"),
           py::arg("k_out") = c10::nullopt,
-          py::arg("v_out") = c10::nullopt);
+          py::arg("v_out") = c10::nullopt,
+          py::arg("kv_start") = c10::nullopt);
     m.def("gather_paged_kv_fp16", &gather_paged_kv_fp16,
           "LEGACY-path fused gather: paged fp16 K + paged fp16 V -> contiguous "
           "BHSD outputs. Returns [k_out, v_out]. V tail zeroed per seq_lens; "

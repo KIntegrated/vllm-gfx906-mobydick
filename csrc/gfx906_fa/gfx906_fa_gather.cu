@@ -54,6 +54,13 @@
 #include "kernel/q8_0_quantize.cuh"
 #include "kernel/gfx906-config.h"
 
+// M1 window-clip margin — defined once here (visible to every gather
+// kernel in this file), shared with the FA config table via
+// kernel/gfx906-config.h: fattn-q8.cuh's config macro static-asserts
+// nbatch_fa <= this value, so a table edit that outgrows the margin
+// fails to compile instead of silently under-covering the clip.
+constexpr int GATHER_CLIP_MARGIN = GFX906_FA_GATHER_CLIP_MARGIN;
+
 // ---------------------------------------------------------------------------
 // Fused gather K_q8 + V_fp16 → contiguous BHSD.
 //
@@ -62,16 +69,29 @@
 //   value_cache   [num_blocks, block_size, Hkv, D]              fp16
 //   block_table   [num_seqs, max_num_blocks]                    int32
 //   seq_lens      [num_seqs]                                    int32
+//   kv_start      [num_seqs]                                    int32 (may be NULL)
 //   k_out         [num_seqs, Hkv, Sk, bytes_per_row]            uint8
 //   v_out         [num_seqs, Hkv, Sk, D]                        fp16
 //
 // Sk = max_seqlen_k (the host rounds it up to a multiple of 32).
+//
+// M1 window clip (LOCKSTEP with the persistent kernel below): with
+// non-null kv_start, per-seq tokens [0, start) are NOT written,
+// start = max(0, kv_start[s] - GATHER_CLIP_MARGIN) clamped to
+// min(seq_len, Sk). Rows are written at ABSOLUTE token indices, so the
+// FA kernel's k-loop start (floor(kv_start, nbatch_fa)) indexes k_out/
+// v_out directly; GATHER_CLIP_MARGIN (kernel/gfx906-config.h) guarantees
+// the floored start is always materialized (its static_assert ties the
+// FA config table to this margin). Tokens [0, start) are never read by
+// the FA kernel — its window mask covers [0, kv_start) and the k-loop
+// starts at floor(kv_start) >= start.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void gather_paged_kv_q8_kernel(
     const uint8_t * __restrict__ key_cache_q8,
     const __half  * __restrict__ value_cache,
     const int32_t * __restrict__ block_table,
     const int32_t * __restrict__ seq_lens,
+    const int32_t * __restrict__ kv_start,
     uint8_t       * __restrict__ k_out,
     __half        * __restrict__ v_out,
     int num_seqs,
@@ -99,6 +119,24 @@ extern "C" __global__ void gather_paged_kv_q8_kernel(
     int seq_len = 0;
     if (lane == 0) seq_len = seq_lens[seq_idx];
     seq_len = __shfl(seq_len, 0, 64);
+
+    // M1 window clip (LOCKSTEP with the persistent kernel below): tokens
+    // below the per-seq clip start are not written (FA never reads them —
+    // see the kernel doc). The stale prefix stays as the buffer's
+    // previous content: finite (previous layer's rows), never visited.
+    int clip_start = 0;
+    if (kv_start) {
+        int kv0 = 0;
+        if (lane == 0) kv0 = kv_start[seq_idx];
+        kv0 = __shfl(kv0, 0, 64);
+        if (kv0 > 0) {
+            const int sl = seq_len < Sk ? seq_len : Sk;
+            clip_start = kv0 - GATHER_CLIP_MARGIN;
+            if (clip_start < 0) clip_start = 0;
+            if (clip_start > sl) clip_start = sl;
+        }
+    }
+    if (tok_pos < clip_start) return;
 
     // Same for block_table[seq, tok_pos / block_size].
     const int block_tab_idx = tok_pos / block_size;
@@ -200,6 +238,12 @@ extern "C" __global__ void gather_paged_kv_q8_kernel(
 //   dst:  [num_seqs, Hkv, Sk, bytes_per_row | D]
 //   Sk is a multiple of 32 (host rounds it).
 //
+// M1 window clip (LOCKSTEP with the persistent kernel): with non-null
+// kv_start, per-seq tokens [0, start) are not written, start = max(0,
+// kv_start[s] - GATHER_CLIP_MARGIN) clamped to min(seq_len, Sk); the FA
+// k-loop starts at floor(kv_start) >= start (absolute-position dst
+// layout — see the V1 kernel doc above).
+//
 // bytes_per_row = (D/32)*34 for q8_0 (D=128 -> 136 bytes). Not a multiple
 // of 16, so for K we do 8xuint4 (128 bytes) + a 1xuint2 (8 bytes) tail.
 // For V (D*2 bytes, D%4==0) it is fully 16-aligned -> pure uint4 loads.
@@ -209,6 +253,7 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
     const __half  * __restrict__ value_cache,
     const int32_t * __restrict__ block_table,
     const int32_t * __restrict__ seq_lens,
+    const int32_t * __restrict__ kv_start,
     uint8_t       * __restrict__ k_out,
     __half        * __restrict__ v_out,
     int num_seqs,
@@ -237,8 +282,10 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
     // ---------- Read phys_block + seq_len ONCE per workgroup ----------
     __shared__ int s_phys_block;
     __shared__ int s_seq_len;
+    __shared__ int s_clip_start;
     if (tid == 0) {
         s_seq_len = seq_lens[seq_idx];
+        s_clip_start = kv_start ? kv_start[seq_idx] : 0;
         const int block_tab_idx = block_start_tok / block_size;
         s_phys_block = (block_tab_idx < max_blocks_per_seq)
             ? block_table[seq_idx * max_blocks_per_seq + block_tab_idx]
@@ -247,6 +294,19 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
     __syncthreads();
     const int phys_block = s_phys_block;
     const int seq_len    = s_seq_len;
+
+    // M1 window clip (LOCKSTEP with the persistent kernel below): tokens
+    // below the per-seq clip start are not written (FA never reads them —
+    // see the V1 kernel doc).
+    const int sl = seq_len < Sk ? seq_len : Sk;
+    int clip_start = 0;
+    if (s_clip_start > 0) {
+        clip_start = s_clip_start - GATHER_CLIP_MARGIN;
+        if (clip_start < 0) clip_start = 0;
+        if (clip_start > sl) clip_start = sl;
+    }
+    // Entire paged block inside the clipped prefix: no work.
+    if (block_start_tok + block_size <= clip_start) return;
 
     // Source base pointers (for a valid phys_block).
     const uint8_t * k_src_base_bh = (phys_block >= 0)
@@ -312,6 +372,7 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
         const int c = idx - t * v_n_u4;
         const int tok_global = block_start_tok + t;
         if (tok_global >= Sk) continue;
+        if (tok_global < clip_start) continue;   // M1 clip: no write
 
         const bool tok_valid = !full_oob && (tok_global < seq_len);
         uint4 val;
@@ -333,6 +394,7 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
             const int c = idx - t * k_n_u4;
             const int tok_global = block_start_tok + t;
             if (tok_global >= Sk) continue;
+            if (tok_global < clip_start) continue;  // M1 clip: leave stale
             if (tok_global >= seq_len) continue;  // out-of-range — leave K
 
             const uint8_t * k_src_tok = k_src_base_bh + (int64_t)t * cache_token_stride;
@@ -348,6 +410,7 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
                 const int c = idx - t * k_tail_u2;
                 const int tok_global = block_start_tok + t;
                 if (tok_global >= Sk) continue;
+                if (tok_global < clip_start) continue;  // M1 clip: leave stale
                 if (tok_global >= seq_len) continue;
 
                 const uint8_t * k_src_tail = k_src_base_bh
@@ -366,6 +429,7 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
                 const int c = idx - t * k_tail_byte;
                 const int tok_global = block_start_tok + t;
                 if (tok_global >= Sk) continue;
+                if (tok_global < clip_start) continue;  // M1 clip: leave stale
                 if (tok_global >= seq_len) continue;
                 const int base = (k_n_u4 << 4) + (k_tail_u2 << 3);
                 const uint8_t * k_src_tok = k_src_base_bh + (int64_t)t * cache_token_stride;
@@ -540,8 +604,6 @@ extern "C" __global__ void gather_paged_kv_quant_kernel(
 // indices, so the FA k-loop start (floor(kv_start)) indexes this buffer
 // directly — no compaction, no reindexing.
 // ---------------------------------------------------------------------------
-constexpr int GATHER_CLIP_MARGIN = GFX906_FA_GATHER_CLIP_MARGIN;
-
 extern "C" __global__ void gather_paged_kv_quant_persistent_kernel(
     const __half  * __restrict__ key_cache,
     const __half  * __restrict__ value_cache,
@@ -769,6 +831,7 @@ extern "C" hipError_t launch_gather_paged_kv_q8(
     const __half  * value_cache,
     const int32_t * block_table,
     const int32_t * seq_lens,
+    const int32_t * kv_start,   // M1 clip (LOCKSTEP), may be NULL
     uint8_t       * k_out,
     __half        * v_out,
     int num_seqs,
@@ -811,7 +874,7 @@ extern "C" hipError_t launch_gather_paged_kv_q8(
         dim3 grid(num_seqs, num_kv_heads, Sk);
         gather_paged_kv_q8_kernel<<<grid, block, 0, stream>>>(
             key_cache_q8, value_cache,
-            block_table, seq_lens,
+            block_table, seq_lens, kv_start,
             k_out, v_out,
             num_seqs, num_kv_heads, Sk, D, bytes_per_row, block_size,
             max_blocks_per_seq,
@@ -825,7 +888,7 @@ extern "C" hipError_t launch_gather_paged_kv_q8(
         dim3 grid(num_seqs, num_kv_heads, n_paged_blocks);
         gather_paged_kv_q8_kernel_v2<<<grid, block, 0, stream>>>(
             key_cache_q8, value_cache,
-            block_table, seq_lens,
+            block_table, seq_lens, kv_start,
             k_out, v_out,
             num_seqs, num_kv_heads, Sk, D, bytes_per_row, block_size,
             max_blocks_per_seq,
