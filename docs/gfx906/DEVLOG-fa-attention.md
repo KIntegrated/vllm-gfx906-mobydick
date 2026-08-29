@@ -712,16 +712,30 @@ Branch `feat/fa-m3-hygiene` (unmerged, for review):
   int32 window (both operands non-negative; the subtraction stays in
   range) and wrapping-free by construction.
 - **#4b**: gfx906_fa.cpp (both forward paths): the `[B, Sq, Hq, 2]`
-  o_meta is allocated only for kv_split==1 (its only live regime);
-  kv_split>1 uses o_meta_split. Saves the dead allocation that scales
-  with Sq (~300 KB/layer at Sq=1568/Hq=24).
+  o_meta is provably dead in BOTH regimes — the kernel's only
+  dst_meta write is guarded by `gridDim.y != 1` (gridDim.y ==
+  kv_split), so at kv_split==1 it is never written, and at
+  kv_split>1 the written/read meta is o_meta_split — and it is a
+  local tensor the caller never reads. Final form (2026-08-29, F2):
+  pass nullptr at kv_split==1, allocate only o_meta_split. The
+  original #4b form (allocate at kv_split==1, skip at kv_split>1)
+  kept the ~300 KB/layer prefill-sized dead allocation and dropped
+  only the ~16 KB decode-sized one — the review's F2 point.
 - **Test hardening** (3 new tests in
   tests/kernels/attention/test_gfx906_fa.py):
   `test_m3_10_oversized_window_bit_identical_causal` (window=INT_MAX
   is bit-identical to plain causal, decode + prefill, both kernels —
-  catches any wrap or silent mask disable);
+  catches any wrap or silent mask disable). Note (F3): both the old
+  and the new cutoff form are INERT at W=INT_MAX, so this test pins
+  the new form's inertness rather than discriminating the rewrite —
+  the rewrite's equivalence rests on the algebraic proof plus the
+  existing unaligned bit-identity suite executing the rewritten
+  sites;
   `test_m3_8_negative_kv_start_clamps_to_zero` (kv_start=-L output
-  bit-identical to kv_start=0, both kernels);
+  bit-identical to kv_start=0, both kernels). Note (F5): run against
+  a PRE-#8 build this test risks wedging the GPU (the paged kernel
+  computes a negative logical block index → wild block_table read)
+  rather than failing cleanly; post-fix it is safe.
   `test_m3_window_boundary_amplified_v` (probe-B trick: the first
   OUT-of-window key's V amplified ~400×; both kernels vs the torch
   reference < 5e-2, and the amplified key is verified discriminating —
@@ -731,8 +745,9 @@ Branch `feat/fa-m3-hygiene` (unmerged, for review):
 
 ## GATE
 
-Hygiene batch: unit suite (62 existing bit-identity/behavior tests +
-3 new = 65) must pass unchanged — the #10 rewrite is provably
+Hygiene batch: unit suite (60 existing bit-identity/behavior cases +
+5 new parametrized cases from 3 test functions = 65) must pass
+unchanged — the #10 rewrite is provably
 equivalent and the existing windowed tests (incl. the unaligned clip
 bit-identity set) are the regression gate. No perf claim, no serving
 slot (roadmap rule: hygiene rides along, not a standalone gate).
