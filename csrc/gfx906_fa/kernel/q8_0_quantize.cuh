@@ -71,3 +71,44 @@ static __device__ __forceinline__ void quantize_block_q8_0_halfwarp(
     }
     y[2 + lane_in_block] = (uint8_t)(int8_t)qi;
 }
+
+// Planar-layout variant of the Q8_0 row (docs/gfx906/plan_fa_part_A.md):
+// the row is [quants plane: 32 int8 per block, contiguous] followed by a
+// [scale plane: one fp16 per block]. Same bytes per row as the interleaved
+// block_q8_0 layout ((D/32)*34); numerics are bit-identical to
+// quantize_block_q8_0_halfwarp (same amax tree, same clamps) — only the
+// byte order within the row differs.
+//
+// y_scale is 2-byte aligned (the scale plane starts at row + D, D % 16
+// == 0), so the scale store is a plain 2-byte write — the unaligned-safe
+// byte pair of the interleaved variant is not needed here.
+static __device__ __forceinline__ void quantize_block_q8_0_halfwarp_planar(
+    const __half * __restrict__ x,      // 32 values (one block)
+    uint8_t      * __restrict__ y_quants, // 32 bytes (this block's int8s)
+    uint16_t     * __restrict__ y_scale,  // 2 bytes (fp16 scale bits)
+    int lane_in_block                // 0..31
+) {
+    const float v = __half2float(x[lane_in_block]);
+    const float absv = fabsf(v);
+
+    float amax = absv;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float o = __shfl_xor(amax, offset, 32);
+        amax = fmaxf(amax, o);
+    }
+
+    const float d  = amax / 127.0f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+
+    float q = v * id;
+    int   qi = (int)rintf(q);
+    if (qi < -128) qi = -128;
+    if (qi >  127) qi = 127;
+
+    if (lane_in_block == 0) {
+        __half d_h = __float2half(d);
+        *y_scale = *reinterpret_cast<uint16_t*>(&d_h);
+    }
+    y_quants[lane_in_block] = (uint8_t)(int8_t)qi;
+}

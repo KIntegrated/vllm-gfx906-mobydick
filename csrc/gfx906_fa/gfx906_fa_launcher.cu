@@ -16,7 +16,8 @@
 //   - use_logit_softcap = false, без sinks
 //   - Causal — inline в kernel (Q_ABS_OFFSET), KV_max — per-seq cut
 //   - Direct paged: K/V читаются из paged cache через block table
-//     (kernel/fattn-q8-paged.cuh); gather-путь — K block_q8_0 pre-quantized
+//     (kernel/fattn-q8-paged.cuh); gather-путь — K q8_0 pre-quantized
+//     (planar row — plan_fa_part_A.md)
 //   - Q — fp32 contiguous
 //   - Output — native BSHD [B, Sq, Hq, D] (transpose в host API убран)
 //
@@ -26,7 +27,7 @@
 //
 // Раскладка tensors (как ggml):
 //   Q: [batch, heads_q, seq_q, head_dim]        float32, contiguous
-//   K: [batch, heads_kv, seq_kv, head_dim/QK8_0] block_q8_0 (34 bytes per block)
+//   K: [batch, heads_kv, seq_kv, (D/QK8_0)*34] q8_0 planar row (plan_fa_part_A.md)
 //   V: [batch, heads_kv, seq_kv, head_dim]       float16, contiguous
 //   O: [batch, seq_q, heads_q, head_dim]         float32 (output, BSHD)
 
@@ -158,7 +159,8 @@ static hipError_t gfx906_fa_launch_impl(
     const int32_t nb02 = nb01 * seq_q;
     const int32_t nb03 = nb02 * heads_q;
 
-    // K is block_q8_0: 34 bytes per 32-elem block
+    // K is planar q8_0 (plan_fa_part_A.md): row = D quants bytes + (D/32)
+    // fp16 scales = (D/32)*34 bytes — same row byte count as block_q8_0.
     const int32_t nb10 = sizeof(block_q8_0);                 // per block
     const int32_t nb11 = nb10 * (HD / QK8_0);          // per K-token row
     const int32_t nb12 = nb11 * seq_kv;                      // per head

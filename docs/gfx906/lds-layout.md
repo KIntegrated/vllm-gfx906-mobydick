@@ -49,3 +49,22 @@ If a row has `K_vec` vec4 elements, allocate:
 
 LDS footprint increase is modest (~1/K_vec fractional overhead) and often
 worth it.
+
+## Power-of-two strides matter in global memory too (2026-08-28)
+
+The same phenomenon extends beyond LDS to **global-memory plane
+layouts**: `mxxm-t/mx-llama.cpp` PR #4 ("q8 repack", merged, real
+MI50 hardware) pads its Q8_0 two-plane row stride by one 32-value
+sub-block **iff the sub-block count is a power of two** — explicitly
+"to avoid shared/global-memory bank conflicts" — and measures
++21…+51 % on its LDS-staged GEMM path with the padding in place (vs
+llama.cpp native MMQ).
+
+Rule of thumb: any plane/tile row stride that comes out a power of
+two (in the access granularity actually used — dword, uint4, or
+sub-block units) should get +1 unit of padding; check this whenever
+a quantized layout is designed, not just for LDS. Incidental
+example: the gfx906-fa Q8 tile stride of 136 B = 4×34 is never a
+power of two at any granularity — safe by construction, but the
+check belongs in the layout decision (see `plan_fa_part_A.md`
+A1/A2).

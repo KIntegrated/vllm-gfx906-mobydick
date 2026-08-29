@@ -48,6 +48,36 @@ Consequences for quantized kernels on this chip:
 - Instruction throughput is clock-scaled (probe ran ~1.5 GHz effective);
   ratios are clock-independent.
 
+## Layout-change outcomes measured on real gfx906 (third-party, 2026-08-28)
+
+`mxxm-t/mx-llama.cpp` PR #4 ("q8 repack", merged 2026-08-18): an
+independent dp4a-based Q8_0 **weight** kernel set using a two-plane
+layout (contiguous int8 quants plane + separate f16 scale plane per
+32-value sub-block). PPL bit-identical to native MMQ/MMVQ on 3
+models. The measured split by regime — the transferable fact:
+
+| regime (their kernels) | analog in our stack | layout-change delta |
+|---|---|---|
+| single-token mat-vec (weight streaming, byte-bound) | B=1 decode gather / FA loader | **neutral** (−1.1…+6.4 %) |
+| multi-token GEMM (LDS-staged, double-buffered, issue-bound) | prefill / spec-decode Sq>1 | **+21…+51 %** |
+
+Readings:
+
+- **Layout work does not pay on byte-bound single-token streaming
+  paths** — confirmed independently of our own roofline analysis
+  (`DEVLOG-fa-attention.md` 2026-08-28). Price layout changes for
+  the multi-token/issue-bound side of the stack, or don't price
+  them at all.
+- Their one single-token win (dense +6.4 %) is a **fused GLU/bias
+  epilogue** (dual accumulator, one quantized-input read feeding two
+  weight streams) — an epilogue-fusion effect, not a layout effect;
+  no attention analog (FA has no gate lane).
+- Portable mechanics: scales read as a separate `uint16` plane with
+  masking (`*dp & rmask`), bit-exact vs the interleaved struct
+  layout; k-major scale staging in LDS (`sWdh`) for the GEMM path.
+- Caveat: their domain is write-once static weights (repack at load,
+  no paging/COW) — looser constraints than a KV-cache alias.
+
 ## Practical limits and caveats
 
 - The gfx906 int-dot set is `{v_dot4_i32_i8}`. Measured 2026-08-28

@@ -11,7 +11,9 @@
 // cache via block_table indirection, eliminating the gather step entirely.
 //
 // Layout of paged caches (vLLM compatible, block_size=16):
-//   K_paged: [num_blocks, block_size, Hkv, (D/32)*34]  uint8  (block_q8_0 bytes)
+//   K_paged: [num_blocks, block_size, Hkv, (D/32)*34]  uint8  (planar q8_0
+//            row — docs/gfx906/plan_fa_part_A.md: [quants D bytes | scale
+//            (D/32) fp16]; same row byte count as block_q8_0)
 //   V_paged: [num_blocks, block_size, Hkv,  D      ]  fp16
 //   block_table: [num_seqs, max_blocks_per_seq]       int32
 //
