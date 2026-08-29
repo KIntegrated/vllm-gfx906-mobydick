@@ -2009,6 +2009,68 @@ def test_forward_paged_gather_window_clip_short_ctx():
     assert (out_on - out_off).abs().max().item() < 1e-7
 
 
+def test_forward_paged_direct_prefill_window_clip_bit_identical():
+    """M2: the DIRECT_PAGED window clip is no longer decode-only — a
+    mid-context prefill chunk (nq=128 > ncols1 tiles) with the
+    conservative chunk-start clip must be bit-identical to the clip-off
+    arm (kernel per-q-tile raise + causal cap, default on) and to the
+    LEGACY gather path's clip (cross-path agreement). Guards the
+    backend gate change (max_seqlen_q == 1 dropped)."""
+    from vllm.gfx906_fa import gfx906_fa_paged as paged
+    dev = "cuda"
+    torch.manual_seed(41)
+    B, L, W, nq = 2, 1024, 512, 128
+    scale = 1.0 / math.sqrt(D)
+    nb = L // BLOCK
+    n_blocks = B * nb
+    kc, vc, kv = _make_paged_cache(n_blocks + 4, dev)
+    K = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    V = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                    dtype=torch.float16) * 0.5
+    slot = torch.arange(n_blocks * BLOCK, dtype=torch.int64, device=dev)
+    fa.reshape_and_cache_q8(K, slot, kc[:n_blocks])
+    stag = torch.zeros_like(kv[:, 1])
+    stag.view(-1, HKV, D)[:n_blocks * BLOCK].copy_(V)
+    kv[:, 1].copy_(stag)
+    bt = torch.stack([torch.arange(b * nb, (b + 1) * nb, dtype=torch.int32)
+                      for b in range(B)]).contiguous().to(dev)
+    sl = torch.full((B,), L, dtype=torch.int32, device=dev)
+    cu = torch.arange(0, B * nq + 1, nq, dtype=torch.int32, device=dev)
+    q = torch.randn(B * nq, HQ, D, device=dev, dtype=torch.float32) * 0.5
+    old_clip, old_mode, old_gclip = (paged._WINDOW_CLIP,
+                                     paged._DIRECT_PAGED_MODE,
+                                     paged._GATHER_CLIP)
+    try:
+        paged._DIRECT_PAGED_MODE = "1"
+        paged._WINDOW_CLIP = False
+        out_off = paged.forward_paged(
+            q, kv[:, 0], vc, bt, sl, cu,
+            max_seqlen_q=nq, max_seqlen_k=L, scale=scale, window=W,
+            key_cache_q8=kc)
+        paged._WINDOW_CLIP = True
+        out_on = paged.forward_paged(
+            q, kv[:, 0], vc, bt, sl, cu,
+            max_seqlen_q=nq, max_seqlen_k=L, scale=scale, window=W,
+            key_cache_q8=kc)
+        # Cross-path: the LEGACY gather path (clip on) must agree bit-for-bit.
+        paged._DIRECT_PAGED_MODE = "0"
+        paged._GATHER_CLIP = True
+        out_leg = paged.forward_paged(
+            q, kv[:, 0], vc, bt, sl, cu,
+            max_seqlen_q=nq, max_seqlen_k=L, scale=scale, window=W,
+            key_cache_q8=kc)
+    finally:
+        paged._WINDOW_CLIP, paged._DIRECT_PAGED_MODE, paged._GATHER_CLIP = \
+            old_clip, old_mode, old_gclip
+    assert torch.equal(out_on, out_off), \
+        ("direct prefill clip on/off differ: "
+         f"{(out_on - out_off).abs().max().item():.3e}")
+    assert torch.equal(out_on, out_leg), \
+        ("direct-on vs legacy gather differ: "
+         f"{(out_on - out_leg).abs().max().item():.3e}")
+
+
 # ---------------------------------------------------------------------------
 # M1 clip on the FUSED Q8 gather (LEGACY=0 read path). Same A/B as
 # test_forward_paged_gather_window_clip_bit_identical, but the K half is
@@ -2271,6 +2333,157 @@ def test_gather_paged_kv_q8_clip_skips_prefix():
     # [L, sk_pad): V zero tail as usual (the clip does not change it).
     assert (v_out[:, :, L:] == 0.0).all()
 
+
+# ---------------------------------------------------------------------------
+# M2 tile clip: per-q-tile k0_base window raise + per-q-tile causal
+# k_VKQ_max cap (GFX906_FA_TILE_CLIP, default on; 0 = A/B arm). The
+# skipped k-tiles are window-/causal-masked to P=0 for every row of the
+# tile, so on vs off must be bit-identical; the win is skipping their
+# k-iterations. Both kernels (gather-path forward + direct-paged),
+# prefill geometry where the per-tile raise actually kicks in (Sq >
+# ncols1 so later q-tiles' window starts move).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("Sq", [256, 64])
+def test_m2_tile_clip_prefill_bit_identical(Sq):
+    """Mid-context prefill chunk + conservative chunk-start clip:
+    tile_clip on (default) and off are bit-identical, and both match the
+    torch windowed reference on boundary rows. Sq=256 = 4 q-tiles
+    (ncols1=64) so the per-tile raise moves tiles 1..3; Sq=64 = 1
+    q-tile (raise no-op, causal cap only)."""
+    dev = "cuda"
+    torch.manual_seed(23)
+    d, hq, hkv, L, W = 128, 32, 2, 1504, 512
+    q_abs = L - Sq                      # chunk starts mid-context
+    kv_start_val = max(0, q_abs + 1 - W)  # conservative chunk start
+    assert q_abs > W, "the window must bite for this test"
+    scale = 1.0 / math.sqrt(d)
+    n_blocks = L // BLOCK
+    kc = torch.zeros(n_blocks, BLOCK, hkv, (d // 32) * 34,
+                     dtype=torch.uint8, device=dev)
+    kv = torch.zeros(n_blocks, 2, BLOCK, hkv, d,
+                     dtype=torch.float16, device=dev)
+    K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    slot = torch.arange(L, dtype=torch.int64, device=dev)
+    fa.reshape_and_cache_q8(K, slot, kc)
+    staging = torch.zeros_like(kv[:, 1])
+    staging.view(-1, hkv, d)[:L].copy_(V)
+    kv[:, 1].copy_(staging)
+    vc = kv.unbind(1)[1]
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, n_blocks)
+    sl = torch.tensor([L], dtype=torch.int32, device=dev)
+    q_abs_t = torch.tensor([q_abs], dtype=torch.int32, device=dev)
+    kv_start_t = torch.tensor([kv_start_val], dtype=torch.int32, device=dev)
+    qf = torch.randn(1, hq, Sq, d, device=dev, dtype=torch.float32) * 0.5
+    Kf, Vf = K.float(), V.float()
+    sk_pad = (L + 31) // 32 * 32
+    k_q8, v_b = fa.gather_paged_kv_q8(kc, vc, bt, sl, sk_pad)
+
+    def _run(clip, kapi):
+        os.environ["GFX906_FA_TILE_CLIP"] = clip
+        if kapi == "fwd":
+            return fa.forward(qf, k_q8, v_b, scale, kv_max=sl,
+                              q_abs_offset=q_abs_t, window=W,
+                              kv_start=kv_start_t)[0]
+        return fa.forward_paged_direct(
+            qf, kc, vc, bt, sl, scale, None, q_abs_t, W, kv_start_t)[0]
+
+    try:
+        for kapi in ("fwd", "direct"):
+            out_off = _run("0", kapi)
+            out_on = _run("1", kapi)
+            assert out_on.shape == out_off.shape == (Sq, hq, d)
+            # Prefill runs kv_split=1 (single pass) — the two arms visit
+            # the same aligned k-tiles with fully-masked differences, so
+            # the result must be bit-identical.
+            assert torch.equal(out_on, out_off), \
+                f"tile_clip on/off differs ({kapi}, Sq={Sq})"
+            # Boundary rows: first (raise no-op), last (max raise +
+            # causal cap), and middle.
+            for t in (0, Sq // 2, Sq - 1):
+                ref = _windowed_ref(qf[0, :, t], Kf, Vf, scale,
+                                    q_abs + t, W)
+                err = ((out_on[t] - ref).norm() / ref.norm()).item()
+                assert err < 5e-2, f"{kapi} Sq={Sq} row {t}: {err}"
+    finally:
+        del os.environ["GFX906_FA_TILE_CLIP"]
+
+
+@pytest.mark.parametrize("kapi", ["fwd", "direct"])
+def test_m2_causal_cap_bit_identical_window_off(kapi):
+    """Causal cap in isolation, BOTH kernels: q_abs_offset set,
+    window=0 (no window mask, no clip) — the cap only skips causally
+    masked tail k-tiles. On vs off must be bit-identical and match the
+    plain causal torch reference (the Sq=1 decode geometry is the
+    no-op corner: ncols1=2 cap = q_abs+1 = seq_len). The direct arm
+    covers the paged kernel's own oob-tail machinery on the unaligned
+    partial last tile (Sq=200), which the windowed test only covers
+    via LOCKSTEP."""
+    dev = "cuda"
+    torch.manual_seed(29)
+    d, hq, hkv, L, Sq = 128, 32, 2, 1008, 200   # 4 q-tiles, unaligned last
+    q_abs = L - Sq
+    scale = 1.0 / math.sqrt(d)
+    n_blocks = L // BLOCK
+    kv = torch.zeros(n_blocks, 2, BLOCK, hkv, d,
+                     dtype=torch.float16, device=dev)
+    K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    slot = torch.arange(L, dtype=torch.int64, device=dev)
+    kc = torch.zeros(n_blocks, BLOCK, hkv, (d // 32) * 34,
+                     dtype=torch.uint8, device=dev)
+    fa.reshape_and_cache_q8(K, slot, kc)
+    staging = torch.zeros_like(kv[:, 1])
+    staging.view(-1, hkv, d)[:L].copy_(V)
+    kv[:, 1].copy_(staging)
+    vc = kv.unbind(1)[1]
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, n_blocks)
+    sl = torch.tensor([L], dtype=torch.int32, device=dev)
+    q_abs_t = torch.tensor([q_abs], dtype=torch.int32, device=dev)
+    qf = torch.randn(1, hq, Sq, d, device=dev, dtype=torch.float32) * 0.5
+    Kf, Vf = K.float(), V.float()
+    sk_pad = (L + 31) // 32 * 32
+    k_q8, v_b = fa.gather_paged_kv_q8(kc, vc, bt, sl, sk_pad)
+
+    def _run(clip):
+        os.environ["GFX906_FA_TILE_CLIP"] = clip
+        if kapi == "fwd":
+            return fa.forward(qf, k_q8, v_b, scale, kv_max=sl,
+                              q_abs_offset=q_abs_t)[0]
+        # window=0, kv_start=None: the cap is the only M2 bound in
+        # play (q_abs_offset set) — the production causal-prefill shape.
+        return fa.forward_paged_direct(qf, kc, vc, bt, sl, scale, None,
+                                       q_abs_t, 0, None)[0]
+
+    try:
+        out_off = _run("0")
+        out_on = _run("1")
+        assert torch.equal(out_on, out_off), \
+            f"tile_clip on/off differs ({kapi}, window=0)"
+        for t in (0, Sq - 1):
+            ref = _windowed_ref(qf[0, :, t], Kf, Vf, scale, q_abs + t, None)
+            err = ((out_on[t] - ref).norm() / ref.norm()).item()
+            assert err < 5e-2, f"{kapi} row {t}: {err}"
+    finally:
+        del os.environ["GFX906_FA_TILE_CLIP"]
+
+    # Decode corner (Sq=1): the cap must be a no-op — bit-identical to
+    # the kv_max-only call (no q_abs_offset at all).
+    q1 = torch.randn(1, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    q_abs1 = torch.tensor([L - 1], dtype=torch.int32, device=dev)
+    try:
+        os.environ["GFX906_FA_TILE_CLIP"] = "1"
+        out_d = fa.forward(q1, k_q8, v_b, scale, kv_max=sl,
+                           q_abs_offset=q_abs1)[0, 0]
+        os.environ["GFX906_FA_TILE_CLIP"] = "0"
+        out_d2 = fa.forward(q1, k_q8, v_b, scale, kv_max=sl,
+                            q_abs_offset=q_abs1)[0, 0]
+    finally:
+        del os.environ["GFX906_FA_TILE_CLIP"]
+    assert torch.equal(out_d, out_d2)
+    ref1 = _windowed_ref(q1[0, :, 0], Kf, Vf, scale, L - 1, None)
+    assert ((out_d - ref1).norm() / ref1.norm()).item() < 5e-2
 
 # ---------------------------------------------------------------------------
 # M3 kernel hygiene batch (roadmap M3, 2026-08-28)

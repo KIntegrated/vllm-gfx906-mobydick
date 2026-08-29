@@ -175,14 +175,19 @@ pp8192/B=1/tg256): **6.042 vs 5.587 t/s = +8.1%**
 time × ~17% FA share of the B=1 step at 8k. See
 DEVLOG-muse-glimmer.md round 5.
 
-### M2 — per-row (2D) prefill clip
+### M2 — per-row (2D) prefill clip — DONE at q-tile granularity, in main since 2026-08-29 (was branch `feat/fa-m2-tile-clip`; log: DEVLOG-fa-attention.md M2 + 2026-08-29 review-fixes entries; 65/65 suite; kernel A/B 3.19×/2.81× windowed + 2.22×/1.96× causal-only at pp4096/full-context; e2e A/B +11.8 % wall / +14.8 % prefill @ pp16384 windowed, +0.73 % @ pp2048 full-attention-hybrid (GEMM-dominated, FA component 1.96–2.22×) — the causal cap is a general chunked-prefill win, not a window feature)
 
 Prefill rows need only `[q_abs+1-W, q_abs]`; today the per-sequence
 `k0_base` covers the whole q-tile, so early rows in a prefill chunk
 still scan (and the gather materializes) out-of-window keys. A
 conservative per-q-tile start (smallest row's window start) is
 implementable without per-row loops. Gate: bit-identity + pp4096
-prefill/TTFT A/B.
+prefill/TTFT A/B. Implemented as two bit-identical per-q-tile scan
+bounds (window raise of `k0_base` + causal cap of `k_VKQ_max`, knob
+`GFX906_FA_TILE_CLIP` default on) + the DIRECT_PAGED clip gate
+extended to prefill; per-row granularity (within a 64-row tile) left
+open — the residual is <= ncols1-1 rows of masked keys per tile, a
+~1/32 effect of what M2 removes.
 
 ### M3 — kernel hygiene batch (one rebuild) — DONE on branch `feat/fa-m3-hygiene` 2026-08-28 (unmerged for review; log: DEVLOG-fa-attention.md 2026-08-28 M3 entry; 65/65 suite)
 
@@ -323,7 +328,15 @@ actually measure — confirmed at code level:
      flipped — the remaining M6 items are the repack (1) and Q4-KV
      (c), which target the B=1 long-context gap, not B=4.
 - **(c) Q4-KV via native `v_dot8_i32_i4` — the LEGACY=0-specific
-  instruction-level upside** (the P·V `v_dot2_f32_f16` rewrite in M3
+  instruction-level upside — SHELVED 2026-08-28 (user decision):
+  quality unproven — Q4 K *and* Q4 Q (or Q8→Q4 requant) quantization
+  accuracy is unvalidated on this model family, and the 7-level
+  q4_0 codebook (vs 127) roughly doubles the KQ quantization error
+  with no measured PPL evidence that attention output absorbs it.
+  Revisit only behind a dedicated accuracy gate (PPL probe bands on
+  the 442-token set, Q4-KV vs Q8-KV arms) that must pass *before* any
+  kernel work; the HBM-traffic arithmetic below is the motivation, not
+  the justification.** (the P·V `v_dot2_f32_f16` rewrite in M3
   is instruction-level too but benefits BOTH LEGACY modes equally and
   does not re-open this gate; 2026-08-28 `dot_isa_probe.py`
   confirmed the i8 dot8 forms are assembler-rejected — dot8 = the i4

@@ -434,6 +434,13 @@ static __global__ void flash_attn_tile_q8_paged(
         // bit-identical). split-K still covers the clipped range exactly:
         // slice y visits k0_base + (y+i*gridDim.y)*nbatch_fa.
         const int32_t * __restrict__ kv_start,
+        // M2 tile clip (host knob GFX906_FA_TILE_CLIP, default 1): per-q-tile
+        // k0_base window raise + per-q-tile causal k_VKQ_max cap. The
+        // skipped tiles are window-/causal-masked to P=0 for every row of
+        // the tile, so both are bit-identical to the full scan; the win is
+        // skipping their k-iterations. 0 = disable (A/B arm). LOCKSTEP with
+        // flash_attn_tile_q8 (fattn-q8.cuh).
+        const int tile_clip,
         const int32_t * __restrict__ block_table,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
@@ -455,7 +462,7 @@ static __global__ void flash_attn_tile_q8_paged(
 #ifdef FLASH_ATTN_AVAILABLE
 
     if (use_logit_softcap && !(DV == 128 || DV == 256)) {
-        GGML_UNUSED_VARS(Q, K_paged_base, V_paged_base, mask, sinks, KV_max, q_abs_offset, window, kv_start, block_table,
+        GGML_UNUSED_VARS(Q, K_paged_base, V_paged_base, mask, sinks, KV_max, q_abs_offset, window, kv_start, tile_clip, block_table,
             dst, dst_meta, scale, max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03, nb01, nb02, nb03,
             ne10, ne11, ne12, ne13,
@@ -545,7 +552,7 @@ static __global__ void flash_attn_tile_q8_paged(
     flash_attn_tile_q8_quantize_Q_to_shared<nwarps*warp_size, ncols, ncols2, DKQ>(
         Q_f, Q_values, Q_scales, col_Q_0, int(ne01.z), head0, ne02, nb01, nb02, scale);
 
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
     // Sliding-window clip start (0 = full scan; see param comment). Floor
     // to the nbatch_fa tile boundary so every tile visited is the same
     // aligned tile the full scan visits (bit-identity — an unaligned start
@@ -566,6 +573,40 @@ static __global__ void flash_attn_tile_q8_paged(
         if (k0_base <= (win_start > 0 ? win_start : 0)) {
             k0_base -= k0_base % nbatch_fa;
         }
+    }
+    // M2 tile clip (GFX906_FA_TILE_CLIP, default 1; 0 = A/B arm).
+    // LOCKSTEP with fattn-q8.cuh — duplicated verbatim.
+    // (1) Per-q-tile window raise: this tile's first row (abs pos
+    //     q_abs + col_Q_0) has the smallest window start in the tile;
+    //     keys before q_abs + col_Q_0 + 1 - window are window-masked to
+    //     -INF for EVERY row of the tile, so raising k0_base to the
+    //     floored tile start skips them (same floor rule as above →
+    //     bit-identical). Clip mode only (kv_start set): without it
+    //     k0_base stays 0 by contract (the clip-vs-no-clip bit-identity
+    //     tests) and the window mask does the work. In prefill the
+    //     backend passes the conservative chunk-start clip
+    //     (kv_start = max(0, chunk_first + 1 - window)), so this raises
+    //     every q-tile after the first — the scan cost becomes ~window
+    //     instead of ~chunk for sliding-window prefill.
+    // (2) Per-q-tile causal cap: the last VALID row of this tile is at
+    //     abs pos q_abs + min(col_Q_0 + ncols1, ne01.z) - 1; keys at or
+    //     past that +1 are causally masked (k > q_abs_row) for every row
+    //     of the tile, exactly as in the full scan, so capping
+    //     k_VKQ_max skips those k-tiles (bit-identical; the oob tail
+    //     logic handles the partial tile at the capped end). For Sq<=2
+    //     (ncols1=2) the cap is q_abs + ne01.z = seq_len — decode is
+    //     unchanged.
+    if (tile_clip && q_abs_offset) {
+        if (kv_start && window > 0) {
+            const int ts = q_abs_offset[sequence] + col_Q_0 + 1 - window;
+            if (ts > 0) {
+                const int tsf = ts - ts % nbatch_fa;
+                if (tsf > k0_base) k0_base = tsf;
+            }
+        }
+        const int tile_end = q_abs_offset[sequence]
+            + (col_Q_0 + ncols1 < (int) ne01.z ? col_Q_0 + ncols1 : (int) ne01.z);
+        if (tile_end < k_VKQ_max) k_VKQ_max = tile_end;
     }
     if (ncols2 == 1) {
         int k_VKQ_0 = k0_base + blockIdx.y*nbatch_fa;

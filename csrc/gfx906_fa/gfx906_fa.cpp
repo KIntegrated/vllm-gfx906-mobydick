@@ -56,6 +56,8 @@ extern "C" hipError_t gfx906_fa_launch(
     // buffer must contain rows [kv_start[b], seq_len[b]) (see
     // launch_gather_paged_kv_quant_persistent).
     const int32_t * KV_START_d,
+    // M2 tile clip (1 = on; GFX906_FA_TILE_CLIP; see flash_attn_tile_q8).
+    int tile_clip,
     int batch, int heads_q, int heads_kv,
     int seq_q, int seq_kv, int head_dim,
     float scale,
@@ -99,6 +101,23 @@ static int get_fa_kv_split() {
         return e ? std::atoi(e) : -1;
     }();
     return v;
+}
+
+// M2 tile clip: per-q-tile k0_base window raise + per-q-tile causal
+// k_VKQ_max cap in both FA kernels (bit-identical; see the kernel
+// comments). Default ON; GFX906_FA_TILE_CLIP=0 is the A/B arm / kill
+// switch (it disables ONLY these two M2 bounds — the M1 sequence-level
+// floor is the _WINDOW_CLIP/_GATHER_CLIP backend clips).
+// Deliberately NOT memoized like the get_fa_* IIFE neighbors — the
+// tests/bench flip the env in-process; a memoized copy would silently
+// test a stale value. A/B scope: read per call, so eager/uncaptured
+// calls see flips; under FULL capture the value is a baked kernel
+// argument (flipping mid-session does not affect already-captured
+// graphs — M2 is prefill-only, so that never matters today; do not
+// inherit this pattern for a decode-relevant knob).
+static int get_fa_tile_clip() {
+    const char *e = std::getenv("GFX906_FA_TILE_CLIP");
+    return e ? (std::atoi(e) != 0 ? 1 : 0) : 1;
 }
 
 // Persistent gather knobs (plan_masked_fa.md). The grid is a capture-time
@@ -165,6 +184,7 @@ extern "C" hipError_t gfx906_fa_launch_paged(
     const int32_t * Q_ABS_OFFSET_d,
     int             window,
     const int32_t * KV_START_d,
+    int             tile_clip,
     int             batch,
     int             heads_q,
     int             heads_kv,
@@ -345,6 +365,7 @@ torch::Tensor gfx906_fa_forward(
     // into o_bshd by gfx906_fa_split_combine.
     const int nc2 = get_fa_nc2();
     int kv_split = get_fa_kv_split();
+    const int tile_clip = get_fa_tile_clip();
     if (kv_split < 0) kv_split = 16;  // gather-path default (B=1 tuning)
     if (seq_q > 2) {
         // KV-split is a B=1-decode parallelism trick (Sq=1 -> 16 blocks per
@@ -455,6 +476,7 @@ torch::Tensor gfx906_fa_forward(
         q_abs_offset_ptr,
         window,
         kv_start_ptr,
+        tile_clip,
         batch, heads_q, heads_kv, seq_q, seq_kv, head_dim,
         (float) scale,
         stream,
@@ -1195,6 +1217,7 @@ torch::Tensor gfx906_fa_forward_paged_direct(
     // it costs +18% (267 vs 226 us) on combine traffic. GFX906_FA_KVSPLIT=1
     // is the kill switch (old grid.y=1 behavior).
     int kv_split = get_fa_kv_split();
+    const int tile_clip = get_fa_tile_clip();
     if (kv_split < 0) {
         kv_split = std::max(2, std::min(8, 16 / std::max(1, batch)));
     }
@@ -1285,6 +1308,7 @@ torch::Tensor gfx906_fa_forward_paged_direct(
         q_abs_offset_ptr,
         window,
         kv_start_ptr,
+        tile_clip,
         batch, heads_q, heads_kv, seq_q, max_seq_kv, head_dim,
         block_size, max_blocks_per_seq,
         k_block_stride, k_token_stride, k_head_stride,

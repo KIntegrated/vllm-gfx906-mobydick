@@ -490,22 +490,30 @@ def forward_paged(
             n_q_per_seq = cu_i64[1:num_seqs + 1] - cu_i64[:num_seqs]
             q_abs_offset_tensor = (sl_i64 - n_q_per_seq).to(torch.int32).contiguous()
 
-        # Phase C: sliding-window KV clip. A decode row only attends to
-        # [max(0, L-W), L), so the kernel k-loop starts there instead of
-        # scanning (and masking) the prefix. Bit-identical output (the
-        # prefix keys are window-masked to -INF anyway, and the kernel
-        # floors the clip start to the KV tile boundary so the fp16
-        # reduction order matches the full scan); the HBM reads drop to
-        # ~W/L of the full scan. Decode rows only — prefill rows have
-        # per-row windows [max(0, t-W+1), t] and the shared scan must
-        # start at 0 (that clip is still open work). This Phase C clip
-        # is specific to the direct-paged dispatch (LEGACY=0-only, and
-        # opt-in via GFX906_FA_DIRECT_PAGED_Q8=1 since round 10); the
-        # gather paths — the LEGACY=1 default, and LEGACY=0 B>=2 since
-        # round 10 — clip via _GATHER_CLIP / _gather_clip_start below,
-        # at every batch size.
+        # Phase C: sliding-window KV clip. A row only attends to
+        # [max(0, t-W+1), t), so the kernel k-loop starts at the
+        # conservative chunk start kv_start = max(0, chunk_first + 1 - W)
+        # instead of scanning (and masking) the prefix. Bit-identical
+        # output (the prefix keys are window-masked to -INF anyway, and
+        # the kernel floors the clip start to the KV tile boundary so the
+        # fp16 reduction order matches the full scan); the HBM reads drop
+        # to ~W/L of the full scan.
+        # M2: prefill chunks included — the kernel's per-q-tile raise
+        # (GFX906_FA_TILE_CLIP, default on) moves each q-tile's scan start
+        # to its own floored window start, so the conservative chunk
+        # start is safe at every Sq (per-row windows [max(0, t-W+1), t]
+        # are supersets of the tile start's window). Before M2 this gate
+        # was decode-only (max_seqlen_q == 1) because the per-sequence
+        # scan start left later q-tiles scanning their masked prefix.
+        # This Phase C clip is specific to the direct-paged dispatch
+        # (LEGACY=0-only, and opt-in via GFX906_FA_DIRECT_PAGED_Q8=1
+        # since round 10); the gather paths — the LEGACY=1 default, and
+        # LEGACY=0 B>=2 since round 10 — clip via _GATHER_CLIP /
+        # _gather_clip_start below, at every batch size (they pass
+        # kv_start for prefill too, so the M2 kernel raise applies
+        # there as well).
         kv_start_tensor = None
-        if _WINDOW_CLIP and window > 0 and max_seqlen_q == 1:
+        if _WINDOW_CLIP and window > 0:
             # kv_start = max(0, q_abs + 1 - window); int32 throughout
             # (q_abs is bounded by the context length).
             kv_start_tensor = (q_abs_offset_tensor + (1 - window)).clamp_(

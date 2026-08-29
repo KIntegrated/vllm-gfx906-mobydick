@@ -1329,3 +1329,38 @@ pool, `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0`).
     1 retry per house recipe; **a retry failure = burst → stop +
     reboot (root)** (boot M would then be at 2 failures in the
     retry chain, 3 wedge observations total ~2.4 h in).
+12. **2026-08-29 ~05:5x–06:00:02Z (boot M, ~15 h in)** — **3rd boot-M
+    wedge: an in-process (TP=1, GPU0) Muse 2×130k-token prefill hung
+    mid-stream** — observed ~05:57Z as GPU use 0 % + main thread
+    200 % CPU spin (two cores), no log progress since the 05:50:51
+    warmup line; SIGTERM 05:59:16Z; kernel then logged `qcm fence
+    wait loop timeout expired` (05:59:59) → `GPU reset(2) succeeded`
+    (06:00:02) on 0000:0b:00.0 (GPU0), "device wedged, but recovered
+    through reset". First boot-M wedge on a SINGLE-CARD launch (the
+    15:00/17:18 pair were TP=2 weight-load hangs) and on RUNNING
+    INFERENCE, with the `qcm fence wait loop timeout` signature
+    (GPU stops honoring a fence mid-stream; the QCM CPU wait-loop
+    gives up) rather than the chronic `hipErrorLaunchFailure`
+    load-family.
+
+    **Bisection (all TILE_CLIP=0 / the pre-M2 path — the wedge is
+    NOT M2-attributable), boot M:** pp16384 completes
+    (128.4 s/sample, 2×16k); pp32768 pass-1 136 s, pp65536 pass-1
+    306 s; the later "stalls" were slow passes meeting my timeouts,
+    not hangs (a 130k pass at the boot's prefill rate is ~9 min).
+
+    **RESOLVED 2026-08-29 ~07:58Z on the fresh boot (boot N):** the
+    same 32k shape (in-process, TP=1, bt4096, main build) measured
+    warmup 135.48 s + sample 136.51 s on a ~2-min-old boot with 0
+    wedges and a 38.9 t/s canary — matching boot M's 136 s exactly,
+    no pass-to-pass drift. **Verdict: the ~214–256 t/s in-process
+    TP=1 prefill rate is the TRUE rate for this hybrid model on this
+    box, not degradation.** Consistency check: the ~450–540 t/s
+    records are TP=2 — 32.8k tokens / 500 t/s = 65.6 s ≈ 135/2.06,
+    i.e. prefill scales ~2× with TP as expected for the
+    GEMM/FA-bound path. Boot M's only genuine anomaly remains the
+    05:59Z fence wedge (isolated; no recurrence on boot N through
+    ~08:10Z). Baseline recorded in the README Muse row so the rate
+    is not re-derived. Evidence: `/local/tmp/m2iso_32k_bootN.log`
+    (persists), boot-M copies in `/tmp/m2iso_*.log` (wiped by the
+    reboot).
