@@ -568,6 +568,14 @@ def rocm_unquantized_gemm_impl(
         and bias is None
         and (k <= 8192 or (on_gfx906() and k in (10240, 17408)))
     ):
+        # fp32 single-token GEMV (e.g. force_fp32_compute router gates):
+        # hipBLAS sgemv is ~15x faster than the fp32 triton/sgemm skinny
+        # paths on gfx906 (8 vs 118-142 us at the [128, 2688] gate shape);
+        # the fp16 GEMV family rejects fp32 operands.
+        if x_view.dtype == torch.float32:
+            return torch.mv(weight, x_view[0]).reshape(
+                *x.shape[:-1], weight.shape[0]
+            )
         if k <= 8192:
             out = _llmm1_tiny_m(weight, x_view)
         else:

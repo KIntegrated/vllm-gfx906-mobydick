@@ -1,4 +1,4 @@
-# Nemotron-H onboarding (Nemotron-3.5-Lightning-30B-A3B mixed INT4/INT8) — serves at 59.4 tok/s on one MI50 after three gfx906 fixes
+# Nemotron-H onboarding (Nemotron-3.5-Lightning-30B-A3B mixed INT4/INT8) — serves at 70.4 tok/s on one MI50 after five gfx906 fixes
 
 > Branch `gfx906/nemotron-h-onboard` off `main` (97a6fbe11a) · model
 > `primitive-ai/Nemotron-3.5-Lightning-30B-A3B-mixed-INT4-INT8` (NFS HF
@@ -202,6 +202,47 @@ Control arm: same tree with the scheme disabled (conch selected).
 - Exllama channel-wise acceptance (groups=1 via `group_size=K`) was
   drafted and dropped: M>32 reconstructs per call (dequant + hipBLAS per
   invocation) would tax prefill; the fp16-dequant path dominates it.
+
+---
+
+## Search keys
+
+## 2026-08-29 — fp32 router-gate GEMV on hipBLAS sgemv (NH-3)
+
+**VERDICT:** SHIPPED · **GATE:** serving A/B, graph mode, pp=2048/tg256,
+4 samples, same boot, plus the PPL probe.
+
+## HYPOTHESIS
+
+If the 128 µs fp32 triton matmul per router gate is a skinny-shape
+artifact (1.3 MB weight read ⇒ ~10 µs at HBM speed), routing the M=1
+fp32 GEMV to hipBLAS sgemv (`torch.mv`) must cut ~3 ms/step and show
+≥ +10% in serving.
+
+## What was done
+
+`rocm_unquantized_gemm_impl` (vllm/model_executor/layers/utils.py):
+fp32 single-token GEMVs take `torch.mv(weight, x_view[0])` before the
+fp16 GEMV family (which rejects fp32). Micro-bench at the gate shape
+[128, 2688]: F.linear fp32 141.8 µs · triton 117.6 µs · mv **8.0 µs**.
+
+## Evidence — FOR
+
+- **Serving (the gate):** 59.44 → **70.40 tok/s** (+18.4%), samples
+  70.34–70.44 (`/tmp/bench_arm4.log`).
+- PPL 26.9757 vs 26.9555 — Δ0.07%, fp32 accumulation-order change,
+  same band as every other kernel swap on this model.
+
+## Evidence — AGAINST
+
+- M=2..32 fp32 (batched/spec-decode steps) still take the ~118 µs
+  triton path — batched fp32 GEMV left open (roadmap NH-3 residue).
+
+## Interactions
+
+- The path only fires for fp32 operands — previously those *crashed*
+  at LLMM1 on gfx906 (blocker 1), so no previously-working model's
+  route changes. Blast radius: fp32-router models only.
 
 ---
 
