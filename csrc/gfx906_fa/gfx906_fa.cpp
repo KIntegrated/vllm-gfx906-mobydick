@@ -374,17 +374,16 @@ torch::Tensor gfx906_fa_forward(
         // Sq (588 MiB at Sq=1568, Hq=24, D=256, split=16) -- OOM on 32 GB.
         kv_split = 1;
     }
-    // M3 #4b: the [B, Sq, Hq, 2] meta is the kv_split==1 dst_meta target
-    // (the kernel may write it through dead branches even at gridDim.y==1);
-    // with kv_split>1 the kernel writes o_meta_split instead, so skip the
-    // dead allocation (scales with Sq: ~300 KB/layer at Sq=1568/Hq=24).
-    torch::Tensor o_meta, o_part, o_meta_split;
+    // M3 #4b: the kernel's only dst_meta write is guarded by
+    // `gridDim.y != 1` (gridDim.y == kv_split), so at kv_split==1 the
+    // [B, Sq, Hq, 2] meta is never written — nor read back: it is a
+    // local tensor, not returned to the caller. Pass nullptr and skip
+    // the dead allocation (scales with Sq: ~300 KB/layer at
+    // Sq=1568/Hq=24). At kv_split>1 the written/read meta is
+    // o_meta_split (consumed by the split-combine), allocated below.
+    torch::Tensor o_part, o_meta_split;
     float * o_fp32_ptr = o_bshd.data_ptr<float>();
     float2 * o_meta_ptr = nullptr;
-    if (kv_split == 1) {
-        o_meta = torch::empty({batch, seq_q, heads_q, 2}, opts_f32);
-        o_meta_ptr = reinterpret_cast<float2 *>(o_meta.data_ptr<float>());
-    }
     if (kv_split > 1) {
         o_part = torch::empty({batch, seq_q, heads_q, kv_split, head_dim}, opts_f32);
         o_meta_split = torch::empty({batch, seq_q, heads_q, kv_split, 2}, opts_f32);
@@ -1224,15 +1223,14 @@ torch::Tensor gfx906_fa_forward_paged_direct(
     if (seq_q > 2) {
         kv_split = 1;
     }
-    // M3 #4b (LOCKSTEP with gfx906_fa_forward): skip the dead [B, Sq, Hq, 2]
-    // meta allocation when kv_split>1 (o_meta_split is the real target).
-    torch::Tensor o_meta, o_part, o_meta_split;
+    // M3 #4b (LOCKSTEP with gfx906_fa_forward): the dst_meta write is
+    // guarded by `gridDim.y != 1` (gridDim.y == kv_split), so the [B, Sq,
+    // Hq, 2] meta is dead at kv_split==1 (never written, never read back)
+    // and at kv_split>1 the written/read meta is o_meta_split. Pass
+    // nullptr in the first case and skip the dead allocation.
+    torch::Tensor o_part, o_meta_split;
     float * o_fp32_ptr = o_bshd.data_ptr<float>();
     float2 * o_meta_ptr = nullptr;
-    if (kv_split == 1) {
-        o_meta = torch::empty({batch, seq_q, heads_q, 2}, opts_f32);
-        o_meta_ptr = reinterpret_cast<float2 *>(o_meta.data_ptr<float>());
-    }
     if (kv_split > 1) {
         o_part = torch::empty({batch, seq_q, heads_q, kv_split, head_dim}, opts_f32);
         o_meta_split = torch::empty({batch, seq_q, heads_q, kv_split, 2}, opts_f32);

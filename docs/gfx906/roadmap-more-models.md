@@ -189,7 +189,7 @@ extended to prefill; per-row granularity (within a 64-row tile) left
 open — the residual is <= ncols1-1 rows of masked keys per tile, a
 ~1/32 effect of what M2 removes.
 
-### M3 — kernel hygiene batch (one rebuild) — DONE on branch `feat/fa-m3-hygiene` 2026-08-28 (unmerged for review; log: DEVLOG-fa-attention.md 2026-08-28 M3 entry; 65/65 suite)
+### M3 — kernel hygiene batch (one rebuild) — DONE on branch `feat/fa-m3-hygiene` 2026-08-28, review fixes 2026-08-29 (unmerged for review; branch now merged with main incl. M2; log: DEVLOG-fa-attention.md 2026-08-28 M3 entry + 2026-08-29 review-fixes section; 70/70 post-merge suite)
 
 From the (now-deleted) qwen review — items carry their text inline —
 bundle into one build/test cycle:
@@ -203,16 +203,22 @@ bundle into one build/test cycle:
   unaligned bit-identity tests; new window=INT_MAX bit-identity test.
   (DONE — see the header; the "overflows" premise was corrected in
   the devlog.)
-- **#4b/c**: allocate only the meta buffer actually used (`o_meta` is
-  dead when `kv_split > 1`); note the `o_part`/`o_meta_split` per-call
-  cliff at `_DIRECT_PAGED_MAX_SQ=16` (~35 MiB/layer) — shared arena
-  only if a real workload hits Sq>2 direct-paged.
+- **#4b/c**: allocate only the meta buffer actually used. F2-verified
+  2026-08-29 against the code: the kernel's only `dst_meta` write is
+  guarded by `gridDim.y != 1` (gridDim.y == kv_split) in BOTH kernels,
+  and the `[B, Sq, Hq, 2]` `o_meta` is a local tensor the caller never
+  reads — so it is dead at `kv_split == 1` too, not just `kv_split > 1`
+  (where the written/read meta is `o_meta_split`). Final form passes
+  `nullptr` at `kv_split == 1` and allocates only `o_meta_split`.
+  Note the `o_part`/`o_meta_split` per-call cliff at
+  `_DIRECT_PAGED_MAX_SQ=16` (~35 MiB/layer) — shared arena only if a
+  real workload hits Sq>2 direct-paged.
 - Test hardening: amplified-V window-boundary case (probe-B trick,
   ~400× discriminative, 3 lines).
 - **FA-Q8 P·V via `v_dot2_f32_f16` — REFUTED 2026-08-28 (ISA), not
   implemented.** The premise ("P·V currently accumulates in `half2`
   (`v_pk_mul_f16` + `v_pk_add_f16` = 2 instr per 2 MAC, fp16-acc)")
-  is wrong against the current ISA: the compiler already emits
+  is wrong against the built ISA: the compiler already emits
   `v_pk_fma_f16` for the P·V accumulate (1 instr per 2 MACs, full
   packed rate — dequant-instructions.md). `v_dot2_f32_f16` is also
   1 instr per 2 MACs (full rate at ILP≥2, latency-sensitive), so the

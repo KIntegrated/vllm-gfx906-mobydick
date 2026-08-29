@@ -83,16 +83,34 @@ hand-derived f16 constants (0x3C00 is 1.0 not 1.5; 0x3800 is 0.5; 0x4600
 is 6.0; 0x5000 is 32.0). Verify f16 bit patterns with a runtime
 `__ushort_as_half` conversion, never by hand.
 
-**Open opportunity — FA-Q8 P·V.** The attention P·V inner loop still
-accumulates with `half2` (`v_pk_mul_f16` + `v_pk_add_f16`: 2 instructions
-per 2 MACs, fp16 accumulate). A `v_dot2_f32_f16` rewrite is 1 instruction
-per 2 MACs with fp32 accumulate — half the P·V instruction count, better
-rounding. (P·V reads both operands from LDS in the current kernel, so the
-inner loop is LDS-load + VOPC-issue — the instruction halving is the
-lever.) The Q·K side has no equivalent move: the dot is already the
-full-rate `v_dot4_i32_i8`, and the per-block dequant ALU (scale mult +
-cvt + fp32 FMA per 4-lane result) is intrinsic to consuming int dots in
-the fp32 softmax — no instruction upgrade exists for it. Gating before
-any attempt: kernel-level A/B (`bench_gfx906_fa_decode.py`) + PPL
-invariance (fp16-acc → fp32-acc changes outputs), so this is a roadmap M3
-candidate, not a drop-in (see `roadmap-more-models.md`).
+**FA-Q8 P·V — the dot2 rewrite's instruction-halving premise is REFUTED
+against the built kernel (2026-08-29; corrects the SUPERSEDED paragraph
+immediately below).** Disassembled the production build's offload bundle
+(`gfx906_fa_launcher.hip.o` → `.hip_fatbin` →
+`clang-offload-bundler -unbundle -type=o` → `llvm-objdump -d`; boot N,
+2026-08-29): the P·V accumulate in `flash_attn_tile_q8<128,128,16,2>`
+(the NC2 prefill shape) is **1024× `v_pk_fma_f16 vd, v, p, vd`** —
+in-place fused `VKQ += v·p`, 1 instruction per 2 MACs at full packed
+rate — against 54× `v_pk_mul_f16` (one-shot dequant scale multiplies,
+no accumulate) and **0× `v_pk_add_f16`**. The source's half2 ops
+(`VKQ += v * p`) contract to the packed FMA under the default fp-contract
+(ROCm 7.14's plain `__hmul2` is contractible; only `__hmul2_rn` carries
+an explicit `fp contract(off)`). Consequence: `v_dot2_f32_f16` is ALSO
+1 instruction per 2 MACs (full rate at ILP≥2), so the rewrite buys ZERO
+instruction count — it is a precision-only change (fp16-acc → fp32-acc,
+changes outputs, needs a PPL gate) with no perf lever. The roadmap M3
+dot2 item closed on this fact 2026-08-28 (devlog evidence at the time
+was a Part A microbench build's `.s` dump; this objdump re-verifies it
+against the current merged build, 2026-08-29).
+
+> **SUPERSEDED 2026-08-29** (misread of the ISA — see the correction
+> above): *The attention P·V inner loop still accumulates with `half2`
+> (`v_pk_mul_f16` + `v_pk_add_f16`: 2 instructions per 2 MACs, fp16
+> accumulate); a `v_dot2_f32_f16` rewrite halves the P·V instruction
+> count. (Kept for the record; the 54× `v_pk_mul_f16` in the built
+> kernel are the QK-path dequant scale multiplies, not P·V.)*
+
+The Q·K side has no equivalent move: the dot is already the full-rate
+`v_dot4_i32_i8`, and the per-block dequant ALU (scale mult + cvt + fp32
+FMA per 4-lane result) is intrinsic to consuming int dots in the fp32
+softmax — no instruction upgrade exists for it.

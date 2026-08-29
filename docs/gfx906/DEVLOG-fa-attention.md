@@ -788,6 +788,52 @@ error unmissable. The dot2 item is reframed in the roadmap: if it is
 ever revisited it is a PRECISION change (fp32 P·V accumulation), not
 a perf one, and only if a numerics gate demands it.
 
+### 2026-08-29 — review fixes (F1, F2 of m3-code-rev-glm5.md) + merge with main (M2)
+
+**F1 (dot2 refutation re-verified against the current build).** The
+2026-08-28 refutation evidence was a Part A microbench build's `.s`
+dump; the review asked for the production build. Extracted the
+offload bundle from the merged M2+M3 build
+(`gfx906_fa_launcher.hip.o` → `.hip_fatbin` →
+`clang-offload-bundler -unbundle -type=o` → `llvm-objdump -d`):
+in `flash_attn_tile_q8<128,128,16,2>` (NC2 prefill shape) the P·V
+region is in-place fused **`v_pk_fma_f16 vd, v, p, vd`** —
+1024× in that kernel vs 54× `v_pk_mul_f16` (QK-path one-shot
+dequant scale multiplies, no accumulate) and **0× `v_pk_add_f16`**.
+Same shape in every other instantiation (count scales with the
+unroll). The refutation holds; `dequant-instructions.md`'s P·V
+paragraph (which had claimed the `v_pk_mul_f16`+`v_pk_add_f16` pair)
+is corrected and marked SUPERSEDED.
+
+**F2 (#4b o_meta — the reviewer's inversion claim is REFUTED; the
+underlying dead allocation is real and now removed).** The review
+claimed #4b "keeps the dead allocation at kv_split==1 and removes
+o_meta at kv_split>1 — where it is actually written and read by
+combine", citing guard `if (dst_meta && (k_split == 0 || gridDim.y
+== 1))`. Against the code: the ONLY `dst_meta` write in BOTH kernels
+is guarded by **`gridDim.y != 1`** (fattn-q8.cuh:1174,
+fattn-q8-paged.cuh:707) with `gridDim.y == kv_split` (launcher
+dim3) — the exact opposite of the cited guard (which does not exist
+in the tree). At kv_split>1 the written/read meta is
+`o_meta_split` — a separate buffer #4b never removed. o_meta was
+always a local tensor (not a parameter; zero Python references
+pre- and post-#4b), so at kv_split==1 it is dead too: the guard
+keeps the kernel from writing it and nobody reads it. Final form:
+pass `nullptr` at kv_split==1 (safe by the guard) and allocate only
+`o_meta_split`; the two code comments (one of which stated the
+inverted guard) are corrected. No behavior change: 70/70 suite
+before and after.
+
+**Merge with main (M2).** The branch had cut from the same base as
+M2 (`7cdedf8de6`); main merged M2 (`06c0614379`) first. Merged main
+into the branch (`19d0a48d7d`): the k-loop regions both branches
+touch (M2 tile clip vs M3 #8 clamp / #10 cutoff) auto-merged
+textually clean and were verified lockstep-consistent by hand in
+both kernels; test file + devlog conflicts resolved by keeping both
+branches' appended sections. Post-merge suite: **70/70** (60 base + 5 M2
+items + 5 M3 items — 3 test functions, two of them parametrized) on
+boot N.
+
 ## 2026-08-28 — M2 per-q-tile prefill clip: per-tile k0_base window raise + per-tile causal kv_max cap in both FA kernels; DIRECT_PAGED window clip extended to prefill chunks
 
 ## HYPOTHESIS
