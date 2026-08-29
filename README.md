@@ -128,7 +128,7 @@ Environment variables:
 |---|---|---|---|
 | `FLASH_ATTENTION_TRITON_AMD_ENABLE` | `TRUE` | **every run** | the ROCm platform aborts at import without it ("ROCm platform requires upstream flash-attn to be installed"); selects the Triton-AMD flash-attn path |
 | `LD_LIBRARY_PATH` | `…/rocm/lib` | venv runs | system ldconfig knows no ROCm — `source` your ROCm env script (or export `LD_LIBRARY_PATH=/opt/rocm/lib`) before launching |
-| `HF_HUB_OFFLINE` | `1` | serving | offline loads from the local HF cache (no hub round-trips at import) |
+| `HF_HUB_OFFLINE` | `1` | optional | set only if the model is already in the local HF cache — without it vLLM downloads/refreshes from the hub on import |
 | `VLLM_GFX906_HIP_LIB_PATH` | `…/rocm/lib/libamdhip64.so.7` | **TP≥2 only** | with the blocking-sync `.pth` shim below (see note) — without both, every TP worker permanently pegs a host core at ~100 % (HIP active-wait) |
 | `VLLM_GFX906_SKINNY_M16` | `1` | optional | dense N=8 concurrent decode (+14.5 % W4 skinny GEMV); default off |
 | `HSA_OVERRIDE_GFX_VERSION` | — **do not set** | — | ROCm 7.14 has native gfx906 (older 7.2.1 images needed `9.0.6`) |
@@ -137,7 +137,7 @@ Environment variables:
 Validated serve command (2× MI50, Qwen3.8-27B-AWQ-INT4, 2026-08-25/29):
 
 ```bash
-FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE HF_HUB_OFFLINE=1 \
+FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
 vllm serve <model> \
   --served-model-name <name> \
   --tensor-parallel-size 2 \
