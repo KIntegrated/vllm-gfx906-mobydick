@@ -77,6 +77,20 @@ the date an investigation began.
   `legacy0_append_cost_probe.py`); `_serve_tp2_gfx906.sh` gained
   EXTRA_SERVE_ENV passthrough. Records:
   `DEVLOG-fa-legacy0-b1-decode.md`.
+- **Roadmap reorganization: three per-topic roadmaps → single
+  priority-ordered `ROADMAP.md` + `REFRIGERATOR.md`.** The per-topic
+  split had leaked (G1/housekeeping in more-models, non-MoE N-items and
+  the upstream queue in the MoE file) and the spec-decode roadmap was
+  100 % parked work. Closures folded in: the spec-decode file is deleted
+  (all four items → REFRIGERATOR with reopen gates); the Muse follow-ups
+  section is empty and gone (LEGACY-flip closed this date, Part C →
+  REFRIGERATOR); DeepSeek-V4-Flash → REFRIGERATOR (not an active
+  target); Qwen3-30B-A3B → DEAD-ENDS (SUPERSEDED — not an active goal,
+  model superseded by the supported Qwen3.5/3.8 line). C4 stays active
+  (70 t/s target active, user decision 2026-08-29). Item IDs (C*, G*,
+  L*, N*, U*, HK*, SD-*) are stable; README/AGENTS references updated;
+  the C8 L2/residency open question is folded into C2. Historical
+  filename mentions inside devlogs/plans are left as records.
 
 ## 2026-08-27–28
 

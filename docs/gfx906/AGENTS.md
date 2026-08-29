@@ -78,7 +78,7 @@ major ongoing theme, with the model/branch/date in the file header:
 - `DEVLOG-fa-splitk-accuracy.md` — the FA split-K accuracy track (M4 closure;
   split-defaults-vs-fp32-ref pins)
 - `DEVLOG-fa-legacy0-b1-decode.md` — the LEGACY=0 B=1 decode-gap track
-  (flip adjudication; see also `roadmap-more-models.md` G1)
+  (flip adjudication; see also `ROADMAP.md` G1)
 - `DEVLOG-dense-decode.md` — Qwen3.5-27B dense decode (GEMV, max-ilp, load tests)
 - `DEVLOG-spec-decode.md` — speculative decoding (incl. the n-gram dense probe)
 - `DEVLOG-gemma4-*.md` — Gemma-4 family (kernel + onboarding/prefill-logprob incident)

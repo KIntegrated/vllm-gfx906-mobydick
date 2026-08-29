@@ -69,9 +69,8 @@ request (4 samples) unless noted. Recipes: §Bench recipes +
 | `DEAD-ENDS.md` | one-pass index: hypothesis → gate → verdict → commit for what was tried (grep-able) |
 | `_devlog-template.md` | the `VERDICT:`/`HYPOTHESIS:`/`GATE:` devlog convention + worked example |
 | `DEVLOG-*.md` | topic-specific experiment records; see the changelog and roadmap entries for the index |
-| `moe-decode-roadmap.md` | open and unmerged MoE-decode candidates |
-| `spec-decode-roadmap.md` | open and deferred speculative-decode work |
-| `roadmap-more-models.md` | open model-onboarding and portability work |
+| `ROADMAP.md` | the single active queue: open work priority-ordered (Tier 0–2, onboarding + upstream queues) |
+| `REFRIGERATOR.md` | parked/shelved items, each with its reopen gate |
 | `running.md` | how to run/build/bench: local venv (canonical) + docker images |
 | `_bench_gfx906.py` | end-to-end pp/tg serving bench harness (BENCH_* env knobs) |
 | `_pp_bench.py` | prefill/decode split harness |
@@ -260,7 +259,7 @@ targets matrix cores; gfx906 has none).
 
 | env | default | effect |
 |---|---|---|
-| `GFX906_FA_LEGACY` | 1 | fp16 KV cache + in-kernel Q8 quantize (validated serving default); `0` = Q8 pre-quantized at KV write into a side **view aliased into the fp16 K half** — zero extra KV memory, COW-safe (page copies move the Q8 bytes); attention reads the Q8 directly instead of re-quantizing per read. 2026-08-27: 46/46 suite + default-config and prefix-cache smokes clean. **Orthogonal to the read pattern** (`GFX906_FA_DIRECT_PAGED*`): direct-paged is LEGACY=0-only (round-7 erratum); LEGACY=0's distinct contribution is the Q8 read (no repeated inline quantize). **TP=2 bake executed 2026-08-28 (roadmap M5, boot M): LEGACY=0 was SLOWER than the LEGACY=1 control at every point** (B=1 decode −2.5…−3.7 % @2k/8k; B=4 @2k aggregate −27…−31 %; prefill wash). ****Default stays `1`**; `0` remains an experimental opt-in (zero-extra-KV-memory alias, COW-safe). Round 10 (M6 Part B, same day): rerouting LEGACY=0 B≥2 to the fused-Q8 gather (`GFX906_FA_DIRECT_PAGED_Q8=0`, now the default) recovered B=4 @2k to 35.7 → 46.3 t/s — parity with the 46.7 LEGACY=1 control *within cross-boot uncertainty* (same-boot adjudication pending) — with B=1/prefill unchanged; direct-paged is opt-in (=1) with no measured advantage. Mechanism (review-softened 2026-08-28): NOT an int8-compute gap (`v_dot4_i32_i8` is full-rate on gfx906, 4 int8 MAC/cyc, 2× packed fp16; both arms share the same dot — `DEVLOG-fa-attention.md` 2026-08-28 entry). The loss is **Sq>1-specific** — the in-process Sq=1 A/B on the identical strided-read path was a wash, which the read-layout theory alone cannot explain; direct-paged's strided Q8-slice reads (136 B slices inside 256-B row strides, 34-B block strides → sector waste) remain the **leading but unconfirmed** hypothesis, with the Sq>1 machinery (round-8 Q-pad/unpad fast paths, graph-capture interaction) at least a co-contributor — devlog round-10 erratum. The flip gate's B=4 half is green; the B=1 same-boot adjudication ran 2026-08-29 (boot O): LEGACY=0 −6.3 % (−6.4 % with direct-paged) — flip CLOSED, default stays 1 (`DEVLOG-fa-legacy0-b1-decode.md`) |
+| `GFX906_FA_LEGACY` | 1 | fp16 KV cache + in-kernel Q8 quantize (validated serving default); `0` = Q8 pre-quantized at KV write into a side **view aliased into the fp16 K half** — zero extra KV memory, COW-safe (page copies move the Q8 bytes); attention reads the Q8 directly instead of re-quantizing per read. 2026-08-27: 46/46 suite + default-config and prefix-cache smokes clean. **Orthogonal to the read pattern** (`GFX906_FA_DIRECT_PAGED*`): direct-paged is LEGACY=0-only (round-7 erratum); LEGACY=0's distinct contribution is the Q8 read (no repeated inline quantize). **TP=2 bake executed 2026-08-28 (roadmap M5, boot M): LEGACY=0 was SLOWER than the LEGACY=1 control at every point** (B=1 decode −2.5…−3.7 % @2k/8k; B=4 @2k aggregate −27…−31 %; prefill wash). ****Default stays `1`**; `0` remains an experimental opt-in (zero-extra-KV-memory alias, COW-safe). Round 10 (M6 Part B, same day): rerouting LEGACY=0 B≥2 to the fused-Q8 gather (`GFX906_FA_DIRECT_PAGED_Q8=0`, now the default) recovered B=4 @2k to 35.7 → 46.3 t/s — parity with the 46.7 LEGACY=1 control (same-boot adjudication since run and closed: −6.3 %, see the row end) — with B=1/prefill unchanged; direct-paged is opt-in (=1) with no measured advantage. Mechanism (review-softened 2026-08-28): NOT an int8-compute gap (`v_dot4_i32_i8` is full-rate on gfx906, 4 int8 MAC/cyc, 2× packed fp16; both arms share the same dot — `DEVLOG-fa-attention.md` 2026-08-28 entry). The loss is **Sq>1-specific** — the in-process Sq=1 A/B on the identical strided-read path was a wash, which the read-layout theory alone cannot explain; direct-paged's strided Q8-slice reads (136 B slices inside 256-B row strides, 34-B block strides → sector waste) remain the **leading but unconfirmed** hypothesis, with the Sq>1 machinery (round-8 Q-pad/unpad fast paths, graph-capture interaction) at least a co-contributor — devlog round-10 erratum. The flip gate's B=4 half is green; the B=1 same-boot adjudication ran 2026-08-29 (boot O): LEGACY=0 −6.3 % (−6.4 % with direct-paged) — flip CLOSED, default stays 1 (`DEVLOG-fa-legacy0-b1-decode.md`) |
 | `GFX906_FA_FUSED_QUANT` | 1 | fuse quantize into the decode KV gather (bit-equal); `0` kill switch |
 | `GFX906_FA_NC2` | 8 (auto-downgrade) | GQA heads packed per KV block; instantiated {1,2,8}; invalid explicit value = error |
 | `GFX906_FA_KVSPLIT` | gather 16; direct-paged `clamp(16/B,2,8)` | decode KV-split factor (one knob, two paths — an exported value pins BOTH; safe explicit values: gather `16`, direct-paged `8` at B≤2 / `2` at B≥4); `1` disables; `0` is NOT the unset default (it clamps to 1). The gather path's fixed `16` is B=1-tuned: at B=4 it costs ~+18 % extra combine-traffic vs the batch-scaled formula (documented in `csrc/gfx906_fa/gfx906_fa.cpp`) — the round-10 reroute's +29.7 % net win is *despite* this; a batch-aware gather split is a follow-up candidate |
@@ -289,12 +288,13 @@ targets matrix cores; gfx906 has none).
 - **LEGACY=0** (Q8 side view) had its warmup/COW/graph-replay desync
   fixed 2026-08-27 (`b98bb329f0`) and is validated (46/46 suite,
   default-config + prefix-cache smokes) but stays experimental — no
-  long-context soak / TP=2 bake / net win in a realistic config yet;
-  keep the LEGACY=1 default until the M5 bake gate
-  (`roadmap-more-models.md`) passes.
+  long-context soak / net win in a realistic config; the M5 bake
+  (2026-08-28) and the same-boot B=1 adjudication (2026-08-29, −6.3 %)
+  both lost, so LEGACY=1 stays the default
+  (`DEVLOG-fa-legacy0-b1-decode.md`).
 - **Layer 0's routed experts ship fp16** (checkpoint
   `modules_to_not_convert`) → Triton `fused_moe`, 414 µs/step MoE. Options
-  catalogued in `moe-decode-roadmap.md` (C4).
+  catalogued in `ROADMAP.md` (C4, Tier 2).
 - **GDN/mamba state copy pile**: ~180 µs/step of `[3,1,32]` copies —
   upstream state bookkeeping, deferred.
 - **B>1 decode**: one 192 KB reshape copy per FA layer remains (zero-copy

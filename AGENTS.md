@@ -156,7 +156,8 @@ vulnerability process.
   optimization hub: measured ISA facts, latency-hiding patterns, and the
   LDS layout standard for MI50, plus the change inventory, benchmark
   record (`README.md`, the `DEVLOG-*.md` set), run/build recipes
-  (`running.md`), and the MoE-decode roadmap. Read the kernel notes before
+  (`running.md`), and the roadmap (`ROADMAP.md` for open work,
+  `REFRIGERATOR.md` for parked items). Read the kernel notes before
   writing or modifying gfx906 kernels or interpreting kernel benchmarks.
   **Dev logs**: read
   [`AGENTS.md`](docs/gfx906/AGENTS.md) before writing/updating any

@@ -418,7 +418,7 @@ table at all.
    fallback path is non-regressive (not just non-improving) relative
    to today's baseline at that context length.
 3. A concurrency/mixed-length A/B (`BENCH_MAX_SEQS`-style, per the
-   C2 precedent in `moe-decode-roadmap.md`) — quantifies the
+   C2 precedent in `ROADMAP.md`) — quantifies the
    batch-wide-cliff discount versus the single-request numbers above.
 4. PPL/greedy correctness gate on the fallback path itself (should be
    a no-op numerically since eager/piecewise `GFX906_FA` is already

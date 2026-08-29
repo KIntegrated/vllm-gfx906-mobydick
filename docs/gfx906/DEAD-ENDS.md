@@ -40,6 +40,8 @@ DEVLOG). Pattern: **hypothesis → gate → verdict → commit/revert → commen
 `GA`=DEVLOG-gemma4-*.md · `W1`=DEVLOG-gdn-mixed-decode.md ·
 `MG`=DEVLOG-muse-glimmer.md.
 
+| Onboard Qwen3-30B-A3B-AWQ as the next generic AWQ MoE candidate (E=128/topk=8/hidden=2048 may fit the M=1 tile) | — (never started) | **SUPERSEDED** (2026-08-29 user decision: not an active goal — the supported Qwen3.5/3.8 line supersedes the model) | — | candidate removed from the onboarding queue during the roadmap reorg; the generic AWQ queue itself stays open for the next compatible checkpoint | ROADMAP (onboarding queue) |
+
 ## OPEN / IN-FLIGHT (verdict not yet recorded)
 
 | Hyp | Gate | Status | Refs |
