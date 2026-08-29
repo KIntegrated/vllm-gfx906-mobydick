@@ -18,7 +18,6 @@ faster than the Conch path it replaces.
 
 import torch
 
-from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
@@ -27,8 +26,6 @@ from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     PackedvLLMParameter,
 )
-
-logger = init_logger(__name__)
 
 __all__ = ["CompressedTensorsW8A16ChannelDequant"]
 
@@ -66,6 +63,8 @@ class CompressedTensorsW8A16ChannelDequant(CompressedTensorsScheme):
         output_size_per_partition = sum(output_partition_sizes)
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
+        layer.output_partition_sizes = output_partition_sizes
+        layer.params_dtype = params_dtype
         if not hasattr(layer, "has_bias"):
             layer.has_bias = False
 
