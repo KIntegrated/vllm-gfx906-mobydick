@@ -63,6 +63,8 @@ code changes on this branch; nothing to revert. Probes and the
 
 ### F1 (P1, fix before merge) — two committed records still say the same-boot adjudication never ran
 
+**FIXED in `a7c07526fd`.**
+
 - **What**: `roadmap-more-models.md`, M6 residuals: "The never-run
   same-boot B=1 adjudication (107.2 boot M vs 111.5 boot L) remains
   available if the question ever reopens." And `README.md`, the
@@ -78,6 +80,8 @@ code changes on this branch; nothing to revert. Probes and the
 
 ### F2 (P2) — append-cost number is a point estimate from an eager, launch-overlap-sensitive measurement
 
+**FIXED in `a7c07526fd`** (band + bound recorded; dev log + CHANGELOG).
+
 - **What**: the dev log/CHANGELOG record "+94.6 µs/step eager" as *the*
   append cost. My same-config re-run got +59.6 µs/step (q8-alone matches
   exactly at 6.6 µs; 6.6×16 = 105.6 µs is the no-overlap upper bound).
@@ -91,6 +95,9 @@ code changes on this branch; nothing to revert. Probes and the
 
 ### F3 (P2, nit) — inconsistent geometry labeling between the two probes
 
+**FIXED in `a7c07526fd`** (dev-log clarification; probe .py left untouched
+so the branch stays docs-only).
+
 The step probe runs Qwen3.8 at Hq=16/**Hkv=2** (per-shard, TP=2); the
 append probe's header and printout say "Qwen3.8 geometry … **Hkv=4**".
 One of them mislabels full-model vs per-shard Hkv. Timing is
@@ -98,6 +105,8 @@ launch-dominated at 1 token (≤2 KB/layer difference), so the measured
 number stands; fix the label for the future reader.
 
 ### F4 (P3, nit) — GATE-line typo
+
+**FIXED in `a7c07526fd`.**
 
 Dev-log GATE line reads "A 40.11/**40.11**"; the table, commit message,
 and degradation row all say 40.11/**40.12**. Trivial.
