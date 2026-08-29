@@ -100,11 +100,13 @@ shape-specific measurement. Follow the procedure above and the open items in
 
 **Status: onboarded 2026-08-28; follow-ups M0–M3, M5, M6 Parts A/B
 and the M3 dot2 refutation are CLOSED (records in `CHANGELOG.md`
-2026-08-27–28 and 2026-08-29; evidence in `DEVLOG-muse-glimmer.md`
-rounds 1–11 and `DEVLOG-fa-attention.md`).** `GFX906_FA_LEGACY=1`
-remains the serving default; LEGACY=0 B≥2 routes through the fused-Q8
-gather (`GFX906_FA_DIRECT_PAGED_Q8=0`, round 10); direct-paged is
-opt-in. Knobs: `README.md` table.
+2026-08-27–29; evidence in `DEVLOG-muse-glimmer.md` rounds 1–11 and
+`DEVLOG-fa-attention.md`).** M6 Part A was **merged 2026-08-29 as
+loader hygiene** (`02d197189f`; flip question stays DEAD-END — same-
+boot B=1 A/B PASS, slope −4.3…−4.8 %, bit-identical, 74/74). 
+`GFX906_FA_LEGACY=1` remains the serving default; LEGACY=0 B≥2 routes
+through the fused-Q8 gather (`GFX906_FA_DIRECT_PAGED_Q8=0`, round
+10); direct-paged is opt-in. Knobs: `README.md` table.
 
 ### M4 — long-context split-K accuracy point (qwen #4a)
 
@@ -137,10 +139,11 @@ long context.
 
 The machine has a single ROCm toolchain now (/opt/rocm is the default),
 so `source ~/env-rocm-7.14-gfx906.sh` (PATH/LD_LIBRARY_PATH to
-/opt/rocm) is presumably unnecessary — remove it from the ACTIVE
-recipes: `/local/git/AGENTS.md` (single-card bench recipe),
-`docs/gfx906/running.md` (×2), `docs/gfx906/README.md`,
-`docs/gfx906/degradation_details.md`. Dev logs keep their lines
-(historical record). Gate: run the single-card bench recipe once
-verbatim WITHOUT the source and confirm the harness works (boot K,
-2026-08-27).
+/opt/rocm) is unnecessary — **confirmed 2026-08-29 (boot N)**: both
+prime dense models' TP=2 serving boots, the 74/74 in-process suite,
+and the FA micro-bench runs all worked without it. Remaining: remove
+it from the ACTIVE recipes: `/local/git/AGENTS.md` (single-card bench
+recipe), `docs/gfx906/running.md` (§0 + build section),
+`docs/gfx906/README.md` (bench recipe). Dev logs and
+degradation_details.md keep their lines (historical record); the
+session `canary.sh` sources it — drop there too when next touched.
