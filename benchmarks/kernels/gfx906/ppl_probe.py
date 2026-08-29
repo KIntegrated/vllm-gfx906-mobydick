@@ -62,6 +62,9 @@ def main():
     moe_backend = os.environ.get("BENCH_MOE_BACKEND")
     if moe_backend:
         extra["moe_backend"] = moe_backend
+    # BENCH_DTYPE (e.g. float16) — checkpoints whose config says bfloat16
+    # need an explicit float16 to select the fp16-only gfx906 kernels.
+    bench_dtype = os.environ.get("BENCH_DTYPE", "auto")
     llm = LLM(
         model=os.environ.get(
             "BENCH_MODEL", "/local/models/QuantTrio/Qwen3.5-35B-A3B-AWQ"),
@@ -69,6 +72,7 @@ def main():
         max_model_len=int(os.environ.get("BENCH_MAXLEN", "32768")),
         gpu_memory_utilization=0.95,
         enforce_eager=True,
+        dtype=bench_dtype,
         hf_overrides={},
         **extra,
     )

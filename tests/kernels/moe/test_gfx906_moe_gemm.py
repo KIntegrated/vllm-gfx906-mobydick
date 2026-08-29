@@ -154,17 +154,22 @@ def _run_case(M, N13, K13, N2, K2, block_m, gs=GS, layout=None):
     rel1 = err1 / ref_rows.abs().max().item()
 
     # ---- activation: silu_and_mul on c1 -> [M*TOPK, N13/2] ----
-    inter = (
-        (
-            torch.nn.functional.silu(c1[:, : N13 // 2].float())
-            * c1[:, N13 // 2 :].float()
+    # (identity for non-gated shapes, e.g. Nemotron-3.5-Lightning relu2
+    # experts where N13 == K2; the kernel is activation-agnostic)
+    if N13 == K2:
+        inter = c1.contiguous()
+    else:
+        inter = (
+            (
+                torch.nn.functional.silu(c1[:, : N13 // 2].float())
+                * c1[:, N13 // 2 :].float()
+            )
+            .half()
+            .contiguous()
         )
-        .half()
-        .contiguous()
-    )
 
     # ---- gemm2 (w2): [M*TOPK, K2] -> [M, N2] fused weight + reduce ----
-    assert N13 // 2 == K2, "test shape mismatch"
+    assert N13 // 2 == K2 or N13 == K2, "test shape mismatch"
     out = torch.zeros(M, N2, device=dev, dtype=torch.float16)
     ops.moe_gptq_gemm_gfx906(
         inter,
@@ -220,6 +225,8 @@ _CASES = [
     (2, 1536, 768, 1536, 768, 1, 128),  # K not mult of 256; N=1536 (gridY partial)
     (1, 1408, 2816, 2816, 704, 1, 32),  # Gemma-4 gemm1/gemm2, decode
     (32, 1408, 2816, 2816, 704, 4, 32),  # Gemma-4 gemm1/gemm2, prefill
+    (1, 1856, 2688, 2688, 1856, 1, 64),  # Nemotron-3.5-Lightning, decode
+    (32, 1856, 2688, 2688, 1856, 4, 64),  # Nemotron-3.5-Lightning, prefill
 ]
 
 

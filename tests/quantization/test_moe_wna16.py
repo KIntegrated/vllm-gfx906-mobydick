@@ -246,7 +246,9 @@ def test_gfx906_hip_oracle_shape_gate(hidden_dim, intermediate_size,
             ),
             "static (non-dynamic) scales",
         ),
-        # Group size outside the validated 32/128 set.
+        # Group size not a multiple of 32: the kernel's per-32-K-slice
+        # group tracking contract is violated (group 64 IS accepted since
+        # the Nemotron-3.5-Lightning onboarding; see the accept test below).
         (
             QuantizationArgs(
                 num_bits=4,
@@ -254,9 +256,9 @@ def test_gfx906_hip_oracle_shape_gate(hidden_dim, intermediate_size,
                 strategy=QuantizationStrategy.GROUP,
                 symmetric=True,
                 dynamic=False,
-                group_size=64,
+                group_size=48,
             ),
-            "group size 32 or 128",
+            "multiple of 32",
         ),
         # Channel strategy: no [E, G, N] group scales for the kernel.
         (
@@ -336,12 +338,14 @@ def test_gfx906_hip_oracle_symmetric_no_zp_contract_gate(quant_config, expected)
     assert expected in reason
 
 
-@pytest.mark.parametrize("group_size", [32, 128])
+@pytest.mark.parametrize("group_size", [32, 64, 128])
 def test_gfx906_hip_oracle_accepts_symmetric_no_zp(group_size):
     from tests.kernels.moe.utils import make_dummy_moe_config
 
     # Gemma-4-26B-A4B-shaped config (group-32 symmetric no-zp): the
-    # shipped no-zp path (180f030ee3) must keep passing the gate.
+    # shipped no-zp path (180f030ee3) must keep passing the gate. Group
+    # 64 is the Nemotron-3.5-Lightning-30B contract (K=2688/1856 both
+    # divisible by 64; any positive multiple of 32 is accepted).
     moe_config = make_dummy_moe_config(hidden_dim=2048, intermediate_size=704)
     quant_config = QuantizationArgs(
         num_bits=4,

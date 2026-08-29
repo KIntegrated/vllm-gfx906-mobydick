@@ -216,9 +216,14 @@ def triton_matmul(a, b):
     return c
 
 
-def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor:
+def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor | None:
     """ops.LLMM1 requires weight rows % 4 == 0; zero-pad tiny m and slice
     the result back.
+
+    Returns None for fp32 operands (e.g. a force_fp32_compute router gate
+    on ROCm, where GateLinear stores fp32 weights and casts x to match) so
+    the caller falls back to the triton/torch path; ops.LLMM1 only accepts
+    fp16/bf16.
 
     gfx906: the custom row-parallel W16A16 GEMV (dense_gemv_gfx906) beats
     LLMM1 rpb=4 on K=2048 rows with N==256 (router, -17%) or N>=2048
@@ -237,6 +242,12 @@ def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor:
     faster in isolation and bit-equal at N=1, K=2048 (measured, see
     docs/gfx906/DEVLOG-moe-opt.md).
     """
+    if weight.dtype not in (torch.float16, torch.bfloat16) or x_view.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        return None
+
     m = weight.shape[0]
     from vllm.platforms.rocm import on_gfx906
 

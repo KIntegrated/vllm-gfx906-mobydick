@@ -46,6 +46,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A8Mxfp8,
+    CompressedTensorsW8A16ChannelDequant,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA4Int,
     CompressedTensorsWNA8Int,
@@ -798,6 +799,22 @@ class CompressedTensorsConfig(QuantizationConfig):
         if self._is_wNa16_group_channel(weight_quant, input_quant) and (
             format == CompressionFormat.pack_quantized.value
         ):
+            # gfx906: channel-wise 8-bit has no competitive MP-linear
+            # kernel (Conch costs ~3.8 ms per M=1 GEMV on MI50); dequant
+            # to fp16 at load and run the optimized GEMV family instead.
+            if (
+                weight_quant.num_bits == 8
+                and weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+                and weight_quant.symmetric
+                and weight_quant.actorder is None
+                and current_platform.is_rocm()
+            ):
+                from vllm.platforms.rocm import on_gfx906
+
+                if on_gfx906():
+                    return CompressedTensorsW8A16ChannelDequant(
+                        layer_name=layer_name
+                    )
             return CompressedTensorsWNA16(
                 num_bits=weight_quant.num_bits,
                 strategy=weight_quant.strategy,

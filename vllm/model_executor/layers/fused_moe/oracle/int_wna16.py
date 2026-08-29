@@ -125,15 +125,21 @@ def _gfx906_no_zp_reason(
         )
     if quant_config.dynamic:
         return "symmetric no-zp MoE requires static (non-dynamic) scales"
-    # The kernel reads [E, G, N] group scales and 32/128 are the
-    # checkpoint-validated group sizes (its per-32-K-slice group tracking
-    # would accept any multiple of 32; widen with a per-shape micro-bench).
+    # The kernel reads [E, G, N] group scales and derives group
+    # boundaries generically as K / groups, so any group size that is a
+    # multiple of 32 works (its per-32-K-slice group tracking constraint).
+    # Validated for 32/128 (Qwen3.5/Gemma-4 shapes) and 64 (Nemotron-3.5-
+    # Lightning: K=2688 w13 / K=1856 w2, both divisible by 64).
     if quant_config.strategy != QuantizationStrategy.GROUP:
         return "symmetric no-zp MoE requires the group strategy"
-    if quant_config.group_size not in (32, 128):
+    if (
+        quant_config.group_size is None
+        or quant_config.group_size <= 0
+        or quant_config.group_size % 32 != 0
+    ):
         return (
-            "symmetric no-zp MoE requires group size 32 or 128 "
-            f"(got {quant_config.group_size})"
+            "symmetric no-zp MoE requires a positive group size that is a "
+            f"multiple of 32 (got {quant_config.group_size})"
         )
     # g_idx activation ordering (group/dynamic) needs a runtime weight
     # reordering the kernel lacks; weight/static are natural-order safe.

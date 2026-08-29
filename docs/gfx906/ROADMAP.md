@@ -248,6 +248,60 @@ the Qwen3.5 GDN, standard GQA, or W4A16 paths.
 Ling (→ REFRIGERATOR) and do not build an expert kernel for an
 unservable model.
 
+### Nemotron-3.5-Lightning-30B-A3B mixed INT4/INT8 (`NemotronHForCausalLM`)
+
+**Status: NH-1 SHIPPED (unmerged, `gfx906/nemotron-h-onboard`); NH-2/NH-3
+open.** Serves at **59.4 tok/s** (graph, pp2048/tg256, 4 samples, GPU0)
+after three fixes on the branch: fp32-router LLMM1 dtype guard, the
+ssd_chunk_scan pointer-yield restructure (triton-gfx906
+CanonicalizePointers workaround), and a new
+`CompressedTensorsW8A16ChannelDequant` scheme replacing Conch
+(3.79 ms → ~62 µs per dense GEMV). Experts run on the custom gfx906
+W4A16 kernel with the group gate widened to any positive multiple of
+32 (g64 here) + `RELU2_NO_MUL` support (+88.8% vs Triton WNA16).
+See `DEVLOG-nemotron-h.md` for gates (PPL 26.9555, A/B tables).
+
+Per-step decode budget at 59.4 tok/s (16.8 ms, clean 32-step profile,
+`/tmp/nemotron_prof3.log`): LLMM1 dense GEMVs 3.57 ms · fp32 router
+gates 3.08 ms (24 × 128 µs triton fp32 matmul) · MoE experts 1.77 ms ·
+mamba elementwise/mul ~3 ms · shared experts 1.0 ms · topk chain
+~1.2 ms · SSU+conv 0.5 ms.
+
+- **NH-2 — int8-channel GEMV kernel (dense INT8 layers).** The dequant
+  path reads 2× the bytes (fp16); an int8 GEMV in the
+  `dense_gemv_gfx906` family (unpack + per-channel scale in-kernel)
+  should halve the 3.57 ms LLMM1 budget. Needs a greedy/PPL gate and a
+  serving A/B; also unlocks retiring the +1.8 GiB dequant VRAM.
+- **NH-3 — fp32 router-gate GEMV (3.1 ms/step, ~18%).** 24 × [≤32, 2688]
+  × [128, 2688] fp32 matmuls run 128 µs each on triton fp32 — ~10 µs
+  should be achievable with an fp32 (or 3×bf16-split) GEMV epilogue on
+  the existing dense GEMV kernel. Semantics: `force_fp32_compute`
+  routing must stay fp32-accumulated.
+- **NH-4 — mamba2 decode tail.** SSU is 20 µs/layer (generic triton) and
+  the mamba gating muls/elementwise average 22–60 µs for KB-sized
+  tensors (launch-tail dominated); a fused gating + SSU pass or gfx906
+  SSU tuning is worth ~1–2 ms/step. Lower confidence than NH-2/NH-3.
+- **NH-5 — topk chain (~1.2 ms/step).** sigmoid + correction-bias +
+  grouped topk = 3 kernels/layer at E=128/topk 6; C1's lesson (removing
+  nodes transfers, replacing the production topk does not) applies —
+  fold, don't replace.
+- **NH-6 — MTP head (parked).** The BF16 MTP layer is present in the
+  checkpoint; nemotron_h_mtp drafting with mamba-state rewind is
+  unvalidated on this fork and MTP was already too heavy for these GPUs
+  on Qwen3.8. Revisit only with ngram numbers first
+  (`--speculative-config '{"method":"ngram",...}'`).
+- **TP=2 untested** for this model (mamba state pool + shared-expert
+  overlap under TP not validated); single-card 32 GB fits maxlen 8k
+  comfortably, 131k needs the second card.
+
+Serve recipe (validated 2026-08-29): `--dtype float16` (bf16 config
+would route shared experts off Exllama and experts off the gfx906
+kernel — both are fp16-acts-only), `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`,
+util 0.90–0.95, graph mode with cudagraph capture sizes matched to
+max_num_seqs; attention runs ROCM_ATTN (the CUSTOM gfx906 FA backend is
+rejected for hybrid DECODER attention — investigate separately if the
+6 GQA layers ever show in the profile; they do not at B=1).
+
 ## Upstream contribution queue (owner time)
 
 Implemented or source-confirmed in the fork but not upstream
