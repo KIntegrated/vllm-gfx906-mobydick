@@ -1400,3 +1400,43 @@ pool, `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0`).
     GPU0). Post-reboot pending (see the degradation.md row): canary,
     then bake arms B/C on `feat/fa-legacy0-b1-decode` (arm A control
     already recorded: 39.76/40.12 t/s @ pp2048/tg256).
+
+## 2026-08-29 15:51 + 16:09Z — boot O, B=1 bake arms A and C (two wedges, non-consecutive)
+
+    Post-reboot bake of `feat/fa-legacy0-b1-decode` (arm A control
+    already recorded on boot N: 39.76/40.12 t/s). Boot O: canary
+    39.3 t/s clean at 15:49.
+
+    **Wedge 1 (15:51:02, arm A 1st attempt):** kernel log — GPU1
+    (0000:0e:00.0) `qcm fence wait loop timeout expired`,
+    `The cp might be in an unrecoverable state due to an unsuccessful
+    queues preemption`, `Failed to evict process queues`,
+    `Failed to quiesce KFD`, `GPU reset begin! Source: 4`, PSP
+    `UNLOAD_TA(0x2) failed (0x117)`, **BACO reset**, `GPU reset
+    succeeded, trying to resume` + coredump file created; userspace
+    `unspecified launch failure` both ranks at the shard-5 weight-load
+    stage. Just before: `amdkfd_restore_userptr_worker hogged CPU
+    >10000us` (workqueue notice; the boot's kernel log is otherwise
+    clean from the 15:37 driver init — no earlier reset this boot).
+
+    **Between the wedges, four clean two-card launches:** bare
+    torch/RCCL probe (50 allreduces, 35.2 ms/iter, ~15:55), arm A
+    retry (loaded 345 s, served, benched 40.11/40.12 t/s, clean
+    teardown), arm B (LEGACY=0) (loaded 325 s, served, benched
+    37.61/37.56 t/s, clean teardown).
+
+    **Wedge 2 (16:09:11, arm C 1st attempt):** identical GPU1
+    signature (`qcm fence wait loop timeout` → evict/KFD-quiet fail
+    → GPU reset), userspace `unspecified launch failure` both ranks at
+    weight load.
+
+    Assessment: boot O is taking intermittent GPU1 qcm-fence wedges
+    under two-card vLLM weight loads, with clean two-card launches
+    between them — NOT the consecutive-failure burst pattern (the
+    clean runs break the chain per the boot-L 12:52 precedent), but
+    this is the 4th consecutive boot (L, M, N, O) with the two-card
+    load-wedge pattern, and every boot-O wedge is GPU1. Chronic
+    hardware/driver suspicion is now the working hypothesis (a
+    reboot alone has not cleared it across L→M→N→O). Protocol: arm C
+    gets one retry; a 3rd boot-O wedge OR the retry wedging stops
+    GPU work pending host investigation.

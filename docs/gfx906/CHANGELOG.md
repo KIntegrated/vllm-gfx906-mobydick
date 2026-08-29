@@ -45,6 +45,23 @@ the date an investigation began.
   Post-merge suite 70/70 (60 base + 5 M2 + 5 M3 parametrized cases);
   both review rounds (`m3-code-rev-glm5.md`, external fold) closed at
   `cf5ccbd685`/`9d98aca9ab`.
+- **B=1 LEGACY=1-vs-0 decode gap closed (roadmap item #1): LEGACY=0
+  stays OFF.** Same-boot (boot O) serving A/B, Qwen3.8-27B TP=2 B=1
+  pp2048/tg256: LEGACY=1 40.11/40.12 vs LEGACY=0 37.61/37.56 (−6.3 %)
+  t/s; the M5-era direct-paged B=1 config lands within 0.2 % of the
+  Q8-gather config (37.55/37.54) despite very different FA/gather
+  subcomponents (kernel probe: the Q8-gather read path is 22–45 %
+  FASTER per step than fp16-gather+quantize, growing with Sk; direct
+  paged is +8–35 % slower). The serving gap is therefore a
+  LEGACY=0-common per-step cost, not FA/gather: the append-time Q8
+  side-buffer write is +94.6 us/step eager (16 full-attn layers), and
+  the ~1.55 ms/step remainder is a serving-harness/graph-node
+  interaction (unmeasured). M5's "LEGACY=0 LOSES, default stays 1"
+  verdict confirmed by a proper same-boot adjudication. Probes kept
+  (`benchmarks/kernels/gfx906/legacy0_b1_step_probe.py`,
+  `legacy0_append_cost_probe.py`); `_serve_tp2_gfx906.sh` gained
+  EXTRA_SERVE_ENV passthrough. Records:
+  `DEVLOG-fa-legacy0-b1-decode.md`.
 
 ## 2026-08-27–28
 

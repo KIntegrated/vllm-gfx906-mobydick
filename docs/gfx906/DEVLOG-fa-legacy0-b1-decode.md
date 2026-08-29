@@ -3,10 +3,10 @@
 
 ## 2026-08-29 — B=1 LEGACY=1-vs-0 decode gap (roadmap item #1)
 
-**VERDICT:** OPEN (serving gate pending — host reboot required, see
-below) · **GATE:** same-boot TP=2 serving A/B, Qwen3.8-27B B=1
-pp2048/tg256, arms A (LEGACY=1), B (LEGACY=0), C (LEGACY=0 +
-DIRECT_PAGED=1 + DIRECT_PAGED_Q8=1).
+**VERDICT:** DEAD-END (flip question closed: LEGACY=1 stays the
+default) · **GATE:** same-boot (boot O) TP=2 serving A/B,
+Qwen3.8-27B B=1 pp2048/tg256, 2 samples/arm — A 40.11/40.11 vs
+B 37.61/37.56 (−6.3 %) vs C 37.55/37.54 (−6.4 %) t/s.
 
 ## HYPOTHESIS
 
@@ -32,8 +32,18 @@ traffic — and the kernel-level decomposition will assign it.
    `/local/tmp/b1_step_probe_run1.log`.
 3. Serving bake (TP=2, Qwen3.8-27B, maxlen 32768,
    `_serve_tp2_gfx906.sh` + new `EXTRA_SERVE_ENV` passthrough +
-   `_bench_serve_grid_gfx906.py [[2048,256]] 2`): arm A done, arm B
-   aborted by host wedges (below).
+   `_bench_serve_grid_gfx906.py [[2048,256]] 2`), boot O (canary
+   39.3 t/s; boot N arm A 39.76/40.12 kept as cross-boot anchor):
+   all three arms ran clean on boot O after two intermittent GPU1
+   qcm-fence load wedges (15:51 arm A 1st try, 16:09 arm C 1st try —
+   recorded in degradation.md/_details; bare two-card RCCL probe +
+   clean runs between break the chain per the boot-L 12:52
+   precedent).
+4. Append-path cost probe (`legacy0_append_cost_probe.py`, eager,
+   B=1 D=256 Hkv=4): the LEGACY=0 per-layer append adds
+   `reshape_and_cache_q8` (6.6 us; +16.4 % on the 36.1 us
+   triton write), ×16 full-attn layers = **+94.6 us/step eager**.
+   Log: /local/tmp/b1ab_*_bootO.log, /local/tmp/b1_step_probe_run1.log.
 
 ## Evidence FOR (the framing is superseded — launch-regime)
 
@@ -54,40 +64,60 @@ C: direct-paged B=1 is +7.6…+34.7 % slower than A, growing with Sk
 vs compact reads — the wrapper header's old "B=1: gather faster by
 ~3-6 %" A/B was measured at short Sk, where the penalty is smallest).
 
-## Evidence AGAINST / blockers
+## Evidence AGAINST (the gate fired — launch-regime numbers did not
+## transfer)
 
-- The serving gate cannot complete on this boot: both arm B attempts
-  wedged at weight load (`hipErrorLaunchFailure`, both ranks, chronic
-  two-card load family; 13:40:36 + 13:42:40) — **2 consecutive
-  failures = BURST → host reboot required** (recorded in
-  `degradation.md` + `degradation_details.md`).
-- Arm A control (LEGACY=1, same boot): B=1 **39.76 / 40.12 t/s**
-  (pp2048/tg256; B=4 41.15/41.04 aggregate) — `/local/tmp/b1ab_armA.log`.
-  Matches the production no-spec decode band (≈39.7 t/s TP=2 record).
+Same-boot (boot O) serving, Qwen3.8-27B TP=2, B=1 pp2048/tg256,
+2 samples/arm (B=4 aggregate in parens):
 
-## Why the item's premise changed
+| arm | path | t/s | vs A |
+|---|---|---|---|
+| A | LEGACY=1 (production default) | 40.11 / 40.12 (41.15/41.04) | — |
+| B | LEGACY=0 (Q8-gather dispatch) | 37.61 / 37.56 (38.24/38.14) | **−6.3 %** |
+| C | LEGACY=0 + direct-paged (M5 era) | 37.55 / 37.54 (38.20/38.12) | **−6.4 %** |
 
-Part B (2026-08-28) rerouted LEGACY=0 B≥2 through the fused-Q8 gather;
-B=1 follows the same Q8 gather under today's defaults (the direct
-branch additionally requires `DIRECT_PAGED_Q8=1`). So "LEGACY=0 B=1 is
-2.5–3.7 % slower" (M5 era, direct-paged) is no longer the production
-comparison — today's comparison (B vs A) is a 22–45 % kernel-level
-WIN for LEGACY=0 that the LEGACY=1 default does not collect. If the
-serving gate confirms the transfer, this flips from "close the gap" to
-"a default-flip candidate for the roadmap" (with the append-time
-quantize cost as the known counterweight).
+Sample spread ≤0.1 % per arm; cross-boot A consistency: boot N
+39.76/40.12 vs boot O 40.11/40.11. The kernel probe's B win (−36 % on
+the gather+FA subcomponent at 2k) did NOT transfer — the serving step
+at 2k context is ~25 ms, of which the subcomponent is ~92 us (0.4 %).
 
-## Interactions / next steps (post-reboot)
+## Why LEGACY=0 loses (mechanism, bounded)
 
-1. Canary (healthy band 38–47 t/s) — if slow, REBOOT AGAIN before the
-   bake.
-2. Arm B: `EXTRA_SERVE_ENV="GFX906_FA_LEGACY=0"` — bench
-   `[[2048,256]] 2` vs arm A's 39.76/40.12.
-3. Arm C: `EXTRA_SERVE_ENV="GFX906_FA_LEGACY=0 GFX906_FA_DIRECT_PAGED=1
-   GFX906_FA_DIRECT_PAGED_Q8=1"` — adjudicates the M5-era 107.2-vs-111.5
-   numbers and the wrapper-header 3–6 % claim on the current build.
-4. Teardown between arms: SIGTERM + VRAM-release wait (TP=2 rule).
-5. Verdict + roadmap/CHANGELOG records; branch stays unmerged for
-   review either way.
+- B and C differ hugely in the FA/gather subcomponent (−36 %/+31 % vs
+  A in the kernel probe) yet land within 0.2 % of each other in
+  serving → the serving gap is NOT in the FA kernel or the gather.
+  It is in what both LEGACY=0 arms share per step.
+- Measured share: the append-time Q8 side-buffer write
+  (`reshape_and_cache_q8` + slot cast, 16 full-attn layers/step) is
+  +94.6 us/step eager — real but an order of magnitude below the
+  ~1.55 ms/step serving delta.
+- The unexplained remainder is a serving-harness interaction specific
+  to LEGACY=0's per-step path: the ~16–32 extra captured graph nodes
+  per decode step (Q8 writes + slot casts) add graph-replay node
+  overhead that is invisible in eager timing, ± TP=2 sync-placement
+  effects. Not further decomposed (a step trace on this stack has
+  the documented wall-alignment caveat; eager TP=2 is not a valid
+  isolator — it collapses ~3× from launch overhead).
+- The steady-state READ path win (Q8 gather 22–45 % below fp16
+  gather+quantize per step, growing with Sk) is real but swamped at
+  2k context; even at 32k it is ~440 us/step vs the ~1.55 ms
+  fixed LEGACY=0 cost — no crossover at reachable context lengths on
+  this step-time shape.
 
-VERDICT: OPEN
+## Interactions / refrigerated residue
+
+- M5's verdict ("LEGACY=0 LOSES, default stays 1") is CONFIRMED by a
+  proper same-boot adjudication; the M5-era 2.5–3.7 % gap does not
+  reproduce at 6.3–6.4 % on the current build (different era —
+  direction unchanged). The wrapper-header "B=1: direct loses 3–6 %"
+  note is superseded by the kernel probe numbers (+8–35 % at
+  2k–32k, growing with Sk) for future reference.
+- Refrigerated: fusing the Q8 write INTO
+  `triton_reshape_and_cache_flash` (one kernel writes fp16 K + Q8
+  bytes) would cut the append delta to ~0 and the graph nodes in
+  half — but the node-overhead remainder would still stand, so this
+  alone would not close a 6 % gap; revisit only with a graph-node
+  overhead measurement.
+
+VERDICT: DEAD-END (flip question closed; records: DEAD-ENDS.md,
+CHANGELOG; branch stays unmerged for review)
