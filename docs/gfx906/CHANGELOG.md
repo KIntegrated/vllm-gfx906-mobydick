@@ -91,6 +91,20 @@ the date an investigation began.
   L*, N*, U*, HK*, SD-*) are stable; README/AGENTS references updated;
   the C8 L2/residency open question is folded into C2. Historical
   filename mentions inside devlogs/plans are left as records.
+- **MoE C1 stage 1: M=1 fused align+count kernel landed (opt-in flag
+  defaulted ON after gate).** The M=1 decode routing chain is 3 kernels
+  per layer (topk + align 2-block + count_and_sort = 120 graph nodes/step
+  ≈ 0.8 ms); the new 1-CTA kernel replaces the align pair (120 → 80
+  nodes), bit-equal to the generic chain. Structural probe + S2
+  re-validation: isolated-graph kernel numbers can flip sign in the
+  production graph (S2 topk swap: −1.03% serving vs −28% per node in
+  isolated graphs), but **node removal transfers** — serving A/B
+  (in-process MoE 35B, pp2048/tg256, 4 samples/arm, back-to-back):
+  **+1.18% (207 µs/step), +1.73% on the second session**; within 8% of
+  the isolated prediction. `VLLM_GFX906_ALIGN_M1=0` opts out. Stage 2
+  (fused topk+align+count, 120 → 40 nodes) is the follow-up. Records:
+  `DEVLOG-moe-c1-routing-fusion.md`,
+  `benchmarks/kernels/gfx906/c1_routing_structural_probe.py`.
 
 ## 2026-08-27–28
 

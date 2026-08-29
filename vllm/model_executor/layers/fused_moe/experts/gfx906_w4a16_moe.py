@@ -13,6 +13,8 @@ Weight format (repacked at load time by the WNA16 oracle, per expert):
   - Zero points ``[E, groups, N/8]`` packed int32 (8 nibbles per word)
 """
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -46,6 +48,62 @@ def _has_gfx906_moe_op() -> bool:
     )
 
 
+def _has_gfx906_align_m1_op() -> bool:
+    return hasattr(torch.ops, "_rocm_C") and hasattr(
+        torch.ops._rocm_C, "moe_align_block_size_m1_gfx906"
+    )
+
+
+def _use_fused_align_m1(
+    topk_ids: torch.Tensor,
+    block_size_m: int,
+    global_num_experts: int,
+    expert_map: torch.Tensor | None,
+) -> bool:
+    """C1 stage 1: single-CTA align+sort for the M=1 decode shape.
+
+    One 128-thread CTA replaces the two-kernel generic chain
+    (moe_align_block_size_kernel + count_and_sort_expert_tokens); outputs
+    are bit-equal to it for E=256 / topk=8 / block_size=1 (see
+    docs/gfx906/DEVLOG-moe-c1-routing-fusion.md). Serving A/B: +1.18% to
+    +1.73% MoE decode t/s (207-301 us/step), so it is the default;
+    VLLM_GFX906_ALIGN_M1=0 to opt out.
+    """
+    return (
+        os.environ.get("VLLM_GFX906_ALIGN_M1", "1") == "1"
+        and _has_gfx906_align_m1_op()
+        and expert_map is None
+        and topk_ids.size(0) == 1
+        and topk_ids.size(1) == 8
+        and block_size_m == 1
+        and global_num_experts == 256
+        and topk_ids.dtype == torch.int32
+    )
+
+
+def _moe_align_block_size_fused_m1(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Same buffer sizes as the moe_align_block_size wrapper for this shape
+    # (M=1, topk=8, block_size=1: numel + E*(1-1) = 8, and numel < E keeps
+    # it at 8; expert_ids size = cdiv(8, 1) = 8).
+    numel = topk_ids.numel()
+    sorted_ids = torch.empty(
+        (numel,), dtype=torch.int32, device=topk_ids.device
+    )
+    expert_ids = torch.empty(
+        (numel,), dtype=torch.int32, device=topk_ids.device
+    )
+    num_tokens_post_pad = torch.empty(
+        (1,), dtype=torch.int32, device=topk_ids.device
+    )
+    torch.ops._rocm_C.moe_align_block_size_m1_gfx906(
+        topk_ids, num_experts, 1, sorted_ids, expert_ids, num_tokens_post_pad
+    )
+    return sorted_ids, expert_ids, num_tokens_post_pad
+
+
 class Gfx906WNA16Experts(FusedMoEExpertsModular):
     """W4A16 MoE experts using the fused gfx906 HIP kernel."""
 
@@ -71,8 +129,8 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
             kInt4Static,
             kInt4Static32,
             kInt4Static32Asym,
-            kInt4StaticAsym,
             kInt4Static32GroupScale,
+            kInt4StaticAsym,
             kInt4StaticGroupScale,
         )
 
@@ -200,11 +258,20 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
         else:
             block_size_m = 8
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = (
-            moe_align_block_size(
-                topk_ids, block_size_m, global_num_experts, expert_map
+        if _use_fused_align_m1(
+            topk_ids, block_size_m, global_num_experts, expert_map
+        ):
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                _moe_align_block_size_fused_m1(
+                    topk_ids, global_num_experts
+                )
             )
-        )
+        else:
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                moe_align_block_size(
+                    topk_ids, block_size_m, global_num_experts, expert_map
+                )
+            )
 
         empty_topk_w = torch.empty(0, dtype=torch.float32,
                                    device=hidden_states.device)

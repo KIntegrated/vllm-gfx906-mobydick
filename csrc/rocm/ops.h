@@ -71,6 +71,16 @@ void moe_topk_softmax_m1_gfx906(torch::Tensor topk_weights,     // [1, 8] f32
                                 torch::Tensor gating,           // [1, 256] f16
                                 bool renormalize);
 
+// M=1 fused moe_align_block_size + count_and_sort for gfx906, E=256,
+// topk=8, block_size=1 (C1 stage 1; see moe_align_m1_gfx906.cu).
+// Buffers are the wrapper-convention sizes for this shape (8 / 8 / 1).
+void moe_align_block_size_m1_gfx906(torch::Tensor topk_ids,          // [1, 8] i32
+                                    int64_t num_experts,             // 256
+                                    int64_t block_size,              // 1
+                                    torch::Tensor sorted_token_ids,  // [8] i32
+                                    torch::Tensor expert_ids,        // [8] i32
+                                    torch::Tensor num_tokens_post_pad);  // [1] i32
+
 void paged_attention(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
     torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,
