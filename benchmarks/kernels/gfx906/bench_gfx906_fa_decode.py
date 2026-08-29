@@ -34,7 +34,8 @@ torch.manual_seed(0)
 
 Hq = int(os.environ.get("BENCH_FA_HQ", "16"))
 Hkv = int(os.environ.get("BENCH_FA_HKV", "2"))
-D, SQ = 256, 2  # decode Sq_pad=2
+D = int(os.environ.get("BENCH_FA_D", "256"))
+SQ = 2  # decode Sq_pad=2
 BPR = (D // 32) * 34  # 272 uint8 per Q8 row
 SK_LIST = [256, 512, 1024, 2048, 3328, 6656, 13312, 26624]
 HBM_BW = 798e9  # P3-0 Q1: measured MI50 HBM read BW

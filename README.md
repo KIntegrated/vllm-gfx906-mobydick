@@ -131,6 +131,7 @@ Environment variables:
 | `HF_HUB_OFFLINE` | `1` | optional | set only if the model is already in the local HF cache — without it vLLM downloads/refreshes from the hub on import |
 | `VLLM_GFX906_HIP_LIB_PATH` | `…/rocm/lib/libamdhip64.so.7` | **TP≥2 only** | with the blocking-sync `.pth` shim below (see note) — without both, every TP worker permanently pegs a host core at ~100 % (HIP active-wait) |
 | `VLLM_GFX906_SKINNY_M16` | `1` | optional | dense N=8 concurrent decode (+14.5 % W4 skinny GEMV); default off |
+| `GFX906_FA_TILE_CLIP` | default `1` | optional | M2 per-q-tile window raise + causal cap in the prefill FA (bit-identical, skips masked k-tiles); `0` = disable (A/B arm) |
 | `HSA_OVERRIDE_GFX_VERSION` | — **do not set** | — | ROCm 7.14 has native gfx906 (older 7.2.1 images needed `9.0.6`) |
 | `VLLM_ATTENTION_BACKEND` | — **do not set** | — | the custom Q8 FA backend (`CUSTOM`) is already the gfx906 default |
 

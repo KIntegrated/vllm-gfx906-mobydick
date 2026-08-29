@@ -90,13 +90,18 @@ the date an investigation began.
   `dequant-instructions.md`); the deficit is read-path/layout, not
   the dot. LEGACY=0 remains an experimental opt-in.
 - **M6 Part A: planar Q8 repack executed — DEAD-END for the flip
-  question (branch `feat/fa-legacy0-m6-partA`, left unmerged).** The
-  rev-2 plan's hard stop-rule fired: loader global loads 10→6 per
-  tile-row (1.67× < the 2× rule) despite a −2.4 % standalone B=1 win,
-  so the B=1 gap is not load-instruction-bound. Code is bit-identical
-  and neutral (production LEGACY=1 shares the loader); merge-or-revert
-  is pending. Record: `DEVLOG-muse-glimmer.md` round 11, `DEAD-ENDS.md`
-  MG row, plan `plan_fa_part_A.md` (on the branch).
+  question; merged to main 2026-08-29 as loader hygiene** (merge
+  `02d197189f`). The rev-2 plan's hard stop-rule fired: loader global
+  loads 10→6 per tile-row (1.67× < the 2× rule) despite a −2.4 %
+  standalone B=1 win, so the B=1 gap is not load-instruction-bound.
+  Merged for the aligned-loader win (production LEGACY=1 shares the
+  loader) and Part C groundwork: merged-tree suite 74/74 (incl. 4
+  byte-level layout pins), same-boot B=1 decode-step A/B (Muse
+  geometry D=128/Hq=32, NC2=1/KVSPLIT=1, boot N): slope 36.0→34.4
+  ns/token (−4.3/−4.8 %), @Sk=2176 83.6→79.1 us (−5.0/−5.6 %),
+  bit-identical (maxerr equal at every Sk) — gate PASS. Record:
+  `DEVLOG-muse-glimmer.md` round 11, `DEAD-ENDS.md` MG row, plan
+  `plan_fa_part_A.md`.
 - **M6 Part C (Q4-KV via `v_dot8_i32_i4`): SHELVED (`5d8d4c7f59`).**
   Quality unproven (Q4 K *and* Q requant; 7-level codebook ≈ doubles
   KQ quantization error with no PPL evidence). Reopens only behind a

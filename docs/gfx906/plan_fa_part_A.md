@@ -3,10 +3,11 @@
 Copyright Kevin Read <me@kevin-read.com>
 
 Status: **EXECUTED 2026-08-28 (round 11) — microbench hard stop-gate
-FIRED: flip question DEAD-END, code change NEUTRAL (kept on this
-branch).** Outcome: `DEVLOG-muse-glimmer.md` round 11 +
-`DEAD-ENDS.md` (`MG` row). Plan text below is the pre-execution
-record (rev 2).
+FIRED: flip question DEAD-END, code change NEUTRAL; MERGED to main
+2026-08-29 as loader hygiene** (`02d197189f`; same-boot B=1
+A/B PASS — slope −4.3/−4.8 %, bit-identical, merged suite 74/74).
+Outcome: `DEVLOG-muse-glimmer.md` round 11 + `DEAD-ENDS.md` (`MG`
+row). Plan text below is the pre-execution record (rev 2).
 
 Part B is gated and merged (round 10). This revision incorporates a
 two-reviewer plan review (since deleted after folding): corrected diff
