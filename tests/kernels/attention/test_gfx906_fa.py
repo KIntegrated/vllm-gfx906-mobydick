@@ -2410,12 +2410,16 @@ def test_m2_tile_clip_prefill_bit_identical(Sq):
         del os.environ["GFX906_FA_TILE_CLIP"]
 
 
-def test_m2_causal_cap_bit_identical_window_off():
-    """Causal cap in isolation: q_abs_offset set, window=0 (no window
-    mask, no clip) — the cap only skips causally masked tail k-tiles.
-    On vs off must be bit-identical and match the plain causal torch
-    reference (the Sq=1 decode geometry is the no-op corner: ncols1=2
-    cap = q_abs+1 = seq_len)."""
+@pytest.mark.parametrize("kapi", ["fwd", "direct"])
+def test_m2_causal_cap_bit_identical_window_off(kapi):
+    """Causal cap in isolation, BOTH kernels: q_abs_offset set,
+    window=0 (no window mask, no clip) — the cap only skips causally
+    masked tail k-tiles. On vs off must be bit-identical and match the
+    plain causal torch reference (the Sq=1 decode geometry is the
+    no-op corner: ncols1=2 cap = q_abs+1 = seq_len). The direct arm
+    covers the paged kernel's own oob-tail machinery on the unaligned
+    partial last tile (Sq=200), which the windowed test only covers
+    via LOCKSTEP."""
     dev = "cuda"
     torch.manual_seed(29)
     d, hq, hkv, L, Sq = 128, 32, 2, 1008, 200   # 4 q-tiles, unaligned last
@@ -2444,17 +2448,23 @@ def test_m2_causal_cap_bit_identical_window_off():
 
     def _run(clip):
         os.environ["GFX906_FA_TILE_CLIP"] = clip
-        return fa.forward(qf, k_q8, v_b, scale, kv_max=sl,
-                          q_abs_offset=q_abs_t)[0]
+        if kapi == "fwd":
+            return fa.forward(qf, k_q8, v_b, scale, kv_max=sl,
+                              q_abs_offset=q_abs_t)[0]
+        # window=0, kv_start=None: the cap is the only M2 bound in
+        # play (q_abs_offset set) — the production causal-prefill shape.
+        return fa.forward_paged_direct(qf, kc, vc, bt, sl, scale, None,
+                                       q_abs_t, 0, None)[0]
 
     try:
         out_off = _run("0")
         out_on = _run("1")
-        assert torch.equal(out_on, out_off)
+        assert torch.equal(out_on, out_off), \
+            f"tile_clip on/off differs ({kapi}, window=0)"
         for t in (0, Sq - 1):
             ref = _windowed_ref(qf[0, :, t], Kf, Vf, scale, q_abs + t, None)
             err = ((out_on[t] - ref).norm() / ref.norm()).item()
-            assert err < 5e-2, f"row {t}: {err}"
+            assert err < 5e-2, f"{kapi} row {t}: {err}"
     finally:
         del os.environ["GFX906_FA_TILE_CLIP"]
 

@@ -1329,3 +1329,45 @@ pool, `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0`).
     1 retry per house recipe; **a retry failure = burst → stop +
     reboot (root)** (boot M would then be at 2 failures in the
     retry chain, 3 wedge observations total ~2.4 h in).
+12. **2026-08-29 ~05:5x–06:00:02Z (boot M, ~15 h in)** — **3rd boot-M
+    wedge: the M2 e2e A/B's first arm (in-process, TP=1, GPU0,
+    Muse 2×130k-token prefill, bt4096) hung mid-prefill** — observed
+    ~05:57Z as GPU use 0 % + main thread 200 % CPU spin (two cores),
+    no log progress since the 05:50:51 warmup line; SIGTERM
+    05:59:16Z; kernel then logged `qcm fence wait loop timeout
+    expired` (05:59:59) → `GPU reset(2) succeeded` (06:00:02) on
+    0000:0b:00.0 (GPU0), "device wedged, but recovered through
+    reset". This is the FIRST boot-M wedge on a SINGLE-CARD launch
+    (the 15:00/17:18 pair were TP=2 weight-load hangs) and the first
+    on a running inference (not load) — the `qcm fence wait loop
+    timeout` is a different signature from the chronic
+    `hipErrorLaunchFailure` load family: the GPU stopped honoring a
+    fence mid-stream and the QCM CPU wait-loop gave up.
+
+    **Bisection after the reset (all TILE_CLIP=0, i.e. the pre-M2
+    kernel path — the wedge is NOT M2-attributable):**
+    - pp16384 nreqs=2: warmup + sample completed (128.4 s/sample).
+    - pp32768 nreqs=1: warmup pass completed in 136 s (~240 t/s
+      prefill), sample pass killed by my 420 s timeout (mid-pass,
+      GPU 0 % at timeout — slow or second stall, unconfirmed).
+    - pp65536 nreqs=1: warmup pass completed in 306 s (~214 t/s),
+      sample pass killed by the 900 s timeout (mid-pass).
+    - pp130000 nreqs=1: 900 s timeout during pass 1/2 (at ~240 t/s
+      each 130k pass is ~9 min — the timeout, not a hang, explains
+      most of the "stalls"; only the 05:59 event is a confirmed
+      wedge).
+
+    **Open question: the ~214–256 t/s in-process (TP=1) prefill
+    rate.** No TP=1 prefill baseline exists on file (the ~450–540
+    t/s records are TP=2, prefix-cache-warm or cold-first-chunk).
+    Two hypotheses: (a) early host degradation (boot M is at ~15 h
+    with 3 wedges; the classic signature is decode-cadence collapse,
+    but prefill at long context is also many small chunk-steps with
+    per-step sync), or (b) the true TP=1 rate for this hybrid model.
+    Discriminator: a canary is decode-only (read 38.9 t/s healthy at
+    06:52Z — 3rd healthy boot-M reading) and a fresh-boot re-measure
+    of the same 32k shape. **Do not trust absolute prefill numbers
+    from this boot; within-boot A/B ratios are valid (the slowdown
+    is boot-uniform and cancels between arms).** Protocol state:
+    isolated (clean 16k/32k/64k/canary runs broke the 17:18 chain);
+    a 2nd confirmed mid-stream wedge or a slow canary = reboot.

@@ -175,7 +175,7 @@ pp8192/B=1/tg256): **6.042 vs 5.587 t/s = +8.1%**
 time × ~17% FA share of the B=1 step at 8k. See
 DEVLOG-muse-glimmer.md round 5.
 
-### M2 — per-row (2D) prefill clip — DONE at q-tile granularity on branch `feat/fa-m2-tile-clip` 2026-08-28 (unmerged for review; log: DEVLOG-fa-attention.md 2026-08-28 M2 entry; 64/64 suite; A/B 3.19× fwd / 2.80× direct at pp4096/full-context)
+### M2 — per-row (2D) prefill clip — DONE at q-tile granularity on branch `feat/fa-m2-tile-clip` 2026-08-28 (unmerged for review; log: DEVLOG-fa-attention.md M2 + 2026-08-29 review-fixes entries; 65/65 suite; kernel A/B 3.19×/2.81× windowed + 2.22×/1.96× causal-only at pp4096/full-context; e2e A/B +11.8 % wall / +14.8 % prefill @ pp16384 windowed, +0.73 % @ pp2048 full-attention-hybrid (GEMM-dominated, FA component 1.96–2.22×) — the causal cap is a general chunked-prefill win, not a window feature)
 
 Prefill rows need only `[q_abs+1-W, q_abs]`; today the per-sequence
 `k0_base` covers the whole q-tile, so early rows in a prefill chunk

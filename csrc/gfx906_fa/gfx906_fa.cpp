@@ -106,7 +106,15 @@ static int get_fa_kv_split() {
 // M2 tile clip: per-q-tile k0_base window raise + per-q-tile causal
 // k_VKQ_max cap in both FA kernels (bit-identical; see the kernel
 // comments). Default ON; GFX906_FA_TILE_CLIP=0 is the A/B arm / kill
-// switch. Read per call (cheap) so an A/B can flip it in-process.
+// switch (it disables ONLY these two M2 bounds — the M1 sequence-level
+// floor is the _WINDOW_CLIP/_GATHER_CLIP backend clips).
+// Deliberately NOT memoized like the get_fa_* IIFE neighbors — the
+// tests/bench flip the env in-process; a memoized copy would silently
+// test a stale value. A/B scope: read per call, so eager/uncaptured
+// calls see flips; under FULL capture the value is a baked kernel
+// argument (flipping mid-session does not affect already-captured
+// graphs — M2 is prefill-only, so that never matters today; do not
+// inherit this pattern for a decode-relevant knob).
 static int get_fa_tile_clip() {
     const char *e = std::getenv("GFX906_FA_TILE_CLIP");
     return e ? (std::atoi(e) != 0 ? 1 : 0) : 1;
