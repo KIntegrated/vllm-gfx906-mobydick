@@ -1,8 +1,6 @@
 # FA split-K long-context accuracy (M4) — production split defaults are
 # safe (in fact MORE accurate) at 16k–32k context
 
-Copyright Kevin Read <me@kevin-read.com>
-
 ## 2026-08-29 — M4 long-context split-K accuracy point (qwen review #4a)
 
 **VERDICT:** SHIPPED · **GATE:** in-process probe at sk=16384/32768,
@@ -35,10 +33,11 @@ suite /local/tmp/m4_suite.log (78/78).
 Mechanism correction (the M4 item's framing was partly stale): the split
 partials are **fp32** in both paths (o_part [B,Sq,Hq,split,D] fp32 +
 (m,l) meta fp32, combine = fp32 log-sum-exp — `fa_split_combine_kernel`,
-`gfx906_fa.cpp:383` / `gfx906_fa_launcher.cu:106`). The only fp16
+`gfx906_fa.cpp:393`/`:1240` / `gfx906_fa_launcher.cu:106`). The only fp16
 precision exposure is the kernel's P·V accumulator
-(`v_pk_fma_f16`, `acc` half2 in `fattn-q8-paged.cuh:261` /
-`fattn-q8.cuh:532`) — **common to split and no-split**; splitting only
+(the P·V fma compiles to `v_pk_fma_f16`; the `half2` accumulator
+`VKQ` is declared at `fattn-q8-paged.cuh:545` /
+`fattn-q8.cuh:1028`) — **common to split and no-split**; splitting only
 shortens each accumulator (sk/split keys) and adds one fp32 rescale+add
 per split in the combine.
 
