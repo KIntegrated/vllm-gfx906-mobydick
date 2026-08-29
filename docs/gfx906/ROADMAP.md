@@ -68,23 +68,43 @@ Run a behavior sanity gate. See
 
 ### C1 — fuse the routing pipeline (~1 ms/step)
 
-**Status: open, IN FLIGHT (`feat/moe-c1-routing-fusion`).**
-`topkGating`, `moe_align_block_size`, and `count_and_sort_expert_tokens`
-account for roughly 1 ms per B=1 decode step. The standalone M=1 top-k
-specialization was tested and rejected for the CUDA-graph regime; the
-remaining candidates are:
+**Status: stage 1 SHIPPED (unmerged, `feat/moe-c1-routing-fusion`);
+stage 2 DEAD-END. Item closed as an active fusion item — the remaining
+topk component is conditional (see below), gated on G1 + a design that
+does not replace the production topk kernel in place.**
 
-- fuse top-k, align, and count into one capture-safe kernel while
-  preserving `sorted_token_ids`, `expert_ids`, and
-  `num_tokens_post_padded`; or
-- fold top-k into the router GEMV epilogue, then fuse the align/count
-  work.
+The M=1 decode routing chain is 3 kernels/layer (topk 11.8 + align
+3.8 + count_and_sort 3.8 µs/node isolated; ≈ 0.8 ms/step at 40 layers,
+M-independent — latency-bound; structural probe in
+`c1_routing_structural_probe.py`). Both stages were gated by serving
+A/B, not isolated kernel numbers, as the item required:
 
-The gate is a serving A/B, not an isolated kernel number. Microbenchmarks
-at M=1/8/32/128 and TCC/occupancy counters should establish whether the
-cost is structural before model-path work begins. See
-`DEVLOG-moe-m1-sprint.md` for the negative top-k result. Run G1 first or
-in parallel — it prices the per-node tax this fusion saves.
+- **Stage 1 — fused align+count (120 → 80 nodes): SHIPPED.** One
+  128-thread CTA replaces the align 2-block + count_and_sort pair,
+  bit-equal to the generic chain
+  (`moe_align_block_size_m1_gfx906`, `VLLM_GFX906_ALIGN_M1` default ON).
+  Serving A/B (Qwen3.5-35B, pp2048/tg256, 4 samples/arm, same boot,
+  back-to-back control): **+1.18 % (207 µs/step) / +1.73 %**, within 8 %
+  of the isolated prediction (224 µs/step). Node removal transfers to
+  serving.
+- **Stage 2 — fused topk+align+count (120 → 40 nodes): DEAD-END.**
+  One-CTA kernel (S2's bit-exact topk phase + stage-1's align phase),
+  28 % faster per node in isolated graphs (10.0 vs 13.8 µs/layer), yet
+  **−1.10 % in serving** (A-B-A: 57.42 → 56.79 → 57.46 t/s). Third
+  confirmation of the S2 flip (2026-08-29); the stage comparison
+  pinpoints the mechanism: REMOVING redundant nodes transfers; REPLACING
+  the proven production topk kernel does not (S2: −1.03 %, stage 2:
+  −1.10 %). Landed behind `VLLM_GFX906_ROUTING_FUSE_M1` (default OFF)
+  with router→expert meta plumbing, kept for future kernel-design
+  iterations.
+
+The standalone M=1 top-k specialization (S2) and stage 2 both lost in
+the CUDA-graph regime, so the remaining topk cost (~470 µs/step
+isolated) is open only under a design that does not swap the production
+topk kernel in place (e.g. fold top-k into the router GEMV epilogue, as
+originally scoped) — and G1 should price the per-node tax first. See
+`DEVLOG-moe-m1-sprint.md` for the negative top-k result and
+`DEVLOG-moe-c1-routing-fusion.md` (both stages, evidence + plumbing).
 
 ### C2 — decode-sized routed GEMM (decide the built wins; finish the axes)
 
