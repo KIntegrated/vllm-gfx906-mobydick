@@ -1396,6 +1396,10 @@ sys.exit(0 if rel < 5e-2 else 1)
     (8, 16, 512, 512, 6, 1),
     # heads_q=6 per-shard ratio with actual GQA (Hq=6/Hkv=3, ratio 2).
     (8, 16, 512, 512, 6, 3),
+    # M4 (qwen #4a): long-context split accuracy — production gather
+    # default (kv_split=16) and the no-split baseline at 16k vs fp32 ref.
+    (1, 16, 16384, 16384, 16, 2),
+    (1, 1, 16384, 16384, 16, 2),
 ])
 def test_forward_kv_split_gqa_pack_vs_fp32_ref(nc2, ys, sk, kv_max, hq, hkv):
     import os
@@ -1581,6 +1585,48 @@ def test_forward_paged_direct_sliding_window_vs_torch_ref(d, hq, hkv, L, W):
         ref = _windowed_ref(qtok[t], Kf, Vf, scale, t, W)
         assert ((outf[t] - ref).norm() / ref.norm()).item() < 5e-2, \
             f"row {t}"
+
+
+@pytest.mark.parametrize("d, hq, hkv", [
+    (256, 16, 2),   # Qwen3.5-family decode shape
+    (128, 32, 2),   # Muse Glimmer shape (Hq 32 / Hkv 2, D 128)
+])
+def test_forward_paged_direct_splitk_long_context_vs_fp32_ref(d, hq, hkv):
+    """M4 (qwen #4a): direct-paged B=1 decode at 16k context runs the
+    internal kv_split=8 default (clamp(16/B, 2, 8)); each fp16 P·V
+    accumulator spans L/8 keys. Pin the long-context accuracy vs the
+    fp32 reference so the production B>=2 serving path cannot silently
+    drift (the small-L suite pins exercise the same split-8 default
+    but with accumulators 32x shorter)."""
+    dev = "cuda"
+    torch.manual_seed(20260829)
+    L = 16384
+    n_blocks = L // BLOCK
+    kc = torch.zeros(n_blocks, BLOCK, hkv, (d // 32) * 34,
+                     dtype=torch.uint8, device=dev)
+    kv = torch.zeros(n_blocks, 2, BLOCK, hkv, d,
+                     dtype=torch.float16, device=dev)
+    K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    slot = torch.arange(L, dtype=torch.int64, device=dev)
+    fa.reshape_and_cache_q8(K, slot, kc)
+    staging = torch.zeros_like(kv[:, 1])
+    staging.view(-1, hkv, d)[:L].copy_(V)
+    kv[:, 1].copy_(staging)
+    vc = kv.unbind(1)[1]  # production layout: unbind(1), non-contiguous
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, -1)
+    sl = torch.tensor([L], dtype=torch.int32, device=dev)
+    scale = 1.0 / math.sqrt(d)
+    q = torch.randn(1, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    out = fa.forward_paged_direct(
+        q, kc, vc, bt, sl, scale, None, None)[0, 0]
+    g = hq // hkv
+    qg = q[0, :, 0].view(hkv, g, d)
+    Kf, Vf = K.float().permute(1, 0, 2), V.float().permute(1, 0, 2)
+    s = torch.einsum("gjd,gld->gjl", qg, Kf) * scale
+    ref = torch.einsum(
+        "gjl,gld->gjd", torch.softmax(s, -1), Vf).reshape(hq, d)
+    assert ((out - ref).norm() / ref.norm()).item() < 5e-2
 
 
 # ---------------------------------------------------------------------------
