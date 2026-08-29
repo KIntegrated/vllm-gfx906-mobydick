@@ -46,6 +46,20 @@ the date an investigation began.
   Post-merge suite 70/70 (60 base + 5 M2 + 5 M3 parametrized cases);
   both review rounds (`m3-code-rev-glm5.md`, external fold) closed at
   `cf5ccbd685`/`9d98aca9ab`.
+- **M4: long-context split-K accuracy point closed (qwen review #4a).**
+  Production split defaults are safe — in fact MORE accurate — at
+  16k–32k context: in-process probe (sk 16384/32768, D=256/Hq16/Hkv2
+  + D=128/Hq32/Hkv2, seed 20260829) shows gather kv_split=16 (the B=1
+  default) at 5.2e-3/6.6e-3 rel vs fp32 ref and direct-paged
+  kv_split=8 (the B≥2 clamp default) at 4.0e-3/5.0e-3 — all ≤ half the
+  5e-2 tolerance, and the no-split baseline is WORSE (1.9e-2/2.6e-2):
+  the split partials are fp32 (the M4 "unscaled fp16 partials" framing
+  was stale) and the fp16 P·V accumulator error scales with
+  accumulator length, which splitting shortens. Suite 74 → 78 (two
+  16k gather arms + direct-paged L=16384 split-8 pin, both
+  geometries); probe kept at
+  `benchmarks/kernels/gfx906/m4_splitk_accuracy_probe.py`.
+  Records: `DEVLOG-fa-splitk-accuracy.md`.
 
 ## 2026-08-27–28
 

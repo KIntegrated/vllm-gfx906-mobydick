@@ -108,15 +108,6 @@ boot B=1 A/B PASS, slope −4.3…−4.8 %, bit-identical, 74/74).
 through the fused-Q8 gather (`GFX906_FA_DIRECT_PAGED_Q8=0`, round
 10); direct-paged is opt-in. Knobs: `README.md` table.
 
-### M4 — long-context split-K accuracy point (qwen #4a)
-
-Direct-paged split-K stores unscaled fp16 partials per split; the
-partial magnitude grows with keys-per-slice × |V|. Tests cover
-L ≤ 512 (plus the 4353/2048 clip case). One accuracy point at
-L=16k–32k, split 8 vs split 1 vs fp32 torch ref (cheap, no server)
-closes the claim that the default `clamp(16/B,2,8)` is safe at
-long context.
-
 ### M6 — residuals (Parts A and B closed; see CHANGELOG)
 
 - **Part C — Q4-KV via native `v_dot8_i32_i4`: SHELVED 2026-08-28
