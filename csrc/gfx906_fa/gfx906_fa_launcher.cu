@@ -76,6 +76,8 @@ static hipError_t gfx906_fa_launch_impl(
     // M1 gather-path window clip start [B] (see flash_attn_tile_q8);
     // nullptr = full scan. Mirrors the paged launcher's KV_START_d.
     const int32_t *    KV_START_d,
+    // M2 tile clip (1 = on; host knob GFX906_FA_TILE_CLIP; see the kernel).
+    int                tile_clip,
     int                batch,
     int                heads_q,
     int                heads_kv,
@@ -238,6 +240,7 @@ static hipError_t gfx906_fa_launch_impl(
             /*q_abs_offset=*/ Q_ABS_OFFSET_d,
             /*window=*/ window,
             /*kv_start=*/ KV_START_d,
+            /*tile_clip=*/ tile_clip,
             O_fp32,
             O_meta,
             scale,
@@ -313,6 +316,7 @@ extern "C" hipError_t gfx906_fa_launch(
     const int32_t *    Q_ABS_OFFSET_d,
     int                window,
     const int32_t *    KV_START_d,
+    int                tile_clip,
     int                batch,
     int                heads_q,
     int                heads_kv,
@@ -324,9 +328,9 @@ extern "C" hipError_t gfx906_fa_launch(
     int                nc2,
     int                kv_split
 ) {
-    if      (head_dim == 128) return gfx906_fa_launch_impl<128>(Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream, nc2, kv_split);
-    else if (head_dim == 256) return gfx906_fa_launch_impl<256>(Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream, nc2, kv_split);
-    else if (head_dim == 64)  return gfx906_fa_launch_impl<64> (Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream, nc2, kv_split);
+    if      (head_dim == 128) return gfx906_fa_launch_impl<128>(Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, tile_clip, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream, nc2, kv_split);
+    else if (head_dim == 256) return gfx906_fa_launch_impl<256>(Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, tile_clip, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream, nc2, kv_split);
+    else if (head_dim == 64)  return gfx906_fa_launch_impl<64> (Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, tile_clip, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream, nc2, kv_split);
     fprintf(stderr, "[gfx906_fa] Unsupported head_dim=%d (supported: 64, 128, 256)\n", head_dim);
     return hipErrorInvalidValue;
 }
@@ -425,6 +429,7 @@ static hipError_t gfx906_fa_launch_paged_impl(
     const int32_t *    Q_ABS_OFFSET_d,
     int                window,
     const int32_t *    KV_START_d,
+    int                tile_clip,
     int                batch,
     int                heads_q,
     int                heads_kv,
@@ -465,6 +470,7 @@ extern "C" hipError_t gfx906_fa_launch_paged(
     const int32_t *    Q_ABS_OFFSET_d,
     int                window,
     const int32_t *    KV_START_d,
+    int                tile_clip,
     int                batch,
     int                heads_q,
     int                heads_kv,
@@ -483,9 +489,9 @@ extern "C" hipError_t gfx906_fa_launch_paged(
     hipStream_t        stream,
     int                kv_split
 ) {
-    if      (head_dim == 128) return gfx906_fa_launch_paged_impl<128>(Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream, kv_split);
-    else if (head_dim == 256) return gfx906_fa_launch_paged_impl<256>(Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream, kv_split);
-    else if (head_dim == 64)  return gfx906_fa_launch_paged_impl<64> (Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream, kv_split);
+    if      (head_dim == 128) return gfx906_fa_launch_paged_impl<128>(Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, tile_clip, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream, kv_split);
+    else if (head_dim == 256) return gfx906_fa_launch_paged_impl<256>(Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, tile_clip, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream, kv_split);
+    else if (head_dim == 64)  return gfx906_fa_launch_paged_impl<64> (Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, tile_clip, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream, kv_split);
     fprintf(stderr, "[gfx906_fa_paged] Unsupported head_dim=%d (supported: 64, 128, 256)\n", head_dim);
     return hipErrorInvalidValue;
 }
@@ -504,6 +510,7 @@ static hipError_t gfx906_fa_launch_paged_impl(
     const int32_t *    Q_ABS_OFFSET_d,
     int                window,
     const int32_t *    KV_START_d,
+    int                tile_clip,
     int                batch,
     int                heads_q,
     int                heads_kv,
@@ -592,6 +599,7 @@ static hipError_t gfx906_fa_launch_paged_impl(
             Q_ABS_OFFSET_d,
             window,
             KV_START_d,
+            tile_clip,
             block_table,
             O_fp32,
             O_meta,

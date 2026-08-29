@@ -685,3 +685,208 @@ the only instruction-level upside left is a Q4-KV format change that
 unlocks native `v_dot8_i32_i4` (2× dot4 MAC rate at half the operand
 bytes, no unpack ALU) — roadmap M6 (rewritten), PPL-gated. Rates
 recorded in `dequant-instructions.md`.
+
+## 2026-08-28 — M2 per-q-tile prefill clip: per-tile k0_base window raise + per-tile causal kv_max cap in both FA kernels; DIRECT_PAGED window clip extended to prefill chunks
+
+## HYPOTHESIS
+
+If the skipped k-tiles are provably fully masked (window or causal) for
+every row of the q-tile, then moving each q-tile's scan to its own
+window start and capping it at its own last row's position is
+bit-identical to the full scan, and cuts the sliding-window prefill
+scan cost from ~chunk to ~window per q-tile (the roadmap M2 "per-row
+(2D) prefill clip", realized at q-tile granularity — per-row would
+need per-row k-loops, per-tile needs none).
+
+## What was done
+
+Branch `feat/fa-m2-tile-clip` (unmerged, for review):
+
+- **Kernel (LOCKSTEP, fattn-q8.cuh + fattn-q8-paged.cuh)**, gated by
+  the new `GFX906_FA_TILE_CLIP` host knob (default 1; 0 = A/B arm,
+  read per call):
+  - **(1) Per-q-tile window raise**: with kv_start set + window>0,
+    `k0_base = max(k0_base, floor16(q_abs + col_Q_0 + 1 - window))`.
+    The tile's first row has the smallest window start in the tile;
+    keys before it are window-masked to -INF for every tile row, so
+    the raised (floored, same bit-identity rule as M1) start skips
+    exactly the fully-masked prefix. Clip mode only — without
+    kv_start the scan starts at 0 by contract (the clip-vs-no-clip
+    bit-identity tests).
+  - **(2) Per-q-tile causal cap**: with q_abs_offset set,
+    `k_VKQ_max = min(k_VKQ_max, q_abs + min(col_Q_0 + ncols1,
+    ne01.z))`. Keys at/past the tile's last VALID row +1 are
+    causally masked (k > q_abs_row) for every tile row — exactly as
+    in the full scan — so the cap skips the causally dead tail
+    k-tiles (the oob-tail logic handles the partial capped tile).
+    Sq<=2 (ncols1=2): cap = q_abs + ne01.z = seq_len — decode is
+    bit-for-bit unchanged.
+- **Backend (gfx906_fa_paged.py)**: the DIRECT_PAGED window clip gate
+  dropped `max_seqlen_q == 1` — prefill chunks now get the
+  conservative chunk-start clip (kv_start = max(0, chunk_first + 1 -
+  window), the existing formula). The LEGACY gather path already
+  passed kv_start for prefill (gate was only `_GATHER_CLIP and
+  window > 0`), so the kernel raise applies there with no change.
+- **Tests (4 new)**: tile_clip on/off bit-identical for a mid-context
+  Sq=256 prefill chunk (4 q-tiles, per-tile raise active) and Sq=64
+  (1 q-tile, cap only) on both kernels + torch windowed reference on
+  boundary rows; causal cap in isolation (window=0) on/off
+  bit-identical + plain-causal reference + the Sq=1 no-op corner;
+  backend-level DIRECT_PAGED prefill clip on/off bit-identical AND
+  bit-identical to the LEGACY gather path's clip (cross-path
+  agreement, guards the backend gate change).
+- **Bench** (`benchmarks/kernels/gfx906/bench_gfx906_fa_tile_clip.py`):
+  Muse geometry (Hq=32/Hkv=2/D=128), L=131072, Sq=4096, W=2048
+  (the pp4096-at-full-context shape), both kernels, clip 0 vs 1.
+
+## GATE
+
+Roadmap M2: bit-identity + pp4096 prefill/TTFT A/B. Bit-identity:
+the full suite (60 existing — every clip/window test runs with
+tile_clip=1 by default — + 4 new = 64) must pass unchanged, plus the
+explicit on/off `torch.equal` arms. A/B: kernel-level prefill timing
+at the 4096-chunk/full-context sliding-window shape (the FA
+component of TTFT; an end-to-end pp4096 serving A/B is not needed if
+the kernel-level win is large and the bit-identity holds).
+
+## Evidence
+
+- Suite: 64/64 (boot M; build after a full FA build-state wipe —
+  see the M3 entry's contamination countermeasure).
+- A/B (in-process, GPU0, 3 warmup + 8 iters):
+  - fwd (gather path): clip=0 62.286 ms → clip=1 19.519 ms = **3.19×**
+  - direct (paged): clip=0 83.791 ms → clip=1 29.892 ms = **2.80×**
+  - Theory: without M2 every q-tile scans [kv_start=124929, 131072)
+    = 6143 keys (384 k-tiles); with M2 tile t scans
+    [floor(124929+64t), 126976+64t) ≈ 2047 keys (128 k-tiles) — a
+    3.0× k-iteration reduction, matching the measured 2.8–3.2×.
+- Cross-path: DIRECT_PAGED prefill clip-on vs LEGACY gather clip-on
+  max|diff| = 0.0 (bit-identical); on/off = 0.0.
+- The two cap halves are independently verified: the window-raise
+  test (Sq=256, raise moves tiles 1–3) and the cap-isolation test
+  (window=0, cap only, incl. the unaligned partial last tile Sq=200).
+
+## VERDICT
+
+**SHIPPED — in main since 2026-08-29 (merged after review; see the
+2026-08-29 review-fixes entry below for the executed e2e gate).**
+M2 closed at q-tile granularity: sliding-window prefill attention
+scan drops from
+~chunk to ~window per q-tile — 2.8–3.2× on the FA kernel at the
+pp4096/full-context shape, i.e. the per-layer attention cost of a
+4096-token chunk on the 39 Muse sliding-window layers at long
+context. The win scales with context length (at short context the
+window already covers the chunk and the clip is ~inert) and with
+chunk size (Sq > W is the regime; for Sq <= W only the causal cap
+bites). Bit-identity is structural (fully-masked tiles are exact
+no-ops: P=0, KQ_max unchanged, VKQ += 0) and held at 0.0 across all
+arms including the cross-path check. Kill switches:
+`GFX906_FA_TILE_CLIP=0` (both caps), `_WINDOW_CLIP=0` (backend clip),
+`GFX906_FA_GATHER_CLIP=0` (LEGACY gather clip). Decode is provably
+unchanged (cap = seq_len, raise = the existing floor).
+
+Co-authored-by: pi (coding agent)
+
+## 2026-08-29 — M2 review fixes (F1–F5 of m2-code-rev-glm5.md): e2e gate executed at pp16384, causal-cap bench arm + paged cap test, README/records
+
+## HYPOTHESIS
+
+The review's blocking condition (F1) is satisfiable without a 130k
+e2e run: a within-boot A/B ratio at a working context length is a
+valid gate (a boot-uniform prefill slowdown cancels between arms),
+and the 130k windowed shape is already covered directly by the
+kernel-level bench. The causal cap deserves its own bench arm and
+records as a general prefill win (F1.2/F1.3), and the remaining
+findings (F2 paged cap test, F3 knob comment, F4 canary record, F5
+README) are mechanical.
+
+## What was done
+
+- **F1 bench arm**: `bench_gfx906_fa_tile_clip.py` now runs two
+  shapes — A: windowed mid-context (L=131072, Sq=4096, W=2048) and
+  B: causal-cap-only first chunk (L=Sq=4096, W=0, q_abs=0 — the
+  first chunk of ANY full-attention model).
+- **F1 e2e A/B** (in-process harness, boot M): Muse pp16384/B=2
+  (windowed, both M2 bounds) and Qwen3.8-27B pp2048 (full-attention
+  layers, causal cap only — the Qwen3.5-27B NFS model is unavailable
+  this boot: `/data` unmounted). The 130k e2e re-scoped off after a
+  boot-M wedge + ~2× slow prefill (see the 2026-08-29 entry in
+  `degradation*.md`); the 130k shape is covered by bench shape A
+  (kernel-level, same-boot ratio).
+- **F2**: `test_m2_causal_cap_bit_identical_window_off` parametrized
+  over both kernels — the paged arm covers the paged kernel's
+  oob-tail machinery on the unaligned partial last tile (Sq=200)
+  with window=0 (cap in isolation, the production causal-prefill
+  shape).
+- **F3**: `get_fa_tile_clip` comment now states the A/B scope
+  (eager/uncaptured calls see flips; FULL capture bakes the value)
+  and why it is deliberately NOT IIFE-memoized like the neighbors
+  (in-process env flips in tests/bench; a memo would silently test a
+  stale value).
+- **F4**: canary state recorded below (boot M: 38.9 t/s at 06:52Z,
+  3rd healthy reading; kernel-timing A/Bs are within-process ratios
+  and match the k-tile theory to <10 %).
+- **F5**: README env table — new `GFX906_FA_TILE_CLIP` row (with the
+  TILE_CLIP-vs-WINDOW_CLIP/GATHER_CLIP layering) and the
+  `GFX906_FA_WINDOW_CLIP` row updated (Phase C now covers prefill
+  chunks, both dispatch paths).
+
+## GATE
+
+Review recommendation: approve contingent on one e2e prefill A/B
+covering BOTH halves (windowed + full-attention first-chunk).
+
+## Evidence
+
+- Suite: **65/65** (60 + 5 M2 tests; the new paged cap arm is the
+  65th), boot M, post-reset.
+- Bench (boot M, in-process; shape A = windowed, shape B =
+  causal-only):
+  - A fwd: 62.222 → 19.525 ms = **3.19×**; A direct: 90.351 →
+    32.196 ms = **2.81×** (re-run after the F2 build; the original
+    62.286/90.351-era direct number was 2.80× — consistent).
+  - B fwd: 43.218 → 19.465 ms = **2.22×**; B direct: 61.246 →
+    31.317 ms = **1.96×**. Shape B's theory: tile t scans
+    64(t+1) vs 4096 → Σ = 64·2080/262144 = 1.97× — the measured
+    1.96–2.22× matches (fwd slightly above theory: the capped
+    tiles' oob-tail padding is cheaper than the full-tail arm's).
+- e2e (in-process harness, boot M, 2 samples/arm, tg=256):
+  - **Muse pp16384/B=2 (windowed, both bounds)**: clip=1
+    134.094/134.401 s vs clip=0 152.007/152.387 s per pass
+    (2×(16k prefill + 256 decode), serialized) → **11.8 % wall /
+    ~14.8 % on the prefill part** (the decode tail is M2-invariant,
+    so the full 17.95 s/pass delta is prefill). In-arm spread 0.2 %
+    — far outside noise. (At 16k the window raise bites less than at
+    130k — scan 14k→2k vs 6.1k→2k — so this is a conservative
+    lower bound on the context-length effect; the 130k windowed
+    shape is bench shape A.)
+  - **Qwen3.8-27B pp2048 (full-attention layers, cap only — the
+    GDN-hybrid's e2e is GEMM/GDN-dominated)**: clip=1 15.817/15.848
+    s vs clip=0 15.931/15.966 s → **+0.73 % e2e**, both samples
+    agree in direction. The FA-component win for this shape is bench
+    shape B (1.96–2.22×).
+- Host caveat (F4): boot M at ~15 h with a 3rd wedge (05:59Z
+  `qcm fence wait loop timeout`, first single-card/mid-stream one)
+  and a ~2×-slow in-process prefill rate with no TP=1 baseline —
+  absolute numbers from this boot are suspect; the A/B ratios are
+  boot-uniform and valid. **Erratum (2026-08-29, boot N): the ~240
+  t/s prefill rate was re-measured on the fresh boot (135.48 s +
+  136.51 s for the same 32k shape, 0 wedges) — it is the TRUE TP=1
+  rate, not degradation** (the ~450–540 t/s records are TP=2; prefill
+  scales ~2× with TP). The e2e A/B numbers above stand as measured;
+  the "suspect" caveat applied only to absolute comparisons against
+  the TP=2 records. See the 2026-08-29 rows in `degradation*.md` and
+  the README Muse-row baseline.
+
+## VERDICT
+
+**SHIPPED — in main since 2026-08-29 (merged after review; the
+merge condition F1 was satisfied before merging).** F1 satisfied:
+e2e A/B executed at pp16384 (windowed) + pp2048 (full-attention),
+causal cap now benched (1.96–2.22× kernel-level) and recorded as a
+general chunked-prefill win in the README knob row. F2/F3/F4/F5
+closed as above. The causal cap is called out for what it is — a
+window-independent prefill win — in the README, commit message, and
+this entry.
+
+Co-authored-by: pi (coding agent)
