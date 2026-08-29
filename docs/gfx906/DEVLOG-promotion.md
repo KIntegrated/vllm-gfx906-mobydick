@@ -10,6 +10,56 @@ Promotion started from `gfx906/main` at `a4cb86c4aa` and finished locally at
 TP=2 recovery gate was interrupted by a GPU half-wedge and requires a host
 reboot first.
 
+## 2026-08-29 — M4 + LEGACY0-B1 review branches promoted (docs/tests/probes only)
+
+## HYPOTHESIS
+
+If the two review branches contain no production-code changes (verified
+by diff), their promotion to `main` cannot regress serving or the
+suite, and the only validation needed is that the merged tree is the
+correct union of both branches.
+
+## GATE
+
+`git diff 04d1b878a7..main -- csrc/ vllm/ CMakeLists.txt cmake/` is
+EMPTY (no rebuild required); suite/test verification was executed on
+the exact branch trees during review (GPU0, boot O) and the merged tree
+differs from them only in the other branch's doc files.
+
+## What was done
+
+- Review fixes applied on-branch first: M4 F1-F3 (`0ba4d96e47` —
+  copyright line, stale line refs, AGENTS.md naming list); LEGACY0
+  F1-F4 (`a7c07526fd` — stale "never-run adjudication" notes in
+  roadmap M6 + README knob row, append-cost band, Hkv label, typo).
+- `feat/fa-m4-splitk-accuracy` merged (merge commit below this entry).
+- `feat/fa-legacy0-b1-decode` merged; one textual CHANGELOG conflict
+  at the shared insertion anchor resolved by keeping both bullets
+  (M4 first, chronological).
+
+## Evidence FOR
+
+- Union verified on the merged tree: skills present, G1 roadmap
+  section present, M4 dev log copyright-free, AGENTS.md naming list
+  updated AND copyright section removed (sweep), new split-K tests
+  present, no conflict markers anywhere under `docs/gfx906/`.
+- Reviewer-run validation this session (GPU0, boot O, canary-healthy):
+  M4 probe 12/12 arms reproduce the recorded numbers, `M4-GATE: PASS`;
+  4/4 new suite tests pass (74→78 confirmed); legacy0 step probe
+  reproduces all 18 cells within ~1 %; append probe reproduces
+  q8-alone exactly (6.6 µs).
+- Merged in a separate worktree; the main checkout (paused agent's
+  MoE C1 WIP on `feat/moe-c1-routing-fusion`) untouched.
+
+## Evidence AGAINST
+
+None — but note `gfx906/main` (`284ce5ff6a`) is now behind `main` and
+`origin`/`kintegrated` remotes are untouched (push is a separate
+decision). The FA suite was not re-run on the merged tree itself
+(doc-only delta vs the tested branch trees).
+
+VERDICT: SHIPPED
+
 ## 2026-08-26 — roadmap archive and local branch promotion
 
 ## HYPOTHESIS
