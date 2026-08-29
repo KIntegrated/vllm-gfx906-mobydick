@@ -5,7 +5,7 @@
 
 **VERDICT:** DEAD-END (flip question closed: LEGACY=1 stays the
 default) · **GATE:** same-boot (boot O) TP=2 serving A/B,
-Qwen3.8-27B B=1 pp2048/tg256, 2 samples/arm — A 40.11/40.11 vs
+Qwen3.8-27B B=1 pp2048/tg256, 2 samples/arm — A 40.11/40.12 vs
 B 37.61/37.56 (−6.3 %) vs C 37.55/37.54 (−6.4 %) t/s.
 
 ## HYPOTHESIS
@@ -40,9 +40,13 @@ traffic — and the kernel-level decomposition will assign it.
    clean runs between break the chain per the boot-L 12:52
    precedent).
 4. Append-path cost probe (`legacy0_append_cost_probe.py`, eager,
-   B=1 D=256 Hkv=4): the LEGACY=0 per-layer append adds
-   `reshape_and_cache_q8` (6.6 us; +16.4 % on the 36.1 us
-   triton write), ×16 full-attn layers = **+94.6 us/step eager**.
+   B=1 D=256 Hkv=4 — full-model Hkv; per-shard at TP=2 is Hkv=2, so
+   the probe writes 2× the per-token K bytes; launch-dominated at 1
+   token, immaterial): the LEGACY=0 per-layer append adds
+   `reshape_and_cache_q8` (6.6 us alone; 16.4 % on the 36.1 us
+   triton write), ×16 full-attn layers = **+60–105 us/step eager**
+   (recorded run +94.6; review re-run +59.6 with the q8-alone ×16 =
+   105.6 us no-overlap bound — eager launch-overlap variance).
    Log: /local/tmp/b1ab_*_bootO.log, /local/tmp/b1_step_probe_run1.log.
 
 ## Evidence FOR (the framing is superseded — launch-regime)
@@ -77,7 +81,7 @@ Same-boot (boot O) serving, Qwen3.8-27B TP=2, B=1 pp2048/tg256,
 | C | LEGACY=0 + direct-paged (M5 era) | 37.55 / 37.54 (38.20/38.12) | **−6.4 %** |
 
 Sample spread ≤0.1 % per arm; cross-boot A consistency: boot N
-39.76/40.12 vs boot O 40.11/40.11. The kernel probe's B win (−36 % on
+39.76/40.12 vs boot O 40.11/40.12. The kernel probe's B win (−36 % on
 the gather+FA subcomponent at 2k) did NOT transfer — the serving step
 at 2k context is ~25 ms, of which the subcomponent is ~92 us (0.4 %).
 
@@ -89,8 +93,9 @@ at 2k context is ~25 ms, of which the subcomponent is ~92 us (0.4 %).
   It is in what both LEGACY=0 arms share per step.
 - Measured share: the append-time Q8 side-buffer write
   (`reshape_and_cache_q8` + slot cast, 16 full-attn layers/step) is
-  +94.6 us/step eager — real but an order of magnitude below the
-  ~1.55 ms/step serving delta.
+  `reshape_and_cache_q8` + slot cast, 16 full-attn layers/step) is
+  +60–105 us/step eager (q8-alone ×16 = 105.6 us bound) — real but an
+  order of magnitude below the ~1.55–1.70 ms/step serving delta.
 - The unexplained remainder is a serving-harness interaction specific
   to LEGACY=0's per-step path: the ~16–32 extra captured graph nodes
   per decode step (Q8 writes + slot casts) add graph-replay node

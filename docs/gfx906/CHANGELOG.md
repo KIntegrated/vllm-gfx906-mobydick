@@ -54,7 +54,8 @@ the date an investigation began.
   FASTER per step than fp16-gather+quantize, growing with Sk; direct
   paged is +8–35 % slower). The serving gap is therefore a
   LEGACY=0-common per-step cost, not FA/gather: the append-time Q8
-  side-buffer write is +94.6 us/step eager (16 full-attn layers), and
+  side-buffer write is +60–105 us/step eager (16 full-attn layers;
+  q8-alone ×16 = 105.6 us bound), and
   the ~1.55 ms/step remainder is a serving-harness/graph-node
   interaction (unmeasured). M5's "LEGACY=0 LOSES, default stays 1"
   verdict confirmed by a proper same-boot adjudication. Probes kept

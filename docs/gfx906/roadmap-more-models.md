@@ -126,12 +126,14 @@ long context.
   Q8-KV arms) that must pass *before* any kernel work; the measured
   ISA rates motivating it are in `dequant-instructions.md`
   (`v_dot8_i32_i4` 49.6 T MAC/s, 2× dot4 at half the operand bytes).
-- **LEGACY-flip adjudication: closed in practice.** Part A's gate
-  fired (the B=1 gap is not load-instruction-bound) and no other
-  candidate closes the B=1 −2.5…−3.7 % delta, so the flip question
-  stays shut unless new evidence appears. The never-run same-boot
-  B=1 adjudication (107.2 boot M vs 111.5 boot L) remains available
-  if the question ever reopens.
+- **LEGACY-flip adjudication: CLOSED 2026-08-29 (same-boot).** Part A's
+  gate fired (the B=1 gap is not load-instruction-bound); the same-boot
+  B=1 adjudication then ran on boot O (Qwen3.8-27B TP=2, pp2048/tg256,
+  2 samples/arm): LEGACY=1 40.11/40.12 vs LEGACY=0 37.61/37.56 (−6.3 %)
+  vs LEGACY=0+direct-paged 37.55/37.54 (−6.4 %) — flip closed, default
+  stays 1; the gap localizes to a LEGACY=0-common per-step cost
+  (`DEVLOG-fa-legacy0-b1-decode.md`, DEAD-ENDS row; the M5-era
+  2.5…−3.7 % cross-boot figure is superseded).
 
 ### Housekeeping — drop the legacy `~/env-rocm-7.14-gfx906.sh` sourcing
 
