@@ -1,7 +1,5 @@
 # gfx906 custom FA — gather-buffer lifecycle fix for the 256k prefill OOM
 
-Copyright Kevin Read <me@kevin-read.com>
-
 2026-08-23. Target: `vllm-gfx906-mobydick` @ `gfx906/main` (4a9e24b5ca).
 Companion docs: `docs/gfx906/oom-256k-prefill.md` (OOM analysis),
 `docs/gfx906/DEVLOG-masked-fa.md` (N4 persistent gather),

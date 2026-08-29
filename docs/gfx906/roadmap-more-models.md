@@ -1,7 +1,5 @@
 # More model families on gfx906 — open roadmap
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Completed onboarding and portability findings are recorded in
 [`CHANGELOG.md`](CHANGELOG.md). This file contains only model work that is
 still open or blocked. The general rule is that gfx906 dispatch is selected by
@@ -119,12 +117,14 @@ through the fused-Q8 gather (`GFX906_FA_DIRECT_PAGED_Q8=0`, round
   Q8-KV arms) that must pass *before* any kernel work; the measured
   ISA rates motivating it are in `dequant-instructions.md`
   (`v_dot8_i32_i4` 49.6 T MAC/s, 2× dot4 at half the operand bytes).
-- **LEGACY-flip adjudication: closed in practice.** Part A's gate
-  fired (the B=1 gap is not load-instruction-bound) and no other
-  candidate closes the B=1 −2.5…−3.7 % delta, so the flip question
-  stays shut unless new evidence appears. The never-run same-boot
-  B=1 adjudication (107.2 boot M vs 111.5 boot L) remains available
-  if the question ever reopens.
+- **LEGACY-flip adjudication: CLOSED 2026-08-29 (same-boot).** Part A's
+  gate fired (the B=1 gap is not load-instruction-bound); the same-boot
+  B=1 adjudication then ran on boot O (Qwen3.8-27B TP=2, pp2048/tg256,
+  2 samples/arm): LEGACY=1 40.11/40.12 vs LEGACY=0 37.61/37.56 (−6.3 %)
+  vs LEGACY=0+direct-paged 37.55/37.54 (−6.4 %) — flip closed, default
+  stays 1; the gap localizes to a LEGACY=0-common per-step cost
+  (`DEVLOG-fa-legacy0-b1-decode.md`, DEAD-ENDS row; the M5-era
+  2.5…−3.7 % cross-boot figure is superseded).
 
 ### Housekeeping — drop the legacy `~/env-rocm-7.14-gfx906.sh` sourcing
 
@@ -138,3 +138,38 @@ recipe), `docs/gfx906/running.md` (§0 + build section),
 `docs/gfx906/README.md` (bench recipe). Dev logs and
 degradation_details.md keep their lines (historical record); the
 session `canary.sh` sources it — drop there too when next touched.
+
+## Decode-graph node-overhead point (shared infra, from the LEGACY=0 B=1 closure)
+
+The 2026-08-29 same-boot adjudication (`DEVLOG-fa-legacy0-b1-decode.md`,
+boot O) left a bounded-but-unexplained **~1.55 ms/step** serving cost
+common to both LEGACY=0 arms, with the extra captured-graph nodes
+(~16–32 per decode step: one Q8 side-buffer write + slot cast per
+full-attn layer) as the leading unmeasured hypothesis. Not further
+decomposed there — the obvious tools are blocked on this stack
+(chrome-trace GPU timestamps are not wall-aligned; eager TP=2
+collapses ~3× from launch overhead). This is NOT LEGACY=0-specific:
+any change that adds per-layer kernels to the captured decode graph
+(MoE routing fusion, spec-decode extensions, future KV-side writes)
+pays the same invisible per-node replay cost, so the measurement
+gates a family of decisions, not just the refrigerated lever below.
+
+**G1 — per-node replay-cost probe (cheap, no model change):** capture
+the standard decode graph, then A/B replay wall time with N dummy
+no-op kernel launches appended per layer (N ∈ {0, 16, 32, 64}), TP=1
+and TP=2, same boot. Falsifiable both ways:
+
+- per-node ≤ ~10 µs → 16–32 nodes explain ≤ ~0.3 ms of the 1.55 ms →
+  node count is NOT the owner; suspect TP=2 sync placement / other
+  LEGACY=0-common per-step work; the Q8-fusion lever stays
+  refrigerated.
+- per-node ≈ 50–100 µs → nodes explain the remainder → the
+  refrigerated lever (fuse the Q8 write into
+  `triton_reshape_and_cache_flash`, halving the nodes) reopens with a
+  real bound — and every future adds-nodes-per-step proposal must
+  budget it.
+
+Gate is wall-clock A/B only (harness or serving). Prior-probability
+note: ~50–100 µs/node would be unusually high for graph replay, so G1
+is more likely to kill the hypothesis than confirm it — either
+outcome is cheap and decisive.

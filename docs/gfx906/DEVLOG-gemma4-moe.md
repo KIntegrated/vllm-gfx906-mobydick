@@ -1,7 +1,5 @@
 # Dev log — Gemma-4 MoE: no-zero-point W4A16 expert kernel for gfx906
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Branch: `gfx906/gemma4-moe-nzp` (from `gfx906/main` @ `934de9b910`, 2026-08-19)
 
 ## Goal

@@ -1,7 +1,5 @@
 # DEVLOG: MoE M=1 expert-kernel sprint (week of 2026-08-18)
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Branch: `gfx906/moe-m1-sprint` (off `gfx906/main` @ 53f5a79429).
 Plan: the 3-4 day set proposed in the former MoE roadmap. It covered
 cheap expert-kernel wins, vectorized loads, gate/GEMV status, RMSNorm-gate

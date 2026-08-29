@@ -1,7 +1,5 @@
 # TP=2 dense decode — max_model_len / context-length decode-speed investigation
 
-Copyright Kevin Read <me@kevin-read.com>
-
 **VERDICT:** OPEN · **GATE:** none run yet — this is a code-analysis
 investigation, no serving A/B has confirmed the mechanism live. See
 "What needs to be checked" for the decisive experiments.

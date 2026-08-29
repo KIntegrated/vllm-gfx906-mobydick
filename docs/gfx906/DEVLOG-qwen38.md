@@ -1,7 +1,5 @@
 # Qwen3.8-27B on gfx906 — onboarding, dtype fix, NAS-crash postmortem
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Branch: `gfx906/main`. Model: `cyankiwi/Qwen3.8-27B-AWQ-INT4`.
 Merged (2026-08-20) from `qwen3.8_crash.md` so one file carries the
 whole model train (onboarding + dtype fix + the NAS-crash postmortem).

@@ -31,6 +31,7 @@ DEVLOG). Pattern: **hypothesis → gate → verdict → commit/revert → commen
 | FA V2 fused gather (416 WG, barriers) in serving | serving graph | **REJECTED** (V1 wins) | `GFX906_FA_GATHER_V=2` | V2 degrades 7× in serving (285 µs) vs V1 42 — wave-scheduling/low-WG effect | FA |
 | salvage LEGACY=0 via a better dot instruction (dp4a/dot2/dot8 swap in the KQ loop) | ISA rate probe + roofline (analytic) | **DEAD-END** (analysis) | — | dp4a/`v_dot4_i32_i8` already the inner loop and measured FULL-RATE (4.44× fp32, 2× packed fp16); B=1 decode is gather-HBM-bound ~2.7× so ALU swaps can't surface; expansion composites 0.17–0.24×. Q4/dot8 = format change, roadmap M6(c) | FA |
 | M6 Part A planar Q8 quants/scale repack closes the LEGACY=0 B=1 gap (flip re-open) | microbench hard stop-rule (ISA loader loads ≥2× AND step ≥2 %) | **DEAD-END** (flip question); code **NEUTRAL** — merged as loader hygiene 2026-08-29 (`02d197189f`), flip-question verdict unchanged | same-boot B=1 A/B PASS: slope 36.0→34.4 ns/token (−4.3/−4.8 %), @Sk=2176 83.6→79.1 us, bit-identical (maxerr equal at every Sk), merged suite 74/74 — **contended-boot caveat (post-merge review): same merged .so = 42.0 us @Sk=2048 / 12.86 ns/tok idle; delta directionally supported, merge not perf-dependent** | ISA-verified loader 10→6 loads/tile-row = 1.67× < 2× (plan's ~17/block assumption was wrong — compiler already 4×8-B + 2-B); standalone B=1 step −2.4 % (disjoint bands) both LEGACY modes; bit-identical (64/64). B=1 gap is elsewhere (write path / Q-side / gather traffic) | MG, plan_fa_part_A.md |
+| LEGACY=0 B=1 decode gap closes under today's dispatch (Q8-gather) — flip default to LEGACY=0 | same-boot serving A/B (boot O, Qwen3.8-27B TP=2, B=1 pp2048/tg256, 2 samples/arm) | **DEAD-END** (flip question closed 2026-08-29) | branch `feat/fa-legacy0-b1-decode` (unmerged; no code to revert) | A 40.11/40.12 vs B (Q8-gather) 37.61/37.56 (−6.3 %) vs C (direct-paged, M5 era) 37.55/37.54 (−6.4 %) t/s; B≈C in serving despite −36 %/+31 % kernel-level subcomponent deltas → gap is a LEGACY=0-common per-step serving cost, NOT FA/gather (Q8 gather is 22–45 % FASTER per step, growing with Sk); measured append-time Q8 write = +94.6 us/step eager (16 layers) — the ~1.55 ms/step remainder is graph-node/serving-harness interaction (unmeasured, refrigerated: fuse Q8 write into the triton append) | FA-LEG, DEVLOG-fa-legacy0-b1-decode.md |
 
 **Sources:** `M0`=DEVLOG-moe-opt.md · `FA`=DEVLOG-fa-attention.md ·
 `D`=DEVLOG-dense-decode.md · `M1`=DEVLOG-moe-m1-sprint.md ·
@@ -59,6 +60,3 @@ DEVLOG). Pattern: **hypothesis → gate → verdict → commit/revert → commen
    verdicts; eager A/B can tie even when kernels differ (launch-bound).
 3. PPL/prompt_logprobs is an unreliable gate on Gemma-4 (hybrid attention);
    gate on coherent text + logprob A/B (`GA`).
-
----
-Copyright Kevin Read <me@kevin-read.com>

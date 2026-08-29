@@ -1,7 +1,5 @@
 # gfx906 speculative-decoding roadmap
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Completed speculative-decoding work has moved to
 [`CHANGELOG.md`](CHANGELOG.md). This file intentionally contains only work
 that is still open or deferred. The current shipped recommendation is MTP k=2

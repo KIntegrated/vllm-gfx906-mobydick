@@ -148,5 +148,3 @@ graphs is retired as a method.
 - A/B logs (this session): `/tmp/ab_g1npt2_{off,on}.log` (graph),
   `/tmp/ab_eager_{off,on}.log` (eager), `/tmp/prof_{off,on}.log` (eager
   census), `/tmp/gprof_{off,on}.log` (graph census attempts).
-
-Copyright Kevin Read <me@kevin-read.com>

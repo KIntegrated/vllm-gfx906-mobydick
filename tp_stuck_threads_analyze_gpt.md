@@ -1,7 +1,5 @@
 # Deeper analysis: TP=2 CPU hot/stuck threads
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Reviewer: GPT, CPU-only analysis, 2026-08-24.
 Source reviewed: `docs/gfx906/cpu-stuck-threads.md`, with the related
 `degradation*.md` and `DEVLOG-tp2-dense.md` records. I also inspected the

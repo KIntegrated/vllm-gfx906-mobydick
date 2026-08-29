@@ -16,6 +16,9 @@
 # (default 6 GiB; Qwen3.8-27B at 256k max-len needs >= 8.09 GiB — use
 # 10737418240). No speculative config: prefill/TTFT benchmarks do not
 # need it (spec only shapes decode).
+#
+# EXTRA_SERVE_ENV: optional space-separated VAR=val pairs prepended to the
+# server env (e.g. EXTRA_SERVE_ENV="GFX906_FA_LEGACY=0" for FA A/B bakes).
 set -u
 cd /local/git/vllm-gfx906-mobydick
 
@@ -23,7 +26,7 @@ case "$1" in
 start)
   tag="$2"; snap="$3"; name="$4"; maxlen="$5"; tool="$6"; reason="$7"
   env HIP_VISIBLE_DEVICES=0,1 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
-      HF_HUB_OFFLINE=1 \
+      HF_HUB_OFFLINE=1 ${EXTRA_SERVE_ENV:-} \
     setsid nohup .venv/bin/vllm serve "$snap" \
       --served-model-name "$name" \
       --tensor-parallel-size 2 --dtype float16 \

@@ -292,6 +292,3 @@ entries).
 ## Search keys
 
 `HYPOTHESIS:` `VERDICT:` `C2-V` `moe-c2v` `batch decode` `TP=2`
-
----
-Copyright Kevin Read <me@kevin-read.com>

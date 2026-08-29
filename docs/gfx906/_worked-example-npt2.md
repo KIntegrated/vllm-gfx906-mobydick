@@ -84,6 +84,3 @@ real but not on the critical path that wall-clock measures.
 ## Search keys
 
 `HYPOTHESIS:` gemm1 NPT=2 · `VERDICT:` DEAD-END · `GATE:` serving graph.
-
----
-Copyright Kevin Read <me@kevin-read.com>

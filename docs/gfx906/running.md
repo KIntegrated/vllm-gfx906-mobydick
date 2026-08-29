@@ -1,6 +1,4 @@
 # Running & building the gfx906 fork
-Copyright Kevin Read <me@kevin-read.com>
-
 
 Quick reference so this doesn't have to be rediscovered. Two environments:
 the **local editable `.venv`** (canonical since 2026-08-16, §0) and the

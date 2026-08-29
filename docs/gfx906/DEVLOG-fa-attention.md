@@ -1,7 +1,5 @@
 # Dev log — gfx906 custom Q8 FA & decode backend
 
-Copyright Kevin Read <me@kevin-read.com>
-
 > Split from DEVLOG-moe-opt.md (2026-08, topic consolidation) — the
 > custom Q8 FlashAttention backend saga, the B=1 decode parallelism
 > track, and the fused-gather/fill-pile work. MoE kernel and dense 27B

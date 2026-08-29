@@ -1,7 +1,5 @@
 # CPU stuck-threads in TP=2 serving (HSA P2P-IPC)
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Status: **open — deterministic host-level defect** (2026-08-24, boots E + F).
 Reproduces on every fresh TP=2 vLLM start on this host within ~15–20 min.
 Reboot does NOT clear it. Not a vLLM bug. Options in §7.

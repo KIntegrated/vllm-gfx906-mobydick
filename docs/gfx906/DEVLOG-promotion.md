@@ -1,7 +1,5 @@
 # gfx906 main promotion — validation and recovery log
 
-Copyright Kevin Read <me@kevin-read.com>
-
 This log records the promotion of `gfx906/main` to the fork's actual
 `main` branch. It does not describe an upstream vLLM merge: `upstream/main`
 continues to be the source for future updates, while the fork's `main` now

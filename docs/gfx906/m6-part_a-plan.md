@@ -1,7 +1,5 @@
 # M6 Part A — merge prep instructions (`feat/fa-legacy0-m6-partA` → main)
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Status: OPEN (2026-08-29). Decision made: **merge, relabeled as a
 loader-hygiene change** — the flip question is DEAD-END (gate fired,
 `DEVLOG-muse-glimmer.md` round 11) but the code is bit-identical,

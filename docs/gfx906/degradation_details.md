@@ -1,7 +1,5 @@
 # Degradation & wedge details — 2× MI50, ROCm 7.14 + amdgpu DKMS 6.19.14
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Companion to `degradation.md` (the timestamped table). This file holds
 the mechanism notes, the kernel evidence, and the open questions. Event
 rows live in the table.
@@ -1364,3 +1362,81 @@ pool, `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0`).
     is not re-derived. Evidence: `/local/tmp/m2iso_32k_bootN.log`
     (persists), boot-M copies in `/tmp/m2iso_*.log` (wiped by the
     reboot).
+
+## 2026-08-29 13:40:36Z — boot N, B=1 LEGACY A/B bake arm B (LEGACY=0 TP=2)
+
+    B=1 decode-gap item, serving A/B bake (Qwen3.8-27B TP=2, maxlen
+    32768, the `_serve_tp2_gfx906.sh` recipe with the new
+    EXTRA_SERVE_ENV passthrough). Arm A (LEGACY=1) loaded clean and
+    produced the control numbers (B=1 39.76/40.12 t/s @ pp2048/tg256,
+    `/local/tmp/b1ab_armA.log`); arm B (EXTRA_SERVE_ENV=
+    "GFX906_FA_LEGACY=0") wedged at weight load, 13:40:36: Worker_TP1
+    `c10::AcceleratorError: CUDA error: unspecified launch failure`
+    surfaced at the load-model memory probe
+    (`rocm.get_current_memory_usage`, an async launch failure from an
+    earlier kernel in the load; no HwException/PSP lines in the log,
+    rocm-smi showed both cards back at the 10.8 MB baseline / 0 %
+    within ~1 min — the driver self-recovered, no zombie VRAM). This
+    is the chronic two-card weight-load-hang family (12th occurrence
+    across boots; boots L/M each had 3 before reboot) and the first
+    HW observation on boot N. It is NOT plausibly LEGACY=0-specific:
+    the failure is in the generic load path (the Q8 side buffer is
+    built at KV-cache append time, not load time), and arm A loaded
+    the identical weights ~10 min earlier on the same cards. Protocol
+    outcome: isolated → one retry of arm B; retry failure = burst →
+    stop + reboot (root). Server log: `/local/tmp/lcbench_b1ab_b_server.log`.
+
+    **RETRY FAILED — 2026-08-29 13:42:05–13:43:04Z.** Identical
+    signature: both ranks `c10::AcceleratorError: CUDA error:
+    unspecified launch failure` (the log shows the duplicated
+    `terminate` from both workers; 2 occurrences of `unspecified
+    launch failure`), at the same weight-load stage; both cards
+    self-recovered to the 10.8 MB baseline / 0 % within ~1 min,
+    no zombie VRAM, no PSP/HwException lines. **2 consecutive
+    launch failures on boot N = BURST per the house recipe → all GPU
+    work stopped; reboot (root) required.** The two-card-launch vs
+    single-card-clean split holds on boot N exactly as it did on boot
+    L (all recent wedges two-card, all recent clean runs single-card
+    GPU0). Post-reboot pending (see the degradation.md row): canary,
+    then bake arms B/C on `feat/fa-legacy0-b1-decode` (arm A control
+    already recorded: 39.76/40.12 t/s @ pp2048/tg256).
+
+## 2026-08-29 15:51 + 16:09Z — boot O, B=1 bake arms A and C (two wedges, non-consecutive)
+
+    Post-reboot bake of `feat/fa-legacy0-b1-decode` (arm A control
+    already recorded on boot N: 39.76/40.12 t/s). Boot O: canary
+    39.3 t/s clean at 15:49.
+
+    **Wedge 1 (15:51:02, arm A 1st attempt):** kernel log — GPU1
+    (0000:0e:00.0) `qcm fence wait loop timeout expired`,
+    `The cp might be in an unrecoverable state due to an unsuccessful
+    queues preemption`, `Failed to evict process queues`,
+    `Failed to quiesce KFD`, `GPU reset begin! Source: 4`, PSP
+    `UNLOAD_TA(0x2) failed (0x117)`, **BACO reset**, `GPU reset
+    succeeded, trying to resume` + coredump file created; userspace
+    `unspecified launch failure` both ranks at the shard-5 weight-load
+    stage. Just before: `amdkfd_restore_userptr_worker hogged CPU
+    >10000us` (workqueue notice; the boot's kernel log is otherwise
+    clean from the 15:37 driver init — no earlier reset this boot).
+
+    **Between the wedges, four clean two-card launches:** bare
+    torch/RCCL probe (50 allreduces, 35.2 ms/iter, ~15:55), arm A
+    retry (loaded 345 s, served, benched 40.11/40.12 t/s, clean
+    teardown), arm B (LEGACY=0) (loaded 325 s, served, benched
+    37.61/37.56 t/s, clean teardown).
+
+    **Wedge 2 (16:09:11, arm C 1st attempt):** identical GPU1
+    signature (`qcm fence wait loop timeout` → evict/KFD-quiet fail
+    → GPU reset), userspace `unspecified launch failure` both ranks at
+    weight load.
+
+    Assessment: boot O is taking intermittent GPU1 qcm-fence wedges
+    under two-card vLLM weight loads, with clean two-card launches
+    between them — NOT the consecutive-failure burst pattern (the
+    clean runs break the chain per the boot-L 12:52 precedent), but
+    this is the 4th consecutive boot (L, M, N, O) with the two-card
+    load-wedge pattern, and every boot-O wedge is GPU1. Chronic
+    hardware/driver suspicion is now the working hypothesis (a
+    reboot alone has not cleared it across L→M→N→O). Protocol: arm C
+    gets one retry; a 3rd boot-O wedge OR the retry wedging stops
+    GPU work pending host investigation.

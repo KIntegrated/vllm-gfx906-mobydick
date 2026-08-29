@@ -1,7 +1,5 @@
 # Dev log — Qwen 3.5 quantized MoE decode/prefill on gfx906
 
-Copyright Kevin Read <me@kevin-read.com>
-
 > The MoE kernel train (W4A16 grouped GEMM, prefill tuning, the
 > fill/copy pile, layer-0 attribution, branch merge/archival). The
 > custom FA backend moved to DEVLOG-fa-attention.md; the dense 27B
