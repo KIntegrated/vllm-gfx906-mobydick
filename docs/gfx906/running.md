@@ -19,7 +19,7 @@ The serving benches moved out of docker on 2026-08-16. The `.venv` holds an
 editable install of this repo; the compiled extensions live in-tree.
 
 ```bash
-source ~/env-rocm-7.14-gfx906.sh        # LD_LIBRARY_PATH=/opt/rocm-7.14/lib (REQUIRED)
+source ~/env-rocm-7.14-gfx906.sh        # ROCM_PATH + LD_LIBRARY_PATH=/opt/rocm/lib (REQUIRED)
 ```
 
 - **TP=2+ serving needs the HIP blocking-sync `.pth` shim, once per venv**
@@ -42,8 +42,11 @@ source ~/env-rocm-7.14-gfx906.sh        # LD_LIBRARY_PATH=/opt/rocm-7.14/lib (RE
   `LD_LIBRARY_PATH` isn't already populated:
 
   ```bash
-  export VLLM_GFX906_HIP_LIB_PATH=/opt/rocm-7.14/lib/libamdhip64.so.7
+  export VLLM_GFX906_HIP_LIB_PATH=/opt/rocm/lib/libamdhip64.so.7
   ```
+  (2026-08: ROCm 7.14 lives at `/opt/rocm`; the old custom
+  `/opt/rocm-7.14` install was removed — update the path to match your
+  install's `lib/`.)
 
   Set `VLLM_GFX906_HIP_BLOCKING_SYNC=0` to disable (e.g. if
   lowest-dispatch-latency active-wait matters more than idle CPU for a
@@ -152,10 +155,14 @@ aware if you see empty device/ROCm detection on 7.14.
 
 ## 2. GPU memory pressure
 
-The MI60/MI50 has 32 GB. Use `gpu_memory_utilization` <= `0.85` (see
-`_bench_gfx906.py` defaults). Notebook/dense models up to ~9B AWQ fit easily;
-MoE works; large fp16 models (Qwen3.6-27B = 52 G, Qwen3.6-35B-A3B = 67 G) do
-**not** fit single-GPU.
+The MI60/MI50 has 32 GB. Current validated practice (2026-08):
+`--gpu-memory-utilization 0.82` for spec-decoding serving, `0.93` for
+dense TP=1 serving (0.95 OOMs on the second request with a warm
+inductor cache — the warm-cache profiling peak is ~0.16 GiB lower than
+cold), `0.95` for the in-process bench harness with an explicit KV
+cap (`--kv-cache-memory-bytes`). See README §Recommended serving
+configuration. Large fp16 models (Qwen3.6-27B = 52 G,
+Qwen3.6-35B-A3B = 67 G) do **not** fit single-GPU.
 
 ---
 

@@ -120,6 +120,68 @@ Set the env `VLLM_ATTENTION_BACKEND=ROCM_ATTN` as well for earlier-stack paths.
 If you built without gfx906 (no FA extension compiled), or the backend is not
 registered, vLLM automatically falls back to the stock ROCm/TRITON backends.
 
+### Recommended serving configuration (gfx906, 32 GB MI50/MI60)
+
+Environment variables:
+
+| variable | value | when | why |
+|---|---|---|---|
+| `FLASH_ATTENTION_TRITON_AMD_ENABLE` | `TRUE` | **every run** | the ROCm platform aborts at import without it ("ROCm platform requires upstream flash-attn to be installed"); selects the Triton-AMD flash-attn path |
+| `LD_LIBRARY_PATH` | `…/rocm/lib` | venv runs | system ldconfig knows no ROCm — `source` your ROCm env script (or export `LD_LIBRARY_PATH=/opt/rocm/lib`) before launching |
+| `HF_HUB_OFFLINE` | `1` | serving | offline loads from the local HF cache (no hub round-trips at import) |
+| `VLLM_GFX906_HIP_LIB_PATH` | `…/rocm/lib/libamdhip64.so.7` | **TP≥2 only** | with the blocking-sync `.pth` shim below (see note) — without both, every TP worker permanently pegs a host core at ~100 % (HIP active-wait) |
+| `VLLM_GFX906_SKINNY_M16` | `1` | optional | dense N=8 concurrent decode (+14.5 % W4 skinny GEMV); default off |
+| `HSA_OVERRIDE_GFX_VERSION` | — **do not set** | — | ROCm 7.14 has native gfx906 (older 7.2.1 images needed `9.0.6`) |
+| `VLLM_ATTENTION_BACKEND` | — **do not set** | — | the custom Q8 FA backend (`CUSTOM`) is already the gfx906 default |
+
+Validated serve command (2× MI50, Qwen3.8-27B-AWQ-INT4, 2026-08-25/29):
+
+```bash
+FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE HF_HUB_OFFLINE=1 \
+vllm serve <model> \
+  --served-model-name <name> \
+  --tensor-parallel-size 2 \
+  --dtype float16 \
+  --max-model-len 262144 \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 4096 \
+  --gpu-memory-utilization 0.82 \
+  --compilation-config '{"cudagraph_capture_sizes":[6,12]}' \
+  --speculative-config '{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_max":2}' \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 \
+  --generation-config auto
+```
+
+- `--dtype float16` is required: gfx906 has no bf16 hardware; bfloat16
+  checkpoints would fall back to fp32 math.
+- cudagraph capture sizes = multiples of `num_speculative_tokens + 1`
+  (6 for ngram n=5); use `[1,2,3,4]` for prefill/TTFT-focused or
+  spec-free serving.
+- MTP/EAGLE are too heavy for these GPUs; ngram n=5 gives +15 % decode
+  on short outputs (48.5 vs 41.9 t/s @ tg256), neutral at tg1024.
+- Tool/reasoning parsers: Qwen 3.5/3.6/3.8 → `qwen3_coder` + `qwen3`;
+  Muse-Glimmer → `muse_glimmer` for both.
+- `--gpu-memory-utilization`: 0.82 with the spec config above; 0.93 for
+  dense TP=1 serving (0.95 OOMs on the second request with a warm
+  inductor cache); the in-process bench harness uses 0.95.
+- **Benchmarks:** add `--no-enable-prefix-caching` (replayed prefixes
+  poison TTFT-derived numbers).
+- **TP=2 prerequisites:** the official AMD DKMS `amdgpu` driver (the
+  stock Ubuntu driver stalls or hangs RCCL P2P/IPC on dual-root-port
+  topologies). One-time shim: `cp docs/gfx906/gfx906-blocking-sync.pth
+  .venv/lib/python3.12/site-packages/` and export
+  `VLLM_GFX906_HIP_LIB_PATH` (absolute path to `libamdhip64.so.7`);
+  re-copy the `.pth` after any fresh venv. TP=1: drop
+  `--tensor-parallel-size`, set `HIP_VISIBLE_DEVICES=0`, skip the shim.
+- **In-process (harness) only:** `VLLM_ENABLE_V1_MULTIPROCESSING=0
+  VLLM_USE_AOT_COMPILE=0 TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` —
+  not needed for `vllm serve`.
+
+Deep-dive recipes, docker images, and build instructions:
+[`docs/gfx906/running.md`](docs/gfx906/running.md).
+
 ### 🐳 Using Pre-built Docker Image (Recommended)
 
 If you have Docker and the AMD ROCm drivers/kernel modules installed on your host system, you can totally bypass the complex manual source-build installation by using our pre-built Docker image.
