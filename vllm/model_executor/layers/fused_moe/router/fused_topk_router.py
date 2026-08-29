@@ -216,8 +216,12 @@ class FusedTopKRouter(BaseRouter):
         self.renormalize = renormalize
         self.scoring_func = scoring_func
         # C1 stage 2: (sorted_token_ids, expert_ids, num_tokens_post_pad)
-        # produced by the fused routing kernel for the M=1 decode shape;
-        # consumed by the MoE runner immediately after select_experts.
+        # produced by the fused routing kernel for the M=1 decode shape.
+        # Invariant: (re)written on EVERY routing call (None on the
+        # non-fused path) and read+cleared ONLY by
+        # MoERunner._apply_quant_method immediately after select_experts;
+        # no other site may read it. A routing call without a following
+        # expert execution would leave dead state.
         self._fused_align_meta: tuple[
             torch.Tensor, torch.Tensor, torch.Tensor
         ] | None = None

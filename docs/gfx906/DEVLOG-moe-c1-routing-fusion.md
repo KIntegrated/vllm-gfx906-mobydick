@@ -81,7 +81,7 @@ router dispatch + gate shape checks.
 | arm | t/s |
 |---|---|
 | A (stage 1 only = current default) | 57.42 |
-| B (routing fuse ON) | **56.79 (−1.10%, −51 µs/step)** |
+| B (routing fuse ON) | **56.79 (−1.10%, −175…−195 µs/step, runs 1–2)** |
 | A2 (control after B) | 57.46 |
 
 A2 ≈ A ⇒ not boot drift: the flip is real, despite the isolated-graph
