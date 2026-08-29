@@ -50,6 +50,32 @@ and bench recipes.
 Details, per-model caveats, and bench recipes:
 [`docs/gfx906/README.md`](docs/gfx906/README.md) §Model support status.
 
+### Long-context performance (TP=2, 2× MI50 32 GB)
+
+Prefill sweep for the two prime dense models at their max context
+(Qwen3.8-27B: 256k; Muse-Glimmer-30B: 128k). Deep prompts, B=1,
+tg=128, mean of 2 samples; prefix caching OFF, `--max-num-batched-tokens
+4096`, float16, trimmed cudagraph capture `[1,2,3,4]`. 2026-08-29,
+boot N (canary 38.9 t/s healthy); csrc @ `cf5ccbd685` (M2 merged + M3
+hygiene, bit-identical). Re-run recipe: `docs/gfx906/_serve_tp2_gfx906.sh`
+(start/wait/stop; Qwen3.8 at 256k needs `KVBYTES=10737418240`) +
+`docs/gfx906/_bench_serve_grid_gfx906.py` with
+`'[[32768,128],[65536,128],[112640,128]]' 2`.
+
+| model (max ctx) | 32k prefill | 64k prefill | 110k prefill | TTFT @ 32k/64k/110k |
+|---|---:|---:|---:|---|
+| Qwen3.8-27B-AWQ-INT4 (256k) | **443.9** | **364.8** | **289.0** | 73.8 s / 179.6 s / 389.7 s |
+| Muse-Glimmer-30B-AWQ-INT4 (128k) | **500.0** | **442.1** | **379.6** | 65.5 s / 148.1 s / 296.7 s |
+
+Prefill t/s = pp / TTFT. Live-ctx tax: prefill rate falls ~12–14 % per
+doubling for Muse and ~18–21 % for Qwen3.8 (head_dim 256 makes its
+attention share scale harder). Decode (byproduct, tg=128, no spec
+decode): Muse 30.5 → 26.3 → 21.9 t/s; Qwen3.8 25.6 → (–) → 13.3 t/s
+(the 64k sample ended at out=1 — the model hit EOS on the repetitive
+filler, a content artifact; TTFT is unaffected). KV budgets: 6 GiB
+(783,892-token pool) for Muse, 10 GiB (323,414-token pool) for
+Qwen3.8 — the 256k max-len needs ≥ 8.09 GiB of KV.
+
 ### Benchmarks
 
 **gfx906 fork — dense AWQ `QuantTrio/Qwen3.5-9B-AWQ` (few full attention

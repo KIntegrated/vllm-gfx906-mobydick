@@ -187,6 +187,31 @@ load-time repack (~65 s). Handles both MoeWNA16 (N-first uint8) and AutoAWQ
 `VLLM_GFX906_SKINNY_M16=1` (default off); 27B N=4 control flat (−0.6 %, flag
 inert). Kernel, gate rationale, and soak: `DEVLOG-fp16-skinny.md`.
 
+### Long-context prefill sweep (TP=2, 2× MI50, 2026-08-29, boot N)
+
+Deep-prompt prefill for the two prime dense models at max context
+(256k / 128k). B=1, tg=128, 2 samples, prefix caching OFF, bt4096,
+float16, capture `[1,2,3,4]`, no spec decode; KV 6 GiB (Muse,
+783,892-token pool) / 10 GiB (Qwen3.8, 323,414 — 256k max-len needs
+≥ 8.09 GiB). Canary 38.9 t/s healthy. csrc @ `cf5ccbd685` (M2 + M3
+hygiene, bit-identical). Harness: `_serve_tp2_gfx906.sh` +
+`_bench_serve_grid_gfx906.py` (`'[[32768,128],[65536,128],[112640,128]]' 2`).
+
+| model | pp | prefill t/s (s0 / s1) | TTFT (s0 / s1) | decode t/s |
+|---|---:|---|---|---:|
+| Qwen3.8-27B (256k) | 32768 | 442.1 / 445.7 | 74.12 / 73.52 | 25.5 / 25.8 |
+| Qwen3.8-27B (256k) | 65536 | 365.1 / 364.5 | 179.49 / 179.78 | — (out=1, EOS on filler) |
+| Qwen3.8-27B (256k) | 112640 | 289.0 / 289.0 | 389.70 / 389.80 | 13.3 / 13.3 |
+| Muse-Glimmer-30B (128k) | 32768 | 500.6 / 499.4 | 65.45 / 65.62 | 30.5 / 30.5 |
+| Muse-Glimmer-30B (128k) | 65536 | 442.5 / 441.6 | 148.09 / 148.41 | 26.3 / 26.3 |
+| Muse-Glimmer-30B (128k) | 112640 | 380.7 / 378.5 | 295.88 / 297.57 | 21.9 / 21.9 |
+
+Sample-to-sample spread ≤ 0.5 % on TTFT. Live-ctx tax per doubling:
+Qwen3.8 −17.8 % / −20.8 % (head_dim 256); Muse −11.6 % / −14.1 %.
+Cross-check: matches the ~500 t/s TP=2 32k prefill records (TP=1
+in-process is ~240 t/s, ~2× scaling holds). Raw logs:
+`/local/tmp/lcbench_{muse,qwen38}_grid*.log`.
+
 ## Bench recipes
 
 Canonical environment is the **local editable `.venv`** (docker images are
@@ -205,6 +230,13 @@ Dense 27B (NFS model; no fastsafetensors; smaller KV):
 `BENCH_GPU_UTIL=0.92 BENCH_KV_MEM=6442450944 BENCH_MAXSEQS=8
 BENCH_BATCHED_TOKENS=4096 BENCH_TEXT_ONLY=1` with model path
 `/data/models/qwen/Qwen3.5-27B-AWQ`.
+
+Long-context TP=2 serve sweep (2026-08-29 recipe):
+`_serve_tp2_gfx906.sh start <tag> <snap> <name> <max-len> <tool> <reason>`
+(`KVBYTES=10737418240` for Qwen3.8-27B @ 256k) → `wait` →
+`LC_MODEL=<name> LC_SNAP=<snap> .venv/bin/python
+docs/gfx906/_bench_serve_grid_gfx906.py '[[32768,128],[65536,128],[112640,128]]' 2`
+→ `stop` (SIGTERM + VRAM-release wait — never SIGKILL a TP=2 server).
 
 Rules: serving benches run sequentially; check `uptime` first (background CPU
 contention invalidates numbers); `BENCH_ATTN_BACKEND` must NOT be set
