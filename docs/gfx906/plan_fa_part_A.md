@@ -1,7 +1,5 @@
 # Part A plan — repack the Q8 tile layout into aligned quants/scale planes (M6)
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Status: **EXECUTED 2026-08-28 (round 11) — microbench hard stop-gate
 FIRED: flip question DEAD-END, code change NEUTRAL; MERGED to main
 2026-08-29 as loader hygiene** (`02d197189f`; same-boot B=1

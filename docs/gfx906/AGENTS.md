@@ -100,8 +100,3 @@ a log that covers only one incident is a weak search target.
 5. **Roadmap vs dev-log stays strict** — roadmap says *what we might do*,
    dev log records *what we did and the outcome* — but keep the cross-links
    so each dead-end is reachable from both directions.
-
-## Copyright
-
-New dev logs/files use the project convention:
-`Copyright Kevin Read <me@kevin-read.com>`.

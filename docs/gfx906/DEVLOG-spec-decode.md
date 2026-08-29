@@ -2,7 +2,6 @@
 
 > Branch: `gfx906/spec-decode`. The 27B Phase-1 spec log (the MoE
 > port is DEVLOG-moe-spec-decode.md).
-> Copyright Kevin Read <me@kevin-read.com>.
 
 Top-line state: **mtp2 (k=2) is the recommended spec method for
 Qwen3.5-27B — 1.503× (39.74 t/s, 1.819 tok/step, 90.95% draft

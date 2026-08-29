@@ -59,6 +59,3 @@ DEVLOG). Pattern: **hypothesis → gate → verdict → commit/revert → commen
    verdicts; eager A/B can tie even when kernels differ (launch-bound).
 3. PPL/prompt_logprobs is an unreliable gate on Gemma-4 (hybrid attention);
    gate on coherent text + logprob A/B (`GA`).
-
----
-Copyright Kevin Read <me@kevin-read.com>

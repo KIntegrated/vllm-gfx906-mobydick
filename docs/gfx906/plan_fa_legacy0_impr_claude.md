@@ -265,6 +265,3 @@ so batching it could not have moved wall-clock regardless of how much
 smaller the diff was. Superseded by this file's Part A (the read-layout
 repack), which targets the actual bottleneck identified by the same
 analysis.
-
----
-Copyright Kevin Read <me@kevin-read.com>

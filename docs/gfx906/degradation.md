@@ -1,7 +1,5 @@
 # GPU wedge / host-degradation event log — 2× MI50 (gfx906), official amdgpu DKMS
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Protocol: **every** half-wedge, full wedge, and host-degradation
 observation gets a row here (timestamped UTC), with a pointer to the
 details in `degradation_details.md`. Sources: `journalctl -k` /

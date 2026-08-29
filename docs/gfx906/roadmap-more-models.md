@@ -1,7 +1,5 @@
 # More model families on gfx906 — open roadmap
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Completed onboarding and portability findings are recorded in
 [`CHANGELOG.md`](CHANGELOG.md). This file contains only model work that is
 still open or blocked. The general rule is that gfx906 dispatch is selected by

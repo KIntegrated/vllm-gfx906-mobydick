@@ -1418,6 +1418,3 @@ now moot *via Part A* — the repack (the B=1 fix candidate) is closed
 as a dead end for the flip; the flip stays closed unless a future
 mechanism (Part C or a write-path fix) targets the residual B=1 gap
 and survives the serving gate.
-
----
-Copyright Kevin Read <me@kevin-read.com>

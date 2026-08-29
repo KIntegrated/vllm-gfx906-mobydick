@@ -3,8 +3,6 @@
 # custom kernel: 65.03 t/s harness A/B (decode-only 81.1), 18.6× over
 # the Triton fallback arm.
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Model: `cyankiwi/Ornith-1.5-35B-A3B-AWQ-INT4` (Qwen3.5-MoE VLM, 40 layers,
 256 experts × 8 top-k, moe_inter 512, 24.33 GiB checkpoint — the same
 decode-shape class as the flagship Qwen3.5-35B-A3B-AWQ). Quant:

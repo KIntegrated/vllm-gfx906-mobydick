@@ -1,7 +1,5 @@
 # 256k-context prefill OOM on Qwen3.8-27B — mechanism and evidence
 
-Copyright Kevin Read <me@kevin-read.com>
-
 2026-08-23, 2× MI50 (gfx906), ROCm 7.14, `vllm-gfx906-mobydick` @
 `gfx906/main`. Model: `/local/cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4`
 (64 layers: 16 FA + 48 GDN, `full_attention_interval=4`, hidden 5120,

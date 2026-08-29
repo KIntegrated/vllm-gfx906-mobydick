@@ -1,7 +1,5 @@
 # MoE decode on gfx906 — open roadmap
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Completed experiments and shipped work have moved to
 [`CHANGELOG.md`](CHANGELOG.md). This document keeps only open, deferred, or
 locally landed-but-not-yet-upstream work. The main reference workload is

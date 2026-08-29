@@ -1,7 +1,5 @@
 # DEVLOG-moe-spec-decode (W2): port the spec-decode rails to the 35B MoE
 
-Copyright Kevin Read <me@kevin-read.com>
-
 **VERDICT:** SHIPPED (2026-08-23: the rails port with no code changes —
 all four were in-tree from the merged 27B phase; mtp2 k=2 is +16–20 %
 graph / ~1.84× eager on the 35B MoE. No dispatch change to ship; the

@@ -1,7 +1,5 @@
 # Dev log — Gemma-4 prefill-logprob anomaly (confident garbage prompt logprobs)
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Branch: `gfx906/gemma4-prefill-logprob` (from `gfx906/main` @ `180f030ee3`, 2026-08-20)
 
 ## Symptom

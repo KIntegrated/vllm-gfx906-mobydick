@@ -1,7 +1,5 @@
 # Dev log — Qwen3.5-27B dense decode on gfx906
 
-Copyright Kevin Read <me@kevin-read.com>
-
 > Split from DEVLOG-moe-opt.md (2026-08, topic consolidation). The
 > dense 27B handover, elementwise/rmsnorm, W4A16-dense-rejected,
 > down_proj GEMV, max-ilp, and the docker load test.

@@ -1,7 +1,5 @@
 # DEVLOG-fp16-skinny (W4): weight-row-parallel skinny fp16 GEMM, M≤16
 
-Copyright Kevin Read <me@kevin-read.com>
-
 **VERDICT: SHIPPED** — 35B MoE N=8 graph **+14.5 %** (191.0 vs 166.9
 t/s steady), 27B (Qwen3.8) N=8 graph **+6.1 %** (104.2 vs 98.2, microbench
 prediction +5.5 %), 27B N=4 control flat (−0.6 %, flag inert). Kernel in-tree

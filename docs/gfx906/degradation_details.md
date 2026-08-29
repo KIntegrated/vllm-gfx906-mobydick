@@ -1,7 +1,5 @@
 # Degradation & wedge details — 2× MI50, ROCm 7.14 + amdgpu DKMS 6.19.14
 
-Copyright Kevin Read <me@kevin-read.com>
-
 Companion to `degradation.md` (the timestamped table). This file holds
 the mechanism notes, the kernel evidence, and the open questions. Event
 rows live in the table.

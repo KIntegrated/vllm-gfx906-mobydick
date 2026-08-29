@@ -1,8 +1,6 @@
 # FA LEGACY=0 B=1 decode gap — kernel-level localization + serving
 # adjudication
 
-Copyright Kevin Read <me@kevin-read.com>
-
 ## 2026-08-29 — B=1 LEGACY=1-vs-0 decode gap (roadmap item #1)
 
 **VERDICT:** OPEN (serving gate pending — host reboot required, see

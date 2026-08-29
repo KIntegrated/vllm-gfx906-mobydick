@@ -61,6 +61,3 @@ Do **not** restate roadmap candidates verbatim; cross-link them.)
 ## Search keys
 
 `HYPOTHESIS:` `VERDICT:` intended to be grep-able in one pass.
-
----
-Copyright Kevin Read <me@kevin-read.com>

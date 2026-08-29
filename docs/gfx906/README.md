@@ -1,5 +1,4 @@
 # gfx906 (MI50/MI60) optimization hub
-Copyright Kevin Read <me@kevin-read.com>
 
 This fork optimizes vLLM for AMD **gfx906 (Vega 20)** — MI50/MI60, 60 CUs,
 32 GB HBM2 (~800 GB/s), **no MFMA, no int8 matrix cores**. All numbers are

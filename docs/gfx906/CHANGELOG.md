@@ -1,5 +1,4 @@
 # gfx906 changelog
-Copyright Kevin Read <me@kevin-read.com>
 
 This file records roadmap items that are complete, rejected, superseded, or
 otherwise closed. Active work, deferred work, and changes that are local but
