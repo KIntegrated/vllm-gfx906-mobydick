@@ -46,6 +46,8 @@ impact); the deliverable is probes + suite pins + records.
 
 ### F1 (P1, fix before merge) — new dev log still carries a copyright line
 
+**FIXED in `0ba4d96e47`.**
+
 `DEVLOG-fa-splitk-accuracy.md` line 3: "Copyright Kevin Read
 <me@kevin-read.com>". This commit landed 13:22; the convention change
 (markdown carries no copyright line) landed 15:46 on
@@ -57,6 +59,8 @@ the line here (docs-only).
 
 ### F2 (P2) — stale source line refs in the dev log's mechanism section
 
+**FIXED in `0ba4d96e47`.**
+
 The mechanism is right but three cited locations are wrong on this
 tree: "`fattn-q8-paged.cuh:261`" → the `half2 VKQ` accumulator is at
 `:545`; "`fattn-q8.cuh:532`" → `:1028`; "`gfx906_fa.cpp:383`" → the
@@ -65,6 +69,10 @@ fp32 partial allocs are at `:393-394` (gather) / `:1240-1241` (paged).
 log's whole point is one-pass lookup, fix the refs.
 
 ### F3 (P2) — single-entry log file vs the grouping rule
+
+**FIXED in `0ba4d96e47`** (option: naming-list entries added to
+`docs/gfx906/AGENTS.md`; folding into `DEVLOG-fa-attention.md` stays an
+option for its next staleness pass).
 
 The conventions say a log covering one experiment is a weak search
 target and route FA work to `DEVLOG-fa-attention.md`. That file is
