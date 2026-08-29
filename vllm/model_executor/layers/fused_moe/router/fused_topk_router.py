@@ -30,6 +30,12 @@ def _has_gfx906_m1_topk() -> bool:
     )
 
 
+def _has_gfx906_routing_fused_m1_op() -> bool:
+    return hasattr(torch.ops, "_rocm_C") and hasattr(
+        torch.ops._rocm_C, "moe_routing_fused_m1_gfx906"
+    )
+
+
 def _get_padding_mask(num_tokens: int) -> torch.Tensor | None:
     if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
         is_padding = get_forward_context().is_padding
@@ -209,6 +215,12 @@ class FusedTopKRouter(BaseRouter):
         )
         self.renormalize = renormalize
         self.scoring_func = scoring_func
+        # C1 stage 2: (sorted_token_ids, expert_ids, num_tokens_post_pad)
+        # produced by the fused routing kernel for the M=1 decode shape;
+        # consumed by the MoE runner immediately after select_experts.
+        self._fused_align_meta: tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor
+        ] | None = None
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
@@ -220,6 +232,39 @@ class FusedTopKRouter(BaseRouter):
             has_e_score_bias=False,
         )
 
+    def _use_routing_fused_m1(
+        self,
+        router_logits: torch.Tensor,
+        indices_type: torch.dtype | None,
+    ) -> bool:
+        """C1 stage 2: single-CTA topk+align+count for the M=1 decode
+        shape (see docs/gfx906/DEVLOG-moe-c1-routing-fusion.md).
+
+        The gate must hold at BOTH this site and the post-routing steps in
+        _select_experts (EPLB mapping and indices-dtype conversion must be
+        identity, or the align metadata would be computed on different
+        ids than the expert sees). Dynamo tracing is excluded: the MoE
+        body is one opaque custom op, so tracing runs the unquantized
+        method (no meta support); at graph capture/replay time
+        is_compiling() is False and the fused branch fires as intended.
+        """
+        return (
+            os.environ.get("VLLM_GFX906_ROUTING_FUSE_M1", "0") == "1"
+            and not torch._dynamo.is_compiling()
+            and on_gfx906()
+            and _has_gfx906_routing_fused_m1_op()
+            and self.scoring_func == "softmax"
+            and self.top_k == 8
+            and self.global_num_experts == 256
+            and self.eplb_state is None
+            and indices_type in (None, torch.int32)
+            and router_logits.shape[0] == 1
+            and router_logits.shape[1] == 256
+            and router_logits.dtype == torch.float16
+            and router_logits.is_contiguous()
+            and _get_padding_mask(1) is None
+        )
+
     def _compute_routing(
         self,
         hidden_states: torch.Tensor,
@@ -229,6 +274,40 @@ class FusedTopKRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using standard fused top-k."""
+        if self._use_routing_fused_m1(router_logits, indices_type):
+            dev = router_logits.device
+            topk_weights = torch.empty(
+                1, self.top_k, dtype=torch.float32, device=dev
+            )
+            topk_ids = torch.empty(
+                1, self.top_k, dtype=torch.int32, device=dev
+            )
+            token_expert_indices = torch.empty(
+                1, self.top_k, dtype=torch.int32, device=dev
+            )
+            # wrapper-convention align buffer sizes for M=1 (see the
+            # moe_align_block_size wrapper: numel + E*(1-1) = 8, and numel
+            # < E keeps it at 8; expert_ids size = cdiv(8, 1) = 8)
+            sorted_token_ids = torch.empty(
+                self.top_k, dtype=torch.int32, device=dev
+            )
+            expert_ids = torch.empty(
+                self.top_k, dtype=torch.int32, device=dev
+            )
+            num_tokens_post_pad = torch.empty(
+                1, dtype=torch.int32, device=dev
+            )
+            torch.ops._rocm_C.moe_routing_fused_m1_gfx906(
+                router_logits, topk_weights, topk_ids, token_expert_indices,
+                sorted_token_ids, expert_ids, num_tokens_post_pad,
+                self.renormalize,
+            )
+            self._fused_align_meta = (
+                sorted_token_ids, expert_ids, num_tokens_post_pad
+            )
+            return topk_weights, topk_ids
+
+        self._fused_align_meta = None
         topk_weights, topk_ids, token_expert_indices = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,

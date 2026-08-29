@@ -133,17 +133,34 @@ def main():
                     torch.ops._rocm_C.moe_align_block_size_m1_gfx906(
                         ti, E, 1, s8, e8, n1)
                     for _ in range(LAYERS)])
+        g_rf = None
+        if m == 1 and hasattr(torch.ops._rocm_C,
+                              "moe_routing_fused_m1_gfx906"):
+            s8 = torch.empty(8, device=dev, dtype=torch.int32)
+            e8 = torch.empty(8, device=dev, dtype=torch.int32)
+            n1 = torch.empty(1, device=dev, dtype=torch.int32)
+            tw1 = torch.empty(1, TOPK, device=dev, dtype=torch.float32)
+            ti1 = torch.empty(1, TOPK, device=dev, dtype=torch.int32)
+            tei1 = torch.empty(1, TOPK, device=dev, dtype=torch.int32)
+            g_rf = graph_replay_us(
+                lambda: [
+                    torch.ops._rocm_C.moe_routing_fused_m1_gfx906(
+                        logits, tw1, ti1, tei1, s8, e8, n1, True)
+                    for _ in range(LAYERS)])
 
         am1 = (f" | align_m1 {g_align_m1:7.1f} us "
                f"({g_align_m1 / 40:.1f} us/node)"
                if g_align_m1 is not None else "")
+        rf = (f" | routing_fused {g_rf:7.1f} us "
+              f"({g_rf / 40:.1f} us/node)"
+              if g_rf is not None else "")
         print(f"M={m:4d} bsm={bsm}: eager topk {t_topk:6.1f} | "
               f"align {t_align:6.1f} | pair {t_pair:6.1f} us "
               f"| graph40: routing {g_chain:7.1f} us "
               f"({g_chain / 80:.1f} us/node) | topk-only "
               f"{g_topk:7.1f} | align-only {g_align:7.1f} | "
               f"dummy80 {g_dummy:7.1f} us ({g_dummy / 80:.1f} us/node)"
-              f"{am1}",
+              f"{am1}{rf}",
               flush=True)
         if m == 1 and hasattr(torch.ops._rocm_C,
                               "moe_topk_softmax_m1_gfx906"):

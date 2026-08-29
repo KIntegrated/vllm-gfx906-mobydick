@@ -86,6 +86,10 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        fused_align_meta: tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor
+        ]
+        | None = None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(
@@ -100,4 +104,5 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
             expert_map=layer.expert_map,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            fused_align_meta=fused_align_meta,
         )

@@ -105,6 +105,20 @@ the date an investigation began.
   (fused topk+align+count, 120 → 40 nodes) is the follow-up. Records:
   `DEVLOG-moe-c1-routing-fusion.md`,
   `benchmarks/kernels/gfx906/c1_routing_structural_probe.py`.
+- **MoE C1 stage 2: fused topk+align+count — DEAD-END in production
+  (flag OFF, kernel + plumbing + tests landed).** The one-CTA fused
+  routing kernel (`moe_routing_fused_m1_gfx906`) is bit-equal to the
+  3-kernel chain (27/27 tests) and 28 % faster in isolated graphs
+  (40 nodes: 10.0 µs/node vs 13.8 µs/layer for the stage-1 pair) — yet
+  the A-B-A serving gate shows **−1.10 %** (57.42 → 56.79 → 57.46
+  control t/s, Qwen3.5-35B, pp2048/tg256): the third S2-pattern flip,
+  and the stage comparison pinpoints it: node REMOVAL transfers
+  (stage 1, +1.2–1.7 %), REPLACING the proven production topk does not
+  (S2: −1.0 %, stage 2: −1.1 %). Router→expert meta plumbing
+  (optional `fused_align_meta` kwarg, signature-gated, dropped for
+  unquantized/ignored layers) is in place and production-neutral with
+  the flag off. Records: `DEVLOG-moe-c1-routing-fusion.md` (stage-2
+  section), `tests/kernels/moe/test_moe_routing_fused_m1_gfx906.py`.
 
 ## 2026-08-27–28
 

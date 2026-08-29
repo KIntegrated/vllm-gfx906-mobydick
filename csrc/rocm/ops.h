@@ -81,6 +81,19 @@ void moe_align_block_size_m1_gfx906(torch::Tensor topk_ids,          // [1, 8] i
                                     torch::Tensor expert_ids,        // [8] i32
                                     torch::Tensor num_tokens_post_pad);  // [1] i32
 
+// M=1 fused topk + moe_align + count_and_sort for gfx906, E=256, topk=8,
+// block_size=1 (C1 stage 2; see moe_routing_fused_m1_gfx906.cu). One
+// 128-thread CTA replaces the three-kernel generic chain; topk outputs are
+// bit-equal to ops.topk_softmax, align outputs to the generic chain.
+void moe_routing_fused_m1_gfx906(torch::Tensor gating,             // [1, 256] f16
+                                 torch::Tensor topk_weights,       // [1, 8] f32
+                                 torch::Tensor topk_ids,           // [1, 8] i32
+                                 torch::Tensor token_expert_ids,   // [1, 8] i32
+                                 torch::Tensor sorted_token_ids,   // [8] i32
+                                 torch::Tensor expert_ids,         // [8] i32
+                                 torch::Tensor num_tokens_post_pad,  // [1] i32
+                                 bool renormalize);
+
 void paged_attention(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
     torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,

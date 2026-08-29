@@ -116,6 +116,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("moe_align_block_size_m1_gfx906", torch::kCUDA,
                 &moe_align_block_size_m1_gfx906);
 
+  // M=1 fused topk + moe_align + count_and_sort for gfx906 (C1 stage 2;
+  // E=256, topk=8, block_size=1). One 128-thread CTA replaces the
+  // three-kernel generic chain for the decode shape.
+  rocm_ops.def(
+      "moe_routing_fused_m1_gfx906(Tensor gating, Tensor! topk_weights, "
+      "Tensor! topk_ids, Tensor! token_expert_ids, Tensor! sorted_token_ids, "
+      "Tensor! expert_ids, Tensor! num_tokens_post_pad, bool renormalize) "
+      "-> ()");
+  rocm_ops.impl("moe_routing_fused_m1_gfx906", torch::kCUDA,
+                &moe_routing_fused_m1_gfx906);
+
   // Custom attention op
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.

@@ -234,6 +234,10 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
         workspace2: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
+        fused_align_meta: tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor
+        ]
+        | None = None,
     ) -> None:
         E, M, N, K, topk = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
@@ -258,7 +262,13 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
         else:
             block_size_m = 8
 
-        if _use_fused_align_m1(
+        if fused_align_meta is not None:
+            # C1 stage 2: the fused routing kernel (router side) already
+            # produced the aligned buffers for this call.
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                fused_align_meta
+            )
+        elif _use_fused_align_m1(
             topk_ids, block_size_m, global_num_experts, expert_map
         ):
             sorted_token_ids, expert_ids, num_tokens_post_padded = (

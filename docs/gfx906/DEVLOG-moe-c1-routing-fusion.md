@@ -1,4 +1,4 @@
-# MoE C1 — M=1 routing pipeline fusion — stage 1 (align+count) SHIPPED
+# MoE C1 — M=1 routing pipeline fusion — stage 1 SHIPPED, stage 2 DEAD-END
 
 **VERDICT:** SHIPPED (stage 1) · **GATE:** in-process
 `_bench_gfx906.py`, Qwen3.5-35B-A3B-AWQ, TP=1 B=1, pp2048/tg256, graph
@@ -59,16 +59,56 @@ wall clock, not just in isolated graph replay.
   mechanisms, not a counterexample to node removal — the back-to-back gate
   shows node removal transfers (207 vs 224 µs/step predicted).
 
-## Notes / next (stage 2, OPEN)
+## Stage 2 — DEAD-END in production (same boot, 2026-08-29)
 
-- topk is the remaining 470 µs/step component (11.8 µs/node × 40). Stage 2
-  = one fused topk+align+count kernel (120 → 40 nodes): needs the router
-  logits (and the topk-skip decision) at the expert `apply` — an optional
-  kwarg through `forward_modular` → quant method → kernel → impl, plus a
-  shared eligibility predicate at the router (S2's bit-exact topk phase is
-  the starting point). Only justified because stage 1 proved the mechanism
-  transfers; the S2 flip means stage 2 must be a *node removal*, not a
-  topk kernel swap.
-- Logs: `/local/tmp/c1_structural_run{1,2,3,4}.log`,
-  `/local/tmp/c1_ab_default.log`, `/local/tmp/c1_ab_topkm1.log`,
-  `/local/tmp/c1s1_ab_arm{A,B,A2,B2}.log` (boot O; /tmp wiped on reboot).
+Fused topk + align + count into ONE kernel (120 → 40 nodes/step) per the
+stage-2 plan: `csrc/rocm/moe_routing_fused_m1_gfx906.cu` (S2's bit-exact
+topk phase + stage-1's LDS count/scan/place in one 128-thread CTA).
+Router-side fused mode in `FusedTopKRouter._compute_routing` (flag
+`VLLM_GFX906_ROUTING_FUSE_M1`, **default OFF**); the (sorted_token_ids,
+expert_ids, ntp) meta is plumbed `moe_runner → forward_modular →
+FusedMoEModularMethod.apply → FusedMoEModularKernel.apply →
+Gfx906WNA16Experts.apply` (optional kwarg, dropped when the quant method
+or impl doesn't declare it — unquantized/ignored layers re-align from the
+same topk_ids, which is exact since the fused kernel's topk phase is
+bit-equal). Tests `tests/kernels/moe/test_moe_routing_fused_m1_gfx906.py`
+27/27: bit-equal to the 3-kernel production chain on all six outputs
+(24 seeds × renormalize, tie-heavy included), graph capture/replay,
+router dispatch + gate shape checks.
+
+**Gate — serving A/B (boot O, A-B-A back-to-back, 4 samples/arm):**
+
+| arm | t/s |
+|---|---|
+| A (stage 1 only = current default) | 57.42 |
+| B (routing fuse ON) | **56.79 (−1.10%, −51 µs/step)** |
+| A2 (control after B) | 57.46 |
+
+A2 ≈ A ⇒ not boot drift: the flip is real, despite the isolated-graph
+prediction of +152 µs/step (40-node fused routing 400.0 µs = 10.0
+µs/node vs stage-1's 80-node 552 µs ≈ 13.8 µs/layer).
+
+**Verdict: DEAD-END — third confirmation of the S2 flip pattern.** The
+stage comparison pinpoints the mechanism: stage 1 (SHIPPED, +1.2–1.7%)
+REMOVED redundant kernels while keeping the proven topk; stage 2
+REPLACED the proven production topk with a new 1-CTA kernel — the exact
+S2 failure mode. **Node removal transfers to serving; replacing a
+working production kernel does not** (S2 topk: 28% faster isolated →
+−1.0%; stage-2 fused routing: 28% faster isolated → −1.1%).
+
+State: kernel + plumbing + tests committed behind the OFF flag
+(production behavior unchanged; re-runnable for future kernel-design
+iterations). Stage 1 remains the C1 outcome; C1 is closed.
+
+## Notes / logs
+
+- Logs (boot O; /tmp wiped on reboot):
+  `/local/tmp/c1_structural_run{1..5}.log` (run5 = stage-2 probe with
+  routing_fused arm), `/local/tmp/c1_ab_default.log`,
+  `/local/tmp/c1_ab_topkm1.log`, `/local/tmp/c1s1_ab_arm{A,B,A2,B2}.log`,
+  `/local/tmp/c1s2_ab_arm{A,B}.log`, `/local/tmp/c1s2_ab2_arm{A2,B2,A3}.log`.
+- The UnquantizedFusedMoEMethod TypeError found in the first A/B arm
+  (ignored/unquantized layers have a real router but a method without the
+  kwarg) is guarded by the signature check in `RoutedExperts` and
+  `FusedMoEModularKernel`; the dynamo-trace exclusion in the router gate
+  keeps the fused branch out of compile tracing.
