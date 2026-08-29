@@ -99,7 +99,14 @@ the date an investigation began.
   byte-level layout pins), same-boot B=1 decode-step A/B (Muse
   geometry D=128/Hq=32, NC2=1/KVSPLIT=1, boot N): slope 36.0→34.4
   ns/token (−4.3/−4.8 %), @Sk=2176 83.6→79.1 us (−5.0/−5.6 %),
-  bit-identical (maxerr equal at every Sk) — gate PASS. Record:
+  bit-identical (maxerr equal at every Sk) — gate PASS. **Caveat
+  (post-merge review): both A/B arms ran under contention — the same
+  merged `.so` measures 42.0 us @Sk=2048 / slope 12.86 ns/token on an
+  idle GPU (1.6–1.8× faster absolute), so the recorded µs/ns are
+  contended-boot numbers; the −4…−5 % delta is directionally
+  supported (16/16 points, round-11 −2.4 %, ISA mechanism) but the
+  merge never depended on it (abort condition was slower-than-noise;
+  bit-identical).** Record:
   `DEVLOG-muse-glimmer.md` round 11, `DEAD-ENDS.md` MG row, plan
   `plan_fa_part_A.md`.
 - **M6 Part C (Q4-KV via `v_dot8_i32_i4`): SHELVED (`5d8d4c7f59`).**
