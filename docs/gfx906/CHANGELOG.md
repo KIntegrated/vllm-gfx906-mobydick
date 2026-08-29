@@ -7,6 +7,46 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-08-29
+
+- **M2: per-q-tile prefill clip merged to `main` (`06c0614379`).** Two
+  bit-identical per-q-tile scan bounds in both FA kernels — a window
+  raise of `k0_base` (the tile's first row has the smallest window
+  start; keys below it are masked for every row) and a causal cap of
+  `k_VKQ_max` (the tile's last valid row bounds the scan tail) — plus
+  the DIRECT_PAGED backend clip extended from decode-only to prefill
+  chunks; knob `GFX906_FA_TILE_CLIP` (default on). Kernel A/B at the
+  pp4096/full-context shape: 3.19×/2.81× (windowed, both kernels) and
+  2.22×/1.96× (causal-cap-only, first-chunk full-attention geometry —
+  the cap is a general chunked-prefill win, not a window feature).
+  Review-gated e2e: Muse pp16384/B=2 windowed **+11.8 % wall / +14.8 %
+  prefill**; Qwen3.8-27B pp2048 full-attention +0.73 % (GEMM-dominated;
+  its FA component is the 1.96–2.22× above). Decode/spec paths provably
+  unchanged (cap = seq_len; raise ≡ the existing floor). Residual:
+  per-row granularity within a 64-row tile (~1/32 of the effect) left
+  open. Records: `DEVLOG-fa-attention.md` (M2 + 2026-08-29 review-fix
+  entries, `m2-code-rev-glm5.md` findings closed by `04e6ab7c60`).
+- **M3: kernel hygiene batch merged (`feat/fa-m3-hygiene`).** #8
+  device-side `k0_base = max(0, kv_start[seq])` clamp (a negative start
+  walked the paged k-loop into token-negative space — illegal access /
+  wedge, not a wrong number); #10 overflow-free window cutoff
+  (`q_abs_row - k_pos_abs >= window`, provably equivalent for all int32
+  window; the old form could not actually wrap — hardening/clarity);
+  #4b `o_meta` `[B,Sq,Hq,2]` allocation dropped entirely (the kernel's
+  only `dst_meta` write is guarded by `gridDim.y != 1` and
+  `gridDim.y == kv_split`, so the buffer is dead at `kv_split==1` too
+  — ~300 KB/layer at Sq=1568/Hq=24); amplified-V window-boundary
+  regression pin (~400× discriminative). The branch's dot2 P·V rewrite
+  premise was REFUTED by ISA and the item closed: objdump of the
+  production build shows the P·V accumulate already compiles to
+  `v_pk_fma_f16` (1024× in `flash_attn_tile_q8<128,128,16,2>`, 0×
+  `v_pk_add_f16`), so `v_dot2_f32_f16` buys zero instruction count —
+  precision-only candidate, revisit only behind a numerics gate
+  (`dequant-instructions.md` corrected, old paragraph SUPERSEDED).
+  Post-merge suite 70/70 (60 base + 5 M2 + 5 M3 parametrized cases);
+  both review rounds (`m3-code-rev-glm5.md`, external fold) closed at
+  `cf5ccbd685`/`9d98aca9ab`.
+
 ## 2026-08-27–28
 
 - **Muse-Glimmer-30B-AWQ-INT4 onboarding + window FA + M1 gather clip
@@ -40,6 +80,32 @@ the date an investigation began.
   LEGACY=1 default; direct-paged stays opt-in (=1). The M5
   LEGACY-flip gate's B=4 half is now green; the flip itself still
   needs the B=1 same-boot adjudication.
+- **M5: LEGACY read-path bake executed — keep `GFX906_FA_LEGACY=1`
+  (`a6780408a8`).** The TP=2 ngram bake measured LEGACY=0 slower at
+  every controlled point (B=1 −2.5…−3.7 %, B=4 −27…−31 %, prefill
+  wash); per the flip rule only a win flips, so the default stands.
+  The bake's original "no int8 path / fp32-ALU" reading was refuted by
+  the SCEV-proof dot-rate probe (`v_dot4_i32_i8` full-rate, 4.44×
+  fp32 FMA — AMD's 53 TOPS INT8 figure is this instruction; rates in
+  `dequant-instructions.md`); the deficit is read-path/layout, not
+  the dot. LEGACY=0 remains an experimental opt-in.
+- **M6 Part A: planar Q8 repack executed — DEAD-END for the flip
+  question (branch `feat/fa-legacy0-m6-partA`, left unmerged).** The
+  rev-2 plan's hard stop-rule fired: loader global loads 10→6 per
+  tile-row (1.67× < the 2× rule) despite a −2.4 % standalone B=1 win,
+  so the B=1 gap is not load-instruction-bound. Code is bit-identical
+  and neutral (production LEGACY=1 shares the loader); merge-or-revert
+  is pending. Record: `DEVLOG-muse-glimmer.md` round 11, `DEAD-ENDS.md`
+  MG row, plan `plan_fa_part_A.md` (on the branch).
+- **M6 Part C (Q4-KV via `v_dot8_i32_i4`): SHELVED (`5d8d4c7f59`).**
+  Quality unproven (Q4 K *and* Q requant; 7-level codebook ≈ doubles
+  KQ quantization error with no PPL evidence). Reopens only behind a
+  dedicated accuracy gate that must pass before any kernel work.
+- **MI50 vLLM memory-attribution skill.** Personal skill
+  (`~/.agents/skills/gfx906-mem-attribution/SKILL.md`) + in-repo probe
+  (`docs/gfx906/_probe_mem_attribution_gfx906.py`): the 3-arm OOM
+  attribution recipe, per-layer hooks, bisection, and the env traps
+  (AOT workers, inductor fork/spawn HSA). Validated on the M0 hunt.
 
 ## 2026-08-14–16
 
