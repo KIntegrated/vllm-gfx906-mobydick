@@ -132,3 +132,18 @@ right epistemic shape; no action.
 Results: append → 36.6/40.4/6.6 µs, +59.6 µs/step (exit 0); step probe →
 table above (exit 0). Logs: `/tmp/review_append_probe.log`,
 `/tmp/review_step_probe.log`.
+
+## Post-review addendum (2026-08-29, same session)
+
+**F6 — no roadmap entry for the ~1.55 ms/step remainder (FOUND, FIXED
+on-branch).** The unexplained LEGACY=0-common per-step cost existed only
+in this dev log: a "not further decomposed" mechanism note plus a
+"revisit only with a graph-node overhead measurement" precondition that
+nobody tracked — the forward-looking candidate belonged in the roadmap
+per the log/roadmap split. Added `roadmap-more-models.md` → "Decode-graph
+node-overhead point (shared infra)" (G1: per-node replay-cost probe,
+dummy-no-op-node A/B, falsifiable both ways) + the one-line cross-link
+from this log's refrigerated section. Deliberately NOT fixed here: F1
+(the stale "never-run same-boot adjudication" notes in the M6 paragraph
+and the README knob row sit in the same file region and remain the dev
+agent's/open decision from the review).

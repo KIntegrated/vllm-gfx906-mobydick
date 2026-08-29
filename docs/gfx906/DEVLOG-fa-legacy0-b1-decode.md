@@ -117,7 +117,8 @@ at 2k context is ~25 ms, of which the subcomponent is ~92 us (0.4 %).
   bytes) would cut the append delta to ~0 and the graph nodes in
   half — but the node-overhead remainder would still stand, so this
   alone would not close a 6 % gap; revisit only with a graph-node
-  overhead measurement.
+  overhead measurement (now tracked: `roadmap-more-models.md` →
+  "Decode-graph node-overhead point", G1).
 
 VERDICT: DEAD-END (flip question closed; records: DEAD-ENDS.md,
 CHANGELOG; branch stays unmerged for review)

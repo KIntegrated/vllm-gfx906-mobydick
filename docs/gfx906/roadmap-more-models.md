@@ -145,3 +145,38 @@ recipe), `docs/gfx906/running.md` (§0 + build section),
 `docs/gfx906/README.md` (bench recipe). Dev logs and
 degradation_details.md keep their lines (historical record); the
 session `canary.sh` sources it — drop there too when next touched.
+
+## Decode-graph node-overhead point (shared infra, from the LEGACY=0 B=1 closure)
+
+The 2026-08-29 same-boot adjudication (`DEVLOG-fa-legacy0-b1-decode.md`,
+boot O) left a bounded-but-unexplained **~1.55 ms/step** serving cost
+common to both LEGACY=0 arms, with the extra captured-graph nodes
+(~16–32 per decode step: one Q8 side-buffer write + slot cast per
+full-attn layer) as the leading unmeasured hypothesis. Not further
+decomposed there — the obvious tools are blocked on this stack
+(chrome-trace GPU timestamps are not wall-aligned; eager TP=2
+collapses ~3× from launch overhead). This is NOT LEGACY=0-specific:
+any change that adds per-layer kernels to the captured decode graph
+(MoE routing fusion, spec-decode extensions, future KV-side writes)
+pays the same invisible per-node replay cost, so the measurement
+gates a family of decisions, not just the refrigerated lever below.
+
+**G1 — per-node replay-cost probe (cheap, no model change):** capture
+the standard decode graph, then A/B replay wall time with N dummy
+no-op kernel launches appended per layer (N ∈ {0, 16, 32, 64}), TP=1
+and TP=2, same boot. Falsifiable both ways:
+
+- per-node ≤ ~10 µs → 16–32 nodes explain ≤ ~0.3 ms of the 1.55 ms →
+  node count is NOT the owner; suspect TP=2 sync placement / other
+  LEGACY=0-common per-step work; the Q8-fusion lever stays
+  refrigerated.
+- per-node ≈ 50–100 µs → nodes explain the remainder → the
+  refrigerated lever (fuse the Q8 write into
+  `triton_reshape_and_cache_flash`, halving the nodes) reopens with a
+  real bound — and every future adds-nodes-per-step proposal must
+  budget it.
+
+Gate is wall-clock A/B only (harness or serving). Prior-probability
+note: ~50–100 µs/node would be unusually high for graph replay, so G1
+is more likely to kill the hypothesis than confirm it — either
+outcome is cheap and decisive.
