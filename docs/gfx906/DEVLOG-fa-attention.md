@@ -768,8 +768,10 @@ the kernel-level win is large and the bit-identity holds).
 
 ## VERDICT
 
-**SHIPPED (branch, unmerged for review).** M2 closed at q-tile
-granularity: sliding-window prefill attention scan drops from
+**SHIPPED — in main since 2026-08-29 (merged after review; see the
+2026-08-29 review-fixes entry below for the executed e2e gate).**
+M2 closed at q-tile granularity: sliding-window prefill attention
+scan drops from
 ~chunk to ~window per q-tile — 2.8–3.2× on the FA kernel at the
 pp4096/full-context shape, i.e. the per-layer attention cost of a
 4096-token chunk on the 39 Muse sliding-window layers at long
@@ -867,15 +869,23 @@ covering BOTH halves (windowed + full-attention first-chunk).
   `qcm fence wait loop timeout`, first single-card/mid-stream one)
   and a ~2×-slow in-process prefill rate with no TP=1 baseline —
   absolute numbers from this boot are suspect; the A/B ratios are
-  boot-uniform and valid.
+  boot-uniform and valid. **Erratum (2026-08-29, boot N): the ~240
+  t/s prefill rate was re-measured on the fresh boot (135.48 s +
+  136.51 s for the same 32k shape, 0 wedges) — it is the TRUE TP=1
+  rate, not degradation** (the ~450–540 t/s records are TP=2; prefill
+  scales ~2× with TP). The e2e A/B numbers above stand as measured;
+  the "suspect" caveat applied only to absolute comparisons against
+  the TP=2 records. See the 2026-08-29 rows in `degradation*.md` and
+  the README Muse-row baseline.
 
 ## VERDICT
 
-**SHIPPED (branch, unmerged for review)** — F1 satisfied: e2e A/B
-executed at pp16384 (windowed) + pp2048 (full-attention), causal cap
-now benched (1.96–2.22× kernel-level) and recorded as a general
-chunked-prefill win in the README knob row. F2/F3/F4/F5 closed as
-above. The causal cap is called out for what it is — a
+**SHIPPED — in main since 2026-08-29 (merged after review; the
+merge condition F1 was satisfied before merging).** F1 satisfied:
+e2e A/B executed at pp16384 (windowed) + pp2048 (full-attention),
+causal cap now benched (1.96–2.22× kernel-level) and recorded as a
+general chunked-prefill win in the README knob row. F2/F3/F4/F5
+closed as above. The causal cap is called out for what it is — a
 window-independent prefill win — in the README, commit message, and
 this entry.
 
