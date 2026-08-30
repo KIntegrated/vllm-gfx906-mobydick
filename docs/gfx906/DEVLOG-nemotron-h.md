@@ -453,6 +453,116 @@ slower than 4 on every GEMM config.
 
 ---
 
+## 2026-08-30 (evening) — NH-5: topk chain node removal — SHIPPED
+
+**VERDICT:** SHIPPED · **GATE:** serving A/B (A–B–A), graph mode, TP=1,
+~2048-token prompt / tg256, 4 samples/arm, same boot (boot O, post-
+amdsmi-flip), streaming client, GPU0, util 0.90.
+
+## HYPOTHESIS
+
+If Nemotron's `grouped_topk` chain is node-heavy only because
+`n_group=1/topk_group=1` makes two of the three `aten::topk` calls and
+the group-mask machinery provable no-ops, and if C1's rule holds (node
+REMOVAL transfers to serving; topk REPLACEMENT does not), then removing
+those nodes — without touching the surviving topk kernel — recovers most
+of the roadmap's ~1.2 ms/step topk-chain cost.
+
+## What was done
+
+Serving-mode census (torch trace of the running server,
+`/local/tmp/nh5_prof/`): per MoE layer per step the chain is
+`triton_poi_fused_add_sigmoid_unsqueeze_0` (sigmoid+bias) + `aten::topk`
+×3 + `triton_red_...gather/sum` (weights) + `moe_align_block_size`
+(2 kernels). The 3 topks are the torch-compiled `grouped_topk`
+(`grouped_topk_router.py`) — the fully-fused `ops.grouped_topk` single
+kernel is unreachable on this fork: its gate requires
+`current_platform.is_cuda()`, which is **False** on this ROCm fork
+(dead path on ROCm here; not touched).
+
+Two folds, both pure node removal (3 kernels/layer):
+
+1. `grouped_topk_router.py`: new `_grouped_topk_single_group` fast path
+   for `n_group==1 and topk_group==1` (Nemotron: E=128/topk=6/sigmoid/
+   bias/renorm/scale=2.5). In the generic chain, group_idx is always 0,
+   group_mask all ones, masked_fill the identity — so it degenerates to
+   one topk over `sigmoid(logits)+bias` with weights gathered from the
+   pre-bias scores. The surviving selection is the SAME `aten::topk`
+   kernel on a bit-identical input; the weights path is byte-identical.
+   Env `VLLM_GFX906_TOPK_SINGLE_GROUP`, default ON.
+2. `moe_align_m1_gfx906.cu`: the C1 stage-1 fused align+count kernel
+   (E=256/topk=8 only) templated on (E, topk) with a (128, 6)
+   instantiation; dispatcher gate `_ALIGN_M1_SHAPES` in
+   `gfx906_w4a16_moe.py` now admits both pairs. One 128-thread CTA
+   replaces the align + count_and_sort pair.
+
+## Evidence FOR
+
+- **Gate — serving A/B (A–B–A, same boot):**
+
+  | arm | folds | decode t/s (4 samples) | mean | ms/step |
+  |---|---|---|---|---|
+  | A (OFF) | both 0 | 107.1 / 107.1 / 106.1 / 106.9 | 106.8 | 9.36 |
+  | B (ON) | defaults | 114.7 / 114.6 / 114.5 / 114.6 | 114.6 | 8.73 |
+  | A2 (OFF control) | both 0 | 107.8 / 107.8 / 107.8 / 107.7 | 107.8 | 9.28 |
+
+  **+7.3 % to +7.8 % decode (0.63 ms/step removed)**; the ON arm sits
+  squarely between two OFF arms, samples stable to ±0.1 %.
+- Launch-regime (isolated, eager, MI50): group topk#1 (top2/128 + sum)
+  24.3 µs, group topk#2 (k=1 over 1) 7.2 µs, generic align+count pair
+  19.4 µs → fused 3.2 µs ⇒ ~47.6 µs/layer × 23 layers =
+  **1.09 ms/step predicted** (the roadmap's ~1.2 ms). In-graph transfer
+  ~58 % (the in-graph topk nodes are cheaper than eager launches; C1
+  stage 1 transferred within 8 %).
+- Correctness: `tests/kernels/moe/test_grouped_topk_single_group.py`
+  **19/19** — fast path bit-equal (`torch.equal`) to the generic chain
+  for random + tie-heavy (all-equal, block-tie) inputs across
+  sigmoid/softmax × bias × renormalize × scale at (1,128,6),
+  (4,128,6), (1,256,8), plus the compiled env-toggle (inductor) pair;
+  `tests/kernels/moe/test_moe_align_m1_gfx906.py` **51/51** — (128,6)
+  bit-equal to the 2-kernel chain + cudagraph-capture replay, (256,8)
+  unchanged. ruff clean.
+- PPL (`ppl_probe.py`, in-process, util 0.90 — see AGENTS note; the
+  0.95 default no longer fits beside the grown llama-server): OFF
+  27.0041 / 27.0177, ON 27.0492 / 27.0688 — Δ +0.18 %, the same
+  magnitude as the established inter-arm noise band (08-29 arms
+  26.9555–27.0216). Mechanism if real: the smaller ON graph lets
+  inductor re-fuse the renormalize reduction differently → ULP jitter in
+  weights, NOT fold logic (eager bit-equality proven above). Coherent
+  greedy output on both arms.
+- Boot note: boot O's 14:2x TP=1 collapse (7→35 t/s, DEG row in
+  `degradation.md`) did NOT reproduce ~4 h later — all three A/B boots
+  ran 106–115 t/s steady, with the amdsmi-fallback lines still in the
+  logs. TP=1 numbers from this window are usable.
+
+## Evidence AGAINST
+
+- Greedy serving output is run-to-run mult-modal for this model
+  (expert-gemm atomic accumulation: two consecutive OFF-arm runs matched
+  on only 1/4 of 128-token prompts), so cross-arm token-identity is not
+  a valid gate here — ON outputs sat inside the OFF mode set
+  (`/local/tmp/nh5_{on,off,off2}_out.json`), but identity is unprovable
+  e2e; the unit-level bit-equality + PPL are the correctness record.
+- PPL ON samples read at/above the top of the historical 26.96–27.02
+  band (27.05–27.07); see mechanism above. Magnitude = historical
+  inter-arm Δ, not an outlier.
+
+## Interactions / follow-ups
+
+- `ops.grouped_topk` (single-kernel sigmoid+bias+grouped-topk) remains
+  dead on this fork (is_cuda() gate). Enabling it for ROCm would be a
+  topk REPLACEMENT — C1's evidence (S2 −1.03 %, stage 2 −1.10 %) says
+  that loses in serving; parked, not NH-5 scope.
+- The (128,6) align instantiation is shape-gated (fail-closed
+  TORCH_CHECK); other (E, topk) pairs keep the generic 2-kernel chain.
+- Remaining topk-chain cost per layer: the surviving top-6/128
+  (`aten::topk`, ~19 µs isolated) + sigmoid/bias + weights + fused align
+  ≈ 4 kernels — next fold would need to replace that topk (C1-forbidden
+  without new design) or fold topk into the gate GEMV epilogue (the
+  original C1 scope, open).
+
+---
+
 ## Search keys
 
 `HYPOTHESIS:` `VERDICT:` Nemotron, nemotron_h, group-64, g64, relu2,
@@ -465,4 +575,8 @@ _shut_down_amdsmi, rocm_platform_plugin, scope=process,
 profile_run, rank-1 worker, NCCL hang, NH-2, NH-2 prime, NO-GO,
 weight_i8, bias-128, 0x80, k_w8a16_gemv, k_w8a16_gemm, SPLIT,
 VLLM_GFX906_W8A16_INT8, bench_w8a16_gfx906, mid-N, spec M=6,
-dense_gemv_m4, 464 GB/s.
+dense_gemv_m4, 464 GB/s, NH-5, topk chain, grouped_topk, single-group,
+VLLM_GFX906_TOPK_SINGLE_GROUP, VLLM_GFX906_ALIGN_M1, moe_align_m1_gfx906,
+(128,6), (256,8), node removal, fold don't replace, is_cuda False,
+ops.grouped_topk dead path, 114.6, 106.8, 0.63 ms, A-B-A, mult-modal
+greedy, atomic accumulation, PPL 27.05.

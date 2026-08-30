@@ -54,6 +54,13 @@ def _has_gfx906_align_m1_op() -> bool:
     )
 
 
+# (E, topk) pairs the single-CTA fused align+sort kernel serves.
+_ALIGN_M1_SHAPES = {
+    (256, 8),  # Qwen3.5-35B (C1 stage 1)
+    (128, 6),  # Nemotron-3.5-Lightning (NH-5)
+}
+
+
 def _use_fused_align_m1(
     topk_ids: torch.Tensor,
     block_size_m: int,
@@ -64,8 +71,9 @@ def _use_fused_align_m1(
 
     One 128-thread CTA replaces the two-kernel generic chain
     (moe_align_block_size_kernel + count_and_sort_expert_tokens); outputs
-    are bit-equal to it for E=256 / topk=8 / block_size=1 (see
-    docs/gfx906/DEVLOG-moe-c1-routing-fusion.md). Serving A/B: +1.18% to
+    are bit-equal to it for each (E, topk) in _ALIGN_M1_SHAPES at
+    block_size=1 (see docs/gfx906/DEVLOG-moe-c1-routing-fusion.md and
+    DEVLOG-nemotron-h.md NH-5). Serving A/B (Qwen3.5-35B): +1.18% to
     +1.73% MoE decode t/s (207-301 us/step), so it is the default;
     VLLM_GFX906_ALIGN_M1=0 to opt out.
     """
@@ -74,9 +82,8 @@ def _use_fused_align_m1(
         and _has_gfx906_align_m1_op()
         and expert_map is None
         and topk_ids.size(0) == 1
-        and topk_ids.size(1) == 8
         and block_size_m == 1
-        and global_num_experts == 256
+        and (global_num_experts, topk_ids.size(1)) in _ALIGN_M1_SHAPES
         and topk_ids.dtype == torch.int32
     )
 
@@ -85,9 +92,9 @@ def _moe_align_block_size_fused_m1(
     topk_ids: torch.Tensor,
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Same buffer sizes as the moe_align_block_size wrapper for this shape
-    # (M=1, topk=8, block_size=1: numel + E*(1-1) = 8, and numel < E keeps
-    # it at 8; expert_ids size = cdiv(8, 1) = 8).
+    # Same buffer sizes as the moe_align_block_size wrapper for the M=1 /
+    # block_size=1 shapes (numel + E*(1-1) = numel = topk; expert_ids
+    # size = cdiv(numel, 1) = numel).
     numel = topk_ids.numel()
     sorted_ids = torch.empty(
         (numel,), dtype=torch.int32, device=topk_ids.device

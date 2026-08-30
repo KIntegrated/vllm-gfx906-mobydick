@@ -250,11 +250,13 @@ unservable model.
 
 ### Nemotron-3.5-Lightning-30B-A3B mixed INT4/INT8 (`NemotronHForCausalLM`)
 
-**Status: NH-1 + NH-3 SHIPPED (unmerged, `gfx906/nemotron-h-onboard`);
-NH-2 NO-GO as Triton (measured; opt-in code on
+**Status: NH-1 + NH-3 + NH-5 SHIPPED (unmerged, `gfx906/nemotron-h-onboard`
+/ `gfx906/nh2-int8-gemv`); NH-2 NO-GO as Triton (measured; opt-in code on
 `gfx906/nh2-int8-gemv`, env default off), NH-2′ (CUDA int8 GEMV family)
-parked; NH-4/NH-5 open.** Serves at **70.4 tok/s** (graph, pp2048/tg256, 4
-samples, GPU0) after five fixes on the branch: fp32-router LLMM1 dtype
+parked; NH-4 open.** Serves at **70.4 tok/s** (graph, pp2048/tg256, 4
+samples, GPU0; boot-dependent — boot O window 2026-08-30 PM: 106.8 →
+**114.6 t/s** after NH-5, A–B–A) after five fixes on the branch:
+fp32-router LLMM1 dtype
 guard, the ssd_chunk_scan pointer-yield restructure (triton-gfx906
 CanonicalizePointers workaround), a new
 `CompressedTensorsW8A16ChannelDequant` scheme replacing Conch
@@ -300,10 +302,22 @@ shared experts 1.0 ms · topk chain ~1.2 ms · SSU+conv 0.5 ms.
   the mamba gating muls/elementwise average 22–60 µs for KB-sized
   tensors (launch-tail dominated); a fused gating + SSU pass or gfx906
   SSU tuning is worth ~1–2 ms/step. Lower confidence than NH-2/NH-3.
-- **NH-5 — topk chain (~1.2 ms/step).** sigmoid + correction-bias +
-  grouped topk = 3 kernels/layer at E=128/topk 6; C1's lesson (removing
-  nodes transfers, replacing the production topk does not) applies —
-  fold, don't replace.
+- **NH-5 — topk chain (~1.2 ms/step): SHIPPED (2026-08-30, node removal
+  only, per C1's fold-don't-replace rule).** (a) single-group degenerate
+  fast path in the torch-compiled `grouped_topk` (n_group=1/topk_group=1
+  — Nemotron) removes 2 of 3 `aten::topk` + the group-mask no-op
+  machinery (`VLLM_GFX906_TOPK_SINGLE_GROUP`, default ON); (b) C1 fused
+  align+count extended to (128, 6) (templated `moe_align_m1_gfx906`).
+  3 kernels/layer removed. Serving A–B–A (boot O): 106.8 → **114.6** →
+  107.8 t/s = **+7.3–7.8 %** (0.63 ms/step vs 1.09 ms isolated
+  prediction; the in-graph topk nodes are cheaper than eager).
+  Correctness: fast path bit-equal to the generic chain (19/19 unit
+  incl. ties + compiled toggle), (128,6) align bit-equal (51/51), PPL
+  27.05 vs 27.00 (Δ = historical inter-arm band). Note: the fully-fused
+  `ops.grouped_topk` kernel stays dead on this fork (its gate needs
+  `current_platform.is_cuda()`, False here) — enabling it would be a
+  topk replacement (C1-negative); the surviving top-6/128 + gate-GEMV
+  epilogue fold remain open. See `DEVLOG-nemotron-h.md` (NH-5).
 - **NH-6 — MTP head (parked).** The BF16 MTP layer is present in the
   checkpoint; nemotron_h_mtp drafting with mamba-state rewind is
   unvalidated on this fork and MTP was already too heavy for these GPUs
