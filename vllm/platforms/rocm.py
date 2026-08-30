@@ -162,26 +162,36 @@ _sync_hip_cuda_env_vars()
 # the major benefit of using AMDSMI is that it will not initialize CUDA
 
 
+def _shut_down_amdsmi(query_succeeded: bool) -> None:
+    # On some ROCm builds (gfx906-native ROCm 7.14) the library inits
+    # "successfully" with 0 processor handles after torch import — the state
+    # get_device_name's GCN-arch fallback handles — and shut_down then returns
+    # AMDSMI_STATUS_NOT_INIT. A cleanup failure must never mask the wrapped
+    # call's outcome: the query result/exception always wins.
+    try:
+        amdsmi_shut_down()
+    except Exception as error:
+        if query_succeeded:
+            logger.warning_once(
+                "amdsmi_shut_down failed after a successful query: %r",
+                error,
+                scope="process",
+            )
+        else:
+            logger.debug("amdsmi_shut_down failed after a failed query: %r", error)
+
+
 def with_amdsmi_context(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         amdsmi_init()
+        succeeded = False
         try:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
+            succeeded = True
+            return result
         finally:
-            try:
-                amdsmi_shut_down()
-            except Exception as error:
-                # On some ROCm builds (gfx906-native ROCm 7.14) the
-                # library inits "successfully" with 0 processor handles
-                # after torch import — the state get_device_name's
-                # GCN-arch fallback handles — and shut_down then returns
-                # AMDSMI_STATUS_NOT_INIT. A cleanup failure must not turn
-                # a successful query into a crash.
-                logger.warning_once(
-                    "amdsmi_shut_down failed after a successful query: %r",
-                    error,
-                )
+            _shut_down_amdsmi(succeeded)
 
     return wrapper
 

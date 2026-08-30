@@ -121,7 +121,13 @@ def rocm_platform_plugin() -> str | None:
             else:
                 logger.debug("ROCm platform is not available because no GPU is found.")
         finally:
-            amdsmi.amdsmi_shut_down()
+            # A shut_down failure (e.g. AMDSMI_STATUS_NOT_INIT after an init
+            # that returned 0 handles) must not reach the outer except below
+            # and misattribute the detection result.
+            try:
+                amdsmi.amdsmi_shut_down()
+            except Exception as error:
+                logger.debug("amdsmi_shut_down failed during detection: %r", error)
     except Exception as e:
         logger.debug("ROCm platform is not available because: %s", str(e))
 

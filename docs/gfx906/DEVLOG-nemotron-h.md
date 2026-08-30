@@ -328,6 +328,41 @@ lookup in the cudagraph-profile dummy run) kills the rank-1 worker inside
   the default launch config on every boot here); tuning is a perf item,
   orthogonal to this incident.
 
+## 2026-08-30 (later) — review follow-up on the wrapper fix
+
+**VERDICT:** SHIPPED · **GATE:** `tests/test_rocm_amdsmi_context.py` (2/2,
+with cleanup + diagnostic-contract asserts) + module import + plugin probe
+on this box.
+
+Self-review of `e4a4dd0edc` found four diagnostic-integrity gaps, all in
+the exact scenario the fix exists for; fixed same day:
+
+- The "after a successful query" warning also fired on the failed-query
+  path (finally runs both ways). Now branched in `_shut_down_amdsmi()`:
+  warning on success, debug on failure — the propagating query exception
+  dominates there.
+- `warning_once` defaulted to `scope="local"` → dropped on non-first
+  local ranks, i.e. the very rank that died in the TP=2 incident. Now
+  `scope="process"`.
+- Same `finally: amdsmi_shut_down()` pattern in
+  `platforms/__init__.py::rocm_platform_plugin` fed the NOT_INIT error
+  into the outer except and misattributed the debug log ("not available
+  because: AmdSmiException" instead of "no GPU found"); return value was
+  unaffected (assignment precedes the finally). Fail-soft swallow+debug
+  applied symmetrically; no dedicated test — the only observable delta
+  is log text, which is brittle to pin.
+- Tests now pin the cleanup half of the contract (`init/shutdown
+  assert_called_once`) and the warning contract (fires once at process
+  scope on success; absent on the failure path); failure test switched
+  to `pytest.raises`.
+
+Not actioned (deliberate): decorator order on `get_device_name`
+(`with_amdsmi_context` outside `lru_cache` → per-call init/shutdown even
+on cache hits) and broken-boot `_GCN_ARCH` initializing CUDA at import —
+both pre-existing design, not regressions; noted for the roadmap if the
+broken-amdsmi boots persist. No commit trailer on `e4a4dd0edc` (policy
+miss, local fork, left as-is).
+
 ---
 
 ## Search keys
@@ -338,4 +373,5 @@ CanonicalizePointers, HAS_INITSTATES, chunk_scan, ssd_chunk_scan, fp32 router,
 LLMM1, GateLinear, force_fp32_compute, AMDGCN_USE_BUFFER_OPS, TP=2,
 tensor-parallel, enable-expert-parallel, EP, expert parallel, 928,
 with_amdsmi_context, AMDSMI_STATUS_NOT_INIT, amdsmi, get_device_name,
+_shut_down_amdsmi, rocm_platform_plugin, scope=process,
 profile_run, rank-1 worker, NCCL hang.
