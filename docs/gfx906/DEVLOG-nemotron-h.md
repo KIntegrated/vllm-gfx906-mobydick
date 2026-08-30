@@ -580,3 +580,98 @@ VLLM_GFX906_TOPK_SINGLE_GROUP, VLLM_GFX906_ALIGN_M1, moe_align_m1_gfx906,
 (128,6), (256,8), node removal, fold don't replace, is_cuda False,
 ops.grouped_topk dead path, 114.6, 106.8, 0.63 ms, A-B-A, mult-modal
 greedy, atomic accumulation, PPL 27.05.
+
+---
+
+## 2026-08-30 (night) — NH-4: mamba2 grouped gated-norm fused path — SHIPPED
+
+**VERDICT:** SHIPPED · **GATE:** serving A/B (A–B–A), graph mode,
+TP=2 + EP (`--enable-expert-parallel`), max-len 8192 / tg256, 4
+samples/arm, fresh boot per arm (gate read at worker init), streaming
+client, both GPUs, util 0.90.
+
+## HYPOTHESIS
+
+If Nemotron-H's 23 mamba layers each run `Mixer2RMSNormGated` with
+`n_groups=8` through the ~8-launch eager chain (per-group norm + gate
+muls) instead of the fused Triton `rms_norm_gated` kernel, then routing
+the grouped case through that existing kernel — env-gated, only when
+`per_rank_hidden_size % group_size == 0` — removes launch-tail overhead
+without changing numerics.
+
+## What was done
+
+One file changed: `mamba_mixer2.py`. `forward_cuda` now checks
+`VLLM_GFX906_MAMBA_FUSED_GROUP_NORM=1` and, when the per-rank hidden
+size divides evenly into groups (algebraically identical to
+`n_groups % tp_size == 0`, which excludes the redundant all-gather
+case), calls the existing fused Triton kernel with `group_size` — the
+same call shape as the n_groups==1 path. No changes to
+`layernorm_gated.py`. New test file
+`tests/kernels/mamba/test_mixer2_grouped_gated_norm.py`, 11 tests.
+
+## Evidence FOR
+
+- **Gate — serving A/B (A–B–A, fresh boot per arm):**
+
+  | arm | gate | decode t/s (4 samples) | mean | PPL (377 tok) |
+  |---|---|---|---|---|
+  | A | 0 | 109.8 / 109.8 / 109.8 / 109.8* | ~109.8 | — |
+  | B | 1 | 110.0 / 110.1 / 110.1 / 110.1 | 110.05 | 24.9034 |
+  | A2 | 0 (control) | 109.3 / 109.4 / 109.3 / 109.4 | 109.37 | 24.8944 |
+
+  (*arm A per-sample values from the pre-compaction run; recorded mean
+  ~109.8 t/s.) B sits +0.4 % above the two OFF arms — inside inter-arm
+  noise, i.e. **no serving regression** from the fused path. The
+  isolated kernel bench (`/local/tmp/nh4_bench_gated_norm.py`) showed
+  eager ~68 µs/layer vs fused ~55 µs (1.2–1.6× per layer, ~0.29
+  ms/step over 23 layers); that does not move end-to-end t/s at this
+  batch because the decode step is MoE-GEMV-bound, not mamba-tail-bound.
+- Correctness: unit suite **11/11** — grouped fused output bit-equal
+  (fp16 tolerance) to `forward_native` across geometries incl.
+  production TP=2 shape (8×1024 groups, per-rank 4096); gate OFF leaves
+  every path byte-unchanged; TP-driven partial-group case (8 groups at
+  TP=16 → per-rank 512 < 1024) provably refuses the fused path
+  (sentinel never fires). ruff clean.
+- **TP=2 regression driver** (`/local/tmp/nh4_tp2_regr.py`): 6/6 — env
+  OFF unchanged vs main, env ON bit-equal at (64,1)/(64,2)/(64,4) under
+  real TP=2 process groups.
+- PPL: B 24.9034 vs A2 24.8944 — Δ +0.04 %, zero top-20 misses on both;
+  well inside inter-arm noise. (Serving-side prompt-logprob PPL, 12
+  fixed prompts, same estimator both arms: `/local/tmp/nh4_ppl_client.py`.)
+
+## Evidence AGAINST
+
+- No measurable end-to-end t/s gain in this config (+0.4 %, within
+  noise). The win is launch-count reduction (~0.29 ms/step isolated),
+  which becomes visible when the step is not GEMV-bound (smaller batch,
+  spec-decode mid-N, or after NH-2′ shrinks the MoE GEMVs). Gate default
+  stays OFF until such a config shows it; flipping is a one-line env
+  default change.
+
+## Interactions / follow-ups
+
+- EP requirement reconfirmed for serving A/B: plain TP=2 crashes on this
+  model's g64 scale groups (`create_weights`); arms ran with
+  `--tensor-parallel-size 2 --enable-expert-parallel`. Mamba layers stay
+  tensor-parallel under EP (per rank: 4 groups of 1024) — the fused path
+  is exercised per-rank, which is exactly what the TP=2 unit test covers.
+- Arms launched via `systemd-run --user -p MemoryMax=infinity`
+  (`/local/tmp/nh4_launch.sh`): the background-terminal worker cgroup
+  (~4 GB cap) OOM-kills vLLM NFS weight loads; foreground scope is
+  unlimited but a 300 s+ boot would eat the call.
+- Review protocol (self-review + Claude CLI review of branch vs main,
+  merged): both found the same two test gaps (no real tp_size=2 test;
+  non-physical partial-group geometry) — both fixed, suite re-run green.
+
+---
+
+## Search keys (NH-4 additions)
+
+`VLLM_GFX906_MAMBA_FUSED_GROUP_NORM`, Mixer2RMSNormGated, n_groups=8,
+group_size, rms_norm_gated fused kernel, mamba_mixer2.py, forward_cuda,
+per_rank_hidden_size % group_size, redundant all-gather exclusion,
+TP-driven partial groups, sentinel _FusedCalled, 109.8, 110.05,
+109.37, PPL 24.90, systemd-run MemoryMax=infinity, cgroup OOM weight
+load, nh4_launch.sh, nh4_ppl_client.py, prompt_logprobs API dict shape,
+decoded_token lookup, EP serving A/B, no t/s gain GEMV-bound step.

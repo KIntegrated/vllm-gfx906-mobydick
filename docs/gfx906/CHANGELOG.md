@@ -6,6 +6,22 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-08-30
+
+- **NH-4: mamba2 grouped gated-norm fused path (SHIPPED, env default
+  OFF).** `Mixer2RMSNormGated.forward_cuda` routes the n_groups>1 case
+  through the existing fused Triton `rms_norm_gated` kernel behind
+  `VLLM_GFX906_MAMBA_FUSED_GROUP_NORM=1`, gated on
+  `per_rank_hidden_size % group_size == 0`. Isolated ~68 → ~55 µs/layer
+  (~0.29 ms/step over 23 mamba layers); serving A–B–A (TP=2+EP, fresh
+  boot per arm) 109.8 → 110.05 → 109.37 t/s (+0.4 %, within inter-arm
+  noise — step is MoE-GEMV-bound at this batch) with PPL 24.9034 vs
+  24.8944 (Δ +0.04 %). Correctness: 11/11 unit tests (incl. production
+  TP=2 geometry and TP-driven partial-group refusal), TP=2 regression
+  driver 6/6 bit-equal, ruff clean. Review protocol: self-review +
+  Claude CLI review of branch vs main, both findings fixed before merge.
+  See `DEVLOG-nemotron-h.md` (NH-4 section) and `ROADMAP.md`.
+
 ## 2026-08-29
 
 - **NH-1 + NH-3: Nemotron-3.5-Lightning-30B-A3B mixed INT4/INT8

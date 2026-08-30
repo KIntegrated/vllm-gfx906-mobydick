@@ -250,10 +250,10 @@ unservable model.
 
 ### Nemotron-3.5-Lightning-30B-A3B mixed INT4/INT8 (`NemotronHForCausalLM`)
 
-**Status: NH-1 + NH-3 + NH-5 SHIPPED, merged to `main` (2026-08-30 ff of
+**Status: NH-1 + NH-3 + NH-4 + NH-5 SHIPPED, merged to `main` (2026-08-30 ff of
 `gfx906/nh2-int8-gemv`, code review `nemotron-nh-code-rev.md` — no blocking
 findings); NH-2 NO-GO as Triton (measured; opt-in in-kernel int8 code on
-`main`, env default off), NH-2′ (CUDA int8 GEMV family) parked; NH-4 open.** Serves at **70.4 tok/s** (graph, pp2048/tg256, 4
+`main`, env default off), NH-2′ (CUDA int8 GEMV family) parked.** Serves at **70.4 tok/s** (graph, pp2048/tg256, 4
 samples, GPU0; boot-dependent — boot O window 2026-08-30 PM: 106.8 →
 **114.6 t/s** after NH-5, A–B–A) after five fixes that landed on `main`:
 fp32-router LLMM1 dtype
@@ -297,10 +297,19 @@ shared experts 1.0 ms · topk chain ~1.2 ms · SSU+conv 0.5 ms.
   changes. M=2..32 fp32 batches still take the triton path (~118 µs);
   a batched fp32 GEMV remains open if spec-decode/batched decode of an
   fp32-router model ever matters.
-- **NH-4 — mamba2 decode tail.** SSU is 20 µs/layer (generic triton) and
-  the mamba gating muls/elementwise average 22–60 µs for KB-sized
-  tensors (launch-tail dominated); a fused gating + SSU pass or gfx906
-  SSU tuning is worth ~1–2 ms/step. Lower confidence than NH-2/NH-3.
+- **NH-4 — mamba2 grouped gated-norm fused path: SHIPPED (2026-08-30,
+  env default OFF).** `Mixer2RMSNormGated.forward_cuda` routes the
+  n_groups>1 case through the existing fused Triton `rms_norm_gated`
+  kernel when `VLLM_GFX906_MAMBA_FUSED_GROUP_NORM=1` and
+  `per_rank_hidden_size % group_size == 0` (≡ `n_groups % tp_size == 0`,
+  excludes the redundant all-gather case). Isolated: ~68 → ~55 µs/layer
+  (1.2–1.6×, ~0.29 ms/step over 23 mamba layers). Serving A–B–A, TP=2+EP:
+  109.8 → **110.05** → 109.37 t/s (+0.4 %, within inter-arm noise — the
+  decode step is MoE-GEMV-bound at this batch) and PPL 24.9034 vs
+  24.8944 (Δ +0.04 %). Correctness: 11/11 unit (incl. production TP=2
+  geometry + TP-driven partial-group refusal), TP=2 regression driver
+  6/6 bit-equal, ruff clean. Ship the opt-in; flip the default when a
+  non-GEMV-bound config (spec-decode mid-N, small batch) shows the win.
 - **NH-5 — topk chain (~1.2 ms/step): SHIPPED (2026-08-30, node removal
   only, per C1's fold-don't-replace rule).** (a) single-group degenerate
   fast path in the torch-compiled `grouped_topk` (n_group=1/topk_group=1

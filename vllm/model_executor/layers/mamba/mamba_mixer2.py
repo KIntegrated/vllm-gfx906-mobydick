@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 from torch import nn
 
@@ -160,6 +162,27 @@ class Mixer2RMSNormGated(CustomOp):
             return x * nn.functional.silu(gate.to(torch.float32)).to(input_dtype)
 
         if ((self.n_groups % self.tp_size) != 0) or self.n_groups != 1:
+            # Grouped RMSNorm (n_groups > 1): the eager native path is a
+            # launch-tail-dominated elementwise chain (~7 kernels/layer at
+            # decode sizes). The fused triton kernel below already supports
+            # per-group reduction, so route the grouped case through it when
+            # each rank owns at least one whole group (Nemotron-H: 8 groups
+            # of 1024; TP=2 -> 4 groups/rank of 1024). Gated by
+            # VLLM_GFX906_MAMBA_FUSED_GROUP_NORM, default off pending the
+            # serving A/B gate (DEVLOG-nemotron-h.md NH-4).
+            if (
+                os.environ.get("VLLM_GFX906_MAMBA_FUSED_GROUP_NORM", "0") == "1"
+                and self.per_rank_hidden_size % self.group_size == 0
+            ):
+                return rms_norm_gated(
+                    x,
+                    self.weight.data,
+                    bias=None,
+                    z=gate,
+                    eps=self.variance_epsilon,
+                    norm_before_gate=False,
+                    group_size=self.group_size,
+                )
             return self.forward_native(x, gate)
 
         return rms_norm_gated(
