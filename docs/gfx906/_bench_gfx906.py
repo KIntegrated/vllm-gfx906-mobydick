@@ -104,7 +104,9 @@ def main():
         model=model,
         gpu_memory_utilization=gpu_util,
         max_model_len=maxlen,
-        dtype="auto",
+        # BENCH_DTYPE (e.g. float16): checkpoints whose config says bfloat16
+        # need an explicit float16 to select the fp16-only gfx906 kernels.
+        dtype=os.environ.get("BENCH_DTYPE", "auto"),
         enforce_eager=eager,
         **extra,
     )

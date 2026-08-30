@@ -8,6 +8,20 @@ the date an investigation began.
 
 ## 2026-08-29
 
+- **NH-1 + NH-3: Nemotron-3.5-Lightning-30B-A3B mixed INT4/INT8
+  onboarding (`gfx906/nemotron-h-onboard`, unmerged).** Serves at
+  70.4 tok/s (graph, pp2048/tg256, 4 samples) from 4.95 tok/s at first
+  load (14.2×): fp32-router LLMM1 dtype guard; ssd_chunk_scan
+  pointer-yield restructure working around the triton-gfx906
+  CanonicalizePointers fat-pointer assertion (94/94 SSD reference
+  tests); new `CompressedTensorsW8A16ChannelDequant` scheme replacing
+  Conch for int8-channel dense layers (3.79 ms → 62 µs per M=1 GEMV,
+  +1.8 GiB VRAM); gfx906 W4A16 MoE oracle gate widened to any positive
+  multiple of 32 (group-64) + RELU2_NO_MUL experts (+88.8% vs Triton
+  WNA16); fp32 router-gate GEMV on hipBLAS sgemv (+18.4%). PPL gate
+  26.96–27.02 band across all arms. Open follow-ups NH-2 (int8 GEMV),
+  NH-4/5 (mamba2/topk tails) in `ROADMAP.md`; records in
+  `DEVLOG-nemotron-h.md`.
 - **M2: per-q-tile prefill clip merged to `main` (`06c0614379`).** Two
   bit-identical per-q-tile scan bounds in both FA kernels — a window
   raise of `k0_base` (the tile's first row has the smallest window

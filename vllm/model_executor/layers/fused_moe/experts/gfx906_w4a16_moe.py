@@ -150,12 +150,18 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
+        # RELU2_NO_MUL: Nemotron-H style non-gated relu^2 experts. The
+        # kernel itself is activation-agnostic (it produces N output
+        # columns; apply_moe_activation handles the non-gated activation),
+        # verified against the reference in test_gfx906_moe_gemm.py
+        # (Nemotron-3.5-Lightning shapes, group-64).
         return activation in [
             MoEActivation.SILU,
             MoEActivation.GELU,
             MoEActivation.GELU_TANH,
             MoEActivation.SWIGLUOAI,
             MoEActivation.SWIGLUSTEP,
+            MoEActivation.RELU2_NO_MUL,
         ]
 
     @staticmethod

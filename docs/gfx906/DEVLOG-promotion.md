@@ -243,3 +243,47 @@ No full-wedge (`PSP resume failed`, return `-62`) was observed. The event is
 recorded in both `degradation.md` and `degradation_details.md`.
 
 VERDICT: OPEN
+
+## 2026-08-29 — Nemotron-H onboarding branch promoted (Python-only)
+
+## HYPOTHESIS
+
+If the branch contains no C/C++ changes (verified by diff), promotion
+cannot invalidate the compiled extension build, and the validation
+already executed on the exact branch tree (tests, PPL, serving A/Bs,
+and a main-vs-branch regression A/B on the reference dense model)
+transfers unchanged to `main` and `gfx906/v0.28.0`.
+
+## GATE
+
+`git diff main..gfx906/nemotron-h-onboard -- csrc/ CMakeLists.txt
+cmake/` is EMPTY (no rebuild required); the validation below ran on
+`c00103a2cd` (branch tip) on GPU0 in one session.
+
+## What was done
+
+- `gfx906/nemotron-h-onboard` merged into `main` (merge commit follows
+  this entry), `main` fast-forwarded into `gfx906/v0.28.0` (linear
+  release-branch style).
+- Remotes untouched (push is a separate decision).
+
+## Evidence FOR
+
+- Branch-tip validation (same session, GPU0): 94/94
+  `test_mamba_ssm_ssd.py` (ssd_chunk_scan restructure), 104 MoE
+  kernel/oracle tests, 33+2 `test_rocm_unquantized_gemm.py` (incl. the
+  new fp32-mv dispatch tests), 3/3 dequant-scheme unit tests.
+- Serving gates on the branch tree: Nemotron 70.40 tok/s (graph,
+  pp2048/tg256, 4 samples, 70.34–70.44) after the five fixes; PPL band
+  26.96–27.02 across all arms; greedy smoke coherent.
+- Regression A/B vs `main` on Qwen3.5-27B-AWQ (reference dense model):
+  16.40/16.38 (branch) vs 16.36/16.33 (main worktree) — identical; the
+  gap to the 25.25 record exists on both trees (host-state suspect,
+  predates this branch; see the session notes in
+  `DEVLOG-nemotron-h.md`).
+
+## Evidence AGAINST
+
+None. `gfx906/main` remains behind `main` (unchanged by this
+promotion); the Qwen record-gap host-state question is open and
+tracked outside this branch.
