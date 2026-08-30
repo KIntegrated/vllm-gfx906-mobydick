@@ -51,10 +51,10 @@ def _make_layer(
     return scheme, layer
 
 
-def _packed_layer(n: int, k: int):
+def _packed_layer(n, k, monkeypatch=None, env=None):
     """Fill a created layer with a known packed pattern + channel scales."""
     torch.manual_seed(0)
-    scheme, layer = _make_layer(n, k, torch.float16)
+    scheme, layer = _make_layer(n, k, torch.float16, monkeypatch, env=env)
     q = torch.randint(0, 256, (n, k), dtype=torch.int32)
     scale = (torch.rand(n, 1) * 0.05 + 0.005).half()
     packed = (
@@ -85,36 +85,35 @@ def test_w8a16_channel_dequant_bit_exact(dist_init, monkeypatch):
 
 
 def test_w8a16_channel_int8_view(dist_init, monkeypatch):
-    scheme, layer, q, scale = _packed_layer(256, 768)
+    scheme, layer, q, scale = _packed_layer(256, 768, monkeypatch, env="1")
     assert layer.serve_int8
 
     scheme.process_weights_after_loading(layer)
 
     w = layer.weight_i8.data
-    assert w.dtype == torch.uint8
+    assert w.dtype == torch.int8
     assert w.shape == (256, 768)
     # no-copy view of the packed storage
     assert w.data_ptr() == layer.weight_packed.data.data_ptr()
     assert w.is_contiguous()
-    # byte convention: byte b of word j is (word >> 8b) & 0xFF
-    words = layer.weight_packed.data
-    for j in range(0, 768 // 4, 192):
-        for b in range(4):
-            expect = (words[:, j] >> (8 * b)) & 0xFF
-            assert torch.equal(w[:, 4 * j + b].long(), expect.long())
-    # matches the dequant-path numerics under the bias-128 convention
-    ref = ((w.long() - 128).float() * scale.float())
-    dequant = ((q - 128).float() * scale.float())
-    assert torch.equal(ref, dequant)
+    # the packed bytes are pre-shifted to (q - 128) & 0xFF == q ^ 0x80, so
+    # the int8 view reads the signed value q - 128 directly
+    stored = layer.weight_packed.data.view(torch.uint8).reshape(256, 768)
+    assert torch.equal(stored.long(), (q ^ 0x80).long())
+    assert torch.equal(w.long(), (q - 128).long())
+    # matches the dequant-path numerics exactly
+    assert torch.equal(
+        (w.float() * scale.float()), ((q - 128).float() * scale.float())
+    )
     # weight_scale is kept; weight_shape is load metadata, freed
     assert "weight_scale" in dict(layer.named_parameters())
     assert "weight_shape" not in dict(layer.named_parameters())
 
 
-def test_w8a16_channel_dequant_fallback_when_env_off(dist_init, monkeypatch):
-    monkeypatch.setenv(_ENV_INT8, "0")
-    scheme, layer, q, scale = _packed_layer(128, 512)
-    assert not layer.serve_int8
+def test_w8a16_channel_dequant_default_when_env_unset(dist_init, monkeypatch):
+    monkeypatch.delenv(_ENV_INT8, raising=False)
+    scheme, layer, q, scale = _packed_layer(128, 512, monkeypatch)
+    assert not layer.serve_int8  # default is the dequant path (NO-GO env)
 
     scheme.process_weights_after_loading(layer)
 
@@ -123,8 +122,7 @@ def test_w8a16_channel_dequant_fallback_when_env_off(dist_init, monkeypatch):
 
 
 def test_w8a16_channel_int8_path_requires_fp16(dist_init, monkeypatch):
-    monkeypatch.setattr("vllm.platforms.rocm.on_gfx906", lambda: True)
-    scheme, layer = _make_layer(64, 256, torch.bfloat16)
+    scheme, layer = _make_layer(64, 256, torch.bfloat16, monkeypatch, env="1")
     assert not layer.serve_int8  # bf16 models keep the dequant path
 
 

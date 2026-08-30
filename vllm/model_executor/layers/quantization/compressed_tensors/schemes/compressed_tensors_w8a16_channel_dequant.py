@@ -10,15 +10,16 @@ for this layout (ConchLinearKernel) costs ~3.8 ms per M=1 GEMV on MI50
 (75% of Nemotron decode GPU time across the 46 dense projections), so
 this scheme has two paths:
 
-int8 in-kernel (default on gfx906 + fp16; NH-2):
-    the packed bytes are kept as a uint8 view of the packed storage —
-    no fp16 materialization, 1 byte/weight. The Triton GEMV (M=1) and
-    GEMM (M>1) kernels dequant in-register ((w - 128) * scale). The
-    GEMM's tile dequant is bit-identical to the old load-time dequant,
-    so M>1 numerics are the dequant path's numerics. Halves the dense
-    weight traffic vs the dequant path (1.32 GB/step -> 2.65 GB/step
-    on Nemotron) and retires the dequant VRAM. Kill switch:
-    VLLM_GFX906_W8A16_INT8=0.
+int8 in-kernel (opt-in on gfx906 + fp16; NH-2 — measured NO-GO for the
+    serving mode, see DEVLOG-nemotron-h.md 2026-08-30):
+    the packed bytes are pre-shifted in-place to signed int8 at load
+    and served as a no-copy view — no fp16 materialization, 1
+    byte/weight. The Triton GEMV (M=1) and GEMM (M>1) kernels dequant
+    in-register. Enable with VLLM_GFX906_W8A16_INT8=1 (default 0);
+    it wins only at M=1 on the K=2688/large-N shapes (lm_head 1.60x,
+    mamba in_proj 1.42x) and loses at M>1 (0.19-0.80x vs the
+    hand-tuned CUDA/hipBLAS paths) — Nemotron's spec-decode serving
+    mode is M=6/step.
 
 load-time dequant (fallback, and all non-gfx906 ROCm):
     the packed int8 is dequantized to fp16 once at load and the
@@ -26,6 +27,12 @@ load-time dequant (fallback, and all non-gfx906 ROCm):
     weight bytes in VRAM; prefill is a plain GEMM).
 
 Both paths use the same convention: w = (byte - 128) * scale.
+
+On the int8 path the packed storage is pre-shifted in-place at load
+(`byte ^= 0x80`, i.e. (byte - 128) mod 256) so `weight_i8` is a signed
+int8 view of it and the kernels run the P2-validated 3-op element chain
+(w.to(f32) * x; no per-element f32 subtract — the M=1 GEMV is
+f32-ALU-bound at Nemotron's K, the 4th op cost ~25 % there).
 """
 
 import os
@@ -61,10 +68,12 @@ def k_w8a16_gemv(
     BK: tl.constexpr,
     SPLIT: tl.constexpr,
 ):
-    """M=1 GEMV over bias-128 int8 rows: out[n] = s[n] * sum_k (w[n,k]-128) x[k].
+    """M=1 GEMV over signed int8 rows: out[n] = s[n] * sum_k w[n,k] * x[k].
 
-    w is uint8 [N, K]; s is fp16 [N]; out is fp16 [N]. For SPLIT > 1 the
-    caller zero-initializes out and partials are atomic-added.
+    w is int8 [N, K] (the packed storage pre-shifted to two's complement
+    at load, see module docstring); s is fp16 [N]; out is fp16 [N]. For
+    SPLIT > 1 the caller zero-initializes out and partials are
+    atomic-added. (P2-validated element chain: 3 f32 ops, no subtract.)
     """
     pn = tl.program_id(0)
     pk = tl.program_id(1)
@@ -81,7 +90,7 @@ def k_w8a16_gemv(
             mask=rmask[:, None] & kmask[None, :],
             other=0,
         )
-        acc += tl.sum((w.to(tl.float32) - 128.0) * x[None, :], axis=1)
+        acc += tl.sum(w.to(tl.float32) * x[None, :], axis=1)
     s = tl.load(s_ptr + rows, mask=rmask, other=0.0).to(tl.float32)
     acc = acc * s
     if SPLIT == 1:
@@ -104,8 +113,9 @@ def k_w8a16_gemm(
     BK: tl.constexpr,
 ):
     """M>1 W8A16 GEMM: dequant each weight tile in-register to fp16
-    (bit-identical to the load-time dequant: f32 (w-128)*s -> f16) and
-    tl.dot with fp32 accumulation. Requires K % BK == 0 (checked by the
+    (bit-identical to the load-time dequant: f32 w*s -> f16, w signed) and
+    tl.dot with fp32 accumulation. w is loaded [BK, BN] so it feeds the
+    dot directly (no transpose). Requires K % BK == 0 (checked by the
     launcher; K is a multiple of the pack factor 4).
     """
     pm = tl.program_id(0)
@@ -122,8 +132,8 @@ def k_w8a16_gemm(
         )
         w = tl.load(w_ptr + rn[None, :] * K + ks[:, None], mask=nmask[None, :], other=0)
         s = tl.load(s_ptr + rn, mask=nmask, other=0.0).to(tl.float32)
-        w16 = ((w.to(tl.float32) - 128.0) * s[None, :]).to(tl.float16)
-        acc = tl.dot(x, tl.trans(w16), acc)
+        w16 = (w.to(tl.float32) * s[None, :]).to(tl.float16)
+        acc = tl.dot(x, w16, acc)
     tl.store(
         o_ptr + rm[:, None] * N + rn[None, :],
         acc.to(o_ptr.dtype.element_ty),
@@ -131,29 +141,37 @@ def k_w8a16_gemm(
     )
 
 
+# (k, n) -> (BN, BK, SPLIT): measured winners on MI50
+# (bench_w8a16_gfx906.py, 2026-08-30, us): k=2688: n=131072 (32,128,1)
+# 530.8 | n=10304 (64,128,1) 49.3 | n=4096 (32,128,1) 28.2 | n=256
+# (16,128,4) 16.9; k=4096: n=2688 (16,512,1) 51.3. The K=4096 family
+# loses to production at every config (P2's fill rule picks SPLIT=2,
+# which measured worse: 51.3 vs 66.1 at SPLIT=1).
+_MEASURED_GEMV = {
+    (2688, 131072): (32, 128, 1),
+    (2688, 10304): (64, 128, 1),
+    (2688, 4096): (32, 128, 1),
+    (2688, 256): (16, 128, 4),
+    (4096, 2688): (16, 512, 1),
+}
+
+
 def _gemv_geometry(n: int, k: int) -> tuple[int, int, int]:
-    """(BN, BK, SPLIT) for the M=1 GEMV: enough (row, k-split) programs to
-    fill the 60 CUs, and BK must divide the per-split K slice exactly (an
-    unaligned chunk silently skips the remainder — a correctness bug, not
-    a crash). Splitting is rejected when the resulting slice cannot take a
-    BK >= 32 (avoids degenerate 16-wide tiles on odd K)."""
-    bn = 32 if n >= 4096 else 16
+    """(BN, BK, SPLIT) for the M=1 GEMV. Measured winners for the known
+    Nemotron shapes; P2's _pick rules otherwise (BN by N band; SPLIT
+    doubled only while the (row, split) program count still under-fills
+    ~5 waves of the 60 CUs; BK = largest power of two (<= 512, >= 64)
+    dividing k — the kernel's kmask handles a partial tail tile)."""
+    if (k, n) in _MEASURED_GEMV:
+        return _MEASURED_GEMV[(k, n)]
+    bn = 64 if n >= 12288 else (32 if n >= 4096 else 16)
     split = 1
-    while split < 8 and k % (split * 2) == 0:
-        per = k // (split * 2)
-        bk_c = 512
-        while bk_c > 32 and (bk_c > per or per % bk_c):
-            bk_c //= 2
-        if per % bk_c:
-            break
+    while split < 8 and k % (split * 2) == 0 and triton.cdiv(n, bn) * split < 300:
         split *= 2
-        if triton.cdiv(n, bn) * split >= 240:
-            break
-    per = k // split
     bk = 512
-    while bk > 16 and (bk > per or per % bk):
+    while bk > 64 and k % bk:
         bk //= 2
-    assert per % bk == 0, f"N={n} K={k}: no aligned BK for split={split}"
+    assert k % bk == 0 and k >= bk, f"N={n} K={k}: no usable BK"
     return bn, bk, split
 
 
@@ -170,8 +188,8 @@ def _gemm_geometry(m: int, k: int) -> tuple[int, int, int]:
 def w8a16_gemv(
     w: torch.Tensor, scale: torch.Tensor, x: torch.Tensor
 ) -> torch.Tensor:
-    """M=1: x [1, K] fp16 -> out [N] fp16. w uint8 [N, K] (the packed
-    storage viewed as bytes), scale fp16 [N]."""
+    """M=1: x [1, K] fp16 -> out [N] fp16. w is int8 [N, K] (the packed
+    storage pre-shifted to signed at load), scale fp16 [N] or [N, 1]."""
     n, k = w.shape
     bn, bk, split = _gemv_geometry(n, k)
     dev = w.device
@@ -201,10 +219,11 @@ def w8a16_gemm(
 class CompressedTensorsW8A16ChannelDequant(CompressedTensorsScheme):
     """Symmetric pack-quantized int8 channel-wise weights.
 
-    On gfx906 with fp16 params the packed bytes are served in-kernel
-    (NH-2, see module docstring); elsewhere they are dequantized to
-    ``params_dtype`` in ``process_weights_after_loading`` and the
-    unquantized GEMV family runs on the result.
+    On gfx906 with fp16 params and VLLM_GFX906_W8A16_INT8=1 the packed
+    bytes are served in-kernel (NH-2 — default off, measured NO-GO for
+    the serving mode, see module docstring); otherwise they are
+    dequantized to ``params_dtype`` in process_weights_after_loading
+    and the unquantized GEMV family runs on the result.
     """
 
     @classmethod
@@ -219,10 +238,12 @@ class CompressedTensorsW8A16ChannelDequant(CompressedTensorsScheme):
     def _int8_path(self, params_dtype: torch.dtype) -> bool:
         from vllm.platforms.rocm import on_gfx906
 
+        # default OFF: measured NO-GO for the serving mode
+        # (DEVLOG-nemotron-h.md, 2026-08-30); =1 for the M=1-only wins
         return (
             on_gfx906()
             and params_dtype == torch.float16
-            and os.environ.get(_ENV_INT8, "1") != "0"
+            and os.environ.get(_ENV_INT8, "0") == "1"
         )
 
     def create_weights(
@@ -299,10 +320,16 @@ class CompressedTensorsW8A16ChannelDequant(CompressedTensorsScheme):
             )
 
         if getattr(layer, "serve_int8", False):
-            # uint8 view of the packed storage: [N, K/4, 4] -> [N, K],
-            # no copy (byte b of word i is k = 4*i + b, ascending).
-            w_u8 = w_packed.view(torch.uint8).reshape(n, k)
-            layer.weight_i8 = torch.nn.Parameter(w_u8, requires_grad=False)
+            # The packed bytes are the bias-128 codes; XOR 0x80 turns each
+            # byte into the two's-complement code of (byte - 128) — an
+            # in-place 1-op/weight pre-shift (no copy, no extra VRAM) so
+            # the kernels consume plain signed int8 (3-op element chain).
+            # After this, weight_packed's storage is no longer the
+            # checkpoint's raw codes.
+            w_bytes = w_packed.view(torch.uint8)
+            w_bytes.bitwise_xor_(0x80)
+            w_i8 = w_bytes.view(torch.int8).reshape(n, k)
+            layer.weight_i8 = torch.nn.Parameter(w_i8, requires_grad=False)
             # weight_packed is the storage; keep it alive. weight_shape is
             # load metadata only.
             del layer.weight_shape
@@ -347,7 +374,7 @@ class CompressedTensorsW8A16ChannelDequant(CompressedTensorsScheme):
             if not x2d.is_contiguous():
                 x2d = x2d.contiguous()
             w = layer.weight_i8.data
-            s = layer.weight_scale.data
+            s = layer.weight_scale.data.squeeze(-1)
             if x2d.shape[0] == 1:
                 out = w8a16_gemv(w, s, x2d[0].contiguous())
             else:

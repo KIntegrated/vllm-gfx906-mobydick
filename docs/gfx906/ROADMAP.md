@@ -251,8 +251,9 @@ unservable model.
 ### Nemotron-3.5-Lightning-30B-A3B mixed INT4/INT8 (`NemotronHForCausalLM`)
 
 **Status: NH-1 + NH-3 SHIPPED (unmerged, `gfx906/nemotron-h-onboard`);
-NH-2 implemented on `gfx906/nh2-int8-gemv` (kernel probe + serving A/B
-pending); NH-4/NH-5 open.** Serves at **70.4 tok/s** (graph, pp2048/tg256, 4
+NH-2 NO-GO as Triton (measured; opt-in code on
+`gfx906/nh2-int8-gemv`, env default off), NH-2′ (CUDA int8 GEMV family)
+parked; NH-4/NH-5 open.** Serves at **70.4 tok/s** (graph, pp2048/tg256, 4
 samples, GPU0) after five fixes on the branch: fp32-router LLMM1 dtype
 guard, the ssd_chunk_scan pointer-yield restructure (triton-gfx906
 CanonicalizePointers workaround), a new
@@ -270,11 +271,23 @@ GEMVs 3.57 ms · ~~fp32 router gates 3.08 ms~~ 0.2 ms after NH-3 (24 ×
 8 µs sgemv) · MoE experts 1.77 ms · mamba elementwise/mul ~3 ms ·
 shared experts 1.0 ms · topk chain ~1.2 ms · SSU+conv 0.5 ms.
 
-- **NH-2 — int8-channel GEMV kernel (dense INT8 layers).** The dequant
-  path reads 2× the bytes (fp16); an int8 GEMV in the
-  `dense_gemv_gfx906` family (unpack + per-channel scale in-kernel)
-  should halve the 3.57 ms LLMM1 budget. Needs a greedy/PPL gate and a
-  serving A/B; also unlocks retiring the +1.8 GiB dequant VRAM.
+- **NH-2 — int8-channel GEMV kernel (dense INT8 layers): NO-GO as
+  Triton (2026-08-30, measured).** Triton int8 GEMV/GEMM at all six
+  Nemotron shape families (`bench_w8a16_gfx906.py`, devlog): M=1 total
+  1.10× (wins 1.29–1.60× on the K=2688/large-N shapes, loses 0.69–0.72×
+  on K=4096/small-N — mid-N is the hand-tuned CUDA's band); M=4
+  0.55–0.80×; M=4096 0.19–0.47×. The serving mode (ngram spec M=6/step
+  + M=4096 prefill) is exactly the losing zone; an M=1-only hybrid
+  needs 3× VRAM. Code + probe + tests land on
+  `gfx906/nh2-int8-gemv` behind `VLLM_GFX906_W8A16_INT8=1` (default
+  off). Real win exists for N ≥ 10K M=1 lm_head-class shapes (1.60×
+  measured).
+- **NH-2′ — int8 CUDA GEMV family (parked).** Port the hand-tuned
+  `LLMM1` / `dense_gemv_m4` / `dense_gemv_gfx906` kernels to byte loads
+  + in-register per-channel dequant. Evidence base: M=4 in_proj cur
+  239 µs (464 GB/s fp16); an int8 kernel at ~700 GB/s ≈ 79 µs (3× on
+  the biggest per-step shape). Only worth it for the spec-decode
+  serving mode — the Triton path can't reach that byte rate at mid-N.
 - **NH-3 — fp32 router-gate GEMV: SHIPPED on the branch.** hipBLAS
   sgemv (`torch.mv`) replaces the 128 µs fp32 triton matmul at M=1
   (8 µs measured at the [128, 2688] gate shape); 59.4 → 70.4 tok/s

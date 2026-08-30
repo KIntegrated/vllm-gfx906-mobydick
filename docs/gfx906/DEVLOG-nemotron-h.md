@@ -365,16 +365,13 @@ miss, local fork, left as-is).
 
 ---
 
-## 2026-08-30 (later) — NH-2: int8 in-kernel W8A16 GEMV/GEMM (CPU side done)
+## 2026-08-30 (later) — NH-2: int8 in-kernel W8A16 GEMV/GEMM — NO-GO
 
-**VERDICT:** OPEN (implementation + CPU gates on
-`gfx906/nh2-int8-gemv`; kernel probe + serving A/B + PPL pending on the
-GPU) · **GATE:** probe at Nemotron's exact dense shapes
-(`benchmarks/kernels/gfx906/bench_w8a16_gfx906.py`: M=1 vs the production
-`rocm_unquantized_gemm_impl` dispatch, M=4 + M=4096 arms, correctness vs
-fp32 reference with 0x80 zero-codes pinned) → serving A/B
-(`VLLM_GFX906_W8A16_INT8=0` arm, same boot, 70.4-tok/s recipe) + PPL
-26.96–27.02 band + 7-prompt greedy A/B.
+**VERDICT:** NO-GO (Triton int8 in-kernel, measured on MI50 2026-08-30;
+branch `gfx906/nh2-int8-gemv`, code lands with the env default OFF)
+· **GATE:** probe at Nemotron's exact dense shapes vs the actual
+production dispatch — the gate failed at the M>1 arms; no serving A/B
+was needed.
 
 ## HYPOTHESIS
 
@@ -382,78 +379,77 @@ Nemotron's per-step dense weight traffic is 1.32 GiB of int8 across the
 71 CT W8A16 channel tensors (23× mamba in_proj [10304, 2688] + 23×
 out_proj [2688, 4096] + 6× GQA q/k/v/o + lm_head [131072, 2688]). The
 scheme dequants to fp16 at load (2× the traffic, +1.3 GiB VRAM) and
-serves M=1 via LLMM1 rpb=4 — 3.57 ms/step in the profile (K=2688/4096
-miss the custom `dense_gemv_gfx906` whitelist). If in-register dequant
-(bias-128, per-channel scale) is cheap, serving the packed bytes directly
-halves the traffic; the P2 probe (`DEVLOG-int8-transfer.md`) measured
-exactly this pattern at 1.93–2.03× on HBM-bound shapes, never worse than
-0.96×.
+serves M=1 via LLMM1 rpb=4 (K=2688/4096 miss the custom
+dense_gemv_gfx906 whitelist). If in-register dequant is cheap, serving
+the packed bytes halves the traffic; the P2 probe
+(`DEVLOG-int8-transfer.md`) had measured this pattern at 1.93–2.03× on
+HBM-bound shapes, "never worse than 0.96×".
 
-## What was done
+## What was built (kept on the branch, env-gated, default off)
 
-- `compressed_tensors_w8a16_channel_dequant.py`: the int8 in-kernel path
-  is now the default on gfx906 + fp16 (`VLLM_GFX906_W8A16_INT8`, default
-  on; `=0` gives the old dequant path, bit-identical). `process_weights`
-  keeps the packed int32 storage and registers `weight_i8` — a uint8
-  [N, K] **view** of it (no copy, no extra VRAM) — freeing only the load
-  metadata. New Triton kernels: `k_w8a16_gemv` (M=1; per-row scale after
-  the f32 reduction; SPLIT-K via atomic on a zeroed output) and
-  `k_w8a16_gemm` (M>1; the tile dequant is bit-identical to the old
-  load-time dequant — f32 (w−128)·s → f16 — so M>1 numerics are the
-  dequant path's numerics; `tl.dot` with f32 accumulation).
-- `_gemv_geometry` = P2's `_pick` with a split guard: P2's `_pick`
-  *asserts* at Nemotron's K=2688 (split=8 → per=336 → no aligned BK);
-  the guard rejects a split whose slice cannot take BK ≥ 32.
-- The probe measures the "current" arm through
-  `rocm_unquantized_gemm_impl` — the actual production dispatch (LLMM1
-  rpb=4 at these K's), not a re-implementation.
-- Unit tests extended (6/6 pass on CPU): the `weight_i8` view aliases
-  the packed storage (data_ptr identity), the byte convention
-  `(word >> 8b) & 0xFF`, numerics equal the dequant reference, env-off
-  fallback, bf16 → dequant path, fail-closed on scale shape / K.
+- Scheme: int8 path pre-shifts the packed bytes in-place at load
+  (`byte ^= 0x80` → two's-complement of (byte−128), 1-op/weight, no
+  copy) so `weight_i8` is a signed int8 view and the kernels run the
+  3-op element chain. New Triton kernels `k_w8a16_gemv` (M=1) /
+  `k_w8a16_gemm` (M>1; tile dequant bit-identical to the load-time
+  dequant, so M>1 numerics = dequant path numerics). `VLLM_GFX906_W8A16_INT8=1`
+  enables (default 0); the dequant path is bit-identical to before.
+- Probe: `benchmarks/kernels/gfx906/bench_w8a16_gfx906.py` — full
+  config sweep (BN×BK×SPLIT / BM×BN×BK×warps) at all six shape
+  families × M=1/4/4096 vs `rocm_unquantized_gemm_impl`, correctness
+  vs fp32 reference with 0x80 zero-codes pinned. 18/18 correctness
+  checks pass (2.0–3.9e-4 rel-err).
 
-## Evidence — FOR (CPU side only)
+## Measured (MI50, torch 2.13+gfx906, triton 3.6; /local/tmp/w8a16_probe_full.log)
 
-- 6/6 unit tests; `_gemv_geometry` verified on all six shapes (K=2688 →
-  BK=64 SPLIT=2; lm_head → 8192 programs SPLIT=1; k/v_proj → SPLIT=4
-  BK=32 — no degenerate tiles); ruff clean.
-- Prior: P2 int8 row-GEMV at 1716.9 µs on the 248320×5120 lm_head shape
-  = 1.81× the 3114–3193 µs recorded production fp16 floor, at 93 % of
-  the int8 floor of its own.
+M=1, best config per shape (cur = production dispatch on dequanted fp16):
 
-## Evidence — AGAINST
+| shape | N×K | ×/step | cur µs | i8 µs | ratio | i8 % floor |
+|---|---|---|---|---|---|---|
+| mamba in_proj | 10304×2688 | 23 | 70.1 | 49.3 (BN64 BK128 S1) | **1.42×** | 142 % |
+| mamba out_proj | 2688×4096 | 23 | 36.4 | 51.3 (BN16 BK512 S1) | 0.71× | 372 % |
+| GQA o_proj | 2688×4096 | 6 | 37.1 | 51.7 | 0.72× | 375 % |
+| GQA q_proj | 4096×2688 | 6 | 36.3 | 28.2 (BN32 BK128 S1) | **1.29×** | 204 % |
+| GQA k/v_proj | 256×2688 | 12 | 11.8 | 16.9 (BN16 BK128 S4) | 0.69× | launch-bound |
+| lm_head | 131072×2688 | 1 | 850.2 | 530.8 (BN32 BK128 S1) | **1.60×** | 120 % |
+| **step total** | | | **3882.7** | **3526.9** | **1.10×** | |
 
-- Nothing measured yet (probe pending). The known risks the probe
-  settles: (a) Triton launch overhead on the 12×/step [256, 2688]
-  k/v_proj (P2: ~15 µs floor on both sides — expected ~neutral);
-  (b) `k_w8a16_gemm` at M=4096 prefill — the in-register dequant adds
-  3–4 ALU ops per element on top of the FMA-bound dot (no MFMA on
-  gfx906; hipBLAS fp16 is FMA-bound too), so prefill is expected ≈
-  neutral, not 2×; (c) fp16 atomic_add partials in the SPLIT>1 GEMV
-  (only the q_proj family) — P2 passed ≤3e-4 rel-err with the same
-  scheme.
+M>1 (best config of 12 each): M=4 best 0.55–0.80× vs cur (in_proj
+395.7 vs 239.3; out_proj 234.6 vs 62.2; lm_head 3158.7 vs 2511.5);
+M=4096 best 0.19–0.47× vs hipBLAS (in_proj 50.1 vs 14.1 ms; out_proj
+21.6 vs 7.2 ms; lm_head 929.8 vs 301.0 ms). num_warps=8 was 1.5–3×
+slower than 4 on every GEMM config.
+
+## Why the P2 GO did not transfer
+
+- P2's evidence set was N ≥ 10K at M=1 (248320/17408/12288/10240);
+  its own table already showed the mid-N collapse (4096×2048 int8 at
+  **11 % of floor**) and flagged its fp16 baseline 2–3× off production
+  at mid sizes. Nemotron's dense set is exactly the mid-N band where
+  the hand-tuned CUDA (LLMM1 rpb=4 / dense_gemv_m4) runs at 400–790
+  GB/s and this Triton at 170–600 GB/s. The two only cross at
+  N ≳ 10K — hence lm_head/in_proj/q_proj win, out_proj/o_proj/k_v
+  lose.
+- The serving mode is the deal-breaker: local Nemotron config runs
+  ngram spec n=5 → **M=6/step** (to 24 at batch 4), where the int8
+  path is the Triton GEMM (0.5–0.8×), plus M=4096 prefill (0.19–0.47×).
+  An M=1-only int8 hybrid is impossible without re-materializing the
+  fp16 weight for the M>1 path (3× VRAM).
+- The byte savings only materialize with a hand-tuned int8 CUDA
+  kernel: M=4 in_proj cur = 239 µs (464 GB/s fp16); an int8 kernel at
+  ~700 GB/s would be ~79 µs (3×). That is **NH-2′** — a CUDA port of
+  the hand-tuned GEMV family (LLMM1 / dense_gemv_m4 / dense_gemv) with
+  byte loads, not Triton; parked in the ROADMAP with this table as the
+  evidence base.
 
 ## Interactions
 
-- Blast radius: only CT W8A16 channel-symmetric fp16 layers on gfx906 —
-  Nemotron-H is the only served model of this shape (its experts are
-  INT4 WNA16, a different scheme). No other model's route changes; the
-  env kill switch reproduces the old path bit-identically for the A/B.
-- lm_head is one of the int8 tensors: 352 MB/step — the single largest
-  decode byte item on this model.
-
-## Refrigerated residue (when the GPU is free)
-
-1. `W8A16_PROBE_QUICK=1` first, then the full probe →
-   `/local/tmp/w8a16_probe.log`.
-2. If any M=1 shape lands < 0.95× of cur: fix the geometry before the
-   serving gate (the probe prints per-shape geometry).
-3. Serving A/B + PPL + 7-prompt greedy A/B (item 3 of the gate above);
-   the dequant arm runs with `VLLM_GFX906_W8A16_INT8=0` on the same
-   boot.
-4. If the M=4096 prefill arm regresses > 10 %: either accept (log it)
-   or revert the whole scheme via the kill switch — there is no
-   int8-GEMV-only hybrid without re-materializing the fp16 weight.
+- Nothing merges as a default change: env default OFF, dequant path
+  bit-identical. The branch is safe to merge for the probe + tests +
+  opt-in kernel only.
+- If a future model has an N ≥ 10K int8-channel GEMV-dominated decode
+  (Qwen-class lm_head) and plain M=1 serving, `VLLM_GFX906_W8A16_INT8=1`
+  is a real win there (lm_head 1.60× measured).
 
 ---
 
@@ -466,6 +462,7 @@ LLMM1, GateLinear, force_fp32_compute, AMDGCN_USE_BUFFER_OPS, TP=2,
 tensor-parallel, enable-expert-parallel, EP, expert parallel, 928,
 with_amdsmi_context, AMDSMI_STATUS_NOT_INIT, amdsmi, get_device_name,
 _shut_down_amdsmi, rocm_platform_plugin, scope=process,
-profile_run, rank-1 worker, NCCL hang, NH-2, weight_i8, bias-128, 0x80,
-k_w8a16_gemv, k_w8a16_gemm, SPLIT, VLLM_GFX906_W8A16_INT8,
-bench_w8a16_gfx906.
+profile_run, rank-1 worker, NCCL hang, NH-2, NH-2 prime, NO-GO,
+weight_i8, bias-128, 0x80, k_w8a16_gemv, k_w8a16_gemm, SPLIT,
+VLLM_GFX906_W8A16_INT8, bench_w8a16_gfx906, mid-N, spec M=6,
+dense_gemv_m4, 464 GB/s.
