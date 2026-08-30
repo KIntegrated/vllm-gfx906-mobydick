@@ -528,3 +528,56 @@ def test_rocm_unquantized_gemm_gfx950_wvsplitkrc_path(monkeypatch):
     x_view = wvsplitkrc_mock.call_args.args[0]
     assert x_view.is_contiguous()
     assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
+
+
+def test_rocm_unquantized_gemm_fp32_gemv_mv_dispatch(monkeypatch):
+    # fp32 single-token GEMVs (e.g. force_fp32_compute router gates) take
+    # the hipBLAS sgemv (torch.mv) path: neither the fp16-only GEMV family
+    # (ops.LLMM1 / dense_gemv_gfx906) nor triton_matmul may run. Mock-based,
+    # arch-independent; the Nemotron-H router gate shape is the case.
+    monkeypatch.delenv("VLLM_GFX906_DENSE_GEMV", raising=False)
+    monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
+    monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx906", lambda: True)
+    x = torch.randn(1, 2688, dtype=torch.float32)
+    weight = torch.randn(128, 2688, dtype=torch.float32)
+
+    llmm1_mock = MagicMock(side_effect=lambda w, xv, _: xv @ w.t())
+    monkeypatch.setattr(utils.ops, "LLMM1", llmm1_mock)
+    gemv_mock = MagicMock(side_effect=lambda w, xv, _: xv @ w.t())
+    monkeypatch.setattr(utils.ops, "dense_gemv_gfx906", gemv_mock)
+    triton_mock = MagicMock(side_effect=lambda xv, w: xv @ w.t())
+    monkeypatch.setattr(utils, "triton_matmul", triton_mock)
+
+    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
+    ref = torch.nn.functional.linear(x, weight)
+
+    gemv_mock.assert_not_called()
+    llmm1_mock.assert_not_called()
+    triton_mock.assert_not_called()
+    assert out.dtype == torch.float32
+    assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
+
+
+def test_rocm_unquantized_gemm_fp32_m_not_div4_stays_triton(monkeypatch):
+    # Boundary pin for the mv dispatch: the n==1 GEMV guard requires
+    # weight rows % 4 == 0 (or < 4); an fp32 weight outside that (m=130)
+    # must NOT take torch.mv and falls through to the triton skinny path.
+    monkeypatch.delenv("VLLM_GFX906_DENSE_GEMV", raising=False)
+    monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
+    monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx906", lambda: True)
+    x = torch.randn(1, 2688, dtype=torch.float32)
+    weight = torch.randn(130, 2688, dtype=torch.float32)
+
+    llmm1_mock = MagicMock(side_effect=lambda w, xv, _: xv @ w.t())
+    monkeypatch.setattr(utils.ops, "LLMM1", llmm1_mock)
+    triton_mock = MagicMock(side_effect=lambda xv, w: xv @ w.t())
+    monkeypatch.setattr(utils, "triton_matmul", triton_mock)
+
+    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
+    ref = torch.nn.functional.linear(x, weight)
+
+    llmm1_mock.assert_not_called()
+    triton_mock.assert_called_once()
+    assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
