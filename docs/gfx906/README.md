@@ -69,6 +69,8 @@ request (4 samples) unless noted. Recipes: §Bench recipes +
 | `DEAD-ENDS.md` | one-pass index: hypothesis → gate → verdict → commit for what was tried (grep-able) |
 | `_devlog-template.md` | the `VERDICT:`/`HYPOTHESIS:`/`GATE:` devlog convention + worked example |
 | `DEVLOG-*.md` | topic-specific experiment records; see the changelog and roadmap entries for the index |
+| `DEVLOG-int8-transfer.md` | int8-transfer session log: checkpoint fp16-mass scan, P1/P2 probes, the `v_dot8_i32_i4` scoping question |
+| `int8-investigation-qwen.md` | gfx908 int8-vllm fork transfer analysis (T0–T5) + the P1/P2 probe records that gated it (source of the `INT8` rows in `DEAD-ENDS.md`) |
 | `ROADMAP.md` | the single active queue: open work priority-ordered (Tier 0–2, onboarding + upstream queues) |
 | `REFRIGERATOR.md` | parked/shelved items, each with its reopen gate |
 | `running.md` | how to run/build/bench: local venv (canonical) + docker images |

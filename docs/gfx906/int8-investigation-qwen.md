@@ -1,13 +1,24 @@
 # INT8 / Q8 on gfx906 — what transfers from the gfx908 int8-vllm fork
 
-Investigation (read-only), 2026-08-30. Inputs: `/local/git/int8-vllm`
+Investigation, 2026-08-30. Inputs: `/local/git/int8-vllm`
 (gfx908/MI100, `curvedinf/int8-vllm` @ `0dc62c98e`), `/home/kread/git/llama.cpp`
 @ `b7386eeae` (gfx906 Q8_0 repack), the two Qwen checkpoints we serve, and
-this hub. **No code was changed and nothing was run for this document.**
+this hub. §1–§5 are analysis; **§7 is measured** — probes P1/P2 were run on
+MI50 #0 on 2026-08-31 (logs `/local/tmp/int8-probes/p1-full.log`,
+`p2-full.log`; no engine code was modified by them).
 
-**VERDICT:** OPEN (analysis complete; all perf numbers here are analytic or
-imported from the records cited, not measured by this document).
-**GATE:** the two probes in §6, then serving A/B per `AGENTS.md`.
+**VERDICT:** **T1 (int8 the fp16 weight mass) GO on the probe gate** —
+1.93–2.03× at every floor-bound shape, never < 1.0×, so it goes to a serving
+A/B. **T3 (A8W8 prefill) NO-GO**: Triton `tl.dot` int8 does emit
+`v_dot4_i32_i8` and is exact, but the Triton-vs-tuned-kernel gap on gfx906
+(1.5–1.7×) is bigger than dot4's edge over packed fp16 (1.96×), so a Triton
+A8W8 GEMM loses to hipBLAS fp16 at every prefill shape we ran (§3.3, §6.2).
+**The HIP-kernel successor question is answered by scope, not by compiler:**
+the fp16 mass is only 7.9 %/8.9 % of per-token GEMM MACs, so no int8 GEMM —
+hand-written or otherwise — is worth more than ~3 % of prefill, while
+`v_dot8_i32_i4` (3.75× packed fp16, int4 weights stay on tape) is the only
+route with >2× headroom (§3.10). T0 (P82 lossy acceptance) and T2 (int8 KV)
+stay open — neither is gated by these probes.
 
 ## 0. Bottom line
 
@@ -17,10 +28,11 @@ byte reduction over what we read today, with no W4 comparison problem.
 
 | # | item | what transfers | expected gfx906 effect | conf | gate |
 |---|---|---|---|---|---|
-| **T1** | int8 for the **fp16 weight mass** (lm_head, FA q/k/v/o, GDN in_proj_qkv/z/out, shared expert, layer 0) — load-time quant, int8 GEMV | yes, fully (byte-bound, no MFMA/aiter needed); their load-time quant pattern (`_quantize_embedding_int8_`) is the template | **dense 27B +8–11 % decode, MoE 35B +10–19 % decode ceiling**; frees 1.3–3.8 GB for KV | **high** (analytic: 33 % of decode weight bytes, both shapes measured at 98–101 % of HBM floor) | probe P2 + serving A/B + KLD/PPL |
+| **T1** | int8 for the **fp16 weight mass** (lm_head, FA q/k/v/o, GDN in_proj_qkv/z/out, shared expert, layer 0, the BF16 MTP draft layer) — load-time quant, W8A16 GEMV | yes, fully (byte-bound, no MFMA/aiter needed); their load-time quant pattern (`_quantize_embedding_int8_`) is the template | **dense 27B +10–13 % decode, MoE 35B +14–19 % ceiling**; ~4.5/4.1 GB of resident weights freed | **high — P2 measured 1.93–2.03×** at floor-bound shapes, ≥ 0.96× everywhere (§7) | serving A/B + KLD/PPL |
 | **T0** | **P82 lossy spec-decode acceptance** (rejection-sampler OR-clause) | yes, arch-free (pure sampler) | their measured **+19…+26 % decode, GSM8K neutral**; ours rides on MTP k=2 (78.7–90.9 % acceptance today) | high (imported) | GSM8K + greedy-coherence + serving A/B; **explicit opt-in only** |
 | **T2** | **int8 KV storage** (`int8_per_token_head` doctrine, but in our Q8_0 layout) | partial: format+doctrine yes, their Triton/aiter kernel no | **1.88× KV capacity** (256k → ~480k-token pool at fixed bytes); decode +1–3 % (halves FA gather traffic, kills the read-side quantize); V-side accuracy is the only new loss | med | FA-side accuracy gate + serving A/B (the LEGACY=0 lesson, §3.2) |
-| **T3** | **A8W8 (int8 act × int8 weight) GEMM for prefill only** | **as Triton source** — our Triton port lowers int8 `tl.dot` to `v_dot4_i32_i8` (§2.3) | ceiling 1.96× the fp16 MAC rate; their measured analogue **1.62× on the 17408-wide MLP, 0.81–0.95× at N=5120, 0.61× small-N** → only dense fat-N prefill qualifies | low-med | probe P1 (GO/NO-GO) |
+| **T3** | **A8W8 (int8 act × int8 weight) GEMM for prefill only** (Triton route; HIP successor → T5, §3.10) | **as Triton source** — our Triton port does lower int8 `tl.dot` to `v_dot4_i32_i8` (§2.3, measured) | **0.59–0.68× of hipBLAS fp16** at our five prefill shapes (measured) — dot4 is real but Triton's GEMM codegen gives up more than int8 wins | — | **closed by P1: NO-GO → `DEAD-ENDS.md`** |
+| **T5** | **hand-kernel prefill dot** — the HIP successor to T3: `v_dot8_i32_i4` (49 600 GMAC/s = 3.75× packed fp16, int4 on both operands → **weights stay int4, no KV cost**), not int8 | nothing to port — the datapath is ours to write (no upstream/MFMA equivalent); int8 has no prefill scope here (§3.10) | ceiling 3.75× packed fp16, and our W4A16 prefill runs at 5.46 T = 0.93× the *scalar fp32-FMA* record (~1 MAC per issued instruction); only 14–22 % of the dot8 record is needed for 1.3–2× — risks are operand supply (`i4→i8 unpack + 2×sdot4 = 0.24×` is our own warning) and W4A4 accuracy | low-med | free ISA audit of the prefill inner loop → **P3a** rate probe → **P3b** accuracy (§3.10) |
 | **T4** | accuracy + measurement methodology (KLD probe, record-once replay budget, paired boots, metric definitions) | yes, pure tooling | our dense PPL band is ±2 % — too coarse to gate a 0.1 % weight perturbation; KLD is ~100× more sensitive | high | adopt on first use |
 
 The single most important framing: **the int8 fork's GEMM layer does not
@@ -74,12 +86,20 @@ Q8 repack PR (commit `b7386eeae`, recorded in `dequant-instructions.md`):
 layout/repack deltas were **neutral (−1.1…+6.4 %) on single-token mat-vec**
 and **+21…+51 % on the LDS-staged multi-token GEMM**.
 
-Our own dense prefill sits at ~41 % of the fp16 MAC ceiling (442 t/s @32k,
-TP=2, `README.md` long-context sweep vs 13.2 T MAC/s/GPU), i.e. there is
+Our own dense prefill sits at ~41 % of the fp16 MAC ceiling (442 t/s @32k at
+TP=2 from the `README.md` long-context sweep, vs 13.2 T MAC/s/GPU taking
+~24.5 B non-vocab params → 49 GFLOP/token), i.e. there is
 headroom for a higher-ceiling dot — but only on the fat shapes:
 `gate/up = [34816, 5120]` ✓, `qkv = [14336, 5120]` ✓, `down/o_proj =
 [5120, 17408]/[5120,5120]` ✗ (their 0.81–0.95× band), MoE experts
 `N=512/1024` ✗✗.
+
+**P1 (2026-08-31) closed that headroom for Triton:** on exactly those two ✓
+shapes a Triton A8W8 kernel reaches 5.0 T MAC/s = 19 % of the dot4 ceiling —
+below hipBLAS fp16's 7.6 T (57 % of the fp16 ceiling) and level with what
+our W4A16 prefill already achieves. The arithmetic ceiling is real and
+unreachable in this compiler; the headroom is a *codegen* problem, not an
+instruction-set one (§3.3, §6.2).
 
 ### 2.2 Our fp16 weight mass (checkpoint scan, 2026-08-30)
 
@@ -96,10 +116,11 @@ our checkpoints it is **big**.
 | `embed_tokens.weight` [248320, 5120] | 2.543 GB | no (row gather) |
 | FA `q_proj` [12288, 5120] ×16 layers | 2.013 GB | **yes** |
 | FA `k_proj`/`v_proj` [1024, 5120] ×16 | 0.336 GB | **yes** |
-| layer 0 (`modules_to_not_convert`, incl. 3×178 MB MLP) | 0.780 GB | **yes** |
-| `mtp.*` sidecar | 0.703 GB | only in MTP arms |
-| GDN `in_proj_a`/`in_proj_b` [48, 5120] ×48 | 0.047 GB | yes (negligible) |
-| **fp16 read per decode step** | **≈ 5.72 GB** | **≈ 7.17 ms @ 798 GB/s** |
+| layer 0 (`modules_to_not_convert`: GDN projs 0.232 + 3×178 MB MLP) | 0.767 GB | **yes** |
+| `mtp.*` draft layer (q/k/v/o 0.210 + `fc` 0.105 + MLP 0.535) | 0.849 GB | **yes, in every MTP arm** |
+| GDN `in_proj_a`/`in_proj_b` [48, 5120] ×96 | 0.047 GB | yes (negligible) |
+| **fp16 read per decode step** | **≈ 5.71 GB** (6.56 GB with the MTP draft) | **≈ 7.17 ms @ 798 GB/s** |
+| `model.visual.*` (27-block ViT + merger, BF16) | 0.922 GB | no (multimodal tower; `Qwen3_5ForConditionalGeneration` ships it in the same shard set) |
 
 That reconciles with the measured `LLGemm1 … ~7,100 µs/step` bucket in
 `DEVLOG-dense-decode.md` to within 1 %. (It does **not** reconcile with that
@@ -125,13 +146,18 @@ Consequences, and they are the reason this document exists:
   (`DEVLOG-moe-m1-sprint.md` "no lever" column; `DEVLOG-dense-decode.md`
   "LLMM1 is at the HBM floor for every dense shape"). Nothing in our
   roadmap can win there — except moving fewer bytes.
-* int8 halves those bytes: **dense −3.6 ms of a 35.6 ms decode-only step
-  (≈ +11 %), MoE −2.4 ms of a 14.8 ms step (≈ +19 %, i.e. the 70 t/s
-  roadmap target in one move if it lands at floor).** Budget 50–70 % of the
-  ideal delta for small-shape launch/occupancy costs.
-* It also frees **1.27 GB (MoE) / 3.8 GB (dense, embed+lm_head)** resident —
-  directly relevant to the `--gpu-memory-utilization 0.93` and 256k-prefill
-  pressure documented in `/local/git/AGENTS.md` and `oom-256k-prefill.md`.
+* int8 halves those bytes. At the floor the convertible mass is worth
+  **dense −3.58 ms (−4.0 ms with the draft leg) of a ~35.5 ms decode step,
+  MoE −2.4 ms of a 15.0 ms step**, i.e. a ceiling of **dense +10–13 % and
+  MoE +14–19 %** (the top of the MoE band is the 70 t/s roadmap target in
+  one move). P2's conversion factors (§7) say the halving is realized
+  wherever the fp16 GEMV is actually at the floor, and buys nothing where
+  the shape is launch-bound (N ≤ 2048 → ~1.0×), which is why the band is
+  14–19 and not a flat 19.
+* It also halves the resident non-visual BF16 set: **−4.5 GB (dense,
+  9.1 GB loaded) / −4.1 GB (MoE, 8.2 GB)** — directly relevant to the
+  `--gpu-memory-utilization 0.93` ceiling and the 256k-prefill pressure in
+  `/local/git/AGENTS.md` and `oom-256k-prefill.md`.
 * **Their doctrine matches ours on what NOT to int8**: they keep `A_log`,
   `dt_bias`, depthwise conv1d, norms, KV scales, GDN recurrent state and
   softmax/P·V float, and they explicitly refuse to quantize `in_proj_a/b`
@@ -147,7 +173,7 @@ Source-verified in our Triton (`/local/git/triton-gfx906`, 3.6.0, the tree
   `i8 × i8 → i32` the chosen intrinsic is `llvm.amdgcn.sdot4`,
   `vectorSize = 4` (operand pack bitcast to `i32`).
 * `.../TargetUtils.cpp:44-56` — `supportsVDot()` includes `VEGA20`.
-* `.../TritonAMDGPUTransforms/AccelerateAMDMatmul.cpp:1665-1669` — the
+* `.../TritonAMDGPUTransforms/AccelerateAMDMatmul.cpp:1663-1669` — the
   I8×I8→I32 v_dot form is legal when `k % 4 == 0`.
 * `.../DotOpToLLVM.cpp:53-55` — a blocked-layout `DotOp` goes to
   `convertAMDFMADot` (the path above); `f16×f16→f32` takes `fdot2` there.
@@ -156,13 +182,19 @@ So the gfx908 fork's **portable** int8 GEMM (`triton_w8a8_gemm_kernel`,
 `triton_w8a16.py:248-341` — `tl.dot(a_q, b_q, out_dtype=tl.int32)` with
 `BLOCK_K == group_size == 128` and one A-scale/B-scale descale per tile,
 exact by construction) can be lifted as *source* with no aiter dependency.
-**This is ISA-level unverified on our toolchain** — probe P1 settles it
-(compile → check the emitted ISA via the `.amdgcn` asm dict / the
-objcopy→objdump chain in the `gfx906-isa-disassembly` skill, then exactness
-vs an int32 reference, then rate). Open risk: the blocked-layout FMA path
-may not stage operands well (our Triton W4A16 `has_zp` branch is 267 ms/tok
-pathological, `README.md`), which is exactly why P1 is a gate and not a
-formality.
+**Measured on our toolchain (P1, 2026-08-31), so this is no longer a
+source-reading claim:** a `16×16×16`-tile int8 `tl.dot` compiles to
+`v_dot4_i32_i8` (16 occurrences in `kernel.asm['amdgcn']`, zero `v_mac_f32`,
+zero `v_fma_f32`), accumulates **exactly** vs an fp64 reference (maxdiff 0 at
+64³ and 32³), and the A8W8 GEMM kernel emits 2048 `v_dot4_i32_i8` against
+4096 `v_dot2_f32_f16` for the same-work fp16 comparator — the 2:1
+instruction ratio the ISA ceiling predicts, with no spills.
+
+What the probe *also* established, and it is the reason T3 died: neither
+path gets near its ISA rate in Triton (int8 14–19 % of the 25 877 GMAC/s
+dot4 record, fp16 12–21 % of the 13 210 `v_pk_fma_f16` record, vs hipBLAS
+fp16 at 57 % of its record). The compiler, not the instruction set, is the
+binding constraint on gfx906 — see §3.3.
 
 ## 3. Surface by surface
 
@@ -181,26 +213,40 @@ verdict → gate.
   fix gathers int8 rows and dequantizes only the selected rows.
 * **Us:** the same load-time conversion applies to the §2.2 mass, not just
   the vocab pair. No checkpoint work, no third-party quant pipeline, and we
-  already do load-time repacks (W4 MoE repack ~65 s). Quantization choice:
-  per-output-row symmetric (their embedding/audit choice; simplest, keeps a
-  GEMV's inner loop scale-free) vs per-128-group along K (better accuracy,
-  one extra scale load per 128 elements — matches the granularity our AWQ
-  scales already use).
+  already do load-time repacks (W4 MoE repack ~65 s). **P2 settles the
+  quantization choice: per-output-channel, scale applied after the
+  reduction.** The per-channel inner loop is scale-free (one `v_cvt` +
+  `v_fma` per weight, scale multiplied into the accumulator once), and P2
+  measured the per-128-group variant at **+28 % over per-channel** at
+  lm_head (2202 vs 1717 µs) for no bandwidth benefit — group granularity is
+  only worth paying for accuracy, and only where per-channel accuracy fails
+  the gate. Note this path is **W8A16**: activations stay fp16, there is no
+  act-quant pass, and no GPTQ packing is involved.
 * **Kernel work:** one int8 weight-stationary GEMV in the
   `csrc/rocm/dense_gemv_gfx906.cu` family (M=1, K≤8192) reading int8 +
   per-row scale, fp16 `x`, `__ockl_fdot2` accumulate. Byte-bound ⇒ the
   dequant ALU is free (the `dequant-instructions.md` warning about
   i8→half2 expansion costing 0.17× applies to *dot-throughput*-bound loops,
-  not to a stream at 800 GB/s). Alternative: quantize `x` per token (K
-  elements — trivial at M=1) and use `v_dot4` with exact int32 accumulation;
-  P2 should measure both shapes cheaply before the kernel is written.
+  not to a stream at 800 GB/s). The `v_dot4` alternative (quantize `x` per
+  token, pad M to 16, exact int32 accumulate) is **measured dead in Triton**:
+  277 ms vs 1.7 ms at lm_head (161×), 107 ms vs 0.7 ms at lm_head-MoE — the
+  broadcast-`tl.dot` form does not generate a usable M=1 loop. If dot-through
+  weight is ever wanted at M=1 it has to be hand-written (the llama.cpp
+  `q8_repack` MMV design, `b7386eeae`, is the reference); P2 says it is not
+  wanted — bytes, not MACs, are what we are paying for.
   `LLMM1`-served shapes (`out_proj`, shared expert) can be routed to the new
   GEMV rather than porting an int8 LLMM1.
-* **Verdict: OPEN, high confidence.** **GATE:** probe P2 (int8 GEMV ≥ 1.7×
-  the fp16 GEMV at `lm_head` and `q_proj` shapes) → serving A/B
-  (`_bench_gfx906.py`, MoE + dense, both arms same boot) → accuracy: PPL
-  bands (6.6817–6.6942 / 6.6993–6.7197) **plus** a KLD gate (§3.8) because
-  the dense PPL band is ±2 % and cannot see a 0.1 % weight change.
+* **Verdict: GO on the probe gate (P2 passed 1.93× / 2.00× against a 1.7× /
+  1.6× bar; §7).** Remaining gate, in order: (1) serving A/B
+  (`_bench_gfx906.py`, MoE + dense, both arms same boot) — the probe's
+  ratios are geometry-clean but its own fp16 baseline is 2–3× off the
+  production kernel at mid shapes, so only the serving number counts
+  (`AGENTS.md` transfer rule); (2) accuracy: PPL bands (6.6817–6.6942 /
+  6.6993–6.7197) **plus** a KLD gate (§3.8) because the dense PPL band is
+  ±2 % and cannot see a 0.1 % weight change — per-channel W8 on lm_head is
+  the highest-risk tensor and should be KLD'd alone; (3) an M=2…4 leg for
+  the MTP verify pass (weight bytes are per-step, not per-token, so the
+  saving should carry, but that is an assumption until measured).
 
 ### 3.2 T2 — int8 KV cache (their `int8_per_token_head`, our Q8_0)
 
@@ -266,11 +312,40 @@ verdict → gate.
   free — their own per-channel requant is lossy and they kept the gs128
   scales around "for the blockscale fallback and the fused context-KV
   dequant".
-* **Verdict: OPEN, low-medium — hold until P1 says GO.** GATE: P1 must show
-  `v_dot4_i32_i8` in the emitted ISA, exact int32 accumulation, and
-  **≥ 1.3× over our current prefill GEMM path at [4096×34816×5120]** after
-  charging the activation-quant cost. Otherwise close it as a DEAD-END with
-  P1 as the evidence.
+* **Verdict: NO-GO for the Triton route, closed by P1 (2026-08-31); the HIP
+  route is a separate question and is scoped in §3.10.** All three ISA-level
+  preconditions passed — `v_dot4_i32_i8` in the ISA, exact int32
+  accumulation, dot4 2:1 on instruction count vs the fp16 comparator — and
+  it still loses, at every shape, by 1.5–1.7×:
+
+  | M×N×K | A8W8 (+act-quant) | Triton fp16 | hipBLAS fp16 | A8W8/hipBLAS |
+  |---|---|---|---|---|
+  | 4096×34816×5120 (gate/up) | 145.75 ms | 167.35 | **96.24** | **0.66×** |
+  | 4096×5120×17408 (down) | 66.93 ms | 78.73 | **43.75** | 0.65× |
+  | 4096×14336×5120 (qkv) | 60.13 ms | 69.07 | **39.80** | 0.66× |
+  | 1024×34816×5120 | 35.55 ms | 39.10 | **24.17** | 0.68× |
+  | 256×34816×5120 (their MIN_M gate) | 10.56 ms | 12.35 | **6.26** | 0.59× |
+
+  A8W8 beats the *same-codegen* fp16 Triton kernel by only 1.10–1.18× (the
+  gate needed 1.30×), i.e. dot4's 1.96× ISA edge is spent closing Triton's
+  own codegen deficit instead of buying speed. Three independent reasons it
+  cannot work here, any one of which is sufficient:
+  1. **Triton's GEMM on gfx906 runs at 19 % of the dot4 record** (5.0 T
+     MAC/s) — the same deficit exists in fp16 (33 % of record) and the
+     hand-written/hipBLAS path is at 57 %; the compiler gap (1.5–1.7×)
+     exceeds the int8 arithmetic edge.
+  2. Our production prefill GEMM is **W4A16**, which reads **half the weight
+     bytes** A8W8 would; A8W8 would *increase* prefill weight traffic over
+     what we do today while only matching its arithmetic rate (~5.0 vs the
+     ~5.4 T MAC/s our dense prefill already achieves, §2.1).
+  3. The 2× weight copy (int8 prefill weights alongside the int4 decode
+     weights) does not fit at TP=1 and competes with T1's own savings.
+
+  Reopen conditions and why they are narrow: a hand-tuned int8 GEMM (the
+  llama.cpp `q8_repack` idiom, or a T1-style LDS-staged kernel) would have to
+  beat W4A16 head-to-head **and** first clear the §3.10 scope argument (8 %
+  of prefill MACs). **Action: move to `DEAD-ENDS.md` with `p1-full.log` as
+  the evidence.**
 
 ### 3.4 Activation quantization numerics (round-to-nearest) — cheap, and it is a numerics lesson not a perf lever
 
@@ -282,12 +357,28 @@ output, rounding recovers ~half of it, and it was *also faster* than the
 gotcha they hit: **`libdevice.rint` is not available on HIP** — they use
 `floor(x + 0.5)`. Our in-tree `_per_token_quant_int8`
 (`vllm/model_executor/layers/quantization/utils/int8_utils.py:47-61`) uses
-`tl.extra.hip.libdevice.round`; P1 should confirm which one actually lowers
-to `v_rndmath_f32`/`cvt` on our build rather than assuming.
-Perf relevance for us: only as a component of T3 (its cost at M=4096 is the
-"quant overhead payback" their N-gate is about) — at M=1 it is noise.
-**Verdict: OPEN (adopt as method); GATE: P1 act-quant timing at the T3
-shapes.**
+`tl.extra.hip.libdevice.round`.
+
+**Measured (P1 part D, 4096×5120 fp16 → int8, per-token symmetric):**
+
+| rounding | time | disagreement vs `floor(x+0.5)` |
+|---|---|---|
+| trunc (`.to(tl.int8)`) | 133.1 µs | 49.7 % of elements |
+| `floor(x + 0.5)` | 131.9 µs | — |
+| `tl.extra.hip.libdevice.round` | 148.3 µs | 0.007 % |
+
+So: `libdevice.round` **is** available on our Triton 3.6 / ROCm 7.14 build
+and costs +12 % over `floor(+0.5)`; it differs from it on 0.007 % of
+elements, consistent with round-half-to-even at exact `.5` (their "100 %
+bit-identical to floor(x+0.5)" claim is off by that tie-breaking, which is
+harmless but should not be quoted as bit-equality). Truncation differs on
+**half the payload** — which is the actual numerics finding of theirs worth
+adopting, and it is a correctness issue, not a perf one.
+Perf relevance for us: only as a component of T3, and T3 is closed. At
+M=4096 the whole pass costs 0.13 ms = 0.14 % of the GEMM, i.e. their
+act-quant overhead never was the problem (§2.1's N-gate is about the GEMM,
+not the quant). **Verdict: adopt RN rounding as method wherever an act-quant
+exists; no standalone perf item.**
 
 ### 3.5 int8 GDN state / conv cache / attention internals — matches our doctrine, no action
 
@@ -372,6 +463,90 @@ dispatch — several of our dispatch gates are analytic (K≤8192, M≤7/≤32 M
 rather than table-driven. **Verdict: OPEN (method), low priority; gate = a
 per-shape table for the §3.1 int8 GEMV, which we need anyway.**
 
+### 3.10 T5 — the HIP-route question: what a hand-written int8/int4 GEMM could win here
+
+P1's NO-GO is a verdict about **Triton codegen**, not about int8 on this
+chip — and our hot path is hand HIP, so the right question is what a
+purpose-built kernel could do. Answer in one line: **int8 (dot4) is scoped
+out by the checkpoint, not by the compiler; `v_dot8_i32_i4` is the only >2×
+ceiling left, and there is a zero-accuracy-risk measurement to do first.**
+
+**The ISA ladder we already measured** (`dequant-instructions.md`, 2026-08-28,
+SCEV-proof probes, MI50) against the rates we actually achieve:
+
+| inner loop | ceiling (GMAC/s) | × packed fp16 | where we sit |
+|---|---|---|---|
+| `v_mac_f32` | 5 824 | 0.44× | **our W4A16 prefill = 5 460 (0.93× this row)** |
+| `v_pk_fma_f16` | 13 210 | 1.00× | hipBLAS fp16 = 7 570 (57 %, P1) |
+| `v_dot2_f32_f16` | 13 210-class, latency-sensitive (~10 T in the MoE harness) | 1.0× | — |
+| `v_dot4_i32_i8` | **25 877** | **1.96×** | nothing in-tree uses it for GEMM |
+| `v_dot8_i32_i4` | **49 600** | **3.75×** | nothing in-tree uses it at all |
+
+The first row is the uncomfortable one: at 41 % of the *fp16* ceiling our
+prefill GEMM runs at **0.93× the scalar fp32-FMA rate — about one MAC per
+issued instruction**. Any inner loop that does not get ≥ 2 MACs per
+instruction is capped near where we already are, which is why three sessions
+of W4A16 GEMM work moved prefill so little. That makes "does our prefill
+inner loop use packed/fdot2 MACs at all?" the cheapest open question on this
+list (ISA audit with the `gfx906-isa-disassembly` skill, **zero accuracy
+risk**, candidate band 1.2–1.5×).
+
+**Why the int8 (dot4) route is scoped out — the checkpoint, not the ISA.**
+The fp16/BF16 mass is only **7.9 % of the dense and 8.9 % of the MoE
+per-token GEMM MAC mass** (checkpoint scan: fp16 24.72 / 34.46 G MAC-token vs
+26.05 / 34.79 G total, excluding `visual`/`embed`/`lm_head`). Even a *perfect*
+1.96× kernel restricted to those tensors wins
+`0.089 × (1 − 1/1.96) = 4.4 %` of prefill compute → ~3 % wall. It is the
+right lever for **decode** (where the same tensors are 60.3 % of the MoE
+per-token *byte* mass — that is T1, and it is a GEMV, no new GEMM needed) and
+the wrong one for prefill.
+
+**Going after the int4 mass with int8 weights costs bytes we do not have:**
+int8 is 2× int4, so +11.4 GB (dense) / +15.8 GB (MoE routed experts) resident
+— TP=2-only, and at TP=2 dense it eats ~178 k tokens of the 445 k KV pool
+(32 KB/token/GPU) to buy at most 1.96× on a path we run at 41 % of the fp16
+ceiling. Plus the lossy AWQ-gs128 → per-channel int8 requant they needed and
+we would too.
+
+**The one route with real ceiling headroom is `v_dot8_i32_i4`** — 8 int4
+MACs/lane/cycle, 3.75× packed fp16, native packed-nibble operands (no unpack
+ALU), and critically it keeps **int4 weights on tape**: no byte increase, so
+it works at TP=1 and costs no KV. Break-even against our measured 5.46 T
+MAC/s: 1.3× needs 7.1 T = **14 % of the dot8 record**; 2× needs 10.9 T =
+22 %. Those are low bars *if operand supply holds* — and that is the whole
+question, because our own `i4→i8 unpack + 2×sdot4 = 0.24×` row shows how fast
+this ISA punishes operand prep that is not free. What it costs:
+
+1. **int4 activations** (dot8 needs i4 on *both* operands). On a model whose
+   weights are already int4 this is W4A4 territory: per-group activation
+   scales, and AWQ carries zero-points (`qzeros`), so the correction terms
+   (`A·z`, `B·z`, `z_A·z_B·k`) land in the epilogue. Expect a real quality
+   hit and an honest KLD + PPL gate — their int8 act-quant result is *not*
+   evidence for int4 act-quant.
+2. **A no-MFMA GEMM that reaches ~20 % of a full-rate instruction** while
+   feeding it nibbles from LDS. Nearest working precedent on this ISA family:
+   llama.cpp's dot4-based multi-token GEMM, measured **+21…+51 %** over its
+   own baseline (`dequant-instructions.md`) — i.e. in practice ~1.3×, not the
+   1.96×/3.75× of the ISA table. That is the number to beat in our own probe,
+   not the record.
+
+**Recommended order (cheapest first):** (a) ISA-audit the existing prefill
+inner loop for packed-MAC usage — free, no accuracy risk; (b) **P3a**, a
+~200-line HIP rate probe: LDS-staged BM=64/BN=64/BK=32 GEMM with a dot4 and a
+dot8 inner loop at [4096, 34816, 5120], *including* operand prep, against
+hipBLAS fp16 (7.57 T). GO bars: int8 ≥ 1.3× hipBLAS fp16, dot8 ≥ 2×. (c)
+**P3b**, only if P3a clears: W4A4 accuracy (KLD corpus + PPL bands). Do not
+start from a vLLM integration.
+
+### 3.11 Why not "just port their aiter kernels to plain HIP" — recorded so it stays closed
+
+The aiter/CK kernels are MFMA (Matrix Core) shaped: `v_mfma_*` does not exist
+on gfx906 (`dequant-instructions.md`), so their tile structure, LDS layouts
+and scale handling have no instruction-level home here. What ports is the
+*algorithm* (per-token A scale × per-group B scale, one descale per tile,
+exact int32 accumulation) — and P1 shows that algorithm's value on this chip
+is bounded by the scope argument in §3.10, not by how well we implement it.
+
 ## 4. Do-not-transfer list (their own negative verdicts)
 
 | tempting idea | their verdict (evidence) |
@@ -388,7 +563,8 @@ per-shape table for the §3.1 int8 GEMV, which we need anyway.**
 
 ## 5. Suggested sequence and roadmap entries
 
-1. **P1 + P2 probes** (§6) — GPU-free queue, no model load, minutes.
+1. ~~**P1 + P2 probes** (§6)~~ **done 2026-08-31**: P2 → GO, P1 → NO-GO
+   (results in §6).
 2. **T1** int8 GEMV for the §2.2 mass, staged by expected value:
    `lm_head` first (single shape, 2.5 GB→1.27 GB dense / 1.02→0.51 GB MoE),
    then FA q/k/v (2.35 GB dense), then GDN in_proj_qkv/z + out_proj
@@ -399,13 +575,24 @@ per-shape table for the §3.1 int8 GEMV, which we need anyway.**
    → **ROADMAP `I2`**.
 4. **T2** int8 KV: stage A (K only, capacity), then stage B (V).
    → **ROADMAP `I3`** (cross-ref G1: it must price the per-node tax first).
-5. **T3** A8W8 prefill — only if P1 clears its bar; and only after T1 freed
-   the footprint. → **ROADMAP `I4`** (Tier 2).
+5. ~~**T3** A8W8 prefill via Triton~~ **closed by P1 (NO-GO)** — →
+   `DEAD-ENDS.md`, not `ROADMAP.md`. Its HIP successor (**T5**, §3.10) is
+   scoped by the same checkpoint arithmetic down to `v_dot8_i32_i4`, and its
+   first step is a free ISA audit of our prefill inner loop, not a kernel.
+6. **T5 step (a)** — ISA-audit the W4A16 prefill inner loop (packed-MAC
+   usage?) → **P3a** HIP rate probe (dot4 / dot8, operand prep charged) →
+   **P3b** W4A4 accuracy. → propose **ROADMAP `I5`** (Tier 2, probe-gated).
 
-## 6. Probes queued for the GPU-free run
+## 6. Probes (run on MI50 #0, 2026-08-31)
 
 Both are standalone (torch + triton only, no vLLM import), take
 `HIP_VISIBLE_DEVICES` from the caller, and print an explicit `GO`/`NO-GO`.
+Logs: `/local/tmp/int8-probes/{p1-full,p2-full,p1-quick,p2-quick}.log`
+(persistent path per `/local/git/AGENTS.md`). Environment: torch
+2.13.0+gfx906.20260802001858, Triton 3.6.0, `HIP_VISIBLE_DEVICES=0`, GPU
+idle before/after, host up 16:47 h (no degradation canary run — these are
+bandwidth-bound, not sync-cadence-bound, so the MI50 host-degradation mode
+documented in `/local/git/AGENTS.md` does not apply).
 
 * **P1 `benchmarks/kernels/gfx906/int8_triton_dot_probe.py`** — decides T3
   and §3.4. (a) compiles an int8 `tl.dot` kernel, asserts exact equality vs
@@ -415,9 +602,11 @@ Both are standalone (torch + triton only, no vLLM import), take
   `gfx906-isa-disassembly` skill); (b) measures int8-vs-fp16 `tl.dot`
   GMAC/s (expect ~1.96× if dot4 is real: records 25 877 vs 13 210);
   (c) runs the ported blockscale A8W8 GEMM against a same-quality fp16 Triton
-  GEMM at our production shapes × M ∈ {1, 64, 512, 2048, 4096}, charging the
-  activation-quant pass; (d) same for the two in-tree act-quant roundings.
+  GEMM at M ∈ {4096, 1024, 256} × our production N/K, charging the
+  activation-quant pass; (d) trunc vs `floor(x+0.5)` vs
+  `tl.extra.hip.libdevice.round` in the act-quant kernel.
   **GO iff** dot4 present ∧ exact ∧ ≥ 1.3× at [4096, 34816, 5120].
+  *(Ran 2026-08-31: dot4 ✓, exact ✓, **0.66×** → NO-GO, §6.2.)*
 * **P2 `benchmarks/kernels/gfx906/int8_gemv_probe.py`** — decides T1.
   Triton M=1 int8-weight GEMV with per-row and per-128-group scales, at the
   real shapes ([248320,5120], [12288,5120]×16, [8192,2048]×30,
@@ -425,7 +614,93 @@ Both are standalone (torch + triton only, no vLLM import), take
   floor; prints achieved GB/s and the projected serving delta.
   **GO iff** ≥ 1.7× at lm_head and ≥ 1.6× at the ×30 GDN shapes.
 
+### 6.1 P2 result — **GO** (1.93× at lm_head, 2.42× at the ×30 GDN shape)
+
+M=1, Triton, int8 weights + fp16 activations (W8A16), per-output-channel
+scale applied after the reduction; `BN=32, BK=512, SPLIT=1` unless noted;
+int8-row correctness spot-checked at rel-err ≤ 3 × 10⁻⁴ against a dequantized
+fp32 reference.
+
+| shape (N×K) | ×/step | fp16 µs | int8 µs | ratio | int8 GB/s (% of 798 floor) |
+|---|---|---|---|---|---|
+| **248320×5120** lm_head dense | 1 | 3315.7 | **1716.9** | **1.93** | 741 (93 %) |
+| 248320×2048 lm_head MoE | 1 | 1316.8 | 712.6 | 1.85 | 714 (89 %) |
+| 12288×5120 FA q_proj dense | 16 | 224.8 | 112.5 | 2.00 | 559 (70 %) |
+| 10240×5120 L0 in_proj_qkv | 1 | 169.8 | 84.8 | 2.00 | 619 (78 %) |
+| 17408×5120 L0/mtp mlp gate,up | 2+2 | 274.0 | 134.9 | 2.03 | 660 (83 %) |
+| 12288×5120 mtp q_proj | 1 | 205.3 | 106.2 | 1.93 | 592 (74 %) |
+| 8192×2048 GDN in_proj_qkv MoE | 30 | 134.5 | 55.5 | **2.42** | 302 (38 %) |
+| 8192×2048 FA q_proj MoE | 10 | 126.3 | 52.5 | 2.40 | 319 (40 %) |
+| 5120×17408 L0/mtp mlp down | 1+1 | 290.9 | 191.6 | 1.52 | 465 (58 %) |
+| 5120×10240 mtp fc | 1 | 279.9 | 192.5 | 1.45 | 272 (34 %) |
+| 4096×2048 GDN in_proj_z MoE | 30 | 143.4 | 94.3 | 1.52 | 89 (11 %) |
+| 2048×4096 GDN out_proj MoE | 30 | 128.9 | 95.3 | 1.35 | 88 (11 %) |
+| 2048×8192 FA o_proj MoE | 10 | 175.1 | 181.4 | 0.96 | 92 (12 %) |
+| 1024×5120 FA k_proj/v_proj | 16+16 | 47.0 | 26.4 | 1.78 | 198 (25 %) |
+| 512×2048 shared gate/up, k/v MoE | 80 | 14.8 | 15.1 | 0.98 | 69 (9 %) |
+| 2048×512 shared down MoE | 40 | 17.1 | 15.1 | 1.13 | 69 (9 %) |
+
+Reads:
+
+1. **Whenever the fp16 side is ≥ 55 % of the HBM floor, int8 lands
+   1.93–2.03×** — the byte halving converts to wall time almost exactly. The
+   two shapes above that bar that miss (down-proj 1.52×, mtp fc 1.45×) are
+   this probe's own auto-geometry (`BK=128/SPLIT=8`: 465 and 272 GB/s where
+   the tuned rows reach 660–741), i.e. tuning debt, not a wall.
+2. **Below ~100 GB/s both sides are launch/occupancy-bound and the ratio
+   goes to 1.0±0.05, never worse.** So the shapes where int8 does nothing are
+   exactly the shapes where *nothing* byte-side does anything — the correct
+   conclusion is "route them elsewhere / batch them", not "int8 fails".
+3. **lm_head, the single biggest item, is also the cleanest**: int8 at
+   1716.9 µs against the *recorded production* fp16 floor of 3114–3193 µs
+   (`DEVLOG-dense-decode.md`) = **1.81× vs what we run today**, and 93 % of
+   the int8 floor of its own. This is the result that makes T1 worth doing.
+4. Per-128-group scales cost **+28 %** at lm_head (2202 vs 1717 µs) → use
+   per-output-channel (§3.1).
+5. `tl.dot`-based int8 GEMV (M padded to 16, dot4): **161× slower** (277 ms
+   at lm_head). Dead; recorded so nobody retries it.
+6. `torch.mv` fp16 is 85 GB/s at lm_head (30.6 ms) — 9× slower than the
+   Triton fp16 GEMV. Confirms the `DEVLOG` line that hipBLAS is not our GEMV
+   path and that these comparisons must be against *our* kernels.
+
+**Reconciling the projection.** P2's self-reported saving (dense 4.60 +
+0.67 ms/step, MoE 6.18 ms/step) is computed against this probe's own fp16
+times, which are 2–3× off the production kernel at mid shapes — so it
+overstates. §2.2 uses the floor-based number instead (dense −4.0 ms,
+MoE −2.2…2.4 ms), and P2's role is only to establish the **conversion
+factor** (1.9–2.0× at floor, ≥ 1.0 everywhere) that made that projection
+legitimate.
+
+### 6.2 P1 result — **NO-GO** for A8W8 (but the ISA question is settled yes)
+
+* int8 `tl.dot` → `v_dot4_i32_i8` ✓ (16 in the ISA, no `v_mac_f32`/`v_fma_f32`),
+  exact int32 vs fp64 ✓, and the A8W8 GEMM emits half the dot instructions of
+  the same-work fp16 kernel (2048 `v_dot4` vs 4096 `v_dot2_f32_f16`, no
+  spills) — the 2:1 the ISA ceiling predicts.
+* Rates: int8 3.76–4.79 T MAC/s (14.5–18.5 % of the 25 877 dot4 record),
+  fp16-Triton 1.53–2.82 T (11.6–21.3 % of the 13 210 record), and the best
+  int8/fp16 tile ratio was **2.51×** — above the 1.96× ISA ceiling, which
+  means the fp16 comparator was latency-stalled rather than issue-bound.
+  Neither path is anywhere near its record; ratios at this level of
+  efficiency are not portable facts, instruction counts are.
+* Production-shape A8W8: **1.10–1.18× vs same-codegen fp16 Triton, 0.59–0.68×
+  vs hipBLAS fp16** at all five shapes including the two that their dispatch
+  gate was designed to catch (table in §3.3). Act-quant charged is 0.13 ms =
+  0.14 % of the GEMM, so overhead was never the issue.
+
 ## 7. Corrections and open questions
+
+* **C-3 (new, checkpoint scan + P1/P2 run):** the **MTP draft layer ships
+  entirely unquantized** — 0.849 GB BF16 on the dense 27B (q/k/v/o 0.210 +
+  `fc` 0.105 + MLP 0.535) and ~0.08 GB/step active on the MoE — and it is
+  read on **every** MTP/spec-decode step. No `DEVLOG-*` budget line accounts
+  for it, which matters twice over: it is a T1 leg in its own right, and any
+  spec-decode step budget that omits it is ~1 ms short of the truth. Same
+  class of finding: both checkpoints carry a **0.92 GB BF16 vision tower**
+  (`model.visual.*`, 333 tensors) under a `*ForConditionalGeneration`
+  architecture — worth confirming it is not resident in our text-only serving
+  runs before sizing anything else (it would explain VRAM we attribute to
+  other pools).
 
 * **C-1 (our record):** `DEVLOG-dense-decode.md` §"Dense model facts"
   attributes 3.79 + 1.25 ms/step to `in_proj_b×48` / `in_proj_a×48` fp16
@@ -442,9 +717,16 @@ Both are standalone (torch + triton only, no vLLM import), take
   T3 needs the llama.cpp `q8_repack` structure (BM=64, BK=4 sub-blocks,
   `sW_lo/sW_hi` double buffer, k-major `sWdh` scales, `sXd[BN][BK+1]`
   padding, DPP reduce with `s_nop` padding — `repack-common.cuh`) ported
-  instead, which is a hand-kernel project.
-* **Q-2:** does an int8 lm_head GEMV stay at the HBM floor once it carries
-  a scale load and a cvt, at 256 threads / K-chunk ≤ 2048 (P2)?
+  instead, which is a hand-kernel project. **Update (P1):** for the *GEMM*
+  the answer is the worse one — dot4 is emitted but Triton reaches only 19 %
+  of its rate, and that deficit (1.5–1.7× vs hipBLAS fp16) exceeds everything
+  int8 can buy (§3.3). For the *GEMV* the answer is the good one: see Q-2.
+* **Q-2 (answered by P2):** no — an int8 lm_head GEMV does *not* fall below
+  the HBM floor once it carries a per-channel scale and a `v_cvt`: 741 GB/s
+  (93 % of floor) in plain Triton, with the scale applied after the reduction
+  so the inner loop stays 1 byte/weight + 1 cvt + 1 fma. **No `q8_repack`
+  port is needed for T1**; the repack structure is only relevant if someone
+  later wants dot-through int8 at M ≥ 16 (§3.3's reopening condition).
 * **Q-3:** int8 K/V with **Q8_0 inline scales** (finer than
   `int8_per_token_head`) — do we keep it, or adopt the upstream
   per-token-head format so upstream ops (paging tests, `triton_attn`,
@@ -468,3 +750,10 @@ gfx908 side: `docs/recipes/README.md` (canonical stack + numbers),
 `INT8_AUDIT_RESULTS.md` (coverage inventory + experiment ledger),
 `docs/mi100_decode_opt/p82_lossy_acceptance.md`, `scripts/kld_probe_v2.py`.
 llama.cpp side: `ggml/src/ggml-cuda/q8_repack/README.md` @ `b7386eeae`.
+
+Probes (this document): `benchmarks/kernels/gfx906/int8_triton_dot_probe.py`
+(P1) and `benchmarks/kernels/gfx906/int8_gemv_probe.py` (P2); logs
+`/local/tmp/int8-probes/`. Both are re-runnable and self-gating; P2 is the
+one to re-run if the int8 GEMV geometry or the HBM floor assumption is ever
+in doubt. Results are indexed in `DEAD-ENDS.md` (A8W8 row = DEAD,
+T1 row = OPEN/IN-FLIGHT).
