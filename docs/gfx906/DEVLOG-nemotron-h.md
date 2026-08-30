@@ -365,6 +365,98 @@ miss, local fork, left as-is).
 
 ---
 
+## 2026-08-30 (later) — NH-2: int8 in-kernel W8A16 GEMV/GEMM (CPU side done)
+
+**VERDICT:** OPEN (implementation + CPU gates on
+`gfx906/nh2-int8-gemv`; kernel probe + serving A/B + PPL pending on the
+GPU) · **GATE:** probe at Nemotron's exact dense shapes
+(`benchmarks/kernels/gfx906/bench_w8a16_gfx906.py`: M=1 vs the production
+`rocm_unquantized_gemm_impl` dispatch, M=4 + M=4096 arms, correctness vs
+fp32 reference with 0x80 zero-codes pinned) → serving A/B
+(`VLLM_GFX906_W8A16_INT8=0` arm, same boot, 70.4-tok/s recipe) + PPL
+26.96–27.02 band + 7-prompt greedy A/B.
+
+## HYPOTHESIS
+
+Nemotron's per-step dense weight traffic is 1.32 GiB of int8 across the
+71 CT W8A16 channel tensors (23× mamba in_proj [10304, 2688] + 23×
+out_proj [2688, 4096] + 6× GQA q/k/v/o + lm_head [131072, 2688]). The
+scheme dequants to fp16 at load (2× the traffic, +1.3 GiB VRAM) and
+serves M=1 via LLMM1 rpb=4 — 3.57 ms/step in the profile (K=2688/4096
+miss the custom `dense_gemv_gfx906` whitelist). If in-register dequant
+(bias-128, per-channel scale) is cheap, serving the packed bytes directly
+halves the traffic; the P2 probe (`DEVLOG-int8-transfer.md`) measured
+exactly this pattern at 1.93–2.03× on HBM-bound shapes, never worse than
+0.96×.
+
+## What was done
+
+- `compressed_tensors_w8a16_channel_dequant.py`: the int8 in-kernel path
+  is now the default on gfx906 + fp16 (`VLLM_GFX906_W8A16_INT8`, default
+  on; `=0` gives the old dequant path, bit-identical). `process_weights`
+  keeps the packed int32 storage and registers `weight_i8` — a uint8
+  [N, K] **view** of it (no copy, no extra VRAM) — freeing only the load
+  metadata. New Triton kernels: `k_w8a16_gemv` (M=1; per-row scale after
+  the f32 reduction; SPLIT-K via atomic on a zeroed output) and
+  `k_w8a16_gemm` (M>1; the tile dequant is bit-identical to the old
+  load-time dequant — f32 (w−128)·s → f16 — so M>1 numerics are the
+  dequant path's numerics; `tl.dot` with f32 accumulation).
+- `_gemv_geometry` = P2's `_pick` with a split guard: P2's `_pick`
+  *asserts* at Nemotron's K=2688 (split=8 → per=336 → no aligned BK);
+  the guard rejects a split whose slice cannot take BK ≥ 32.
+- The probe measures the "current" arm through
+  `rocm_unquantized_gemm_impl` — the actual production dispatch (LLMM1
+  rpb=4 at these K's), not a re-implementation.
+- Unit tests extended (6/6 pass on CPU): the `weight_i8` view aliases
+  the packed storage (data_ptr identity), the byte convention
+  `(word >> 8b) & 0xFF`, numerics equal the dequant reference, env-off
+  fallback, bf16 → dequant path, fail-closed on scale shape / K.
+
+## Evidence — FOR (CPU side only)
+
+- 6/6 unit tests; `_gemv_geometry` verified on all six shapes (K=2688 →
+  BK=64 SPLIT=2; lm_head → 8192 programs SPLIT=1; k/v_proj → SPLIT=4
+  BK=32 — no degenerate tiles); ruff clean.
+- Prior: P2 int8 row-GEMV at 1716.9 µs on the 248320×5120 lm_head shape
+  = 1.81× the 3114–3193 µs recorded production fp16 floor, at 93 % of
+  the int8 floor of its own.
+
+## Evidence — AGAINST
+
+- Nothing measured yet (probe pending). The known risks the probe
+  settles: (a) Triton launch overhead on the 12×/step [256, 2688]
+  k/v_proj (P2: ~15 µs floor on both sides — expected ~neutral);
+  (b) `k_w8a16_gemm` at M=4096 prefill — the in-register dequant adds
+  3–4 ALU ops per element on top of the FMA-bound dot (no MFMA on
+  gfx906; hipBLAS fp16 is FMA-bound too), so prefill is expected ≈
+  neutral, not 2×; (c) fp16 atomic_add partials in the SPLIT>1 GEMV
+  (only the q_proj family) — P2 passed ≤3e-4 rel-err with the same
+  scheme.
+
+## Interactions
+
+- Blast radius: only CT W8A16 channel-symmetric fp16 layers on gfx906 —
+  Nemotron-H is the only served model of this shape (its experts are
+  INT4 WNA16, a different scheme). No other model's route changes; the
+  env kill switch reproduces the old path bit-identically for the A/B.
+- lm_head is one of the int8 tensors: 352 MB/step — the single largest
+  decode byte item on this model.
+
+## Refrigerated residue (when the GPU is free)
+
+1. `W8A16_PROBE_QUICK=1` first, then the full probe →
+   `/local/tmp/w8a16_probe.log`.
+2. If any M=1 shape lands < 0.95× of cur: fix the geometry before the
+   serving gate (the probe prints per-shape geometry).
+3. Serving A/B + PPL + 7-prompt greedy A/B (item 3 of the gate above);
+   the dequant arm runs with `VLLM_GFX906_W8A16_INT8=0` on the same
+   boot.
+4. If the M=4096 prefill arm regresses > 10 %: either accept (log it)
+   or revert the whole scheme via the kill switch — there is no
+   int8-GEMV-only hybrid without re-materializing the fp16 weight.
+
+---
+
 ## Search keys
 
 `HYPOTHESIS:` `VERDICT:` Nemotron, nemotron_h, group-64, g64, relu2,
@@ -374,4 +466,6 @@ LLMM1, GateLinear, force_fp32_compute, AMDGCN_USE_BUFFER_OPS, TP=2,
 tensor-parallel, enable-expert-parallel, EP, expert parallel, 928,
 with_amdsmi_context, AMDSMI_STATUS_NOT_INIT, amdsmi, get_device_name,
 _shut_down_amdsmi, rocm_platform_plugin, scope=process,
-profile_run, rank-1 worker, NCCL hang.
+profile_run, rank-1 worker, NCCL hang, NH-2, weight_i8, bias-128, 0x80,
+k_w8a16_gemv, k_w8a16_gemm, SPLIT, VLLM_GFX906_W8A16_INT8,
+bench_w8a16_gfx906.

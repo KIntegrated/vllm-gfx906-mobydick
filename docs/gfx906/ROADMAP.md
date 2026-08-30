@@ -251,7 +251,8 @@ unservable model.
 ### Nemotron-3.5-Lightning-30B-A3B mixed INT4/INT8 (`NemotronHForCausalLM`)
 
 **Status: NH-1 + NH-3 SHIPPED (unmerged, `gfx906/nemotron-h-onboard`);
-NH-2/NH-4/NH-5 open.** Serves at **70.4 tok/s** (graph, pp2048/tg256, 4
+NH-2 implemented on `gfx906/nh2-int8-gemv` (kernel probe + serving A/B
+pending); NH-4/NH-5 open.** Serves at **70.4 tok/s** (graph, pp2048/tg256, 4
 samples, GPU0) after five fixes on the branch: fp32-router LLMM1 dtype
 guard, the ssd_chunk_scan pointer-yield restructure (triton-gfx906
 CanonicalizePointers workaround), a new
