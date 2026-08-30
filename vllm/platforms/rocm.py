@@ -169,7 +169,19 @@ def with_amdsmi_context(fn):
         try:
             return fn(*args, **kwargs)
         finally:
-            amdsmi_shut_down()
+            try:
+                amdsmi_shut_down()
+            except Exception as error:
+                # On some ROCm builds (gfx906-native ROCm 7.14) the
+                # library inits "successfully" with 0 processor handles
+                # after torch import — the state get_device_name's
+                # GCN-arch fallback handles — and shut_down then returns
+                # AMDSMI_STATUS_NOT_INIT. A cleanup failure must not turn
+                # a successful query into a crash.
+                logger.warning_once(
+                    "amdsmi_shut_down failed after a successful query: %r",
+                    error,
+                )
 
     return wrapper
 

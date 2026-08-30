@@ -246,9 +246,96 @@ fp16 GEMV family (which rejects fp32). Micro-bench at the gate shape
 
 ---
 
+## 2026-08-30 — TP=2 crash reports investigated: EP flag required + amdsmi wrapper fix
+
+**VERDICT:** SHIPPED (wrapper fix + verification) · **GATE:** TP=2 +
+`--enable-expert-parallel` serving boot + greedy A/B vs TP=1 (7 prompts,
+token-ids/text diff) + multi-chunk prefill.
+
+## HYPOTHESIS
+
+If a user launches this model at TP=2, (1) the default no-EP config dies
+in `CompressedTensorsWNA16MoEMethod.create_weights` because the g64 scale
+groups do not divide the per-rank intermediate (1856/2 = 928, 928 % 64 = 32),
+and (2) on boots whose post-torch amdsmi is broken (0 handles, `shut_down`
+returns NOT_INIT), the first unprotected `get_device_name` (SSD config
+lookup in the cudagraph-profile dummy run) kills the rank-1 worker inside
+`with_amdsmi_context`'s `finally`, leaving rank 0 hung in an NCCL spin.
+
+## What was done
+
+- Reproduced (1) exactly: TP=2 default → `ValueError: ... intermediate
+  size per tensor-parallel partition (928) to be divisible by group_size
+  (64)` in `create_weights` (pre-existing upstream check, untouched by the
+  onboard branch — the message itself prescribes the fix).
+- Reproduced (2): rank-1 worker died in
+  `selective_state_update → get_ssm_configs → get_device_name` with
+  `AMDSMI_STATUS_NOT_INIT` from the wrapper's `finally: amdsmi_shut_down()`
+  (`/local/tmp/nemotron_tp2_ep_server.log`); rank 0 then spun at 100 % CPU
+  + GPU (NCCL) until SIGTERM. Fresh-process probe: post-torch
+  `amdsmi_init()` returns success with **0 handles** and `shut_down()`
+  raises NOT_INIT — deterministic this boot (single- and dual-GPU).
+- Fixed `with_amdsmi_context` (vllm/platforms/rocm.py): cleanup failure in
+  `finally` no longer masks a successful query (warning only); the
+  0-handles GCN-arch fallback (`AMD_GFX906`) then carries the lookup.
+  This is the permanent fix the 2026-08-22 C2-V entry in
+  `degradation_details.md` called for (same crash signature, 35B-MoE
+  rank-1 death in `get_device_name` during `profile_run`; that boot's
+  workaround was a per-run sitecustomize shim). Test:
+  `tests/test_rocm_amdsmi_context.py` (2/2).
+- Verified TP=2 + `--enable-expert-parallel`: boots (64 local experts/rank,
+  `GFX906_HIP` MoE backend still selected under EP), multi-chunk prefill
+  (5041 tok = 2 chunks) + decode coherent.
+
+## Evidence — FOR
+
+- Greedy A/B TP1 vs TP2+EP, same tree (7 prompts, temp 0):
+  5/7 token-identical; 2/7 (`story`, `mito`) diverge mid-output and stay
+  coherent (quantized-kernel + all-reduce float diffs — expected). The
+  whitespace-loop `transformer` prompt loops **identically** on both —
+  model behavior, not EP corruption. Probe: `/local/tmp/nemotron_tp_ab.py`
+  (JSONs `nemotron_tp_ab_tp{1,2}.json`).
+- Steady-state decode TP2+EP B=1: ~100 tok/s (128-tok runs 99.4/101.4/
+  101.0; 1.26–1.29 s) — above the 70.4 TP=1 healthy-host record, as
+  expected (EP halves per-GPU expert traffic). **Caveat:** this boot's
+  amdsmi is broken (fallback marker in every log) — the number stands but
+  host state is suspect; re-confirm on a clean boot.
+
+## Evidence — AGAINST
+
+- None at the gate. Note the TP=1 arm on this same boot ran abnormally
+  slow (first request ~7 tok/s, warming to ~35) while TP=2 ran at
+  record level — a TP-dependent perf anomaly on a suspect boot, not
+  adjudicated (canary + clean boot pending; see degradation.md rows).
+
+## Interactions
+
+- **Operational rule:** this model at TP>1 needs
+  `--enable-expert-parallel` (g64 + pure-TP shard is unsatisfiable:
+  1856/TP must be a multiple of 64, which only holds at TP=1 — or TP=29,
+  which is not a deployment; 128 % 2 == 0, so EP=2 is exact).
+  Recorded in the workspace AGENTS.md local-serving notes.
+- The wrapper fix is generic (any `get_device_name`/`get_device_uuid`/
+  memory query on a broken-amdsmi boot); blast radius: none on healthy
+  boots (shut_down succeeds → no warning path).
+
+## Refrigerated residue
+
+- This boot's perf anomaly (TP1 decode ~7–35 tok/s vs TP2 ~100, boot O,
+  amdsmi broken since ~08-30 morning) is an open question for the
+  degradation TP-dependence line — needs the canary on a clean boot.
+- Tuned SSD-decode configs for `AMD_GFX906` do not exist (lookup falls to
+  the default launch config on every boot here); tuning is a perf item,
+  orthogonal to this incident.
+
+---
+
 ## Search keys
 
 `HYPOTHESIS:` `VERDICT:` Nemotron, nemotron_h, group-64, g64, relu2,
 RELU2_NO_MUL, W8A16 channel, int8 channel, dequant, Conch, ConchLinearKernel,
 CanonicalizePointers, HAS_INITSTATES, chunk_scan, ssd_chunk_scan, fp32 router,
-LLMM1, GateLinear, force_fp32_compute, AMDGCN_USE_BUFFER_OPS.
+LLMM1, GateLinear, force_fp32_compute, AMDGCN_USE_BUFFER_OPS, TP=2,
+tensor-parallel, enable-expert-parallel, EP, expert parallel, 928,
+with_amdsmi_context, AMDSMI_STATUS_NOT_INIT, amdsmi, get_device_name,
+profile_run, rank-1 worker, NCCL hang.
