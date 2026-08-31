@@ -78,14 +78,20 @@ is cheap and decisive.
 
 ### HK-1 — drop the legacy `~/env-rocm-7.14-gfx906.sh` sourcing
 
-The machine has a single ROCm toolchain now (/opt/rocm is the default),
-so sourcing it is unnecessary — **confirmed 2026-08-29 (boot N)**: both
-prime dense models' TP=2 serving boots, the 74/74 in-process suite, and
-the FA micro-bench runs all worked without it. Remaining: remove it from
-the ACTIVE recipes: `/local/git/AGENTS.md` (single-card bench recipe),
-`running.md` (§0 + build section), `README.md` (bench recipe). Dev logs
-and `degradation_details.md` keep their lines (historical record); the
-session `canary.sh` sources it — drop there too when next touched.
+**Status: in-repo recipes DONE (2026-08-31, branch
+`gfx906/hk1-drop-env-sourcing`); `/local/git/AGENTS.md` pending — its edit
+is a protected-file write awaiting user approval.** The machine has a
+single ROCm toolchain now (/opt/rocm is the default), so sourcing it is
+unnecessary — **confirmed 2026-08-29 (boot N)**: both prime dense models'
+TP=2 serving boots, the 74/74 in-process suite, and the FA micro-bench runs
+all worked without it; re-verified 2026-08-31 with a torch HIP matmul under
+`env -u ROCM_PATH -u LD_LIBRARY_PATH`. Removed from the ACTIVE recipes:
+`running.md` (§0 + build section), `docs/gfx906/README.md` (bench recipe),
+`.agents/skills/gfx906-mem-attribution/SKILL.md` (the in-repo skill's
+recipe). Dev logs and `degradation_details.md` keep their lines (historical
+record); the session `canary.sh` sources it — drop there too when next
+touched. setup.py needs no change: `is_rocm_system()` already falls back to
+`/opt/rocm` when `ROCM_PATH` is unset.
 
 ### N1 — quiet the expected AutoAWQMoEMarlin fallback
 

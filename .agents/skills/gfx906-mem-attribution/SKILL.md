@@ -73,7 +73,7 @@ on wedge-accumulated boots. Required for any in-process run that
 compiles new shapes:
 
 ```bash
-cd /local/git/vllm-gfx906-mobydick && source ~/env-rocm-7.14-gfx906.sh
+cd /local/git/vllm-gfx906-mobydick   # no env sourcing needed: /opt/rocm is default (HK-1)
 env VLLM_USE_AOT_COMPILE=0 \
     TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0 \
     FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE HF_HUB_OFFLINE=1 \

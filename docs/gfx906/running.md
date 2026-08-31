@@ -17,7 +17,9 @@ The serving benches moved out of docker on 2026-08-16. The `.venv` holds an
 editable install of this repo; the compiled extensions live in-tree.
 
 ```bash
-source ~/env-rocm-7.14-gfx906.sh        # ROCM_PATH + LD_LIBRARY_PATH=/opt/rocm/lib (REQUIRED)
+# /opt/rocm is the default ROCm toolchain on this box — no env sourcing
+# needed (HK-1, confirmed 2026-08-29: serving boots + in-process suite +
+# FA micro-bench all run without it). rocminfo resolves via /usr/bin.
 ```
 
 - **TP=2+ serving needs the HIP blocking-sync `.pth` shim, once per venv**
@@ -71,7 +73,9 @@ source ~/env-rocm-7.14-gfx906.sh        # ROCM_PATH + LD_LIBRARY_PATH=/opt/rocm/
   the package). Use:
 
   ```bash
-  source ~/env-rocm-7.14-gfx906.sh
+  # No env sourcing needed: /opt/rocm is the default toolchain (HK-1,
+  # confirmed 2026-08-29 — build + serving + in-process suite run without
+  # it; setup.py falls back to /opt/rocm when ROCM_PATH is unset).
   export PATH="$PWD/.venv/bin:$PATH"          # venv cmake must win
   FETCHCONTENT_BASE_DIR=/tmp/vllm-deps \
   HIP_VISIBLE_DEVICES=0 .venv/bin/python setup.py build_ext --inplace

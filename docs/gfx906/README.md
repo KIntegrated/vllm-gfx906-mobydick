@@ -218,7 +218,7 @@ Canonical environment is the **local editable `.venv`** (docker images are
 legacy; both documented in `running.md`). MoE:
 
 ```bash
-source ~/env-rocm-7.14-gfx906.sh
+# /opt/rocm is the default ROCm toolchain — no env sourcing needed (HK-1).
 HIP_VISIBLE_DEVICES=0 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE HF_HUB_OFFLINE=1 \
 BENCH_EAGER=0 BENCH_PP=2048 BENCH_TG=256 BENCH_MAXLEN=3328 BENCH_GPU_UTIL=0.95 \
 BENCH_BATCHED_TOKENS=4096 BENCH_CG_MODE=FULL_DECODE_ONLY \
