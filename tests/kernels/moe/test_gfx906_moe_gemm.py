@@ -292,14 +292,30 @@ def test_gfx906_repack_gptq_kfirst_sym():
         _repack_w4a16_gfx906_expert(w, s, torch.randint(0, 2**31, (E, G, N)))
 
 
+def _take_path():
+    """Read-and-reset the M=1 gemm dispatch-path marker (see
+    csrc/rocm/moe_q_gemm_gfx906.cu). Returns the tile selected by the most
+    recent moe_gptq_gemm_gfx906 call: 0 = legacy <1,4> gemm1 (MOE_NPT=4),
+    1 = v2 512-thread gemm2, 2 = legacy <1,4> gemm2 fallback, 3 = default
+    <1,2> gemm1. Needed because the M=1 kernels are atomic-accumulated and
+    therefore not bit-reproducible run-to-run."""
+    from vllm import _custom_ops as ops
+
+    return int(ops.take_moe_m1_dispatch_path())
+
+
 @pytest.mark.parametrize("layout", ["awq_kfirst", "awq_kfirst_sym"])
 def test_gfx906_moe_gemm_m1_v2_flag(layout):
     """VLLM_GFX906_MOE_M1 re-tiles the M=1 gemm2 (fused weight/reduce)
-    path to the 512-thread lane-column kernel. It is not bit-equal to
-    the default path (fp32 in-block reduce + one CAS per cell vs the
-    fp16 z-slice CAS chain), so the gates are: the flag changes the
-    output (V2 actually runs), the difference is fp16-atomic noise
-    level, and the result stays within the normal reference tolerance.
+    path to the 512-thread lane-column kernel. It is now DEFAULT-ON (the
+    C2 combined A/B promoted it), so the gates are: the default and an
+    explicit =1 both take the V2 tile, the explicit opt-out (=0) takes the
+    legacy <1,4> tile, and every arm stays within normal reference
+    tolerance. Path selection is verified with the dispatch-path marker
+    (torch.ops._rocm_C.take_moe_m1_dispatch_path): the M=1 kernels
+    accumulate via packed CAS atomics, so their outputs are NOT
+    bit-reproducible run-to-run and cannot prove which tile ran. The test
+    shape (N2=1024, K2=512) is V2-qualifying so the shape gate passes.
     awq_kfirst_sym covers the symmetric (empty zp / inlined zero 8) path."""
     import os
 
@@ -364,24 +380,34 @@ def test_gfx906_moe_gemm_m1_v2_flag(layout):
         )
         return out
 
-    os.environ.pop("VLLM_GFX906_MOE_M1", None)
-    out_off = gemm2()
+    # gemm1 is <1,2> by default (marker 3) in every arm — the flag under test
+    # only touches gemm2, so read the marker after each call pair.
+    for k in ("VLLM_GFX906_MOE_M1", "VLLM_GFX906_MOE_NPT"):
+        os.environ.pop(k, None)
+    out_default = gemm2()
+    assert _take_path() == 1, (
+        "default M=1 gemm2 did not take the V2 re-tile (marker != 1)"
+    )
+    os.environ["VLLM_GFX906_MOE_M1"] = "0"
+    try:
+        out_off = gemm2()
+    finally:
+        os.environ.pop("VLLM_GFX906_MOE_M1")
+    assert _take_path() == 2, (
+        "VLLM_GFX906_MOE_M1=0 did not select the legacy <1,4> gemm2 "
+        "(marker != 2)"
+    )
     os.environ["VLLM_GFX906_MOE_M1"] = "1"
     try:
         out_on = gemm2()
     finally:
         os.environ.pop("VLLM_GFX906_MOE_M1")
-
-    # The re-tile must actually be in use (different accumulation order).
-    assert not torch.equal(out_off, out_on), (
-        "VLLM_GFX906_MOE_M1=1 produced bit-identical output; the M=1 "
-        "gemm2 re-tile was not taken"
+    assert _take_path() == 1, (
+        "VLLM_GFX906_MOE_M1=1 did not select the V2 tile (marker != 1)"
     )
-    # fp16 atomic-ordering noise: the off-vs-on gap is bounded by the
-    # sum of each path's error against the fp32 reference (checked below),
-    # so no separate absolute gate is needed here.
-    # still within the normal reference tolerance (recompute inter; the
-    # gemm1 path is flag-invariant)
+
+    # fp32 reference for gemm2 (recompute inter; the gemm1 path is
+    # flag-invariant across these arms)
     wdeq2 = _dequant_ref(w2, s2, zz2, q2)
     ref_out = torch.zeros(1, N2, device=dev, dtype=torch.float32)
     c1 = torch.zeros(TOPK, N13, device=dev, dtype=torch.float16)
@@ -416,14 +442,219 @@ def test_gfx906_moe_gemm_m1_v2_flag(layout):
                 continue
             h = inter[i].float() @ wdeq2[e].t()
             ref_out[0] += h * topk_w[0, i].float()
-    rel = ((out_on.float() - ref_out).abs().max() / ref_out.abs().max()).item()
-    assert rel < 1e-1, f"v2 gemm2 too far from reference: maxrel={rel:.2e}"
-    rel_off = ((out_off.float() - ref_out).abs().max() / ref_out.abs().max()).item()
-    assert rel_off < 1e-1, f"default gemm2 too far: maxrel={rel_off:.2e}"
-    diff = (out_off.float() - out_on.float()).abs().max().item()
-    assert diff < 0.3 * ref_out.abs().max().item() + 0.05, (
-        f"v2 vs default gemm2 diff too large: {diff}"
+    scale = ref_out.abs().max().item()
+    for name, out in (("default(v2)", out_default), ("opt-out", out_off), ("=1(v2)", out_on)):
+        rel = ((out.float() - ref_out).abs().max() / scale).item()
+        assert rel < 1e-1, f"v2-flag gemm2 ({name}) too far from reference: maxrel={rel:.2e}"
+
+
+@pytest.mark.parametrize("layout", ["awq_kfirst", "awq_kfirst_sym"])
+def test_gfx906_moe_gemm_m1_npt2_flag(layout):
+    """VLLM_GFX906_MOE_NPT=2 re-tiles the M=1 **gemm1** (w13 scatter) path
+    to the <1,2> kernel (64 cols/block vs <1,4>'s 128). It is now
+    DEFAULT-ON for BM=1 (the C2 combined A/B promoted it), so the gates
+    mirror the MOE_M1 test: explicit opt-out (=4) differs from the
+    default/<1,2> arm, the default matches an explicit =2, both arms stay
+    within normal reference tolerance, and the off-vs-on gap is
+    fp16-atomic noise level. gemm2 must be untouched by the flag (its
+    dispatch ignores NPT for BM=1 unless MOE_M1 fires)."""
+    import os
+
+    from vllm import _custom_ops as ops
+
+    N13, K13, N2, K2 = 1024, 2048, 1024, 512
+    w13, s13, z13, q13, zz13 = _make_layer(N13, K13, layout)
+    wq13, sc13, zp13 = _repack_w4a16_gfx906_expert(w13, s13, z13)
+
+    dev = "cuda"
+    torch.manual_seed(1)
+    x = (torch.randn(1, K13, dtype=torch.float16) * 0.5).to(dev)
+    topk_ids = torch.randint(0, E, (1, TOPK), dtype=torch.int32).to(dev)
+    sorted_ids, expert_ids, ntp = moe_align_block_size(topk_ids, 1, E)
+    empty_tw = torch.empty(0, dtype=torch.float32, device=dev)
+
+    def gemm1():
+        c1 = torch.zeros(TOPK, N13, device=dev, dtype=torch.float16)
+        ops.moe_gptq_gemm_gfx906(
+            x,
+            c1,
+            wq13,
+            sc13,
+            zp13,
+            empty_tw,
+            sorted_ids,
+            expert_ids,
+            ntp,
+            TOPK,
+            1,
+            False,
+            0,
+            0,
+        )
+        return c1
+
+    # Default (no env var) must be the <1,2> re-tile now; explicit opt-out
+    # (=4) selects the legacy <1,4> tile and explicit =2 must match default.
+    for k in ("VLLM_GFX906_MOE_M1", "VLLM_GFX906_MOE_NPT"):
+        os.environ.pop(k, None)
+    out_default = gemm1()
+    assert _take_path() == 3, (
+        "default M=1 gemm1 did not take the <1,2> re-tile (marker != 3)"
     )
+    os.environ["VLLM_GFX906_MOE_NPT"] = "4"
+    try:
+        out_off = gemm1()
+    finally:
+        os.environ.pop("VLLM_GFX906_MOE_NPT")
+    assert _take_path() == 0, (
+        "VLLM_GFX906_MOE_NPT=4 did not select the legacy <1,4> gemm1 "
+        "(marker != 0)"
+    )
+    os.environ["VLLM_GFX906_MOE_NPT"] = "2"
+    try:
+        out_on = gemm1()
+    finally:
+        os.environ.pop("VLLM_GFX906_MOE_NPT")
+    assert _take_path() == 3, (
+        "VLLM_GFX906_MOE_NPT=2 did not select the <1,2> tile (marker != 3)"
+    )
+    # fp32 per-expert reference for the w13 scatter.
+    wdeq13 = _dequant_ref(w13, s13, zz13, q13)
+    ref_c1 = torch.zeros(TOPK, N13, device=dev, dtype=torch.float32)
+    for i in range(TOPK):
+        e = int(topk_ids[0, i])
+        ref_c1[i] = x[0].float() @ wdeq13[e].t()
+    scale = ref_c1.abs().max().item()
+    for name, out in (("default(<1,2>)", out_default), ("opt-out(<1,4>)", out_off), ("=2(<1,2>)", out_on)):
+        rel = ((out.float() - ref_c1).abs().max() / scale).item()
+        assert rel < 1e-1, f"NPT-flag gemm1 ({name}) too far from reference: {rel:.2e}"
+
+
+@pytest.mark.parametrize("layout", ["awq_kfirst", "awq_kfirst_sym"])
+def test_gfx906_moe_gemm_m1_shape_gate(layout):
+    """The default-on M=1 gemm2 V2 path is SHAPE-GATED: for a non-qualifying
+    shape (Nemotron-3.5-Lightning decode, K2=1856 not a multiple of 256) the
+    default must fall back to the legacy <1,4> tile — verified via the
+    dispatch-path marker (marker 2, same as explicit opt-out =0) and within
+    normal reference tolerance — while an explicit =1 fails closed
+    (TORCH_CHECK) instead of silently running a kernel that rejects the
+    shape. This is what keeps default-on safe for models whose gemm2 does not
+    meet the V2 tile's N%256==0 / K%256==0 / K<=2048 / groupsize%32==0
+    contract."""
+    import os
+
+    from vllm import _custom_ops as ops
+
+    # Nemotron-3.5-Lightning shapes (gs=64): gemm2 = [., 1856] x [1856, 2688]
+    N13, K13, N2, K2 = 1856, 2688, 2688, 1856
+    gs = 64
+    w13, s13, z13, _, _ = _make_layer(N13, K13, layout, gs)
+    w2, s2, z2, q2, zz2 = _make_layer(N2, K2, layout, gs)
+    wq13, sc13, zp13 = _repack_w4a16_gfx906_expert(w13, s13, z13)
+    wq2, sc2, zp2 = _repack_w4a16_gfx906_expert(w2, s2, z2)
+
+    dev = "cuda"
+    torch.manual_seed(2)
+    x = (torch.randn(1, K13, dtype=torch.float16) * 0.5).to(dev)
+    topk_ids = torch.randint(0, E, (1, TOPK), dtype=torch.int32).to(dev)
+    topk_w = torch.rand(1, TOPK, dtype=torch.float16).to(dev)
+    sorted_ids, expert_ids, ntp = moe_align_block_size(topk_ids, 1, E)
+    empty_tw = torch.empty(0, dtype=torch.float32, device=dev)
+
+    def gemm2():
+        c1 = torch.zeros(TOPK, N13, device=dev, dtype=torch.float16)
+        ops.moe_gptq_gemm_gfx906(
+            x,
+            c1,
+            wq13,
+            sc13,
+            zp13,
+            empty_tw,
+            sorted_ids,
+            expert_ids,
+            ntp,
+            TOPK,
+            1,
+            False,
+            0,
+            0,
+        )
+        inter = c1.contiguous()  # identity: Nemotron relu2 experts (N13 == K2)
+        out = torch.zeros(1, N2, device=dev, dtype=torch.float16)
+        ops.moe_gptq_gemm_gfx906(
+            inter,
+            out,
+            wq2,
+            sc2,
+            zp2,
+            topk_w.view(-1).float(),
+            sorted_ids,
+            expert_ids,
+            ntp,
+            1,
+            1,
+            True,
+            TOPK,
+            0,
+        )
+        return out
+
+    for k in ("VLLM_GFX906_MOE_M1", "VLLM_GFX906_MOE_NPT"):
+        os.environ.pop(k, None)
+    out_default = gemm2()
+    assert _take_path() == 2, (
+        "default M=1 gemm2 on a non-qualifying shape did not fall back to "
+        "the legacy <1,4> tile (marker != 2)"
+    )
+    os.environ["VLLM_GFX906_MOE_M1"] = "0"
+    try:
+        out_off = gemm2()
+    finally:
+        os.environ.pop("VLLM_GFX906_MOE_M1")
+    assert _take_path() == 2, (
+        "VLLM_GFX906_MOE_M1=0 did not select the legacy <1,4> gemm2 "
+        "(marker != 2)"
+    )
+
+    # Explicit =1 on a non-qualifying shape fails closed (TORCH_CHECK).
+    os.environ["VLLM_GFX906_MOE_M1"] = "1"
+    try:
+        with pytest.raises(RuntimeError, match="shape"):
+            gemm2()
+    finally:
+        os.environ.pop("VLLM_GFX906_MOE_M1")
+
+    # The fallback result must still be correct against the fp32 reference.
+    wdeq2 = _dequant_ref(w2, s2, zz2, q2, gs)
+    ref_out = torch.zeros(1, N2, device=dev, dtype=torch.float32)
+    c1 = torch.zeros(TOPK, N13, device=dev, dtype=torch.float16)
+    ops.moe_gptq_gemm_gfx906(
+        x,
+        c1,
+        wq13,
+        sc13,
+        zp13,
+        empty_tw,
+        sorted_ids,
+        expert_ids,
+        ntp,
+        TOPK,
+        1,
+        False,
+        0,
+        0,
+    )
+    inter = c1.contiguous()  # identity: Nemotron relu2 experts (N13 == K2)
+    for e in range(E):
+        for i in range(TOPK):
+            if topk_ids[0, i] != e:
+                continue
+            h = inter[i].float() @ wdeq2[e].t()
+            ref_out[0] += h * topk_w[0, i].float()
+    scale = ref_out.abs().max().item()
+    for name, out in (("default(fallback)", out_default), ("opt-out", out_off)):
+        rel = ((out.float() - ref_out).abs().max() / scale).item()
+        assert rel < 1e-1, f"shape-gate fallback gemm2 ({name}) too far: maxrel={rel:.2e}"
 
 
 if __name__ == "__main__":

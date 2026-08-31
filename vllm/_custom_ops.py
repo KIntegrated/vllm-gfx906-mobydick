@@ -773,6 +773,15 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
     ) -> None:
         return
 
+    def take_moe_m1_dispatch_path() -> int:
+        """Test-only: read-and-reset the M=1 gemm dispatch-path marker set by
+        the most recent moe_gptq_gemm_gfx906 call (0 = legacy <1,4> gemm1
+        opt-out, 1 = v2 512-thread gemm2, 2 = legacy <1,4> gemm2 fallback,
+        3 = default <1,2> gemm1). The M=1 kernels are atomic-accumulated and
+        not bit-reproducible run-to-run, so tests use this to verify which
+        tile actually ran (see csrc/rocm/moe_q_gemm_gfx906.cu)."""
+        return int(torch.ops._rocm_C.take_moe_m1_dispatch_path())
+
 
 def dense_gemv_gfx906(
     weight: torch.Tensor,

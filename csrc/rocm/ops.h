@@ -52,6 +52,14 @@ void moe_gptq_gemm_gfx906(torch::Tensor a, torch::Tensor c,
                           bool mul_topk_weight, int64_t output_topk,
                           int64_t zero_offset);
 
+// Test-only: returns the M=1 gemm dispatch-path marker set by the most recent
+// moe_gptq_gemm_gfx906 call (0 = legacy <1,4> gemm1 opt-out, 1 = v2 512-thread
+// gemm2, 2 = legacy <1,4> gemm2 fallback, 3 = default <1,2> gemm1) and resets
+// it to 0. Needed because the M=1 kernels are atomic-accumulated and therefore
+// not bit-reproducible run-to-run — output comparison cannot prove which tile
+// ran (see csrc/rocm/moe_q_gemm_gfx906.cu). Returns int64_t (schema "int").
+int64_t take_moe_m1_dispatch_path();
+
 // M<=4 W16A16 dense GEMM (GEMV-family) for gfx906 spec decode (L1').
 torch::Tensor dense_gemv_m4_gfx906(torch::Tensor weight, torch::Tensor x,
                                    int64_t kchunk);

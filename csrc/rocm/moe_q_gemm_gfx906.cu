@@ -25,6 +25,7 @@
 // accumulated with packed 64-bit CAS atomic-adds into a pre-zeroed output
 // tensor (no FP32 scratch buffer).
 
+#include <atomic>
 #include <cstdint>
 
 #include <torch/all.h>
@@ -619,6 +620,23 @@ static int select_n_per_thread(int block_size_m) {
                               expert_zeros_stride, mul_topk_weight,       \
                               output_topk, zero_offset, stream)
 
+// Test-only dispatch-path marker for the M=1 gemm tiles: records which kernel
+// dispatch_moe_gemm_q4 selected on the most recent call (read-and-reset via
+// take_moe_m1_dispatch_path_impl, wrapped at global scope by
+// take_moe_m1_dispatch_path for the public binding). The kernels accumulate
+// with packed CAS atomics (K-split), so their outputs are NOT bit-reproducible
+// run-to-run — even two calls of the SAME kernel differ by ~1 fp16 ulp. A
+// dispatch-path marker is therefore the only deterministic way for a test to
+// verify which tile actually ran. Values: 0 = legacy <1,4> gemm1 (MOE_NPT=4
+// opt-out), 1 = v2 512-thread gemm2, 2 = legacy <1,4> gemm2 (shape-gate
+// fallback / MOE_M1=0), 3 = <1,2> gemm1 (default). Non-M=1 calls never touch
+// it. Single-writer by construction (one dispatch per call).
+std::atomic<int> moe_m1_dispatch_path{0};
+
+int64_t take_moe_m1_dispatch_path_impl() {
+  return moe_m1_dispatch_path.exchange(0);
+}
+
 void dispatch_moe_gemm_q4(
     const half* a, half* c, const uint32_t* b_q_weight, const half* b_scales,
     const uint32_t* b_qzeros, const float* topk_weights,
@@ -628,31 +646,48 @@ void dispatch_moe_gemm_q4(
     int expert_weight_stride, int expert_scales_stride, int expert_zeros_stride,
     bool mul_topk_weight, int output_topk, int zero_offset, cudaStream_t stream) {
   const int npt = select_n_per_thread(block_size_m);
-  // M=1 decode fast path (VLLM_GFX906_MOE_M1=1, default off): only the
-  // gemm2 fused topk-weight/CAS path is re-tiled to the 512-thread
-  // lane-column kernel (26.8 -> 22.3 us/call in-model). The gemm1
-  // re-tile measured neutral (27.5 vs 26.8 us/call) and stays on the
-  // <1,4> kernel, so this path requires output_topk > 0 (gemm2). For
-  // gemm2 a = act_out [EM, N2] with EM = M*topk, so size_m ==
-  // output_topk identifies the single-token case.
+  // M=1 decode fast path (VLLM_GFX906_MOE_M1, default ON since the C2
+  // combined A/B): the gemm2 fused topk-weight/CAS path is re-tiled to the
+  // 512-thread lane-column kernel (26.8 -> 22.3 us/call in-model). The
+  // gemm1 re-tile measured neutral here and stays on the <1,4> kernel, so
+  // this path requires output_topk > 0 (gemm2). For gemm2 a = act_out
+  // [EM, N2] with EM = M*topk, so size_m == output_topk identifies the
+  // single-token case.
+  //
+  // The v2 kernel consumes 32 k-elements per iteration per wave and
+  // refreshes scale/zeros only at 32-aligned group boundaries, so it is
+  // CORRECT only when slice_k = size_k/8 is a multiple of 32 (===>
+  // size_k % 256 == 0) and groupsize % 32 == 0. Default-on therefore
+  // shape-gates: non-qualifying shapes (e.g. K > 2048, as in Nemotron-H's
+  // gemm2 K=2688) silently fall back to the legacy <1,4> tile — the exact
+  // path they used before this flag existed — so enabling the default can
+  // never change a model's numerics or crash it. The gate is M=1-only (inert
+  // at N>=2 / prefill). Set VLLM_GFX906_MOE_M1=0 to force the legacy <1,4>
+  // tile; =1 forces v2 and re-arms the shape assert (a forced bad shape is a
+  // programming error, not a fallback case). Combined TP=2 M=1 A/B
+  // (Qwen3.5-35B-A3B, pp2048/tg256, graph): +2.72 % vs off; see
+  // docs/gfx906/DEVLOG-moe-c2v.md "C2 combined TP=2 M=1 A/B".
   if (block_size_m == 1 && output_topk > 0 && size_m == output_topk) {
+    const bool v2_shape_ok =
+        size_n % 256 == 0 && size_k % 256 == 0 && size_k <= 2048 &&
+        groups > 0 && (size_k / groups) % 32 == 0;
     // Read per call (80x/step) so the flag can be flipped at runtime in
     // tests. Note: the flag only affects launches dispatched after the
     // flip — it has no effect on an already-captured CUDA graph (the
     // replayed kernel was chosen at capture time). The getenv cost is
     // negligible next to the launch.
     const char* m1_env = getenv("VLLM_GFX906_MOE_M1");
-    if (m1_env != nullptr && m1_env[0] != '0' && m1_env[0] != '\0') {
-      // The v2 kernel consumes 32 k-elements per iteration per wave and
-      // refreshes scale/zeros only at 32-aligned group boundaries, so it
-      // requires slice_k = size_k/8 to be a multiple of 32 (==>
-      // size_k % 256 == 0) and groupsize % 32 == 0; anything else would
-      // read past end_k or miss group refreshes.
+    const bool force_v2 = m1_env != nullptr && m1_env[0] == '1';
+    const bool disable_v2 = m1_env != nullptr && m1_env[0] == '0';
+    if (!disable_v2 && (force_v2 || v2_shape_ok)) {
+      // Only assert the shape when the user explicitly forced v2 (=1); a
+      // default-on non-qualifying shape is handled by the fallback above.
       TORCH_CHECK(
-          size_n % 256 == 0 && size_k % 256 == 0 && size_k <= 2048 &&
-              groups > 0 && (size_k / groups) % 32 == 0,
-          "moe_gemm_q4 v2 M=1 tile requires size_n%256==0, "
-          "size_k%256==0, size_k<=2048, groupsize%32==0");
+          !force_v2 || v2_shape_ok,
+          "VLLM_GFX906_MOE_M1=1 forces the v2 M=1 tile but the gemm2 shape "
+          "does not qualify (requires size_n%256==0, size_k%256==0, "
+          "size_k<=2048, groupsize%32==0); unset the flag to fall back");
+      moe_m1_dispatch_path.store(1);            // path 1: v2 gemm2
       launch_moe_gemm_q4_v2<512, 4, 256>(
           a, c, b_q_weight, b_scales, b_qzeros, topk_weights,
           sorted_token_ids, expert_ids, num_tokens_post_padded,
@@ -662,23 +697,40 @@ void dispatch_moe_gemm_q4(
       return;
     }
   }
-  // M=1 gemm1 re-tile trial (C2-V, opt-in): VLLM_GFX906_MOE_NPT=2
-  // selects the <1,2> kernel (64 cols/block vs <1,4>'s 128) for gemm1
-  // (output_topk == 0). Standalone sweep: 25.13 vs ~26.9 us/call
-  // (N=1024, K=2048); the in-model A/B was under-powered at 4 samples
-  // (see docs/gfx906/DEVLOG-moe-c2v.md, Stage 1). gemm2 keeps <1,4>
-  // (or the VLLM_GFX906_MOE_M1 v2 tile when that flag is on), so the
-  // two trial flags never touch the same kernel. Read per call like
-  // MOE_M1 (80x/step, negligible next to the launch) so tests can flip
-  // it at runtime; captured graphs replay the kernel chosen at capture.
+  // M=1 gemm1 re-tile (C2 combined A/B, default ON): the <1,2> kernel
+  // (64 cols/block vs <1,4>'s 128) for gemm1 (output_topk == 0). Standalone
+  // sweep: 25.13 vs ~26.9 us/call (N=1024, K=2048); the powered in-model A/B
+  // measured +2.82 % TP=2 M=1 / neutral TP=1 M=1 (see
+  // docs/gfx906/DEVLOG-moe-c2v.md "C2 combined TP=2 M=1 A/B"). Default-on is
+  // safe: the gate below is M=1-only (inert at N>=2 / prefill) and gemm2
+  // keeps <1,4> (or the MOE_M1 v2 tile when that flag is on), so the two
+  // flags never touch the same kernel. Set VLLM_GFX906_MOE_NPT=4 to force
+  // the legacy <1,4> M=1 gemm1 tile (=2 selects it explicitly; BM>=8 NPT
+  // tuning is unaffected — see select_n_per_thread). Read per call like
+  // MOE_M1 (80x/step, negligible next to the launch) so tests can flip it
+  // at runtime; captured graphs replay the kernel chosen at capture.
   const char* npt_env = getenv("VLLM_GFX906_MOE_NPT");
-  const bool m1_npt2 = block_size_m == 1 && output_topk == 0 &&
-      npt_env != nullptr && npt_env[0] == '2';
+  const bool m1_npt4 = block_size_m == 1 && output_topk == 0 &&
+      npt_env != nullptr && npt_env[0] == '4';
   switch (block_size_m) {
     case 1:
-      if (m1_npt2) {
-        LAUNCH_MOE(1, 2);
+      if (output_topk == 0) {
+        // gemm1: <1,2> is the default since the C2 combined A/B; MOE_NPT=4
+        // forces the legacy <1,4> tile.
+        if (m1_npt4) {
+          moe_m1_dispatch_path.store(0);       // path 0: legacy <1,4> gemm1
+          LAUNCH_MOE(1, 4);
+        } else {
+          moe_m1_dispatch_path.store(3);      // path 3: default <1,2> gemm1
+          LAUNCH_MOE(1, 2);
+        }
       } else {
+        // gemm2 fallback (v2 not taken: MOE_M1=0 or shape-gate miss). Keep
+        // the legacy <1,4> tile — the exact path that existed before any of
+        // these flags. The NPT default-on must NOT leak into gemm2: the A/B
+        // that promoted it only measured gemm1 on <1,2>, and the shape-gate
+        // fallback contract is "bit-identical to pre-flag behavior".
+        moe_m1_dispatch_path.store(2);        // path 2: legacy <1,4> gemm2
         LAUNCH_MOE(1, 4);
       }
       break;
@@ -712,6 +764,13 @@ void dispatch_moe_gemm_q4(
 
 }  // namespace moe_gptq_gfx906
 }  // namespace vllm
+
+// Public (global-scope) accessor for the M=1 dispatch-path marker; wraps the
+// namespaced impl so the torch binding can reach it. See the marker's doc
+// comment inside vllm::moe_gptq_gfx906 above.
+int64_t take_moe_m1_dispatch_path() {
+  return vllm::moe_gptq_gfx906::take_moe_m1_dispatch_path_impl();
+}
 
 // ---------------------------------------------------------------------------
 // Public entry point

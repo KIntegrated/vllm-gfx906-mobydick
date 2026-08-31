@@ -86,6 +86,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("moe_gptq_gemm_gfx906", torch::kCUDA,
                 &moe_gptq_gemm_gfx906);
 
+  // Test-only: read-and-reset the M=1 gemm dispatch-path marker (see
+  // csrc/rocm/moe_q_gemm_gfx906.cu). Lets tests assert which tile ran despite
+  // the kernels' atomic (non-bit-reproducible) accumulation. Zero-arg op:
+  // PyTorch requires a fallback registration, so it is bound for CPU too
+  // (the impl is a device-independent atomic exchange; returns 0 when no M=1
+  // gemm ran on this process).
+  rocm_ops.def("take_moe_m1_dispatch_path() -> int");
+  rocm_ops.impl("take_moe_m1_dispatch_path", torch::kCUDA,
+                &take_moe_m1_dispatch_path);
+  rocm_ops.impl("take_moe_m1_dispatch_path", torch::kCPU,
+                &take_moe_m1_dispatch_path);
+
   // M=1 W16A16 dense GEMV for gfx906 (Phase 3 P3-2b). Works on any ROCm
   // target; selected at runtime on gfx906.
   rocm_ops.def(
@@ -158,6 +170,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                Tensor? fp8_out_scale,"
       "                str mfma_type) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
+}
+
+// take_moe_m1_dispatch_path takes no tensors, so device dispatch has nothing
+// to key on; a CompositeExplicitAutograd impl makes it callable from Python
+// (same pattern as _C_cuda_utils' zero-tensor ops in
+// csrc/libtorch_stable/torch_bindings.cpp). The non-stable API registers the
+// raw function pointer directly (no TORCH_BOX, which is stable-ABI only).
+TORCH_LIBRARY_IMPL(TORCH_EXTENSION_NAME, CompositeExplicitAutograd, rocm_ops_impl) {
+  rocm_ops_impl.impl("take_moe_m1_dispatch_path", take_moe_m1_dispatch_path);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
