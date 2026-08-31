@@ -45,6 +45,19 @@ flight). 13 rows annotated `FULLY DEAD` in `DEAD-ENDS.md`; **no branch opened**
 
 ### G1 — decode-graph per-node replay-cost probe
 
+**STATUS: DONE 2026-08-31 — NODE COUNT IS NOT THE OWNER (hypothesis killed).**
+Probe `benchmarks/kernels/gfx906/g1_node_replay_probe.py` (decode-shaped
+graph, N ∈ {0,16,32,64} dummy no-op kernels/layer, wall-clock A/B replay):
+**~1.2 µs/node TP=1, ~1.1 µs/node TP=2** — linear across the whole range, an
+order of magnitude below the ~10 µs needed for node count to own the
+1.55 ms/step. 16–32 extra nodes/decode step ≈ 0.02–0.04 ms/step (~2 % of the
+unexplained cost). The remainder lives in TP=2 sync placement / other
+LEGACY=0-common per-step work (eager TP=2 can't isolate it — documented).
+Consequences: the refrigerated Q8-fusion lever stays refrigerated (halving
+~16–32 nodes saves ≤ ~0.03 ms/step, cannot close a 6 % gap); future
+adds-nodes-per-step proposals now carry a citable budget of **~1 µs/node**.
+Full record: `DEVLOG-fa-legacy0-b1-decode.md` (G1 addendum).
+
 The 2026-08-29 same-boot LEGACY adjudication
 (`DEVLOG-fa-legacy0-b1-decode.md`, boot O) left a bounded-but-unexplained
 **~1.55 ms/step** serving cost common to both LEGACY=0 arms, with the

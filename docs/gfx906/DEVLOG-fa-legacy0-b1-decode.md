@@ -127,3 +127,44 @@ at 2k context is ~25 ms, of which the subcomponent is ~92 us (0.4 %).
 
 VERDICT: DEAD-END (flip question closed; records: DEAD-ENDS.md,
 CHANGELOG; branch stays unmerged for review)
+
+## G1 addendum — per-node replay cost measured (2026-08-31, boot of this session)
+
+The "node-overhead point" (G1) above is now MEASURED, closing the last
+unmeasured hypothesis. Probe: `benchmarks/kernels/gfx906/
+g1_node_replay_probe.py` — captures a decode-shaped CUDA graph (40 layers ×
+3 real work kernels + 3 sink bookkeeping = 240 base nodes; TP=2 adds one
+allreduce per layer) and re-captures with N dummy no-op Triton launches
+appended per layer (N ∈ {0,16,32,64}); replays WARM=50 + ITERS=300, host wall
+time per replay incl. device sync (the vLLM decode-step shape).
+
+Results (same boot, GPUs idle at start):
+
+| config | N=0 base | slope us/node | linearity |
+|--------|----------|---------------|-----------|
+| TP=1   | 3206 µs/replay (240 nodes) | **1.20–1.23** | ~1.2 across all ΔN |
+| TP=2   | 3976 µs/replay (280 nodes) | **0.77–1.10** | ~1.1 across all ΔN |
+
+Per-node replay cost ≈ **1 µs/node**, an order of magnitude below the ~10 µs
+that would be needed for node count to own the 1.55 ms/step. At the real
+LEGACY=0 delta (16–32 extra nodes/decode step) this is only
+**~0.02–0.04 ms/step** — ~2 % of the unexplained cost, not the owner.
+
+Consequence for the roadmap:
+- G1's falsifiable branch taken: **node count is NOT the owner** of the
+  ~1.55 ms/step. The remainder lives in TP=2 sync placement / other
+  LEGACY=0-common per-step work (eager TP=2 can't isolate it — documented).
+- The refrigerated Q8-fusion lever (fuse the Q8 write into
+  `triton_reshape_and_cache_flash`) does NOT reopen on this evidence: halving
+  ~16–32 nodes saves at most ~0.03 ms/step, which cannot close a 6 % gap. It
+  stays refrigerated.
+- Budget for future adds-nodes-per-step proposals (MoE routing fusion,
+  spec-decode extensions, KV-side writes): **~1 µs/node** of replay overhead
+  on this stack — cheap, but now bounded and citable rather than a guess.
+
+Note: `torch.cuda.device_count()` misreports 0 on this ROCm 7.14 stack even
+with GPUs present (rocm-smi + real HIP init both fine); the TP=2 launcher
+(`/local/tmp/g1_tp2_launch.sh`) pins each rank to its own GPU via
+HIP_VISIBLE_DEVICES before torch import and inits NCCL without device_id, so
+the probe runs despite that quirk.
+
