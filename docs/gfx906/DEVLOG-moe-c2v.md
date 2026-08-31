@@ -331,17 +331,21 @@ case a V1 variant becomes a dispatch candidate.
   (64 KB stream), v1d `<32,1>` = 256 blocks × 32 cols (32 KB), v1e `<16,1>`
   = 512 blocks × 16 cols (16 KB). Added to both the correctness section
   (vs fp32 CPU reference) and the timing section.
-- Corrected-harness PASS flow re-run: 3 full runs of `moe_m1_harness 2000`
+- Corrected-harness PASS flow re-run: 4 full runs of `moe_m1_harness 2000`
   (boot P, host clean — canary 9.9 TFLOP/s fp16 both GPUs pre-run, no
-  amdgpu resets in journal since boot). All checks green; records in
-  `/local/tmp/c2finish/` (run_main_2000.log, run_rep2.log, run_rep3.log).
+  amdgpu resets in journal since boot; a hipDeviceProp warpSize probe was
+  also run). All checks green; records in `/local/tmp/c2finish/`
+  (run_main_2000.log, run_rep2.log, run_rep3.log, run_final.log — the last
+  two after the comment-only edits, confirming no behavior change).
 
 ### Evidence — FOR (axis closure)
 
 All five V1 variants correct vs CPU ref (max abs err 0.2511 each = the
-fp16-accumulation noise band of v1a/v1b and v2; gate 0.35):
+fp16-accumulation noise band of v1a/v1b and v2; gate 0.35). "Per-block
+weight read" = cols/block × K/2 bytes (each output column is a K/2-byte
+W4 weight strip):
 
-| variant | blocks × cols/block | per-block stream | µs/launch (3-run median) | vs current 28.7 |
+| variant | blocks × cols/block | per-block weight read | µs/launch (3-run median) | vs current 28.7 |
 |---|---|---|---|---|
 | current (gemm1, pre-zeroed) | 64 × 1024 (z=8 CAS) | — | 28.70–28.79 | — |
 | v1a `<32,4>` (record 117.2–117.4) | 64 × 128 | 128 KB | 115.58–115.60 | **4.0× slower** |
@@ -350,23 +354,32 @@ fp16-accumulation noise band of v1a/v1b and v2; gate 0.35):
 | v1d `<32,1>` (NEW) | 256 × 32 | 32 KB | 74.82–74.86 | **2.6× slower** |
 | v1e `<16,1>` (NEW) | 512 × 16 | 16 KB | 87.45–87.47 | **3.0× slower** |
 
-- The block-count axis is **non-monotone and never approaches current**:
-  64→128 blocks costs +23 µs (v1c), 128→256 saves −7 µs (v1d, the best V1
-  point ever measured — still 2.6× off), 256→512 costs +13 µs (v1e).
-  Halving the per-block stream did NOT recover in-flight bandwidth.
-- N-splitting DOES buy something: v1d (256 blocks) is −35 % vs v1a
-  (64 blocks), consistent with the original stream-length mechanism being
-  partially right — but it cannot close a 2.6× gap, so an additional
-  structural cost survives N-splitting: every V1 block walks the full
-  64-iteration K-loop over K=2048 (current's z-split blocks walk 8), so
-  per-block memory-level parallelism is capped regardless of how many such
-  blocks are launched.
+- The best point of all five variants is v1b (64 blocks, 128 KB/block):
+  59.0 µs — still **2.1× slower than current**. Every N-split variant
+  (v1c/v1d/v1e = 64/32/16 KB/block) is SLOWER than v1b: +22.9 / +15.8 /
+  +28.5 µs, and the axis is non-monotone within the N-split family
+  (128→256→512 blocks = 81.9→74.8→87.5 µs). No variant approaches
+  current's 28.7 µs at any block count.
+- **Confound noted (mechanism not cleanly isolated):** the N-split variants
+  shorten the per-block stream *and* drop to half/quarter-wavefront blocks
+  (v1c/v1d = 32 threads, v1e = 16) at the same time, whereas v1b is 2 full
+  wavefronts/block. The v1a-vs-v1b pair (both 64 blocks / 128 cols / 128 KB
+  stream; only wavefront config differs) shows that config dominates — v1b's
+  2 full wavefronts beat v1a's half wavefront ~2× (59.0 vs 115.6 µs). So the
+  N-split loss is a mix of shorter-stream and fewer-wavefront effects, and
+  this data **neither confirms nor falsifies** the original stream-length
+  mechanism in isolation — but it does show that adding blocks to shorten the
+  stream buys nothing on top of the best V1 point. The residual structural
+  cost common to all V1 variants is the per-block K-loop length: every V1
+  block walks the full 64-iteration K-loop over K=2048 (current's z-split
+  blocks walk 8), capping per-block memory-level parallelism regardless of
+  tiling.
 - v1e `<16,1>` (512 blocks) is slower than v1d `<32,1>` (256 blocks): both
   have NPT=1, so the only difference is threads/block — 16 vs 32. On this
   gfx906 `warpSize = 64` (hipDeviceProp probe), so a 32-thread block already
   runs at half-wavefront occupancy and a 16-thread block at a quarter; v1e
   issues fewer concurrent loads per block than v1d, which is why it loses.
-- Corrected-harness PASS flow: `HARNESS PASS` ×3. v1a/v1b bands match the
+- Corrected-harness PASS flow: `HARNESS PASS` ×4. v1a/v1b bands match the
   08-19 records (117.2–117.4 / 60.4–60.5) within 2.5 % (115.6 / 59.0);
   current's pre-zeroed time reads 28.7 here vs the 08-19 record 26.9
   (~+7 %, boot/build-to-build drift — the A/B ratios in this entry are
@@ -374,23 +387,26 @@ fp16-accumulation noise band of v1a/v1b and v2; gate 0.35):
 
 ### Evidence — AGAINST (a V1 dispatch candidate)
 
-(none needed — the axis closes on the FOR side: best-ever V1 point is
-74.8 µs vs current 28.7; even at 512 blocks the full-K-loop structure
-loses by 2.6×.)
+(none needed — the axis closes on the FOR side: the best of all five V1
+variants is v1b at 59.0 µs vs current's 28.7, a 2.1× gap; no variant
+comes within an order of magnitude, so a serving A/B is unreachable.)
 
 ### Why it failed (mechanism, refined)
 
-The original mechanism ("one long stream can't stay in flight") was
-necessary but not sufficient: splitting N multiplies independent streams
-and still loses. The structural cost that survives N-splitting is the
-per-block K-loop length: every V1 block walks all 64 K-iterations of
-K=2048 on at most one wavefront, so per-block memory-level parallelism is
-capped no matter how many such blocks are launched; current's z-split
-blocks walk 8 iterations each and get 8× K-parallel streams per
-(slot, n-tile) for free. N-splitting only moves the operating point along
-the V1 family (best-ever 74.8 µs at 256 blocks) — it cannot cross to
-current's 28.7 µs. The V1 family is closed at every measured block count;
-the axis is exhausted without a serving gate.
+The N-split axis closes on measurement, not on a clean mechanism proof:
+every block count loses by ≥2.1× vs current, and the best V1 point (v1b,
+59.0 µs) is untouched by adding blocks — every N-split variant is slower
+than it. The v1a-vs-v1b pair isolates one clean effect (wavefront config:
+2 full wavefronts beat a half wavefront ~2× at equal block count and
+stream length), but the N-split variants confound shorter streams with
+fewer wavefronts, so the original stream-length mechanism is neither
+confirmed nor falsified by this data. What IS established for all V1
+variants: a structural cost common to the family — every V1 block walks
+all 64 K-iterations of K=2048 (current's z-split blocks walk 8), capping
+per-block memory-level parallelism regardless of tiling. N-splitting only
+moves the operating point along the V1 family (best-ever 59.0 µs at v1b) —
+it cannot cross to current's 28.7 µs. The V1 family is closed at every
+measured block count; the axis is exhausted without a serving gate.
 
 ### In-tree state after this verdict
 

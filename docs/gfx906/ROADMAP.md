@@ -181,15 +181,17 @@ unmeasured, not rejected. Remaining:
 - measure and, if useful, re-tile the BM≥2 grouped path for concurrent
   decode (the only open axis — needs a multi-hour serving A/B session);
 - ~~build the V1 N-split/direct-store variant (128/256/512 blocks)~~
-  **CLOSED 2026-08-31**: all five V1 variants correct; the new N-split
-  points lose by ≥2.6× vs current (best-ever point v1d, 256 blocks @
-  74.8 µs vs current 28.7; non-monotone in block count) — the per-block
-  full-K loop caps memory-level parallelism regardless of stream
-  splitting; axis is measured-and-rejected, no serving gate reachable at
-  that margin (`DEVLOG-moe-c2v.md` "V1 N-split axis"; DEAD-ENDS row
-  annotated);
+  **CLOSED 2026-08-31**: all five V1 variants correct; every new N-split
+  point is SLOWER than the existing best V1 point (v1b, 64 blocks @ 59.0 µs),
+  and none comes within 2.1× of current (best N-split v1d, 256 blocks:
+  74.8 vs 28.7). Adding blocks to shorten the per-block stream buys nothing;
+  the v1a-vs-v1b pair isolates wavefront config as a ~2× effect, but the
+  N-split variants confound stream length with wavefront count (mechanism
+  not cleanly isolated — see devlog). Axis is measured-and-rejected at every
+  block count, no serving gate reachable at that margin (`DEVLOG-moe-c2v.md`
+  "V1 N-split axis"; DEAD-ENDS row annotated);
 - ~~rerun the corrected standalone harness PASS flow~~ **DONE 2026-08-31**:
-  `HARNESS PASS` ×3 (boot P, clean host), v1a/v1b bands match the 08-19
+  `HARNESS PASS` ×4 (boot P, clean host), v1a/v1b bands match the 08-19
   records within 2.5 % — old S5 microbenchmark numbers re-validated.
 
 See `DEVLOG-moe-c2v.md` (incl. "Combined default-on decision" and
