@@ -34,6 +34,7 @@ from __future__ import annotations
 import os
 import statistics
 import sys
+import time
 
 import torch
 import triton
@@ -101,8 +102,6 @@ def measure(g: torch.cuda.CUDAGraph, device: torch.device) -> dict:
         g.replay()
     torch.cuda.synchronize(device)
     times = []
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
     import time as _time
 
     for _ in range(ITERS):
@@ -133,9 +132,10 @@ def main():
         _dist.init_process_group(backend="nccl")
         dist = _dist
     else:
-        device = torch.device(
-            "cuda", int(os.environ.get("HIP_VISIBLE_DEVICES", 0))
-        )
+        # Non-distributed: the caller pins the GPU via HIP_VISIBLE_DEVICES
+        # (a visibility mask, per repo convention), so this process sees
+        # exactly one device — always "cuda" in its view.
+        device = torch.device("cuda")
 
     rank = int(os.environ.get("RANK", 0))
     if rank == 0:
