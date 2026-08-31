@@ -202,6 +202,12 @@ See `DEVLOG-moe-c2v.md` (incl. "Combined default-on decision" and
   12 MB of active W4 weights per layer. The result determines whether
   C2's target should be based on the HBM floor or on latency/occupancy
   rather than on the current kernel's apparent bandwidth.
+  **DONE 2026-08-31** (measurement; `DEVLOG-moe-residency.md`): combined
+  active W4 set = 12.47 MB > 8 MB L2/TCC ⇒ not fully resident, but the
+  production gemm1 `<1,4>` M=1 kernel achieves only ~195 GB/s ≈ **24% of the
+  HBM floor** / <64% of its working set's achievable read BW. Binding
+  constraint at M=1 is **latency/occupancy (MLP), not the HBM floor** ⇒ C2's
+  target = close that read-BW gap (~2×+ headroom before bandwidth binds).
 
 ### C3 — fold the two MoE zeroings (234 µs/step)
 
