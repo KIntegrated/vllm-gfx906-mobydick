@@ -26,6 +26,19 @@ pytestmark = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _clear_once_caches():
+    """info_once/warning_once dedupe via module-level lru_cache; clear them so
+    reruns of these tests (e.g. pytest --count) don't see suppressed records."""
+    from vllm.logger import _print_info_once, _print_warning_once
+
+    _print_info_once.cache_clear()
+    _print_warning_once.cache_clear()
+    yield
+    _print_info_once.cache_clear()
+    _print_warning_once.cache_clear()
+
+
 def _make_config():
     from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 
@@ -78,8 +91,6 @@ def _patch_wna16(monkeypatch) -> tuple[list, object]:
 def test_gfx906_fallback_is_single_info(caplog, monkeypatch):
     """gfx906: intentional fallback -> one info line, no warning; the WNA16
     path is still taken for every layer (behavior unchanged)."""
-    import vllm.model_executor.layers.quantization.auto_awq as auto_awq
-
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.auto_awq.on_gfx906", lambda: True
     )
@@ -117,10 +128,6 @@ def test_non_gfx906_fallback_keeps_warning(caplog, monkeypatch):
     """Platforms where the Marlin->WNA16 fallback is unexpected keep the
     per-layer warning. ``warning_once`` dedupes by (message, prefix) — so a
     repeated call for the same layer yields one record, exactly as before N1."""
-    import vllm.model_executor.layers.quantization.auto_awq as auto_awq
-
-    # Non-gfx906 platform (e.g. other ROCm arch): the fallback is unexpected,
-    # so the per-layer warning is retained (deduped by warning_once).
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.auto_awq.on_gfx906", lambda: False
     )
