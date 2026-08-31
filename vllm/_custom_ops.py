@@ -806,6 +806,41 @@ def dense_gemv_m4_gfx906(
     return torch.ops._rocm_C.dense_gemv_m4_gfx906(weight, x, kchunk)
 
 
+def dense_gemv_i8_gfx906(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    x: torch.Tensor,
+    kchunk: int,
+) -> torch.Tensor:
+    """M=1 W8A16 int8-weight dense GEMV for gfx906 (NH-2'; see
+    csrc/rocm/dense_gemv_gfx906.cu).
+
+    ``weight`` [N, K] row-major pre-shifted signed int8
+    (CompressedTensorsW8A16ChannelDequant convention: w = weight * scale),
+    ``scale`` [N] fp16 per-channel, ``x`` [K] fp16. ``kchunk`` 1024, 2048
+    or 4096 BYTES of weight per thread-slice (ksplit = ceil(K / kchunk); a
+    partial tail block contributes zero). K % 16 == 0 required. Returns ``out``
+    [1, N] fp16. RPT defaults to the gfx906-measured rule; override with
+    VLLM_GFX906_GEMV_I8_RPT for micro-bench sweeps.
+    """
+    return torch.ops._rocm_C.dense_gemv_i8_gfx906(weight, scale, x, kchunk)
+
+
+def dense_gemv_i8_m4_gfx906(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    x: torch.Tensor,
+    kchunk: int,
+) -> torch.Tensor:
+    """M<=4 W8A16 int8-weight dense GEMM (GEMV-family) for gfx906 spec
+    decode (NH-2'). Same conventions as ``dense_gemv_i8_gfx906``; ``x`` is
+    [M, K] with 1 <= M <= 4. Returns ``out`` [M, N] fp16. Weight traffic is
+    M-invariant (row-parallel); the K-split CAS epilogue requires N % RPT ==
+    0. RPT is 2 or 4 (VLLM_GFX906_GEMV_I8_RPT for sweeps; default 2).
+    """
+    return torch.ops._rocm_C.dense_gemv_i8_m4_gfx906(weight, scale, x, kchunk)
+
+
 def moe_topk_softmax_m1_gfx906(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -852,6 +887,39 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
             (x.size(0), weight.size(0)),
             dtype=weight.dtype,
             device=weight.device,
+        )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "dense_gemv_i8_gfx906"
+):
+
+    @register_fake("_rocm_C::dense_gemv_i8_gfx906")
+    def _dense_gemv_i8_gfx906_fake(
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        x: torch.Tensor,
+        kchunk: int,
+    ) -> torch.Tensor:
+        # Output is fp16 like the input activations (x), not the int8 weight.
+        return torch.empty(
+            (1, weight.size(0)), dtype=x.dtype, device=weight.device
+        )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "dense_gemv_i8_m4_gfx906"
+):
+
+    @register_fake("_rocm_C::dense_gemv_i8_m4_gfx906")
+    def _dense_gemv_i8_m4_gfx906_fake(
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        x: torch.Tensor,
+        kchunk: int,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (x.size(0), weight.size(0)), dtype=x.dtype, device=weight.device
         )
 
 

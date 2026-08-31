@@ -54,6 +54,28 @@ __all__ = ["CompressedTensorsW8A16ChannelDequant"]
 
 _DEQUANT_CHUNK_ROWS = 8192
 _ENV_INT8 = "VLLM_GFX906_W8A16_INT8"
+# NH-2': CUDA byte-load + in-register per-channel dequant GEMV family
+# (dense_gemv_i8_gfx906 / dense_gemv_i8_m4_gfx906), opt-in on top of the
+# int8 path. Supported: M <= 4, K % 16 == 0, N even; everything else
+# falls back to the Triton kernels below (bit-exact same convention).
+_ENV_INT8_CUDA = "VLLM_GFX906_W8A16_INT8_CUDA"
+
+
+def _i8_cuda_kchunk(k: int) -> int | None:
+    """KC (bytes of weight per thread-slice) for a given K, or None when the
+    CUDA family cannot serve it. KC must be in {1024, 2048, 4096} (whole
+    wavefronts); ksplit = ceil(K / KC)."""
+    if k % 16 != 0:
+        return None
+    for kc in (2048, 4096):
+        if kc >= k:
+            return kc
+    # K > 4096: split only when divisible by a supported KC.
+    if k % 2048 == 0:
+        return 2048
+    if k % 1024 == 0:
+        return 1024
+    return None
 
 
 @triton.jit
@@ -375,7 +397,27 @@ class CompressedTensorsW8A16ChannelDequant(CompressedTensorsScheme):
                 x2d = x2d.contiguous()
             w = layer.weight_i8.data
             s = layer.weight_scale.data.squeeze(-1)
-            if x2d.shape[0] == 1:
+            m = x2d.shape[0]
+            # NH-2': CUDA byte-load + in-register per-channel dequant
+            # (opt-in on top of the int8 path; A/B-gated, default off).
+            # M=1 routes through the M<=4 kernel too (M is a template
+            # parameter there) so one dispatch covers the whole serving
+            # range; kchunk selection and the fallback to Triton are
+            # shape-driven.
+            if (
+                os.environ.get(_ENV_INT8_CUDA, "0") == "1"
+                and m <= 4
+                and w.shape[0] % 2 == 0
+            ):
+                kc = _i8_cuda_kchunk(w.shape[1])
+                if kc is not None:
+                    from vllm import _custom_ops as ops
+
+                    out = ops.dense_gemv_i8_m4_gfx906(
+                        w, s, x2d.contiguous(), kc
+                    )
+                    return out.view(*x.shape[:-1], out.shape[-1])
+            if m == 1:
                 out = w8a16_gemv(w, s, x2d[0].contiguous())
             else:
                 out = w8a16_gemm(w, s, x2d)

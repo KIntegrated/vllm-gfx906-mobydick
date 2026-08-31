@@ -56,6 +56,21 @@ void moe_gptq_gemm_gfx906(torch::Tensor a, torch::Tensor c,
 torch::Tensor dense_gemv_m4_gfx906(torch::Tensor weight, torch::Tensor x,
                                    int64_t kchunk);
 
+// M=1 W8A16 int8-weight dense GEMV for gfx906 (NH-2'; see
+// dense_gemv_gfx906.cu). weight [N, K] row-major pre-shifted signed int8
+// (CompressedTensorsW8A16ChannelDequant convention: w = weight * scale),
+// scale [N] fp16 per-channel, x [K] fp16. kchunk 512|1024|2048|4096 BYTES
+// of weight per thread-slice (must divide K when split; >= K means a
+// single pass). K % 16 == 0 required. Returns out [1, N] fp16.
+torch::Tensor dense_gemv_i8_gfx906(torch::Tensor weight, torch::Tensor scale,
+                                   torch::Tensor x, int64_t kchunk);
+
+// M<=4 W8A16 int8-weight dense GEMM (GEMV-family) for gfx906 spec decode
+// (NH-2'). Same conventions as dense_gemv_i8_gfx906; x is [M, K] with
+// 1 <= M <= 4. Returns out [M, N] fp16.
+torch::Tensor dense_gemv_i8_m4_gfx906(torch::Tensor weight, torch::Tensor scale,
+                                      torch::Tensor x, int64_t kchunk);
+
 // M=1 W16A16 dense GEMV for gfx906 (P3-2b; see dense_gemv_gfx906.cu).
 // weight [N, K] row-major fp16, x [1, K] fp16, kchunk 512|1024|2048|4096 (divides K).
 // Returns out [1, N] fp16.

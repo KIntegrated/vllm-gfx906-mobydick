@@ -97,6 +97,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "dense_gemv_m4_gfx906(Tensor weight, Tensor x, int kchunk) -> Tensor");
   rocm_ops.impl("dense_gemv_m4_gfx906", torch::kCUDA, &dense_gemv_m4_gfx906);
 
+  // M=1 W8A16 int8-weight dense GEMV for gfx906 (NH-2'). weight [N, K]
+  // pre-shifted signed int8, scale [N] fp16 per-channel, x [K] fp16.
+  rocm_ops.def(
+      "dense_gemv_i8_gfx906(Tensor weight, Tensor scale, Tensor x, int kchunk) -> Tensor");
+  rocm_ops.impl("dense_gemv_i8_gfx906", torch::kCUDA, &dense_gemv_i8_gfx906);
+
+  // M<=4 W8A16 int8-weight dense GEMM (GEMV-family) for gfx906 spec decode
+  // (NH-2'). x is [M, K], 1 <= M <= 4.
+  rocm_ops.def(
+      "dense_gemv_i8_m4_gfx906(Tensor weight, Tensor scale, Tensor x, int kchunk) -> Tensor");
+  rocm_ops.impl("dense_gemv_i8_m4_gfx906", torch::kCUDA, &dense_gemv_i8_m4_gfx906);
+
   // M=1 fused top-k softmax router for gfx906 (S2; E=256, topk=8).
   // Works on any ROCm target; selected at runtime on gfx906 for the
   // exact decode shape (M==1, half, softmax, no bias/padding).

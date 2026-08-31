@@ -589,6 +589,355 @@ __global__ void __launch_bounds__(KCHUNK / 8)
   }
 }
 
+// ---------------------------------------------------------------------------
+// W8A16 int8-weight GEMV family (NH-2', 2026-08-30).
+//
+//   out[1, N] = s[n] * sum_k w_i8[n, k] * x[k]       M=1
+//   out[M, N] = s[n] * sum_k w_i8[n, k] * x[m, k]    1 <= M <= 4
+//
+// Row-parallel, same structure as the fp16 kernels above, but each thread
+// owns a 16-byte (16 int8) weight slice and dequantizes it in-register to
+// half2 pairs (__int2half_rn; gfx906 has no integer dot product, so the MACs
+// run through the existing __ockl_fdot2 chain). Weight bytes per step are
+// halved vs the fp16 family: at Nemotron's mid-N dense shapes the fp16
+// kernels sit at 400-790 GB/s while Triton int8 reaches only 170-600 (NH-2
+// NO-GO, DEVLOG-nemotron-h.md); P2 measured i8-row at 741 GB/s on the big
+// rows (int8_gemv_probe.py). The serving mode (ngram spec n=5 -> M=6/step)
+// needs the M<=4 CUDA path to win at mid-N — that is the NH-2' gate. These
+// are exactly the K=2688 shapes (in_proj/out_proj/qkv/lm_head) and o_proj
+// (K=2048) that the fp16 GEMV dispatch does NOT reach (_llmm1_tiny_m only
+// routes K in {2048,512} at M=1; _gfx906_spec_gemv_m4 requires k%512==0 and
+// 2688/512 is not integral).
+//
+// w_i8 is the pre-shifted signed-int8 view served by
+// CompressedTensorsW8A16ChannelDequant (byte ^ 0x80 at load, plain two's
+// complement; w = w_i8 * s per P2's 3-op convention). s is fp16 [N], one
+// scale per output row (per-channel — P2 measured per-128-group scales cost
+// +28 %). Scale application:
+//   M=1, ksplit==1 : in the epilogue, after the K reduction (one mul/row)
+//   M=1, ksplit>1  : partials accumulate UNSCALED through the packed CAS; a
+//                    dense_gemv_i8_scale kernel scales them on the same
+//                    stream afterwards (no per-chunk rounding at all)
+//   M<=4          : the epilogue scales its fp32 partials before the packed
+//                    CAS (one extra fp16 rounding per chunk — the fp16
+//                    dense_gemv_m_kernel makes the identical trade; the
+//                    ksplit>1 M<=4 shapes are small)
+//
+// KC is BYTES of weight per thread-slice = 16 int8. THREADS = KC/16 must be
+// a whole number of 64-lane wavefronts (the shfl+LDS reduction assumes it),
+// so KC in {1024, 2048, 4096} -> 64 | 128 | 256 threads. K % 16 == 0 is
+// required for the aligned uint4 loads. KC need NOT divide K: ksplit =
+// ceil(K / KC); a thread whose slice [k0 + t*16, k0 + t*16 + 16) starts at or
+// past K contributes zero via the inb mask (the slice is either fully in-
+// bounds or fully out — both K and the slice edges are multiples of 16).
+// Real Nemotron int8 dense Ks: 2688 (KC=2048 -> ksplit=2 with a 640-element
+// tail block; KC=4096 -> single pass) and 2048 (KC=2048 single pass).
+
+// Signed two's-complement byte -> int (bytes >= 0x80 read as -128..-1; the
+// scheme stores pre-shifted signed int8, so a plain (short)(b) cast would
+// sign-extend from the wrong width).
+__forceinline__ __device__ int i8_byte(int b) { return b >= 0x80 ? b - 256 : b; }
+
+__forceinline__ __device__ void dequant_i8_to_h2(const uint4 u, half2 (&h)[8]) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const unsigned word = ((const unsigned*)&u)[i];
+    h[2 * i] = __halves2half2(
+        __int2half_rn(i8_byte((word >> 0) & 0xff)),
+        __int2half_rn(i8_byte((word >> 8) & 0xff)));
+    h[2 * i + 1] = __halves2half2(
+        __int2half_rn(i8_byte((word >> 16) & 0xff)),
+        __int2half_rn(i8_byte((word >> 24) & 0xff)));
+  }
+}
+
+template <int RPT, int KC>
+__global__ void __launch_bounds__(KC / 16)
+    dense_gemv_i8_kernel(const half* __restrict__ x,   // [K]
+                         const signed char* __restrict__ w,  // [N, K]
+                         const half* __restrict__ s,   // [N]
+                         half* __restrict__ out,       // [N], pre-zeroed if KSPLIT>1
+                         const int N, const int K,
+                         const int ksplit) {
+  static_assert(KC == 1024 || KC == 2048 || KC == 4096,
+                "KC must be 1024, 2048 or 4096 (whole wavefronts)");
+  static_assert(RPT == 2 || RPT == 4, "RPT must be 2 or 4");
+  constexpr int THREADS = KC / 16;
+  static_assert(THREADS % 64 == 0, "KC/16 must be a whole number of wavefronts");
+  constexpr int WARPS = THREADS / 64;
+  const int t = threadIdx.x;
+  const int row0 = blockIdx.x * RPT;
+  const int k0 = blockIdx.y * KC;
+
+  // This thread covers 16 int8 weights at element indices [k0 + t*16,
+  // k0 + t*16 + 16), so it needs 16 halves of x = two uint4s. (An fp16
+  // thread covers only 8 elements / one uint4; the int8 slice is 2x wider in
+  // element count because a byte holds one weight, not half.)
+  const bool inb = (k0 + t * 16) < K;  // slice fully in-bounds or fully out
+  union {
+    uint4 u;
+    half2 h2[4];
+  } xa0, xa1;
+  if (inb) {
+    xa0.u = *(const uint4*)(x + k0 + t * 16);      // x[k0+t*16 .. +7]
+    xa1.u = *(const uint4*)(x + k0 + t * 16 + 8);  // x[k0+t*16+8 .. +15]
+  }
+
+  float acc[RPT];
+#pragma unroll
+  for (int r = 0; r < RPT; ++r) {
+    const int row = row0 + r;
+    if (row >= N || !inb) {
+      acc[r] = 0.0f;
+      continue;
+    }
+    half2 wh[8];
+    dequant_i8_to_h2(*(const uint4*)(w + (int64_t)row * K + k0 + t * 16), wh);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      // wh[i] holds weights at element offsets 2i,2i+1; pair with the same
+      // x offsets: h2[0..3] from xa0 (offsets 0..7), h2[4..7] from xa1 (8..15).
+      const half2& xx = (i < 4) ? xa0.h2[i] : xa1.h2[i - 4];
+      acc[r] = __ockl_fdot2(wh[i], xx, acc[r], true);
+    }
+  }
+
+  // Reduce the K-split within this block (THREADS/64 wavefronts) — mirrors
+  // the fp16 dense_gemv_kernel exactly.
+#pragma unroll
+  for (int mask = 32; mask >= 1; mask /= 2) {
+#pragma unroll
+    for (int r = 0; r < RPT; ++r)
+      acc[r] += __shfl_xor(acc[r], mask);
+  }
+
+  if constexpr (WARPS == 1) {
+    // Single wavefront: lane r < RPT holds row r's full sum.
+    if (t < RPT) {
+      const int row = row0 + t;
+      if (row >= N) return;
+      if (ksplit == 1) {
+        // Single pass: scale in the epilogue (P2: after the reduction).
+        out[row] = __float2half_rn(acc[t] * __half2float(s[row]));
+      } else if constexpr (RPT == 4) {
+        if (t == 0)
+          atomic_add_pk4_f16(
+              out + row0,
+              __halves2half2(__float2half_rn(acc[0]), __float2half_rn(acc[1])),
+              __halves2half2(__float2half_rn(acc[2]), __float2half_rn(acc[3])));
+      } else {
+        if (t == 0)
+          atomic_add_pk2_f16(
+              out + row0,
+              __halves2half2(__float2half_rn(acc[0]), __float2half_rn(acc[1])));
+      }
+    }
+  } else {
+    __shared__ float red_smem[RPT][8];  // WARPS <= 4 (KC <= 4096)
+    const int warp = t / 64;
+    const int lane = t % 64;
+    if (lane < RPT) red_smem[lane][warp] = acc[lane];
+    __syncthreads();
+    if (warp == 0 && lane < RPT) {
+      const int row = row0 + lane;
+      if (row >= N) return;
+      float sum = 0.0f;
+#pragma unroll
+      for (int wp = 0; wp < WARPS; ++wp) sum += red_smem[lane][wp];
+      if (ksplit == 1) {
+        out[row] = __float2half_rn(sum * __half2float(s[row]));
+      } else if constexpr (RPT == 4) {
+        if (lane == 0) {
+          float s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+#pragma unroll
+          for (int wp = 0; wp < WARPS; ++wp) {
+            s1 += red_smem[1][wp];
+            s2 += red_smem[2][wp];
+            s3 += red_smem[3][wp];
+          }
+          atomic_add_pk4_f16(
+              out + row0,
+              __halves2half2(__float2half_rn(sum), __float2half_rn(s1)),
+              __halves2half2(__float2half_rn(s2), __float2half_rn(s3)));
+        }
+      } else {
+        if (lane == 0) {
+          float s1 = 0.0f;
+#pragma unroll
+          for (int wp = 0; wp < WARPS; ++wp) s1 += red_smem[1][wp];
+          atomic_add_pk2_f16(
+              out + row0,
+              __halves2half2(__float2half_rn(sum), __float2half_rn(s1)));
+        }
+      }
+    }
+  }
+}
+
+template <int RPT, int KC, int M>
+__global__ void __launch_bounds__(KC / 16)
+    dense_gemv_i8_m_kernel(const half* __restrict__ x,   // [M, K]
+                           const signed char* __restrict__ w,  // [N, K]
+                           const half* __restrict__ s,   // [N]
+                           half* __restrict__ out,       // [M, N], pre-zeroed if KSPLIT>1
+                           const int N, const int K,
+                           const int ksplit) {
+  static_assert(KC == 1024 || KC == 2048 || KC == 4096,
+                "KC must be 1024, 2048 or 4096 (whole wavefronts)");
+  static_assert(RPT == 2 || RPT == 4, "RPT must be 2 or 4");
+  static_assert(M >= 1 && M <= 4, "M must be 1..4");
+  constexpr int THREADS = KC / 16;
+  static_assert(THREADS % 64 == 0, "KC/16 must be a whole number of wavefronts");
+  constexpr int WARPS = THREADS / 64;
+  constexpr int NV = RPT * M;  // values per thread (flattened r*M+m)
+  const int t = threadIdx.x;
+  const int row0 = blockIdx.x * RPT;
+  const int k0 = blockIdx.y * KC;
+
+  // x slices for all M rows, each 16 halfs (two uint4s). x is small
+  // (M*K*2B <= 64 KB, L2-resident); every block re-reads its k-chunk.
+  const bool inb = (k0 + t * 16) < K;
+  union {
+    uint4 u;
+    half2 h2[4];
+  } xa0[M], xa1[M];
+  if (inb) {
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      xa0[m].u = *(const uint4*)(x + (int64_t)m * K + k0 + t * 16);
+      xa1[m].u = *(const uint4*)(x + (int64_t)m * K + k0 + t * 16 + 8);
+    }
+  }
+
+  float acc[RPT][M];
+#pragma unroll
+  for (int r = 0; r < RPT; ++r) {
+    const int row = row0 + r;
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[r][m] = 0.0f;
+    if (row >= N || !inb) continue;
+    half2 wh[8];
+    dequant_i8_to_h2(*(const uint4*)(w + (int64_t)row * K + k0 + t * 16), wh);
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const half2& xx = (i < 4) ? xa0[m].h2[i] : xa1[m].h2[i - 4];
+        acc[r][m] = __ockl_fdot2(wh[i], xx, acc[r][m], true);
+      }
+  }
+
+#pragma unroll
+  for (int mask = 32; mask >= 1; mask /= 2)
+    #pragma unroll
+    for (int r = 0; r < RPT; ++r)
+      #pragma unroll
+      for (int m = 0; m < M; ++m)
+        acc[r][m] += __shfl_xor(acc[r][m], mask);
+
+  if constexpr (WARPS == 1) {
+    // Lane i < RPT*M holds (r=i/M, m=i%M)'s full sum. After the butterfly
+    // every lane holds every value in its own registers — read them from
+    // `acc` directly, never via __shfl(acc[...], i) (ROCm 7.14 lowers a
+    // divergent cross-lane shfl to a misaligned ds_bpermute window read;
+    // see dense_gemv_m_kernel).
+    if (ksplit == 1) {
+      if (t < NV) {
+        const int r = t / M, m = t % M, row = row0 + r;
+        if (row < N)
+          out[(int64_t)m * N + row] =
+              __float2half_rn(acc[r][m] * __half2float(s[row]));
+      }
+    } else {
+      // CAS packs the RPT adjacent rows of each out[m]; lane 0 issues the M
+      // CAS ops. Scales applied to the fp32 partials before the packed-fp16
+      // conversion (see the family header for the rounding trade-off).
+      if (t == 0) {
+        float sv[NV];
+#pragma unroll
+        for (int i = 0; i < NV; ++i) {
+          const int r = i / M, m = i % M;
+          sv[i] = acc[r][m] * __half2float(s[row0 + r]);
+        }
+        if (row0 + RPT - 1 < N) {  // ragged tail (launcher enforces N%RPT==0)
+#pragma unroll
+          for (int m = 0; m < M; ++m) {
+            if constexpr (RPT == 4)
+              atomic_add_pk4_f16(
+                  out + (int64_t)m * N + row0,
+                  __halves2half2(__float2half_rn(sv[0 * M + m]),
+                                 __float2half_rn(sv[1 * M + m])),
+                  __halves2half2(__float2half_rn(sv[2 * M + m]),
+                                 __float2half_rn(sv[3 * M + m])));
+            else
+              atomic_add_pk2_f16(
+                  out + (int64_t)m * N + row0,
+                  __halves2half2(__float2half_rn(sv[0 * M + m]),
+                                 __float2half_rn(sv[1 * M + m])));
+          }
+        }
+      }
+    }
+  } else {
+    __shared__ float red_smem[NV][8];  // WARPS <= 4 (KC <= 4096)
+    const int warp = t / 64;
+    const int lane = t % 64;
+    if (lane < NV) red_smem[lane][warp] = acc[lane / M][lane % M];
+    __syncthreads();
+    if (warp == 0) {
+      if (ksplit == 1) {
+        if (lane < NV) {
+          const int r = lane / M, m = lane % M, row = row0 + r;
+          float sum = 0.0f;
+#pragma unroll
+          for (int wp = 0; wp < WARPS; ++wp) sum += red_smem[lane][wp];
+          if (row < N)
+            out[(int64_t)m * N + row] =
+                __float2half_rn(sum * __half2float(s[row]));
+        }
+      } else {
+        if (lane == 0) {
+          float sv[NV];
+#pragma unroll
+          for (int i = 0; i < NV; ++i) {
+            const int r = i / M;  // m = i % M recovered per-column below
+            float sum = 0.0f;
+#pragma unroll
+            for (int wp = 0; wp < WARPS; ++wp) sum += red_smem[i][wp];
+            sv[i] = sum * __half2float(s[row0 + r]);
+          }
+          if (row0 + RPT - 1 < N) {  // ragged tail
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+              if constexpr (RPT == 4)
+                atomic_add_pk4_f16(
+                    out + (int64_t)m * N + row0,
+                    __halves2half2(__float2half_rn(sv[0 * M + m]),
+                                   __float2half_rn(sv[1 * M + m])),
+                    __halves2half2(__float2half_rn(sv[2 * M + m]),
+                                   __float2half_rn(sv[3 * M + m])));
+              else
+                atomic_add_pk2_f16(
+                    out + (int64_t)m * N + row0,
+                    __halves2half2(__float2half_rn(sv[0 * M + m]),
+                                   __float2half_rn(sv[1 * M + m])));
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Post-accumulation per-channel scale for the M=1 ksplit>1 path. Runs on the
+// same stream, so it observes every CAS from the GEMV launch.
+__global__ void dense_gemv_i8_scale_kernel(half* __restrict__ out,
+                                           const half* __restrict__ s,
+                                           const int N) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) out[i] = __float2half_rn(__half2float(out[i]) * __half2float(s[i]));
+}
+
 }  // namespace dense_gemv_gfx906
 }  // namespace vllm
 
@@ -838,5 +1187,189 @@ torch::Tensor dense_gemv_gfx906(torch::Tensor weight, torch::Tensor x,
     LAUNCH_BY_RPT(1024);
   else
     LAUNCH_BY_RPT(512);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// NH-2' entry points (W8A16 int8-weight GEMV family).
+//
+//   weight: [N, K] int8, row-major, contiguous — the pre-shifted signed
+//           view served by CompressedTensorsW8A16ChannelDequant (byte ^
+//           0x80 at load; w = weight * scale)
+//   scale:  [N] or [N, 1] fp16 (per output channel)
+//   x:      [K] (M=1) or [M, K] (1 <= M <= 4) fp16, contiguous
+//   kchunk: BYTES of weight per thread-slice; 1024, 2048 or 4096.
+//           ksplit = ceil(K / kchunk); a partial tail block (threads whose
+//           slice starts at/after K) contributes zero via the inb mask.
+//
+// Returns out: [1, N] (M=1) or [M, N] fp16. K % 16 == 0 is required
+// (aligned 16B slice loads); other shapes fall back to the Triton path.
+// RPT defaults to 2 (N%2==0) or 4 (N%4==0 and ksplit>1), overridable with
+// VLLM_GFX906_GEMV_I8_RPT for micro-bench sweeps.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+int i8_rpt(int N, int ksplit, int default_rpt) {
+  const char* e = getenv("VLLM_GFX906_GEMV_I8_RPT");
+  if (e) {
+    const int v = atoi(e);
+    TORCH_CHECK(v == 2 || v == 4,
+                "VLLM_GFX906_GEMV_I8_RPT must be 2 or 4 (got ", v, ")");
+    return v;
+  }
+  return default_rpt;
+}
+
+bool i8_kchunk_ok(int64_t kchunk) {
+  return kchunk == 1024 || kchunk == 2048 || kchunk == 4096;
+}
+
+}  // namespace
+
+torch::Tensor dense_gemv_i8_gfx906(torch::Tensor weight, torch::Tensor scale,
+                                   torch::Tensor x, int64_t kchunk) {
+  TORCH_CHECK(weight.is_cuda() && x.is_cuda());
+  TORCH_CHECK(weight.dim() == 2 && x.dim() == 1);
+  TORCH_CHECK(weight.scalar_type() == torch::kChar);
+  TORCH_CHECK(x.scalar_type() == torch::kHalf);
+  TORCH_CHECK(scale.scalar_type() == torch::kHalf);
+  TORCH_CHECK(weight.is_contiguous() && x.is_contiguous());
+  const int64_t N = weight.size(0);
+  const int64_t K = weight.size(1);
+  TORCH_CHECK(x.size(0) == K, "x/weight K mismatch");
+  TORCH_CHECK(scale.numel() == N, "scale must have N elements");
+  TORCH_CHECK(K % 16 == 0, "K (", K, ") must be a multiple of 16");
+  TORCH_CHECK(i8_kchunk_ok(kchunk),
+              "kchunk must be 1024, 2048 or 4096 (got ", kchunk, ")");
+
+  const int ksplit = (int)((K + kchunk - 1) / kchunk);  // ceil; tail masked
+  if (ksplit > 1)
+    TORCH_CHECK(N % 2 == 0 || N % 4 == 0,
+                "N must be even for the packed CAS epilogue");
+  int rpt = (N % 4 == 0 && ksplit > 1) ? 4 : (N % 2 == 0 ? 2 : -1);
+  if (rpt < 0)
+    TORCH_CHECK(false, "N (", N, ") must be even for the packed CAS epilogue");
+  rpt = i8_rpt((int)N, ksplit, rpt);
+  TORCH_CHECK(N % rpt == 0, "N (", N, ") not divisible by RPT (", rpt, ")");
+
+  auto out = torch::empty({1, N}, x.options());
+  if (ksplit > 1) out.zero_();
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(weight));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const signed char* wp = (const signed char*)weight.data_ptr();
+  const half* sp = (const half*)scale.data_ptr();
+  const half* xp = (const half*)x.data_ptr();
+  half* op = (half*)out.data_ptr();
+
+#define LAUNCH_I8(RPT, KC)                                                  \
+  {                                                                         \
+    dim3 grid((N + RPT - 1) / RPT, ksplit);                                 \
+    vllm::dense_gemv_gfx906::dense_gemv_i8_kernel<RPT, KC>                  \
+        <<<grid, KC / 16, 0, stream>>>(xp, wp, sp, op, (int)N, (int)K,      \
+                                       ksplit);                             \
+  }
+
+#define LAUNCH_I8_BY_RPT(KCVAL)                                             \
+  do {                                                                      \
+    if (rpt == 4)                                                           \
+      LAUNCH_I8(4, KCVAL)                                                   \
+    else                                                                    \
+      LAUNCH_I8(2, KCVAL)                                                   \
+  } while (0)
+
+  if (kchunk == 4096)
+    LAUNCH_I8_BY_RPT(4096);
+  else if (kchunk == 2048)
+    LAUNCH_I8_BY_RPT(2048);
+  else
+    LAUNCH_I8_BY_RPT(1024);
+
+#undef LAUNCH_I8
+#undef LAUNCH_I8_BY_RPT
+
+  if (ksplit > 1) {
+    const int threads = 256;
+    const int blocks = (int)((N + threads - 1) / threads);
+    vllm::dense_gemv_gfx906::dense_gemv_i8_scale_kernel<<<blocks, threads, 0, stream>>>(
+        op, sp, (int)N);
+  }
+  return out;
+}
+
+torch::Tensor dense_gemv_i8_m4_gfx906(torch::Tensor weight, torch::Tensor scale,
+                                      torch::Tensor x, int64_t kchunk) {
+  TORCH_CHECK(weight.is_cuda() && x.is_cuda());
+  TORCH_CHECK(weight.dim() == 2 && x.dim() == 2);
+  TORCH_CHECK(weight.scalar_type() == torch::kChar);
+  TORCH_CHECK(x.scalar_type() == torch::kHalf);
+  TORCH_CHECK(scale.scalar_type() == torch::kHalf);
+  TORCH_CHECK(weight.is_contiguous() && x.is_contiguous());
+  const int64_t M = x.size(0);
+  const int64_t N = weight.size(0);
+  const int64_t K = weight.size(1);
+  TORCH_CHECK(M >= 1 && M <= 4, "M must be 1..4 (got ", M, ")");
+  TORCH_CHECK(x.size(1) == K, "x/weight K mismatch");
+  TORCH_CHECK(scale.numel() == N, "scale must have N elements");
+  TORCH_CHECK(K % 16 == 0, "K (", K, ") must be a multiple of 16");
+  TORCH_CHECK(i8_kchunk_ok(kchunk),
+              "kchunk must be 1024, 2048 or 4096 (got ", kchunk, ")");
+
+  const int ksplit = (int)((K + kchunk - 1) / kchunk);  // ceil; tail masked
+  int rpt = (N % 4 == 0) ? 4 : (N % 2 == 0 ? 2 : -1);
+  if (rpt < 0)
+    TORCH_CHECK(false, "N (", N, ") must be even for the packed CAS epilogue");
+  rpt = i8_rpt((int)N, ksplit, rpt);
+  TORCH_CHECK(N % rpt == 0, "N (", N, ") not divisible by RPT (", rpt, ")");
+
+  auto out = torch::empty({M, N}, x.options());
+  if (ksplit > 1) out.zero_();
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(weight));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const signed char* wp = (const signed char*)weight.data_ptr();
+  const half* sp = (const half*)scale.data_ptr();
+  const half* xp = (const half*)x.data_ptr();
+  half* op = (half*)out.data_ptr();
+
+#define LAUNCHM_I8(MVAL, RPT, KC)                                           \
+  {                                                                         \
+    dim3 grid((N + RPT - 1) / RPT, ksplit);                                 \
+    vllm::dense_gemv_gfx906::dense_gemv_i8_m_kernel<RPT, KC, MVAL>          \
+        <<<grid, KC / 16, 0, stream>>>(xp, wp, sp, op, (int)N, (int)K,      \
+                                       ksplit);                             \
+  }
+
+#define LAUNCHM_I8_BY_RPT(MVAL, KCVAL)                                      \
+  do {                                                                      \
+    if (rpt == 4)                                                           \
+      LAUNCHM_I8(MVAL, 4, KCVAL)                                            \
+    else                                                                    \
+      LAUNCHM_I8(MVAL, 2, KCVAL)                                            \
+  } while (0)
+
+#define LAUNCHM_I8_BY_KC(MVAL)                                              \
+  do {                                                                      \
+    if (kchunk == 4096)                                                     \
+      LAUNCHM_I8_BY_RPT(MVAL, 4096);                                        \
+    else if (kchunk == 2048)                                                \
+      LAUNCHM_I8_BY_RPT(MVAL, 2048);                                        \
+    else                                                                    \
+      LAUNCHM_I8_BY_RPT(MVAL, 1024);                                        \
+  } while (0)
+
+  if (M == 1)
+    LAUNCHM_I8_BY_KC(1);
+  else if (M == 2)
+    LAUNCHM_I8_BY_KC(2);
+  else if (M == 3)
+    LAUNCHM_I8_BY_KC(3);
+  else
+    LAUNCHM_I8_BY_KC(4);
+
+#undef LAUNCHM_I8
+#undef LAUNCHM_I8_BY_RPT
+#undef LAUNCHM_I8_BY_KC
   return out;
 }
