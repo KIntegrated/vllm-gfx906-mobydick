@@ -221,9 +221,20 @@ preserved.
 
 ### N3 — GDN state-bookkeeping copies (~180 µs/step)
 
-Attribute and reduce the upstream `[3,1,32]` state copies (about
-180 µs/step eager). The graph serving gate is required because this is
-launch-latency-bound.
+**CLOSED 2026-08-31** (measured, no code change; `DEVLOG-gdn-n3-state-copies.md`).
+Attribution probe (`benchmarks/kernels/gfx906/n3_state_copy_probe.py`,
+in-process, 32 profiled decode tokens, Qwen3.5-35B-A3B-AWQ) run in both
+regimes: eager and production `FULL_DECODE_ONLY`. Copy-class op
+invocations per step drop **~214 → ~57 (−73 %)** under graph serving —
+`clone`/`contiguous` −99 %, `copy_` −68 % (residual + `_to_copy` are the
+state/metadata bookkeeping outside the captured region). The eager
+~180 µs/step was per-op CPU **launch overhead** on 192-B `[3,1,32]`
+copies, not GPU work; CUDA-graph capture absorbs it (same mechanism as
+the FA decode copy pile). Residual ~57 tiny copies/step is bounded well
+under 60 µs/step and realistically sub-µs against a ~1.5 ms step — not
+worth an upstream patch or custom kernel. Disposition: closed, "upstream
+code, small", now backed by a measurement. Graph-serving gate (required
+because launch-latency-bound) = the graph arm above.
 
 ### C5 — fuse the shared-expert chain (150–250 µs)
 
