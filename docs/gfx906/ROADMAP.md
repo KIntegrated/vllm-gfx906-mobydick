@@ -284,7 +284,9 @@ unservable model.
 **Status: NH-1 + NH-3 + NH-4 + NH-5 SHIPPED, merged to `main` (2026-08-30 ff of
 `gfx906/nh2-int8-gemv`, code review `nemotron-nh-code-rev.md` — no blocking
 findings); NH-2 NO-GO as Triton (measured; opt-in in-kernel int8 code on
-`main`, env default off), NH-2′ (CUDA int8 GEMV family) parked.** Serves at **70.4 tok/s** (graph, pp2048/tg256, 4
+`main`, env default off); NH-2′ (CUDA int8 GEMV family) MERGED 2026-08-31 as
+opt-in after a NO-GO serving A/B gate (M-mismatch — kernel's M≤4 support
+misses the m=6 spec-decode steps).** Serves at **70.4 tok/s** (graph, pp2048/tg256, 4
 samples, GPU0; boot-dependent — boot O window 2026-08-30 PM: 106.8 →
 **114.6 t/s** after NH-5, A–B–A) after five fixes that landed on `main`:
 fp32-router LLMM1 dtype
@@ -314,12 +316,21 @@ shared experts 1.0 ms · topk chain ~1.2 ms · SSU+conv 0.5 ms.
   needs 3× VRAM. Code + probe + tests land on `main` behind
   `VLLM_GFX906_W8A16_INT8=1` (default off). Real win exists for N ≥ 10K
   M=1 lm_head-class shapes (1.60× measured).
-- **NH-2′ — int8 CUDA GEMV family (parked).** Port the hand-tuned
-  `LLMM1` / `dense_gemv_m4` / `dense_gemv_gfx906` kernels to byte loads
-  + in-register per-channel dequant. Evidence base: M=4 in_proj cur
-  239 µs (464 GB/s fp16); an int8 kernel at ~700 GB/s ≈ 79 µs (3× on
-  the biggest per-step shape). Only worth it for the spec-decode
-  serving mode — the Triton path can't reach that byte rate at mid-N.
+- **NH-2′ — int8 CUDA GEMV family: MERGED as opt-in (2026-08-31; serving
+  A/B gate NO-GO).** Byte-load + in-register per-channel dequant kernels
+  (`dense_gemv_i8_gfx906` M=1, `dense_gemv_i8_m4_gfx906` M≤4), env-gated
+  behind `VLLM_GFX906_W8A16_INT8_CUDA=1` on top of the NH-2 int8 path (both
+  default off; dequant path bit-identical when off — verified by review).
+  Kernel-level GO: M=4 in_proj [10304,2688] 239 → 72 µs (3.3×), 10/10 unit
+  tests vs fp64 + Triton cross-check. Serving A/B gate (TP=2+EP, ngram spec
+  n=5, warm median-of-3): armA 119.2 t/s → armB **46.1 t/s (−61%)**, PPL
+  24.9260 vs 24.8826 (noise). Root cause = M-mismatch: the real serving M
+  distribution is m=1 72% / m=6 28% / m=4 ~1% (eager-mode MLOG, devlog) —
+  the micro-bench's headline M=4 operating point essentially never occurs,
+  and the 28% m=6 steps fall back to the slow Triton int8 GEMM. Revival path:
+  extend the kernel family to M≤6 (or a dedicated M=6 variant) so all
+  spec-decode steps hit the CUDA path; then re-gate. See devlog "NH-2′
+  serving A/B gate" section.
 - **NH-3 — fp32 router-gate GEMV: SHIPPED, merged to `main`.** hipBLAS
   sgemv (`torch.mv`) replaces the 128 µs fp32 triton matmul at M=1
   (8 µs measured at the [128, 2688] gate shape); 59.4 → 70.4 tok/s
