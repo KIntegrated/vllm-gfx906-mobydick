@@ -351,10 +351,19 @@ class AutoAWQConfig(QuantizationConfig):
             if not check_moe_marlin_supports_layer(
                 layer, self.group_size, allow_tile_padding=True
             ):
-                logger.warning_once(
-                    f"Layer '{prefix}' is not supported by AutoAWQMoEMarlin. "
-                    "Falling back to Moe WNA16 kernels."
-                )
+                # On gfx906 the fallback to the custom WNA16 path is
+                # intentional (Marlin MoE is unsupported there), so one
+                # info line per process instead of a per-layer warning.
+                if current_platform.is_rocm() and on_gfx906():
+                    logger.info_once(
+                        "AutoAWQMoEMarlin is not supported on gfx906; "
+                        "using Moe WNA16 kernels for all MoE layers."
+                    )
+                else:
+                    logger.warning_once(
+                        f"Layer '{prefix}' is not supported by AutoAWQMoEMarlin. "
+                        "Falling back to Moe WNA16 kernels."
+                    )
                 from vllm.model_executor.layers.quantization.moe_wna16 import (
                     MoeWNA16Config,
                 )
