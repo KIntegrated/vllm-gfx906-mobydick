@@ -75,7 +75,7 @@ editable install of this repo; the compiled extensions live in-tree.
   ```bash
   # No env sourcing needed: /opt/rocm is the default toolchain (HK-1,
   # confirmed 2026-08-29 — build + serving + in-process suite run without
-  # it; setup.py falls back to /opt/rocm when ROCM_PATH is unset).
+  # it; ROCm resolves to /opt/rocm by default when ROCM_PATH is unset).
   export PATH="$PWD/.venv/bin:$PATH"          # venv cmake must win
   FETCHCONTENT_BASE_DIR=/tmp/vllm-deps \
   HIP_VISIBLE_DEVICES=0 .venv/bin/python setup.py build_ext --inplace

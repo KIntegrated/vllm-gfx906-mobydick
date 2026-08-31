@@ -90,8 +90,9 @@ all worked without it; re-verified 2026-08-31 with a torch HIP matmul under
 `.agents/skills/gfx906-mem-attribution/SKILL.md` (the in-repo skill's
 recipe). Dev logs and `degradation_details.md` keep their lines (historical
 record); the session `canary.sh` sources it — drop there too when next
-touched. setup.py needs no change: `is_rocm_system()` already falls back to
-`/opt/rocm` when `ROCM_PATH` is unset.
+touched. No code change needed: without `ROCM_PATH` the build resolves the
+toolchain via torch's cpp_extension (wheel-download path via
+`setup.py is_rocm_system()`), both landing on /opt/rocm here.
 
 ### N1 — quiet the expected AutoAWQMoEMarlin fallback
 
