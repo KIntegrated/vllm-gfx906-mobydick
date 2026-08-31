@@ -14,8 +14,13 @@
 //   sweep    — the current kernel templated on (THREADS_X == BLOCK_KN,
 //              NPT): maps the z-split-granularity axis (C2, 2026-08-19).
 //   v1       — full-K per block, direct store, no CAS/zeroing (C2's V1
-//              design; REJECTED: 64 blocks x one long weight stream is
-//              bandwidth-starved, 2.2-4.3x slower than current).
+//              design; REJECTED at 64 blocks: one long weight stream per
+//              block is bandwidth-starved, 2.2-4.3x slower than current).
+//              N-split axis (C2 finish, 2026-08-31): the same kernel at
+//              128/256/512 blocks halves the per-block weight stream each
+//              step (128 -> 64 -> 32 -> 16 KB) while keeping the full-K
+//              loop, to test whether more independent streams recover the
+//              in-flight bandwidth. Same kernel, new instantiations only.
 //
 // Checks: both vs an fp32 CPU reference (dequant + matmul, fp16-rounded
 // weights), and v2 vs current (must agree within fp16 accumulation noise —
@@ -622,11 +627,15 @@ __global__ void __launch_bounds__(THREADS_X)
 
 // ---------------------------------------------------------------------------
 // V1 (C2): full-K per block, direct store. No CAS, no zeroing, no K-split.
-//   v1a: THREADS=32  (1 wavefront), NPT=4 — lane owns 4 columns, 128 cols/
-//         block; the roadmap's "64 blocks, each a 1-wavefront 2048-K loop".
-//   v1b: THREADS=128 (4 wavefronts), NPT=1 — wave w owns the disjoint 32-col
-//         strip [w*32, w*32+32); same total wavefront count as current,
+// NOTE: the kernel groups threads in 32s (w = t/32); on this gfx906
+// warpSize = 64 (hipDeviceProp probe), so THREADS=32 is half a wavefront.
+//   v1a: THREADS=32, NPT=4 — lane owns 4 columns, 128 cols/block; the
+//         roadmap's "64 blocks, each a single 32-thread group looping K".
+//   v1b: THREADS=128 (4 groups of 32), NPT=1 — group w owns the disjoint
+//         32-col strip [w*32, w*32+32); same total thread count as current,
 //         isolates the CAS/z-split structure cost.
+//   v1c/v1d/v1e (C2 finish): N-split axis — 128/256/512 blocks with 64/32/16
+//         cols per block; see "V1 N-split axis" in DEVLOG-moe-c2v.md.
 // gemm1-only (direct store; M=1: every slot reads activation row 0).
 // ---------------------------------------------------------------------------
 
@@ -1136,6 +1145,32 @@ int main(int argc, char** argv) {
           GROUPS, TOPK, wstride, sstride, zstride, 0);
       CHECK(hipGetLastError());
     }, "v1b 128t 1col full-K direct");
+    // N-split axis (C2 finish): more blocks, shorter per-block weight
+    // stream (64/32/16 KB vs v1a/v1b's 128 KB), same full-K loop.
+    run_v1([&] {
+      dim3 blk(32);
+      dim3 grid(EM, N / 64);
+      moe_gemm_q4_v1<32, 2, 2048><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_sorted, d_eids, d_npp, M, N, K,
+          GROUPS, TOPK, wstride, sstride, zstride, 0);
+      CHECK(hipGetLastError());
+    }, "v1c 32t 2col full-K direct (128 blk)");
+    run_v1([&] {
+      dim3 blk(32);
+      dim3 grid(EM, N / 32);
+      moe_gemm_q4_v1<32, 1, 2048><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_sorted, d_eids, d_npp, M, N, K,
+          GROUPS, TOPK, wstride, sstride, zstride, 0);
+      CHECK(hipGetLastError());
+    }, "v1d 32t 1col full-K direct (256 blk)");
+    run_v1([&] {
+      dim3 blk(16);
+      dim3 grid(EM, N / 16);
+      moe_gemm_q4_v1<16, 1, 2048><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_sorted, d_eids, d_npp, M, N, K,
+          GROUPS, TOPK, wstride, sstride, zstride, 0);
+      CHECK(hipGetLastError());
+    }, "v1e 16t 1col full-K direct (512 blk)");
   }
 
   // ---- z-split sweep (gemm1 semantics: pre-zeroed, direct CAS fan-in)
@@ -1344,6 +1379,30 @@ int main(int argc, char** argv) {
           GROUPS, TOPK, wstride, sstride, zstride, 0);
       CHECK(hipGetLastError());
     }, "v1b 128t 1col fullK");
+    time_v2([&] {
+      dim3 blk(32);
+      dim3 grid(EM, N / 64);
+      moe_gemm_q4_v1<32, 2, 2048><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_sorted, d_eids, d_npp, M, N, K,
+          GROUPS, TOPK, wstride, sstride, zstride, 0);
+      CHECK(hipGetLastError());
+    }, "v1c 32t 2col fullK");
+    time_v2([&] {
+      dim3 blk(32);
+      dim3 grid(EM, N / 32);
+      moe_gemm_q4_v1<32, 1, 2048><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_sorted, d_eids, d_npp, M, N, K,
+          GROUPS, TOPK, wstride, sstride, zstride, 0);
+      CHECK(hipGetLastError());
+    }, "v1d 32t 1col fullK");
+    time_v2([&] {
+      dim3 blk(16);
+      dim3 grid(EM, N / 16);
+      moe_gemm_q4_v1<16, 1, 2048><<<grid, blk>>>(
+          d_a, d_c1, d_w, d_sc, d_z, d_sorted, d_eids, d_npp, M, N, K,
+          GROUPS, TOPK, wstride, sstride, zstride, 0);
+      CHECK(hipGetLastError());
+    }, "v1e 16t 1col fullK");
     auto time_sweep = [&](auto launch, const char* name) {
       for (int i = 0; i < 50; ++i) launch();
       CHECK(hipStreamSynchronize(0));

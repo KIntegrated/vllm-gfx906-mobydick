@@ -165,8 +165,10 @@ originally scoped) — and G1 should price the per-node tax first. See
 
 ### C2 — decode-sized routed GEMM (decide the built wins; finish the axes)
 
-**Status: M=1 default-on decision SHIPPED (2026-08-31); remaining axes
-open.** The combined TP=2 M=1 A/B + numerics gate resolved the
+**Status: M=1 default-on decision SHIPPED (2026-08-31); V1 N-split axis
+CLOSED + harness PASS flow re-run (2026-08-31, `gfx906/c2-finish-axes`);
+BM≥2 grouped path still open.** The combined TP=2 M=1 A/B + numerics gate
+resolved the
 default-on question: `VLLM_GFX906_MOE_M1` (gemm2 v2 tile) and
 `VLLM_GFX906_MOE_NPT=2` (gemm1 `<1,2>` re-tile) are now **default-on
 for the M=1 decode path** — +5.0 % decode at TP=2 M=1 (81.58 →
@@ -177,14 +179,21 @@ because it takes the unretiled BM≥2 grouped path; that path is still
 unmeasured, not rejected. Remaining:
 
 - measure and, if useful, re-tile the BM≥2 grouped path for concurrent
-  decode;
-- build the V1 N-split/direct-store variant (128/256/512 blocks) before
-  closing the untested block-count axis; and
-- rerun the corrected standalone harness PASS flow before quoting old S5
-  microbenchmark numbers.
+  decode (the only open axis — needs a multi-hour serving A/B session);
+- ~~build the V1 N-split/direct-store variant (128/256/512 blocks)~~
+  **CLOSED 2026-08-31**: all five V1 variants correct; the new N-split
+  points lose by ≥2.6× vs current (best-ever point v1d, 256 blocks @
+  74.8 µs vs current 28.7; non-monotone in block count) — the per-block
+  full-K loop caps memory-level parallelism regardless of stream
+  splitting; axis is measured-and-rejected, no serving gate reachable at
+  that margin (`DEVLOG-moe-c2v.md` "V1 N-split axis"; DEAD-ENDS row
+  annotated);
+- ~~rerun the corrected standalone harness PASS flow~~ **DONE 2026-08-31**:
+  `HARNESS PASS` ×3 (boot P, clean host), v1a/v1b bands match the 08-19
+  records within 2.5 % — old S5 microbenchmark numbers re-validated.
 
-See `DEVLOG-moe-c2v.md` (incl. "Combined default-on decision") and
-`DEVLOG-moe-gemm1-retiling.md`.
+See `DEVLOG-moe-c2v.md` (incl. "Combined default-on decision" and
+"V1 N-split axis") and `DEVLOG-moe-gemm1-retiling.md`.
 
 - **C8 — expert-weight residency measurement (feeds C2's target
   selection).** Measure L2/TCC hit and miss behavior for the roughly

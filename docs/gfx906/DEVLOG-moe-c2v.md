@@ -304,6 +304,101 @@ Session cost notes: one chronic weight-load wedge (08:49:34, GPU0,
 isolated per house recipe) and the worker-cgroup OOM finding → systemd
 migration; both recorded in `degradation_details.md`.
 
+## V1 N-split axis + corrected-harness re-run (C2 finish, 2026-08-31)
+
+**VERDICT:** SHIPPED (measurement complete; the V1 block-count axis is
+closed — no dispatch change, per the no-busywork rule). **GATE:** n/a for
+a measurement-only close — standalone launch-regime numbers are the
+deliverable here because the hypothesis was structural (in-flight
+bandwidth vs per-block stream length), and every V1 variant is ≥2.0×
+slower than current in the regime where it would have to win, so no
+serving A/B can be reached (the transfer failures of §3/DEVLOG-moe-gemm1-
+retiling make a serving gate uninformative at this margin).
+
+### HYPOTHESIS
+
+If V1's 2.2–4.3× loss at 64 blocks is caused by each block streaming one
+long 128 KB weight sequence that can't stay in flight on the MI50, then
+splitting N more (128/256/512 blocks → 64/32/16 KB per-block streams)
+recovers enough independent streams to beat or approach current — in which
+case a V1 variant becomes a dispatch candidate.
+
+### What was done
+
+- `benchmarks/kernels/gfx906/harness/moe_m1_harness.cu`: three new
+  instantiations of the existing `moe_gemm_q4_v1<THREADS,NPT,K_T>` kernel
+  (no kernel change — only grid/cols): v1c `<32,2>` = 128 blocks × 64 cols
+  (64 KB stream), v1d `<32,1>` = 256 blocks × 32 cols (32 KB), v1e `<16,1>`
+  = 512 blocks × 16 cols (16 KB). Added to both the correctness section
+  (vs fp32 CPU reference) and the timing section.
+- Corrected-harness PASS flow re-run: 3 full runs of `moe_m1_harness 2000`
+  (boot P, host clean — canary 9.9 TFLOP/s fp16 both GPUs pre-run, no
+  amdgpu resets in journal since boot). All checks green; records in
+  `/local/tmp/c2finish/` (run_main_2000.log, run_rep2.log, run_rep3.log).
+
+### Evidence — FOR (axis closure)
+
+All five V1 variants correct vs CPU ref (max abs err 0.2511 each = the
+fp16-accumulation noise band of v1a/v1b and v2; gate 0.35):
+
+| variant | blocks × cols/block | per-block stream | µs/launch (3-run median) | vs current 28.7 |
+|---|---|---|---|---|
+| current (gemm1, pre-zeroed) | 64 × 1024 (z=8 CAS) | — | 28.70–28.79 | — |
+| v1a `<32,4>` (record 117.2–117.4) | 64 × 128 | 128 KB | 115.58–115.60 | **4.0× slower** |
+| v1b `<128,1>` (record 60.4–60.5) | 64 × 128 | 128 KB | 59.00–59.04 | **2.1× slower** |
+| v1c `<32,2>` (NEW) | 128 × 64 | 64 KB | 81.92–81.95 | **2.9× slower** |
+| v1d `<32,1>` (NEW) | 256 × 32 | 32 KB | 74.82–74.86 | **2.6× slower** |
+| v1e `<16,1>` (NEW) | 512 × 16 | 16 KB | 87.45–87.47 | **3.0× slower** |
+
+- The block-count axis is **non-monotone and never approaches current**:
+  64→128 blocks costs +23 µs (v1c), 128→256 saves −7 µs (v1d, the best V1
+  point ever measured — still 2.6× off), 256→512 costs +13 µs (v1e).
+  Halving the per-block stream did NOT recover in-flight bandwidth.
+- N-splitting DOES buy something: v1d (256 blocks) is −35 % vs v1a
+  (64 blocks), consistent with the original stream-length mechanism being
+  partially right — but it cannot close a 2.6× gap, so an additional
+  structural cost survives N-splitting: every V1 block walks the full
+  64-iteration K-loop over K=2048 (current's z-split blocks walk 8), so
+  per-block memory-level parallelism is capped regardless of how many such
+  blocks are launched.
+- v1e `<16,1>` (512 blocks) is slower than v1d `<32,1>` (256 blocks): both
+  have NPT=1, so the only difference is threads/block — 16 vs 32. On this
+  gfx906 `warpSize = 64` (hipDeviceProp probe), so a 32-thread block already
+  runs at half-wavefront occupancy and a 16-thread block at a quarter; v1e
+  issues fewer concurrent loads per block than v1d, which is why it loses.
+- Corrected-harness PASS flow: `HARNESS PASS` ×3. v1a/v1b bands match the
+  08-19 records (117.2–117.4 / 60.4–60.5) within 2.5 % (115.6 / 59.0);
+  current's pre-zeroed time reads 28.7 here vs the 08-19 record 26.9
+  (~+7 %, boot/build-to-build drift — the A/B ratios in this entry are
+  intra-run, so unaffected). Old S5 microbenchmark numbers re-validated.
+
+### Evidence — AGAINST (a V1 dispatch candidate)
+
+(none needed — the axis closes on the FOR side: best-ever V1 point is
+74.8 µs vs current 28.7; even at 512 blocks the full-K-loop structure
+loses by 2.6×.)
+
+### Why it failed (mechanism, refined)
+
+The original mechanism ("one long stream can't stay in flight") was
+necessary but not sufficient: splitting N multiplies independent streams
+and still loses. The structural cost that survives N-splitting is the
+per-block K-loop length: every V1 block walks all 64 K-iterations of
+K=2048 on at most one wavefront, so per-block memory-level parallelism is
+capped no matter how many such blocks are launched; current's z-split
+blocks walk 8 iterations each and get 8× K-parallel streams per
+(slot, n-tile) for free. N-splitting only moves the operating point along
+the V1 family (best-ever 74.8 µs at 256 blocks) — it cannot cross to
+current's 28.7 µs. The V1 family is closed at every measured block count;
+the axis is exhausted without a serving gate.
+
+### In-tree state after this verdict
+
+Harness-only change (benchmark file, no production dispatch touched).
+V1 N-split axis: CLOSED (measured-and-rejected, not untested). C2's
+remaining open axis: the BM≥2 grouped-path measurement (serving A/B —
+needs multi-hour serving infrastructure; left open on the roadmap).
+
 ## Verdict (final)
 
 - **Reopen gate TRIGGERED** (roadmap rule: any positive ≥0.5 %):
