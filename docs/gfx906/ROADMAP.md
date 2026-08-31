@@ -165,15 +165,16 @@ originally scoped) — and G1 should price the per-node tax first. See
 
 ### C2 — decode-sized routed GEMM (decide the built wins; finish the axes)
 
-**Status: partially open, TP=2 M=1 scope.** The gemm2 lane-column re-tile
-and the `VLLM_GFX906_MOE_M1` path are local, default-off options. C2-V
-showed a positive TP=2 M=1 result (about +1.47% for gemm2); the TP=1
-result was neutral. The NPT=2 gemm1 trial was similarly positive only in
-the TP=2 M=1 arm (about +1.23% graph, +1.32% eager). Decide whether
-either flag should become default-on after a combined TP=2 A/B and
-numerics gate. The tested batch arm was neutral because it takes the
-unretiled BM≥2 grouped path; that path is still unmeasured, not
-rejected. Remaining:
+**Status: M=1 default-on decision SHIPPED (2026-08-31); remaining axes
+open.** The combined TP=2 M=1 A/B + numerics gate resolved the
+default-on question: `VLLM_GFX906_MOE_M1` (gemm2 v2 tile) and
+`VLLM_GFX906_MOE_NPT=2` (gemm1 `<1,2>` re-tile) are now **default-on
+for the M=1 decode path** — +5.0 % decode at TP=2 M=1 (81.58 →
+85.65 t/s), +2.9 % at TP=1 M=1, output fingerprint identical across
+all 8 arms. Non-qualifying gemm2 shapes fall back silently; env opt-out
+retained (`MOE_M1=0`, `MOE_NPT=4`). The tested batch arm was neutral
+because it takes the unretiled BM≥2 grouped path; that path is still
+unmeasured, not rejected. Remaining:
 
 - measure and, if useful, re-tile the BM≥2 grouped path for concurrent
   decode;
@@ -182,7 +183,8 @@ rejected. Remaining:
 - rerun the corrected standalone harness PASS flow before quoting old S5
   microbenchmark numbers.
 
-See `DEVLOG-moe-c2v.md` and `DEVLOG-moe-gemm1-retiling.md`.
+See `DEVLOG-moe-c2v.md` (incl. "Combined default-on decision") and
+`DEVLOG-moe-gemm1-retiling.md`.
 
 - **C8 — expert-weight residency measurement (feeds C2's target
   selection).** Measure L2/TCC hit and miss behavior for the roughly

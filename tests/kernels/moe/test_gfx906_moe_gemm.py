@@ -457,7 +457,8 @@ def test_gfx906_moe_gemm_m1_npt2_flag(layout):
     default/<1,2> arm, the default matches an explicit =2, both arms stay
     within normal reference tolerance, and the off-vs-on gap is
     fp16-atomic noise level. gemm2 must be untouched by the flag (its
-    dispatch ignores NPT for BM=1 unless MOE_M1 fires)."""
+    dispatch ignores NPT for BM=1 unless MOE_M1 fires) — tested below via
+    the dispatch marker, not just asserted in prose."""
     import os
 
     from vllm import _custom_ops as ops
@@ -528,6 +529,50 @@ def test_gfx906_moe_gemm_m1_npt2_flag(layout):
     for name, out in (("default(<1,2>)", out_default), ("opt-out(<1,4>)", out_off), ("=2(<1,2>)", out_on)):
         rel = ((out.float() - ref_c1).abs().max() / scale).item()
         assert rel < 1e-1, f"NPT-flag gemm1 ({name}) too far from reference: {rel:.2e}"
+
+    # No-leak check (the docstring's "gemm2 must be untouched" claim): the
+    # NPT flag must not change gemm2 dispatch. This test shape is V2-
+    # qualifying, so with MOE_M1 unset gemm2 takes the default-on v2 tile
+    # (marker 1) both with and without NPT=2 set.
+    w2, s2, z2, q2, zz2 = _make_layer(N2, K2, layout)
+    wq2, sc2, zp2 = _repack_w4a16_gfx906_expert(w2, s2, z2)
+    topk_w = torch.rand(1, TOPK, dtype=torch.float16).to(dev)
+
+    def gemm2_only():
+        c1b = torch.zeros(TOPK, N13, device=dev, dtype=torch.float16)
+        ops.moe_gptq_gemm_gfx906(
+            x, c1b, wq13, sc13, zp13, empty_tw, sorted_ids, expert_ids, ntp,
+            TOPK, 1, False, 0, 0,
+        )
+        inter = (
+            (
+                torch.nn.functional.silu(c1b[:, : N13 // 2].float())
+                * c1b[:, N13 // 2 :].float()
+            )
+            .half()
+            .contiguous()
+        )
+        out2 = torch.zeros(1, N2, device=dev, dtype=torch.float16)
+        ops.moe_gptq_gemm_gfx906(
+            inter, out2, wq2, sc2, zp2, topk_w.view(-1).float(), sorted_ids,
+            expert_ids, ntp, 1, 1, True, TOPK, 0,
+        )
+        return out2
+
+    for k in ("VLLM_GFX906_MOE_M1", "VLLM_GFX906_MOE_NPT"):
+        os.environ.pop(k, None)
+    gemm2_only()
+    assert _take_path() == 1, (
+        "baseline M=1 gemm2 did not take the default-on v2 tile (marker != 1)"
+    )
+    os.environ["VLLM_GFX906_MOE_NPT"] = "2"
+    try:
+        gemm2_only()
+    finally:
+        os.environ.pop("VLLM_GFX906_MOE_NPT")
+    assert _take_path() == 1, (
+        "VLLM_GFX906_MOE_NPT=2 leaked into gemm2 dispatch (marker != 1)"
+    )
 
 
 @pytest.mark.parametrize("layout", ["awq_kfirst", "awq_kfirst_sym"])

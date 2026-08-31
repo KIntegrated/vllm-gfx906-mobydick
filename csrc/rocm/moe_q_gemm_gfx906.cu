@@ -678,6 +678,9 @@ void dispatch_moe_gemm_q4(
     // negligible next to the launch.
     const char* m1_env = getenv("VLLM_GFX906_MOE_M1");
     const bool force_v2 = m1_env != nullptr && m1_env[0] == '1';
+    // Only an exact "1" forces v2 (pre-C2, any non-"0" value did and failed
+    // closed on bad shapes); other values like "true" now leave the default-on
+    // shape gate to decide instead of asserting. Documented behavior change.
     const bool disable_v2 = m1_env != nullptr && m1_env[0] == '0';
     if (!disable_v2 && (force_v2 || v2_shape_ok)) {
       // Only assert the shape when the user explicitly forced v2 (=1); a
@@ -705,7 +708,8 @@ void dispatch_moe_gemm_q4(
   // safe: the gate below is M=1-only (inert at N>=2 / prefill) and gemm2
   // keeps <1,4> (or the MOE_M1 v2 tile when that flag is on), so the two
   // flags never touch the same kernel. Set VLLM_GFX906_MOE_NPT=4 to force
-  // the legacy <1,4> M=1 gemm1 tile (=2 selects it explicitly; BM>=8 NPT
+  // the legacy <1,4> M=1 gemm1 tile; any other value (incl. =2) selects the
+  // default <1,2> tile — only 4 and the default are distinct here (BM>=8 NPT
   // tuning is unaffected — see select_n_per_thread). Read per call like
   // MOE_M1 (80x/step, negligible next to the launch) so tests can flip it
   // at runtime; captured graphs replay the kernel chosen at capture.

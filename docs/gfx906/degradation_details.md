@@ -1440,3 +1440,53 @@ pool, `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0`).
     reboot alone has not cleared it across L→M→N→O). Protocol: arm C
     gets one retry; a 3rd boot-O wedge OR the retry wedging stops
     GPU work pending host investigation.
+
+## 2026-08-31 (boot P) — C2 combined A/B session: chronic load wedge + worker-cgroup OOM finding
+
+    Boot P started 2026-08-30 20:51:32. Early-boot wedges
+    (interactive session, pre-cron): GPU0 02:55:13 and GPU1 04:24:55 —
+    both `qcm fence wait loop timeout` → BACO → "recovered through
+    reset", the chronic two-card weight-load-hang family, intermittent
+    with clean windows between (not a burst).
+
+    **Cron C2 combined A/B (TP=2 M=1 default-on decision), 08:36–09:1xZ:**
+    - Pre-bench canary both GPUs: 16 TFLOP/s warm, 0 resets in the
+      window. Host judged healthy for A/B gating.
+    - **TP=1 off arm (in-process harness): 82.37 ± 0.07 t/s** Δ-metric
+      (fp d2e5262183c6b92f) — clean, load 391 s.
+    - **Wedge 08:49:34 (TP=1 `MOE_M1=1` arm):** `unspecified launch
+      failure` at weight-load shard 9/9 → qcm fence timeout +
+      unsuccessful queue preemption → BACO reset on GPU0, "device
+      wedged, but recovered through reset". NOT a MOE_M1 kernel fault:
+      the flag only changes decode-time gemm2 dispatch (the engine died
+      during load, before any MoE GEMM ran); v2-tile source unchanged
+      since C2-V measured it clean (08-22/23). 3rd reset this boot but
+      intermittent (clean windows + the full off arm between events) →
+      isolated per house recipe. Post-reset canary: both GPUs 16
+      TFLOP/s, VRAM 0%/0%.
+    - **TP=2 in-process OOM finding (new, software):** the first TP=2
+      engine (off arm) was SIGKILL'd at NCCL init by the **hermes
+      worker cgroup** (`memory.max` cap on
+      `app.slice/hermes-worker-proc_*.scope`, ~4 GiB): two TP workers
+      (~1.8 GB RSS each + shmem + inductor) exceed it. No GPU event.
+      Fix per the standing rule: long vLLM work under **systemd user
+      services with MemoryMax=infinity** (new unit `c2arm@.service`,
+      one-shot per arm). Under systemd the TP=2 off arm completed
+      clean: **81.58 ± 0.58 t/s**, fp d2e5262183c6b92f (identical to
+      the TP=1 off arm — numerics gate passes at the control point),
+      unit peak 13.9 GB, 0 resets in the window.
+    - Remaining arms (m1 / npt2 / both) run under the same systemd
+      path with a burst guard (abort on 2 consecutive failures or ≥3
+      resets since run start; canary before/after each arm).
+
+    **Completion (09:1x–12:0xZ, interactive + cron sessions):** all
+    four TP=2 arms done under systemd (m1 83.80, npt2 83.88, both
+    85.65 t/s; off 81.58 — full table in `DEVLOG-moe-c2v.md` final
+    section). The two missing TP=1 arms (m1, npt2) were re-run
+    in-process at 11:5x–12:0xZ (the cgroup OOM only affects TP=2's
+    dual-worker footprint): m1 84.41, npt2 84.64 t/s; the final TP=1
+    both arm ran in-process at 12:53–12:56Z: 84.74 t/s. All 8 arms
+    share output fingerprint d2e5262183c6b92f (numerics gate PASS).
+    0 new resets after the 08:49:34 event; VRAM drained to ~10 MB/card
+    between every arm; post-run canary clean. GPUs idle at session end.
+

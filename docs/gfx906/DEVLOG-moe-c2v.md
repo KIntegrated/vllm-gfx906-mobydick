@@ -232,6 +232,47 @@ deltas are intra-driver (adjacent engines) and unaffected; no wedge
 or reset overnight (VRAM 0/0 at completion, no degradation-table
 entries).
 
+## Combined default-on decision (C2 final, 2026-08-31)
+
+The C2-V reopen left one Kevin-decision open: promote the two TP=2-M=1
+wins to default-on or keep them env-gated. Resolved by a **combined**
+A/B (both flags on in one engine vs off) + numerics gate, 8 arms
+(4 × TP ∈ {1,2}), model Qwen3.5-35B-A3B-AWQ, pp=2048/tg=256, graph
+mode, util 0.95, 3 repeats/arm, per-arm VLLM_CACHE_ROOT isolation.
+TP=2 arms under systemd user services (worker-cgroup OOM finding,
+`degradation_details.md`); TP=1 in-process.
+
+| arm | TP | MOE_M1 | MOE_NPT | decode t/s (Δ-metric) | vs off |
+|---|---|---|---|---|---|
+| off | 1 | — | — | 82.37 ± 0.07 | — |
+| m1 | 1 | 1 | — | 84.41 ± 0.06 | +2.5 % |
+| npt2 | 1 | — | 2 | 84.64 ± 0.09 | +2.8 % |
+| **both** | 1 | 1 | 2 | **84.74 ± 0.10** | **+2.9 %** |
+| off | 2 | — | — | 81.58 ± 0.58 | — |
+| m1 | 2 | 1 | — | 83.80 ± 0.03 | +2.7 % |
+| npt2 | 2 | — | 2 | 83.88 ± 0.03 | +2.8 % |
+| **both** | 2 | 1 | 2 | **85.65 ± 0.04** | **+5.0 %** |
+
+- **Numerics gate PASS:** output fingerprint `d2e5262183c6b92f`
+  identical across all 8 arms (every repeat).
+- **VERDICT: SHIPPED default-on.** Both flags promoted for the M=1
+  decode path: gemm2 takes the v2 512-thread tile when its shape gate
+  passes (non-qualifying shapes — e.g. Nemotron-H K2=1856 — fall back
+  to legacy `<1,4>` silently), gemm1 takes the `<1,2>` re-tile. Env
+  overrides retained: `VLLM_GFX906_MOE_M1=0` / `VLLM_GFX906_MOE_NPT=4`
+  opt out; `MOE_M1=1` still hard-asserts the shape gate (documented
+  narrowing: only an exact `"1"` forces v2 — pre-C2 any non-`"0"` did).
+  Dispatch-path marker op (`take_moe_m1_dispatch_path`, registered via
+  CompositeExplicitAutograd as the codebase pattern for zero-tensor
+  ops) + per-flag unit tests guard which tile actually ran.
+- TP=1 deltas are larger than C2-V's powered neutral (+0.48 %): the
+  combined A/B ran on a fresh boot (P) with a different build; the
+  gate decision rests on TP=2 M=1 where the signal was always largest,
+  and TP=1 is positive here too — no regime shows a regression.
+- Session cost notes: one chronic weight-load wedge (08:49:34, GPU0,
+  isolated per house recipe) and the worker-cgroup OOM finding →
+  systemd migration; both recorded in `degradation_details.md`.
+
 ## Verdict (final)
 
 - **Reopen gate TRIGGERED** (roadmap rule: any positive ≥0.5 %):

@@ -88,15 +88,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
 
   // Test-only: read-and-reset the M=1 gemm dispatch-path marker (see
   // csrc/rocm/moe_q_gemm_gfx906.cu). Lets tests assert which tile ran despite
-  // the kernels' atomic (non-bit-reproducible) accumulation. Zero-arg op:
-  // PyTorch requires a fallback registration, so it is bound for CPU too
-  // (the impl is a device-independent atomic exchange; returns 0 when no M=1
-  // gemm ran on this process).
+  // the kernels' atomic (non-bit-reproducible) accumulation. Zero-arg op —
+  // device dispatch has nothing to key on, so it is registered via
+  // CompositeExplicitAutograd below (the codebase pattern for zero-tensor
+  // ops); the impl is a device-independent atomic exchange that returns 0
+  // when no M=1 gemm ran in this process.
   rocm_ops.def("take_moe_m1_dispatch_path() -> int");
-  rocm_ops.impl("take_moe_m1_dispatch_path", torch::kCUDA,
-                &take_moe_m1_dispatch_path);
-  rocm_ops.impl("take_moe_m1_dispatch_path", torch::kCPU,
-                &take_moe_m1_dispatch_path);
 
   // M=1 W16A16 dense GEMV for gfx906 (Phase 3 P3-2b). Works on any ROCm
   // target; selected at runtime on gfx906.
