@@ -89,10 +89,16 @@ session `canary.sh` sources it — drop there too when next touched.
 
 ### N1 — quiet the expected AutoAWQMoEMarlin fallback
 
-On gfx906 the fallback to the custom WNA16 path is intentional. Replace
-the repeated per-layer warnings with one info/debug message on gfx906
-while retaining warnings on platforms where the fallback is unexpected.
-Run a behavior sanity gate. See
+**Status: SHIPPED, merged to `main` (2026-08-31, ff of
+`gfx906/n1-awq-fallback-quiet`; self-review + Claude CLI review — no
+blockers, dead-import cleanup + once-log cache fixture applied).**
+On gfx906 the fallback to the custom WNA16 path is intentional:
+`get_quant_method` now emits one `info_once` line per process instead of a
+per-layer warning when `current_platform.is_rocm() and on_gfx906()`; all
+other platforms keep the (deduped) warning. Returned quant method identical
+in both branches. Behavior gate:
+`tests/quantization/test_auto_awq_gfx906_fallback.py` (2 tests; verified to
+FAIL if the production change is reverted). See
 `vllm/model_executor/layers/quantization/auto_awq.py`.
 
 ## Tier 1 — decode fast path
