@@ -675,3 +675,136 @@ TP-driven partial groups, sentinel _FusedCalled, 109.8, 110.05,
 109.37, PPL 24.90, systemd-run MemoryMax=infinity, cgroup OOM weight
 load, nh4_launch.sh, nh4_ppl_client.py, prompt_logprobs API dict shape,
 decoded_token lookup, EP serving A/B, no t/s gain GEMV-bound step.
+
+---
+
+## 2026-08-31 — NH-2′: CUDA int8 W8A16 GEMV serving A/B gate — NO-GO (M-mismatch)
+
+**VERDICT:** NO-GO at serving level (measured on MI50, 2026-08-31; branch
+`gfx906/nh2c-int8-cuda`, checkpoint `8b0c2e38b9`). The CUDA kernel is
+correct and fast *in isolation* but the serving A/B is a **−61% regression**
+because the M distribution it was gated on (M=4) is not the M distribution
+serving actually produces.
+
+· **GATE:** serving A-B-A, spec-decode ngram n=5, TP=2+EP, port 8931, local
+NVMe weights, per-arm isolated `VLLM_CACHE_ROOT`, warm (untimed pre-pass) +
+median-of-3 timed runs; PPL via prompt_logprobs on both arms.
+
+### Symptom / paradox
+
+The M=4 micro-bench gate passed with a strong win (in_proj [10304,2688]
+239 µs → 72 µs = **3.3×**, out_proj 245 → 74 µs = 3.3×). Yet the serving A/B
+measures armB (CUDA int8 active) at **46.1 t/s** vs armA (baseline dequant)
+at **119.2 t/s** — a **−61% regression**, uniform across every prompt. The
+kernel is provably faster on the shape it was tuned for, but serving gets
+slower. That is the contradiction this section resolves.
+
+### Run recipe (what actually worked after 3 infra blockers)
+
+- Launch: systemd **user service unit** `nh2p-arm{A,B}.service`
+  (`Type=simple`, `MemoryMax=infinity`) → `/local/tmp/nh2p_serve.sh <arm>`.
+  This escapes the 4 GiB cgroup cap that OOM-killed vLLM workers during
+  host-RAM weight staging (kernel log: `usage 4194304kB, limit 4194304kB`).
+  Do **not** set `VLLM_ENABLE_V1_MULTIPROCESSING=0` (collapses the engine
+  into the API process and breaks TP=2 worker spawn).
+- Weights: local NVMe copy `/local/cache/huggingface/nemotron35` (NFS
+  safetensors concurrent-mmap flaked with `UntypedStorage` on shard 2; local
+  copy removes NFS as a variable entirely).
+- Required flags for TP=2+EP: `--tensor-parallel-size 2
+  --enable-expert-parallel --disable-custom-all-reduce`. Missing the last one
+  → NCCL-init hang (workers sleep at 0% CPU after "using nccl==2.30.4").
+- **Per-arm `VLLM_CACHE_ROOT=/local/tmp/vllmcache_<arm>` is REQUIRED.** The
+  torch.compile AOT cache hash does NOT include the `VLLM_GFX906_W8A16_INT8`
+  gate, so armB replayed armA's cached graph (traced under the dequant path)
+  and crashed with `KeyError: 'weight'` during `determine_available_memory →
+  profile_run → _dummy_run`. Isolate each arm's cache or the A/B is unsound.
+
+### Measured (MI50, torch 2.13+gfx906; /local/tmp/nh2p_gate_arm{A,B}.json)
+
+| | armA (baseline dequant) | armB (CUDA int8 active) | Δ |
+|---|---|---|---|
+| Decode t/s (warm, median×3, 7 prompts) | **119.2** | **46.1** | **−61%** |
+| PPL (12 prompts, 377 tok, 0 top-20 misses) | 24.9260 | 24.8826 | +0.002 (noise) |
+
+Per-prompt t/s is uniform in the regression direction (no single outlier
+swamps it — that was a v1 protocol artifact, fixed by adding an untimed
+warmup pass so per-prompt cudagraph/JIT first-request cost lands there).
+PPL delta is within noise → **armB is not "slow AND wrong", just slow.**
+
+### The M distribution (root cause) — captured in eager mode
+
+Instruments inside the compiled `apply_weights` region are impossible under
+this fork's `aot_compile_fullgraph`: file I/O, `print`, and even a
+`@torch.compiler.disable`d recorder each trip Dynamo
+(`Unsupported: Attempted to call function marked as skipped` /
+`Failed to trace builtin operator`). The only way to read the live M
+distribution was an **eager-mode** boot (`--compilation-config
+'{"mode":"NONE"}'`) with a one-line `print` (safe when uncompiled), then a
+128-token decode. Result (both TP ranks, per (m,n,k)):
+
+```
+3422  m=1 n=2688 k=2048     708  m=1 n=2304 k=2688    120  m=1 n=65536 k=2688
+2714  m=1 n=5152 k=2688     264  m=6 n=2304 k=2688     58  m=5 n=2688 k=2048
+1276  m=6 n=2688 k=2048     1012 m=6 n=5152 k=2688      56  m=4 n=2688 k=2048
+  46  m=5 n=5152 k=2688      44  m=6 n=65536 k=2688     44  m=4 n=5152 k=2688
+  12  m=5 n=2304 k=2688      12  m=4 n=2304 k=2688       2  m=4 n=65536 k=2688
+```
+
+Totals: **m=1 = 72%**, **m=6 = 28%**, m=4 + m=5 = ~2%. This is the smoking
+gun. The kernel's M≤4 gate fires on m=1 (72%) and m=4/m=5 (~2%), but the
+**m=6 case — 28% of all calls, including every full-acceptance spec step —
+falls through to the Triton int8 GEMM**, which the NH-2 devlog already
+measured at **0.5–0.8×** of the fp16 baseline (in-register per-tile dequant).
+
+### Why the M=4 micro-bench gate did not predict this
+
+The kernel was tuned and gated on **M=4 in_proj = 3.3×**, but under ngram
+spec-decode the verification step runs at **M=5–6** (1 real token + up to 5
+drafts), and single-token steps run at M=1. M=4 is only ~1% of calls. So:
+
+- The 72% m=1 traffic *does* hit the fast CUDA kernel, but M=1's absolute win
+  is far smaller than M=4's (lm_head M=1 was actually *below* Triton in the
+  micro-bench: 544 vs 730 GB/s).
+- The 28% m=6 traffic hits the **slow** Triton int8 GEMM fallback.
+- Net across the real mix: −61%.
+
+The gate measured an operating point (M=4) that essentially never occurs in
+this serving mode, and did not measure the two that do (M=1, M=6).
+
+### Ruled out
+
+| hypothesis | status | evidence |
+|---|---|---|
+| GPU1 `hipErrorLaunchFailure` wedge | ruled out (transient) | probe: matmul + int8 launch both pass; retry boots clean; no dmesg errors |
+| stale `_rocm_C.so` (BUILD_RC=1) | ruled out | BUILD_RC=1 was a **versioning** failure (`vcs_versioning` can't parse tag `gfx906-main-pre-promotion`; `SETUPTOOLS_SCM_PRETEND_VERSION` is ignored by it), not a compile error. `.so` (01:14) predates the failed build and contains all 3 kernel symbols (`dense_gemv_i8_gfx906`, `_m4_`, `_gfx906`) |
+| armB crash = bug in my dispatch | ruled out | `KeyError 'weight'` was armA's stale AOT cache replayed under INT8=1; per-arm `VLLM_CACHE_ROOT` fixes it. My int8 path correctly uses `layer.weight_i8` (no `['weight']` lookup) |
+| M-histogram instrumentation bug | ruled out (but unusable in-graph) | the recorder is correct, but fullgraph compilation rejects any graph break / disable-marked call / print inside the region — must run eager |
+| "slow AND wrong" (int8 dequant shifts logits) | ruled out | PPL armA 24.9260 vs armB 24.8826, 0 misses both; delta is noise |
+
+### Next steps / how this could become a GO
+
+- **The kernel must serve M=5–6.** That is the actual serving operating
+  point (28% of calls, and the full-acceptance spec step). A CUDA int8 GEMM
+  at M≤6 that beats the fp16 baseline (not just the Triton-int8 fallback) on
+  in_proj/out_proj would flip the sign. This is a new kernel target, not a
+  config tweak — the existing `dense_gemv_i8_m4` family caps at M=4.
+- **Re-gate on the real M mix**, not M=4: measure m=1 and m=6 in_proj +
+  out_proj against the fp16 baseline (the production dispatch), weighted by
+  the 72/28 split above. If m=1 is ~parity and m=6 is a loss, there is no win
+  to capture without fixing m=6 first.
+- Keep the kernel + tests on the branch env-gated default-OFF (safe to merge
+  as opt-in); do **not** enable it by default.
+
+### Interactions
+
+- Nothing merges as a default change: `VLLM_GFX906_W8A16_INT8` /
+  `_INT8_CUDA` stay OFF; the dequant path is bit-identical.
+- The M-distribution finding (m=1 72% / m=6 28%, m=4 ~1%) is reusable for any
+  future NH-2′/int8-decode work: it supersedes the "M=4 in_proj" framing in
+  the ROADMAP and the NH-2 section above.
+
+*Keywords: NH-2', CUDA int8 W8A16 GEMV, serving A/B gate NO-GO, M-mismatch,
+ngram spec m=1/m=6 distribution, aot_compile_fullgraph no graph break,
+per-arm VLLM_CACHE_ROOT KeyError weight, vcs_versioning tag parse BUILD_RC=1,
+systemd user service MemoryMax=infinity, local NVMe nemotron35 weights, eager
+mode MLOG, PPL 24.9 noise, dense_gemv_i8_m4 M≤4 cap.*
