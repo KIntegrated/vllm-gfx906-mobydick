@@ -12,6 +12,37 @@ tiers are do-order, sections within a tier are ordered the same way.
 
 ## Tier 0 — cheap, decisive, low-risk
 
+### DE-1 — dead-end register-spill / compiler-structural audit (HIGH PRIORITY)
+
+**User request 2026-08-31.** Every HIP-kernel row in `DEAD-ENDS.md` is
+re-examined for compiler-caused underperformance: VGPR/AGPR pressure,
+register spills, occupancy loss, bad vectorization — i.e. failures that may
+be *fixable by restructuring* rather than dead by hypothesis. Method per
+kernel: (1) locate the source (in-tree flag, branch, or `/tmp` prototype),
+(2) compile it standalone for gfx906 with register-usage reporting and
+record VGPRs/AGPRs/spills, (3) check whether the measured shortfall is
+consistent with spill/occupancy loss (gfx906: 64-lane wavefronts, 40
+waves/CU max = 2560 threads; register file per CU pinned via runtime API —
+see audit), (4) verdict — **fixable → open a branch** with the restructure +
+serving gate; **not fixable** (HBM floor, structural design flaw,
+graph-regime transfer failure, or scope cap) → mark the row `FULLY DEAD` in
+`DEAD-ENDS.md` with the compiler evidence. Non-HIP rows (Triton codegen,
+Python/serving, analytic, memory-fit) are classified and closed without
+branches.
+
+**STATUS: DONE 2026-08-31.** Verdict: **zero dead-ends failed from register
+spills or measurable register pressure** — `vgpr_spill_count = 0` on every
+in-tree HIP-kernel dead-end (VGPRs 12–93; highest, gemm1 re-tile family at 79,
+is LDS-limited by design and failed on wall-clock transfer, not per-wave
+throughput). The two primary suspects confirmed non-pressure: FA V2 = 16 VGPR
+vs shipped V1's 12 (both spill-free → the 7× serving loss is grid-shape/
+scheduler, not compiler); gemm1 V1 single-wave full-K was structural by
+construction (one wavefront/block, K-looped; 64 × 128 KB streams can't stay in
+flight). 13 rows annotated `FULLY DEAD` in `DEAD-ENDS.md`; **no branch opened**
+(no fixable-by-restructure case found). Open rows T1/T5 untouched. Full record:
+[`DEAD-ENDS-AUDIT.md`](DEAD-ENDS-AUDIT.md); rerunnable harness
+`/local/tmp/spill_audit.py`, raw tables `/local/tmp/de1_audit_results.txt`.
+
 ### G1 — decode-graph per-node replay-cost probe
 
 The 2026-08-29 same-boot LEGACY adjudication
