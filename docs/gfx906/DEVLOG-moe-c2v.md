@@ -309,19 +309,19 @@ migration; both recorded in `degradation_details.md`.
 **VERDICT:** SHIPPED (measurement complete; the V1 block-count axis is
 closed — no dispatch change, per the no-busywork rule). **GATE:** n/a for
 a measurement-only close — standalone launch-regime numbers are the
-deliverable here because the hypothesis was structural (in-flight
-bandwidth vs per-block stream length), and every V1 variant is ≥2.0×
-slower than current in the regime where it would have to win, so no
-serving A/B can be reached (the transfer failures of §3/DEVLOG-moe-gemm1-
-retiling make a serving gate uninformative at this margin).
+deliverable here because every V1 variant is ≥2.1× slower than current in
+the regime where it would have to win (v1b 59.0 vs 28.7 µs), so no serving
+A/B can be reached (the transfer failures of §3/DEVLOG-moe-gemm1-retiling
+make a serving gate uninformative at this margin).
 
 ### HYPOTHESIS
 
-If V1's 2.2–4.3× loss at 64 blocks is caused by each block streaming one
-long 128 KB weight sequence that can't stay in flight on the MI50, then
-splitting N more (128/256/512 blocks → 64/32/16 KB per-block streams)
-recovers enough independent streams to beat or approach current — in which
-case a V1 variant becomes a dispatch candidate.
+The V1 family was rejected at 64 blocks on the stream-length mechanism.
+If more N-splitting (128/256/512 blocks → 64/32/16 KB per-block streams)
+recovers enough independent weight streams, then some block count beats or
+approaches current — in which case a V1 variant becomes a dispatch
+candidate. (Note: the new points also change wavefront config, so the data
+cannot isolate stream length alone — see the confound note below.)
 
 ### What was done
 
