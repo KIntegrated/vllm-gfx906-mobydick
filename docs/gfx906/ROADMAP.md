@@ -211,6 +211,19 @@ See `DEVLOG-moe-c2v.md` (incl. "Combined default-on decision" and
 
 ### C3 — fold the two MoE zeroings (234 µs/step)
 
+**NO-GO 2026-09-01** (measured; `DEVLOG-moe-c3-zeroing-fold.md`). Phase A
+folded `w1_out.zero_()` into the single-CTA M=1 align kernel (stream-ordered,
+not P2-0b's racy in-GEMM clear) — bit-correct (fingerprint identical; 78/78 +
+67/67 green) and confirmed firing (~37 MoE layers/step). But the FULL_DECODE_ONLY
+serving A/B (N=1 M=1, pp2048/tg256, TP=1) is a **wash within noise**: on median
+85.42 vs off median 85.62 t/s (the +0.7% "mean" was one noisy off rep). Root
+cause: this model's `w1_out` is only 8 KB (moe_intermediate=512), so removing
+~40 tiny memset nodes saves ~tens of µs/step (~0.3% of a ~15 ms step) — below
+the A/B's noise floor, and the fold adds an 8 KB store to align that offsets it.
+`output.zero_()` (the other half) is alias-blocked and not pursued for the same
+reason. Fails the user gate ("no gain ⇒ do not merge"); **not merged**. Would
+only clear the bar on a larger-moe_intermediate MoE model, none in scope.
+
 `w1_out.zero_()` and `output.zero_()` cost about 234 µs per step and are
 required by the current atomic K-split/aliased-workspace design. If C2
 does not replace that design, fold the zeroing operations into the
