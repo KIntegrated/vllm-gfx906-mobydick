@@ -77,6 +77,10 @@ editable install of this repo; the compiled extensions live in-tree.
   # confirmed 2026-08-29 — build + serving + in-process suite run without
   # it; ROCm resolves to /opt/rocm by default when ROCM_PATH is unset).
   export PATH="$PWD/.venv/bin:$PATH"          # venv cmake must win
+  # VLLM_VERSION_OVERRIDE: the branch tag `gfx906-main-pre-promotion` does not
+  # parse as a version (setup.py's setuptools_scm step crashes on it); set it
+  # to match the existing vllm/_version.py so the build proceeds.
+  export VLLM_VERSION_OVERRIDE=0.28.0rc2
   FETCHCONTENT_BASE_DIR=/tmp/vllm-deps \
   HIP_VISIBLE_DEVICES=0 .venv/bin/python setup.py build_ext --inplace
   ```
