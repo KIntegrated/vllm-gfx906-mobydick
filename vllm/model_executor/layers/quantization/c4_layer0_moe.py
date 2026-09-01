@@ -231,7 +231,29 @@ class C4QuantizedLayer0MoEMethod(UnquantizedFusedMoEMethod):
         # Shared gfx906 repack + kernel setup.
         self._wna16_method = MoeWNA16Method(moe_wna16_config, layer.moe_config)
         self._wna16_method.process_weights_after_loading(layer)
+
+        # Sync the runner-visible state from the delegate. The MoE runner
+        # reads these off *this* method (self._quant_method), not the
+        # delegate: moe_kernel drives _fused_output_is_reduced,
+        # supports_internal_mk (property over moe_kernel),
+        # mk_can_overlap_shared_experts, topk_indices_dtype, and
+        # do_naive_dispatch_combine. Without this sync layer 0 would look
+        # like a non-MK method to the runner even though its forward runs
+        # through the WNA16 kernel.
+        self.moe_kernel = self._wna16_method.moe_kernel
+        self.moe_quant_config = self._wna16_method.moe_quant_config
+        self.experts_cls = self._wna16_method.experts_cls
+
         self._c4_active = True
+
+    @property
+    def supports_eplb(self) -> bool:
+        # UnquantizedFusedMoEMethod advertises True, but the active WNA16
+        # path does not support EPLB (base default False). Follow the path
+        # that actually runs.
+        if self._c4_active and self._wna16_method is not None:
+            return self._wna16_method.supports_eplb
+        return super().supports_eplb
 
     def apply(self, layer, x, topk_weights, topk_ids, shared_experts,
               shared_experts_input):
