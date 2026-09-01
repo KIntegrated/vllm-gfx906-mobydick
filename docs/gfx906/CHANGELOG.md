@@ -6,6 +6,23 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-01
+
+- **C4: load-time int4 quantization of the unquantized first MoE layer (GO,
+  measured).** Qwen3.5-35B-A3B-AWQ leaves `model.layers.0.` in fp16
+  (`modules_to_not_convert`), so its routed experts ran on the Triton
+  unquantized path at ~4× per-call cost (740 vs 182 µs, C2 profile). New
+  method loads fp16 as usual, then quantizes to int4 in
+  `process_weights_after_loading` (asymmetric AWQ, codepoints against the
+  stored fp16 scale) and delegates to the shared gfx906 WNA16 repack — no new
+  kernel code; fp16 storage released (~1.5 GiB). Gates: unit 8/8; PPL Δ +0.04
+  (noise); greedy serving fingerprint bit-identical across arms; serving A/B
+  (M=1, pp2048/tg256, same boot) **84.95 → 87.51 t/s = +3.0%** (above the
+  ~1.8% noise floor). Pre-merge review (self + Claude CLI): runner-visible
+  quant-method state sync + `supports_eplb` path-following fixed; one finding
+  rejected with evidence. Ships opt-in (`VLLM_GFX906_QUANT_LAYER0_MOE=1`)
+  pending a soak window. See `DEVLOG-c4-layer0-quant.md`.
+
 ## 2026-08-30
 
 - **NH-4: mamba2 grouped gated-norm fused path (SHIPPED, env default
