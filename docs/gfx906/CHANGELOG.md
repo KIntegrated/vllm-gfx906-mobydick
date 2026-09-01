@@ -8,6 +8,37 @@ the date an investigation began.
 
 ## 2026-09-01
 
+- **Post-C4 maintainability sweep: removed the two FULLY-DEAD M=1 routing
+  experiments (S2 topk kernel + C1 stage 2 fused routing).** Per the
+  post-C4 inventory directive (inventory all merged-but-not-default-enabled
+  gfx906 work; remove dead code for maintainability with a preservation
+  branch first), branch `gfx906/preserve-dead-kernels` was cut at main so
+  every removed line stays in git history, then: S2 (`moe_topk_gfx906.cu`,
+  the `VLLM_GFX906_TOPK_M1` dispatch, bindings, `_custom_ops` wrapper +
+  fake, tests, bench) and C1 stage 2
+  (`moe_routing_fused_m1_gfx906.cu`, the `VLLM_GFX906_ROUTING_FUSE_M1`
+  dispatch, bindings, tests) were deleted, along with the
+  `_fused_align_meta` router→expert plumbing they orphaned (C1 stage 2 was
+  its only producer; verified zero non-None assignments remain) — touching
+  `moe_runner.py`, `routed_experts.py`, `modular_kernel.py`,
+  `fused_moe_modular_method.py`, `gfx906_w4a16_moe.py`, and
+  `fused_topk_router.py`. Net −406/+9 lines, 13 files. Both were already
+  recorded FULLY DEAD in `DEAD-ENDS.md` (3rd isolated→serving flip pattern;
+  C1 stage-1 — the align+count kernel that shipped default-on — is
+  untouched). The structural probe `c1_routing_structural_probe.py` is kept
+  (hasattr-guarded, degrades gracefully) as the cited evidence record.
+  Verification: incremental build rc=0; unit suites green; live M=1/M=4
+  `fused_topk` through the edited router OK; removed ops confirmed absent
+  from the compiled extension; full-engine e2e probe (Ornith-1.5-35B-A3B,
+  C4 ON) loading + coherent decode. Remaining default-off knobs after the
+  sweep: `SKINNY_M16` (cleared to flip default-on — pending decision),
+  `MAMBA_FUSED_GROUP_NORM` NH-4 (+0.4 % = noise; keep, revisit when a
+  non-MoE-GEMV-bound config exists), the int8 W8A16 family
+  (`W8A16_INT8*`, T1 PROBE GO dependency — keep), and C4
+  `QUANT_LAYER0_MOE` (GO, opt-in pending soak). The stale S5 row in
+  `DEAD-ENDS.md` was corrected: that kernel is live default-on as
+  `VLLM_GFX906_MOE_M1` since the C2 combined A/B (+2.72 %).
+
 - **C4: load-time int4 quantization of the unquantized first MoE layer (GO,
   measured).** Qwen3.5-35B-A3B-AWQ leaves `model.layers.0.` in fp16
   (`modules_to_not_convert`), so its routed experts ran on the Triton

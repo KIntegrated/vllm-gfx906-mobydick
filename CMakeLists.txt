@@ -1498,9 +1498,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/rocm/attention.cu"
     "csrc/rocm/moe_q_gemm_gfx906.cu"
     "csrc/rocm/dense_gemv_gfx906.cu"
-    "csrc/rocm/moe_topk_gfx906.cu"
-    "csrc/rocm/moe_align_m1_gfx906.cu"
-    "csrc/rocm/moe_routing_fused_m1_gfx906.cu")
+    "csrc/rocm/moe_align_m1_gfx906.cu")
   set(VLLM_ROCM_EXT_FLAGS ${VLLM_GPU_FLAGS})
 
   # skinny_gemms*.cu are built on gfx9/gfx11 ISA (MFMA, dot2/dot4, legacy

@@ -1664,17 +1664,6 @@ class FusedMoEKernel:
         """
         return self.prepare_finalize.output_is_reduced()
 
-    def _impl_accepts_fused_align_meta(self) -> bool:
-        cached = getattr(self, "_impl_takes_fused_align_meta", None)
-        if cached is None:
-            import inspect
-
-            cached = "fused_align_meta" in inspect.signature(
-                self.impl.apply
-            ).parameters
-            self._impl_takes_fused_align_meta = cached
-        return cached
-
     def apply_monolithic(
         self,
         hidden_states: torch.Tensor,
@@ -1720,35 +1709,8 @@ class FusedMoEKernel:
         apply_router_weight_on_input: bool,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
-        fused_align_meta: tuple[
-            torch.Tensor, torch.Tensor, torch.Tensor
-        ]
-        | None = None,
     ) -> torch.Tensor:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
-        # Only impls declaring fused_align_meta (the gfx906 W4A16 expert,
-        # C1 stage 2) accept it; check the signature once. If the impl
-        # does not take it, drop it — the expert then re-aligns from
-        # topk_ids (same values the fused routing kernel computed).
-        if (
-            fused_align_meta is not None
-            and not self._impl_accepts_fused_align_meta()
-        ):
-            fused_align_meta = None
-        if fused_align_meta is None:
-            return self.impl.apply(
-                hidden_states=hidden_states,
-                w1=w1,
-                w2=w2,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                activation=activation,
-                global_num_experts=global_num_experts,
-                expert_map=expert_map,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                shared_experts=shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
         return self.impl.apply(
             hidden_states=hidden_states,
             w1=w1,
@@ -1761,5 +1723,4 @@ class FusedMoEKernel:
             apply_router_weight_on_input=apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
-            fused_align_meta=fused_align_meta,
         )

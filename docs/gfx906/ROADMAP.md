@@ -214,8 +214,10 @@ A/B, not isolated kernel numbers, as the item required:
   pinpoints the mechanism: REMOVING redundant nodes transfers; REPLACING
   the proven production topk kernel does not (S2: −1.03 %, stage 2:
   −1.10 %). Landed behind `VLLM_GFX906_ROUTING_FUSE_M1` (default OFF)
-  with router→expert meta plumbing, kept for future kernel-design
-  iterations.
+  with router→expert meta plumbing; **removed from the tree 2026-09-01**
+  (maintainability sweep — code preserved on branch
+  `gfx906/preserve-dead-kernels`, including the now-orphaned
+  `_fused_align_meta` plumbing).
 
 The standalone M=1 top-k specialization (S2) and stage 2 both lost in
 the CUDA-graph regime, so the remaining topk cost (~470 µs/step

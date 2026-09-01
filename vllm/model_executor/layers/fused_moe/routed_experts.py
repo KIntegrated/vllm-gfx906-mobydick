@@ -1200,10 +1200,6 @@ class RoutedExperts(PluggableLayer):
         topk_ids: torch.Tensor,
         shared_experts: "SharedExperts | None" = None,
         shared_experts_input: torch.Tensor | None = None,
-        fused_align_meta: tuple[
-            torch.Tensor, torch.Tensor, torch.Tensor
-        ]
-        | None = None,
     ) -> torch.Tensor:
         """
         Execute routed experts using the quantization method's apply function.
@@ -1218,32 +1214,12 @@ class RoutedExperts(PluggableLayer):
             topk_ids: Selected expert IDs from router (for modular kernels)
             shared_experts: The shared experts (if any)
             shared_experts_input: Input for shared experts (if any)
-            fused_align_meta: (sorted_token_ids, expert_ids,
-                num_tokens_post_pad) pre-computed by the gfx906 fused
-                routing kernel (C1 stage 2); None otherwise
 
         Returns:
             Output tensor from routed experts
         """
         assert not self.quant_method.is_monolithic
 
-        # Pass fused_align_meta only when set AND when the method accepts
-        # it: ignored-layer / unquantized methods (and any method without
-        # the kwarg) keep working — their expert re-aligns from the same
-        # topk_ids, so dropping the meta is only an optimization loss.
-        if fused_align_meta is not None and not (
-            self._quant_method_takes_fused_align_meta()
-        ):
-            fused_align_meta = None
-        if fused_align_meta is None:
-            return self.quant_method.apply(
-                layer=self,
-                x=x,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
         return self.quant_method.apply(
             layer=self,
             x=x,
@@ -1251,19 +1227,7 @@ class RoutedExperts(PluggableLayer):
             topk_ids=topk_ids,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
-            fused_align_meta=fused_align_meta,
         )
-
-    def _quant_method_takes_fused_align_meta(self) -> bool:
-        cached = getattr(self, "_qm_takes_fused_align_meta", None)
-        if cached is None:
-            import inspect
-
-            cached = "fused_align_meta" in inspect.signature(
-                self.quant_method.apply
-            ).parameters
-            self._qm_takes_fused_align_meta = cached
-        return cached
 
     def forward_monolithic(
         self,

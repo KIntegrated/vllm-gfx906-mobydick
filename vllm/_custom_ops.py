@@ -850,23 +850,6 @@ def dense_gemv_i8_m4_gfx906(
     return torch.ops._rocm_C.dense_gemv_i8_m4_gfx906(weight, scale, x, kchunk)
 
 
-def moe_topk_softmax_m1_gfx906(
-    topk_weights: torch.Tensor,
-    topk_indices: torch.Tensor,
-    token_expert_indices: torch.Tensor,
-    gating_output: torch.Tensor,
-    renormalize: bool,
-) -> None:
-    """M=1 fused top-k softmax router for gfx906 (E=256, topk=8; see
-    csrc/rocm/moe_topk_gfx906.cu). Bit-equal to ops.topk_softmax for the
-    exact decode shape it serves; callers must gate on that shape.
-    """
-    torch.ops._rocm_C.moe_topk_softmax_m1_gfx906(
-        topk_weights, topk_indices, token_expert_indices, gating_output,
-        renormalize,
-    )
-
-
 if hasattr(torch.ops, "_rocm_C") and hasattr(
     torch.ops._rocm_C, "dense_gemv_gfx906"
 ):
@@ -930,21 +913,6 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
         return torch.empty(
             (x.size(0), weight.size(0)), dtype=x.dtype, device=weight.device
         )
-
-
-if hasattr(torch.ops, "_rocm_C") and hasattr(
-    torch.ops._rocm_C, "moe_topk_softmax_m1_gfx906"
-):
-
-    @register_fake("_rocm_C::moe_topk_softmax_m1_gfx906")
-    def _moe_topk_softmax_m1_gfx906_fake(
-        topk_weights: torch.Tensor,
-        topk_indices: torch.Tensor,
-        token_expert_indices: torch.Tensor,
-        gating_output: torch.Tensor,
-        renormalize: bool,
-    ) -> None:
-        return None
 
 
 if hasattr(torch.ops._C, "allspark_w8a16_gemm"):

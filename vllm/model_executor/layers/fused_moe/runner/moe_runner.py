@@ -600,20 +600,12 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            # C1 stage 2: the gfx906 fused routing kernel (M=1 decode)
-            # computes the align metadata in the router; consume it here so
-            # the expert skips its own moe_align_block_size.
-            fused_align_meta = getattr(self.router, "_fused_align_meta", None)
-            if fused_align_meta is not None:
-                self.router._fused_align_meta = None
-
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 shared_experts=self._shared_experts,
                 shared_experts_input=shared_experts_input,
-                fused_align_meta=fused_align_meta,
             )
 
         self._maybe_apply_shared_experts(
