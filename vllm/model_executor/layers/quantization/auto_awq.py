@@ -42,6 +42,9 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.c4_layer0_moe import (
+    c4_quant_layer0_enabled,
+)
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     check_marlin_supported,
@@ -346,6 +349,17 @@ class AutoAWQConfig(QuantizationConfig):
                 getattr(self, "modules_to_not_convert", []),
                 match_mode="substring",
             ):
+                # C4 (gfx906): the checkpoint's deliberately-unquantized first
+                # MoE layer otherwise runs the generic Triton unquantized path
+                # (~4x/call vs the custom W4A16 kernel at M=1). Opt-in via
+                # VLLM_GFX906_QUANT_LAYER0_MOE=1, quantize its fp16 experts to
+                # int4 after load and route them through the gfx906 kernel.
+                if c4_quant_layer0_enabled():
+                    from vllm.model_executor.layers.quantization.c4_layer0_moe import (
+                        C4QuantizedLayer0MoEMethod,
+                    )
+
+                    return C4QuantizedLayer0MoEMethod(layer.moe_config, self)
                 return UnquantizedFusedMoEMethod(layer.moe_config)
 
             if not check_moe_marlin_supports_layer(
