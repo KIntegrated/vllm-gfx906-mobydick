@@ -339,13 +339,39 @@ serving, correctness, and memory gates.
 
 ### C4 — quantize layer-0 routed experts (414 µs/step)
 
-**Status: open — the 70 t/s target is ACTIVE (user decision
-2026-08-29).** The checkpoint leaves layer 0's routed experts in fp16, so
-the unquantized Triton path costs about 414 µs per decode step. A
-load-time calibration-free W4A16 repack could remove the last
-routed-expert Triton dependency and reduce the layer's weight traffic.
-This is a quantization-path change, not a kernel-only change: it needs a
-PPL/coherence gate and a serving A/B.
+**Status: GO 2026-09-01 (measured; `gfx906/c4-layer0-quant`, pending merge).**
+The checkpoint leaves layer 0's routed experts in fp16, so the unquantized
+Triton path costs ~740 µs per call at M=1 (C4 scoping probe) vs 182 µs for
+the gfx906 W4A16 kernel — ~558 µs/step ≈ 4.8% of the ~11.7 ms step.
+
+Implementation: `c4_layer0_moe.py` installs a method on the skipped
+RoutedExperts layer that loads fp16 as usual, then in
+`process_weights_after_loading` quantizes to int4 (asymmetric AWQ, group size
+from the checkpoint config; codepoints chosen against the stored fp16 scale)
+and delegates to the shared gfx906 WNA16 repack + kernel — no new kernel
+code. The fp16 storage is released via `register_parameter(name, None)`
+(~1.5 GiB back for graph capture). Gated by
+`VLLM_GFX906_QUANT_LAYER0_MOE=1` (default off until soak).
+
+Gates (all passed):
+- Unit: 8/8 (`tests/kernels/moe/test_c4_layer0_quant.py`) — bit-exact packing
+  vs an independent reference, round-trip error bounds, cross-check against the
+  production gfx906 repack.
+- Quality: PPL off 15.9531 → on 15.9929 (Δ +0.04, noise; gate < 0.5); greedy
+  serving fingerprint bit-identical across arms (`d2e5262183c6b92f`); coherent
+  text all samples.
+- Serving A/B (M=1 decode, pp2048/tg256, 3 reps/arm, same boot): off
+  84.95 ± 0.08 → on **87.51 ± 0.33 t/s = +3.0%**, above the ~1.8% A/B noise
+  floor (C3's wash was 0.3%). Firing confirmed in the ON-arm log.
+
+Pre-merge review (self + Claude CLI, validated): synced the runner-visible
+quant-method state from the delegate (`moe_kernel`/`moe_quant_config`/
+`experts_cls`) and made `supports_eplb` follow the active path — without the
+sync the MoE runner would have treated layer 0 as a non-MK method.
+
+Open: default-on decision after soak (keep opt-in until at least one full-day
+serving window); T1 (int8 family, PROBE GO) may supersede part of this work
+if it lands on the unquantized mass instead.
 
 ## Model onboarding queue (own cadence)
 
