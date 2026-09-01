@@ -10,6 +10,68 @@ E=256, topk=8, hidden=2048, W4A16 group-128 experts; B=1 decode step
 ≈ 15 ms at 66.5 t/s. Priority = expected gain × confidence ÷ effort+risk;
 tiers are do-order, sections within a tier are ordered the same way.
 
+## High priority — user-requested (2026-09-01)
+
+### MTP-1 — Qwen3.8-27B dense MTP long-context decode: crossover, remaining wins, dynamic depth (HIGH PRIORITY)
+
+**User request 2026-09-01.** Reports of low long-context performance with
+MTP on **TP=2** for the dense 27B model. Three subtasks, in order; do not
+start a later one before the earlier has delivered its measurement.
+
+Target: `Qwen3.8-27B-AWQ-INT4` (dense), TP=2 on the official amdgpu DKMS
+driver (platform fixed, S4), `--dtype float16`, util 0.93, trimmed capture
+`[1,2,3,4]`. This is dense-model work — separate from the MoE Tier-1 C*
+items; do not import Qwen3.5 MoE numbers.
+
+**Known starting evidence (S9, boot E, 2026-08-24) — a curve, not a pinned
+bracket.** MTP k=2 vs greedy, TP=2, live-context decode tax:
+
+| live ctx | MTP t/s | greedy t/s | MTP/greedy |
+|---|---|---|---|
+| ~2k  | 59.2 | 40.8 | **1.45×** |
+| ~8k  | 44.9 | 38.1 | **1.18×** |
+| ~32k | 25.2 | 30.5 | **0.83×** |
+| ~64k | 16.6 | 24.1 | **0.69×** |
+
+Crossover already observed between 8k and 32k (README: "MTP < greedy beyond
+~20k ctx"). Mechanism from S8/S9: FA gather/attention is O(Sk); MTP's ~2.5
+tok/step no longer beats greedy's 1× FA/draft overhead past ~20k live ctx
+(step ≈ 40 ms + ~1.7 µs/token). **But** that curve is n=2–3 per point, single
+boot, and conflates prefill length with live context (prefix-cache warm hits
+inflate the short-ctx cells). The crossover bracket is NOT yet pinned.
+
+- **MTP-1a — pin the crossover bracket.** Sweep prefill / live-context
+  length on TP=2 dense 27B, MTP k=2 vs greedy, same boot, n≥4 reps per point,
+  and **separate prefill length from live context** (unique prompt headers to
+  defeat prefix-cache carryover). Deliver the exact bracket where MTP k=2
+  transitions from faster to slower than greedy, with a confidence band.
+  Gate: same-boot graph-mode streaming A/B (`tp2_serve_bench2.py` lineage);
+  update the README S9 curve with the pinned numbers. This is measurement —
+  no code change; stop and report before MTP-1b if the bracket surprises the
+  ~20k estimate.
+- **MTP-1b — remaining Qwen3.8 MTP gfx906 optimization opportunities.**
+  Profile the MTP draft+verify path at and beyond the crossover: the FA
+  gather/attention O(Sk) cost of the draft layer, the verification step, KV
+  writes for draft tokens, and any MTP-specific kernel that falls back to a
+  slow path on gfx906. Identify concrete wins (kernel / dispatch / config).
+  Gate: serving A/B + PPL/coherence (model is non-deterministic at temp=0 —
+  token-identity gates unusable; use t/s + PPL/coherence).
+- **MTP-1c — dynamic MTP logic.** Investigate runtime-adaptive spec decode:
+  (a) disable MTP when context length exceeds the crossover or draft
+  acceptance is low, or (b) change MTP depth dynamically (k=2 → k=1/k=0) by
+  context length / content shape. First determine what this fork's
+  spec-decode engine exposes for per-request or per-step control; if absent,
+  scope the patch. Gate: correctness + a serving A/B on a **mixed-context**
+  workload showing net positive vs the best static config (a dynamic policy
+  must beat the static optimum it is trying to replace).
+
+**Stop rules:** (1) MTP-1c is design work only until MTP-1a pins the bracket
+and MTP-1b shows a real remaining win — no dynamic-MTP machinery on an
+unmeasured crossover. (2) Long-context runs sit in the GPU-degradation-risk
+zone (`degradation.md`) — run the canary before each sweep and stop after any
+reset burst. (3) TP=2 requires the official amdgpu DKMS driver; if it is not
+the active driver, do not force a fallback and record it.
+
 ## Tier 0 — cheap, decisive, low-risk
 
 ### DE-1 — dead-end register-spill / compiler-structural audit (HIGH PRIORITY)
