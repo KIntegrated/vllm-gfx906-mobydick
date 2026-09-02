@@ -62,6 +62,35 @@ blocked by zombie KFD handle from old-vLLM wedge — needs reboot). Old-vLLM
 (0.23.1) A/B abandoned: that code path wedges GPUs loading this model on both
 userlands (see degradation.md 2026-09-02 entries).
 
+**STATUS (2026-09-02, boot S): MTP-1b gate MET — kernel breakdown + K=1 arm.**
+The budget puzzle is resolved: CUDA-event phase hooks (mode-NONE, validated to
+0.4% vs wall) show the greedy @120k step = **full_attn 57.3 ms (73%)** / mlp
+12.6 ms (16%) / lin_attn 8.5 ms (11%). Full attention is O(Sk) and dominates;
+GDN linear-attn stays flat — confirming the crossover mechanism. **K=1 arm
+(boot S, n=3):** k=1 spec decode BEATS BOTH greedy and k=2 at every long-context
+point — the "crossover" was K=2-specific:
+
+| pp | k=2 (boot Q) | **k=1 (boot S)** | greedy (boot Q) | k1/greedy |
+|---:|---:|---:|---:|---:|
+| 65536 | 15.95 | **31.61** | 18.86 | **1.68×** |
+| 98304 | 11.19 | **25.29** | 14.80 | **1.71×** |
+| 122880 | 9.18 | **22.07** | 12.74 | **1.73×** |
+
+k=1 acceptance = 1.0/draft-token (same as k=2's per-draft acceptance; k=2
+accepts ~2/step, k=1 ~1/step — the extra k=2 draft token is pure O(Sk) overhead
+at long ctx). **Root-cause candidate found in our own FA kernel:** both
+`gfx906_fa_forward` and `gfx906_fa_forward_paged_direct` clamp
+`kv_split = 1` when `seq_q > 2` (an OOM guard meant for prefill, where Sq is
+thousands). Spec-decode verify presents the target model k+1 query tokens as
+ONE sequence (`seq_q = k+1`, padded via `_pick_ncols1`), so **k=2 verify
+(seq_q=3→pad 4) loses ALL its KV-split parallelism on exactly the O(Sk)
+attention that is 73% of the step**, while greedy (seq_q=1) and k=1 (seq_q=2)
+keep kv_split. This is **MTP-1b-0** below — the top MTP-1b item (user
+re-prioritized 2026-09-02: "fixing the KV split for k>1 is a high priority fix,
+higher than the syv ideas"). Recon docs from the two external repos (source
+forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx3090.md),
+[RECON-joe2gaan-localaiservers](RECON-joe2gaan-localaiservers.md).
+
 - **MTP-1a — pin the crossover bracket.** ~~Sweep prefill / live-context~~
   **DONE 2026-09-02 (boot Q):** bracket pinned at **32k–64k pp** (1.03× at
   32k, 0.85× at 64k); n=3 reps, cold prefill, separate arms sequential. See
@@ -74,6 +103,88 @@ userlands (see degradation.md 2026-09-02 entries).
   slow path on gfx906. Identify concrete wins (kernel / dispatch / config).
   Gate: serving A/B + PPL/coherence (model is non-deterministic at temp=0 —
   token-identity gates unusable; use t/s + PPL/coherence).
+
+  **MTP-1b-0 — fix the FA kv_split clamp for spec-decode verify (k>1). TOP
+  PRIORITY (user, 2026-09-02). DONE + VALIDATED (2026-09-02, boot S).** Both
+  `gfx906_fa_forward` (gather path) and `gfx906_fa_forward_paged_direct` forced
+  `kv_split = 1` when `seq_q > 2`, which fired for k=2 verify (seq_q=3→pad 4)
+  but NOT for greedy (seq_q=1) or k=1 verify (seq_q=2). The clamp was a prefill
+  OOM guard (partial buffer `[B, Sq, Hq, kv_split, D]` fp32 scales with Sq —
+  multi-GB at Sq~thousands), but at verify Sq=k+1 is tiny (a few MB even at
+  kv_split=16). **Fix:** replaced the hard clamp in both paths with a byte
+  budget (`GFX906_FA_KVSPLIT_MAX_BYTES`, default 512 MiB): keep kv_split>1
+  whenever the partial buffer fits — covers Sq≤~32 at B=1/Hq=24/D=256/split=16
+  (~24 MB) and still forces y=1 for real prefill.
+
+  **Correctness (branch `gfx906/mtp1b0-kvsplit-verify`):** kv_split=1 vs =8
+  outputs identical for Sq∈{1,2,3,4} on both paths (max|d| ≤ 4.6e-4) and match
+  a torch causal reference within 1.2e-4 (`/local/tmp/mtp1/kvsplit_verify_test.py`).
+
+  **Serving A/B @120k-class points (n=3, cold prefill, S9 corpus):**
+
+  | pp | k=2 baseline (clamp) | k=2 fixed | gain | vs k=1 same boot |
+  |---:|---:|---:|---:|---:|
+  | 65536 | 15.95 | **37.95** | 2.38× | beats k=1 (31.6) |
+  | 98304 | 11.19 | **29.88** | 2.67× | beats k=1 (25.3) |
+  | 122880 | 9.18 | **25.70** | 2.80× | beats k=1 (22.1) |
+
+  The fix makes k=2 beat even k=1 at every long-context point: it recovers the
+  full benefit of 2 draft tokens (acc_mean=2.0) on top of keeping KV-split
+  parallelism. This SUPERSEDES the K=1-as-best-config conclusion — with the
+  clamp fixed, **k=2 is the best static config at ≥64k** (and the earlier
+  32k–64k "crossover" was an artifact of the clamp, not a fundamental MTP
+  limit). Data: `/local/tmp/mtp1/data_mtp_k2fix_bootS.jsonl`.
+
+  **Remaining before merge:** (a) PPL/coherence gate on k=2-fixed vs baseline
+  (model non-deterministic at temp=0 — token-identity gates unusable); (b)
+  prefill-OOM regression check (large-Sq batch, budget guard exercised at the
+  boundary); (c) merge per the pre-merge protocol (self-review + claude CLI
+  review of branch vs main). **Status: VALIDATED — pending PPL gate + merge.**
+
+  **Ideas from external repos (source forks cited in the linked recon docs):**
+  - **SYV-1 — split-KV for multi-query verify.** From
+    [syv-ai/qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx3090.md) (RTX 3090,
+    same model family). Their FA2 only splits KV for single-query requests;
+    verify (k+1 queries) ran on 24/82 SMs. **SUPERSEDED by MTP-1b-0** — our
+    kernel already has split-KV; the clamp fix is the actual work. Kept as the
+    external validation that this is the right lever.
+  - **SYV-2 — lookahead/context drafting.** Draft from the request's own token
+    history (point-mass, lossless). Their numbers: +55% verbatim, +2–3% prose.
+    Our workload has heavy verbatim reproduction; acceptance already 1.0/
+    draft-token at 120k so upside is content-shape. Pure scheduler+sampler
+    glue, no new params. **Status: open (MTP-1c candidate — pairs with the
+    dynamic-depth policy).**
+  - **SYV-3 — quantize MTP draft + small draft vocab.** Their drafter was bf16
+    + full 248k lm_head per draft. **LIKELY LOW VALUE on gfx906** — our
+    microbench measured lm_head-per-draft at +322 µs/step = 0.4% (memory-bound
+    GEMV, not their compute-bound sm86 case). Closed negative unless a new
+    measurement contradicts it.
+  - **SYV-4 — sort-free small-k top-k/top-p sampler.** Their gain +4%. Cheap to
+    check whether our sampler path has the same shape; medium value. **Status:
+    open (low effort).**
+  - **SYV-5 — fp16 GDN recurrent state** (`--mamba-ssm-cache-dtype float16`).
+    Config flag, trivial A/B; we run B=1 so mainly a concurrency win for future
+    multi-request work. **Status: open (low effort).**
+  - **SYV-6 — int8 activations (W4A8 Marlin) + negative-scale bug fix.**
+    Batch-mode only (we run B=1); park until multi-request resumes. The bug fix
+    is model-portable if we ever hit it. **Status: parked.**
+  - **SYV-7 — hybrid-model prefix caching** (`PREFIX_CACHE=1`). Biggest
+    real-workload win for chat-on-docs; our sweep uses cold prefill so it doesn't
+    change MTP-1 numbers. **Status: open (real-workload, not MTP-1).**
+  - **SYV-8 — DFlash2 block drafter.** Different drafter arch (whole-block
+    non-autoregressive). Big effort, needs V2 runner (conflicts with our
+    FULLGRAPH path). **Status: parked — revisit only if SYV-1/MTP-1b-0 + SYV-2
+    don't deliver.**
+  - **SYV-9 — int8-QK prefill attention.** Prefill-only; not our bottleneck.
+    **Status: parked.**
+  - **J2G-1 — persistent all-reduce** (from
+    [joe2gaan/localaiservers](RECON-joe2gaan-localaiservers.md), TP=8 host).
+    Attacks TP comm cost — the per-step work our phase profile could NOT
+    attribute (outside any hookable module; hooked modules = ~38% of MTP step).
+    Their prebuilt `.so` is topology-specific (TP=8); the env-only RCCL knobs
+    (`NCCL_ALGO/PROTO/CHANNELS`) are the transferable first probe. **Status:
+    open — cheap env A/B before any port.**
+
 - **MTP-1c — dynamic MTP logic.** Investigate runtime-adaptive spec decode:
   (a) disable MTP when context length exceeds the crossover or draft
   acceptance is low, or (b) change MTP depth dynamically (k=2 → k=1/k=0) by
@@ -82,6 +193,13 @@ userlands (see degradation.md 2026-09-02 entries).
   scope the patch. Gate: correctness + a serving A/B on a **mixed-context**
   workload showing net positive vs the best static config (a dynamic policy
   must beat the static optimum it is trying to replace).
+
+  **NOTE (2026-09-02): MTP-1b-0 changes this item's premise.** With the kv_split
+  clamp fixed, k=2 may win at long context again, so the dynamic policy becomes
+  "pick k by context/content" rather than "disable MTP past a crossover." The
+  fork's existing dynamic-SD mechanism (`vllm/v1/spec_decode/dynamic/`) keys K
+  on `len(num_scheduled_tokens)` — per-step batch token count, NOT context
+  length (scheduler.py:1256) — so a context-length-keyed policy is new machinery.
 
 **Stop rules:** (1) MTP-1c is design work only until MTP-1a pins the bracket
 and MTP-1b shows a real remaining win — no dynamic-MTP machinery on an
