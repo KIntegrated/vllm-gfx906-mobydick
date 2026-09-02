@@ -40,15 +40,33 @@ tok/step no longer beats greedy's 1× FA/draft overhead past ~20k live ctx
 boot, and conflates prefill length with live context (prefix-cache warm hits
 inflate the short-ctx cells). The crossover bracket is NOT yet pinned.
 
-- **MTP-1a — pin the crossover bracket.** Sweep prefill / live-context
-  length on TP=2 dense 27B, MTP k=2 vs greedy, same boot, n≥4 reps per point,
-  and **separate prefill length from live context** (unique prompt headers to
-  defeat prefix-cache carryover). Deliver the exact bracket where MTP k=2
-  transitions from faster to slower than greedy, with a confidence band.
-  Gate: same-boot graph-mode streaming A/B (`tp2_serve_bench2.py` lineage);
-  update the README S9 curve with the pinned numbers. This is measurement —
-  no code change; stop and report before MTP-1b if the bracket surprises the
-  ~20k estimate.
+**STATUS (2026-09-02): MTP-1a DONE — crossover pinned 32k–64k pp on clean
+boot Q.** Full record: [DEVLOG-mtp1](DEVLOG-mtp1.md). Pinned curve (n=3, cold
+prefill, separate prefill/live-context):
+
+| pp | MTP t/s | greedy t/s | ratio |
+|---:|---:|---:|---:|
+| 2048 | 55.3 | 39.9 | **1.39×** |
+| 16384 | 39.9 | 31.9 | **1.25×** |
+| 32768 | 26.6 | 25.9 | **1.03×** (last win) |
+| 65536 | 16.0 | 18.9 | **0.85×** ← crossover |
+| 98304 | 11.2 | 14.8 | **0.76×** |
+| 122880 | 9.2 | 12.7 | **0.72×** |
+
+Acceptance = 2.0 stable through 120k (no collapse) → the loss is O(Sk) step
+cost, not draft rejection. Optz microbench: lm_head-per-draft lead DEAD
+(memory-bound, +322 µs/step = 0.4%); attention K-multiplier ~1.0 at 120k (KV
+bytes shared). **Budget puzzle:** 78 ms/step @120k greedy vs ~12 ms BW floor
+= 6× unexplained → rocprofv3 kernel breakdown is the real MTP-1b gate (pending,
+blocked by zombie KFD handle from old-vLLM wedge — needs reboot). Old-vLLM
+(0.23.1) A/B abandoned: that code path wedges GPUs loading this model on both
+userlands (see degradation.md 2026-09-02 entries).
+
+- **MTP-1a — pin the crossover bracket.** ~~Sweep prefill / live-context~~
+  **DONE 2026-09-02 (boot Q):** bracket pinned at **32k–64k pp** (1.03× at
+  32k, 0.85× at 64k); n=3 reps, cold prefill, separate arms sequential. See
+  [DEVLOG-mtp1](DEVLOG-mtp1.md). Bracket is ~2× wider than the S9 ~20k
+  estimate — reported per stop rule before proceeding to MTP-1b.
 - **MTP-1b — remaining Qwen3.8 MTP gfx906 optimization opportunities.**
   Profile the MTP draft+verify path at and beyond the crossover: the FA
   gather/attention O(Sk) cost of the draft layer, the verification step, KV

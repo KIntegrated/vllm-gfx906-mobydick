@@ -6,6 +6,22 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-02
+
+- **MTP-1a closed: Qwen3.8-27B dense MTP k=2 crossover pinned at 32k–64k pp**
+  (clean boot Q, TP=2, n=3, cold prefill, arms sequential). MTP wins ≤32k
+  (1.03×), loses ≥64k (0.85× → 0.72× @120k); acceptance 2.0 stable through
+  120k so the tax is O(Sk) step cost, not draft rejection. Bracket is ~2×
+  wider than S9's ~20k estimate. Optz microbench: lm_head-per-draft lead
+  DEAD (memory-bound, +322 µs/step = 0.4% of the 78 ms @120k step); attention
+  K-multiplier ~1.0 at S=120k (KV bytes shared). Open residue: the 78 ms vs
+  ~12 ms bandwidth-floor gap needs a rocprofv3 kernel breakdown (MTP-1b gate;
+  blocked by a zombie KFD VRAM handle left by the old-vLLM wedge below).
+  Old-vLLM 0.23.1 A/B abandoned: that code path wedged GPUs loading this AWQ
+  model at shard ~2/5 on BOTH userlands (docker ROCm 7.2, in-process ROCm
+  7.14) — incompatible with the model+host, not an env issue. Record:
+  `DEVLOG-mtp1.md`, degradation entries 2026-09-01/02.
+
 ## 2026-09-01
 
 - **Post-C4 maintainability sweep: removed the two FULLY-DEAD M=1 routing

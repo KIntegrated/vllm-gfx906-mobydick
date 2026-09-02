@@ -1490,3 +1490,49 @@ pool, `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0`).
     0 new resets after the 08:49:34 event; VRAM drained to ~10 MB/card
     between every arm; post-run canary clean. GPUs idle at session end.
 
+## 2026-09-01 (boot Q) + 2026-09-02 — MTP-1 session: three wedges, two from old-vLLM code path
+
+Boot Q = the clean reboot requested before trusting MTP-1 crossover data
+(~16:35 UTC 2026-09-01). Three HW events across the MTP-1 work:
+
+1. **2026-09-01 14:00:45 (GPU1, pre-reboot tail):** first Qwen3.8-27B TP=2
+   MTP serve launch this boot — worker-init `hipErrorLaunchFailure` → qcm
+   fence timeout → BACO reset, recovered. Chronic weight-load-hang family.
+2. **2026-09-01 20:29:04 (GPU0, boot Q):** in-process TP=2 *profiler* launch
+   wedged at weight load; `VRAM is lost due to GPU reset!`, PSP resume OK.
+   First HW reset on boot Q — the in-process weight-load trigger recurs even
+   on a clean-booted host. Both GPUs passed matmul post-reset. Did NOT
+   invalidate the MTP-1 sweep (both arms completed 20:09, pre-event).
+3. **2026-09-02 03:12:41–53 (BOTH GPUs):** old-vLLM docker image
+   `aiinfos/vllm-gfx906-mobydick:v0.23.1rc0.x-rocm7.2.1-pytorch2.11.0` TP=2
+   serve → `HW Exception ... GPU Hang` at weight-load shard ~2/5 on both
+   cards simultaneously; both wedged, both recovered via reset + PSP resume.
+   First dual-GPU simultaneous hang on this host. Userspace: segfault in
+   `__clone`. Suspect: old ROCm 7.2 container userland vs modern kernel
+   driver (6.8.12-acso).
+4. **2026-09-02 06:10:17 (GPU0):** old-vLLM 0.23.1 **in-process** via
+   PYTHONPATH on the MODERN ROCm 7.14 userland (platform detection fixed via
+   sitecustomize RocmPlatform pin — the old fork predates our amdsmi→
+   `torch.version.hip` fallback, and under this userland `import vllm`
+   poisons amdsmi to 0 handles) → same `unspecified launch failure` at
+   weight-load shard ~2/5 → BACO reset, recovered. **Same signature as event
+   3 on a different userland** → root cause is the old vLLM code path itself
+   (predates our gfx906 weight-load/FA fixes), not userland or harness env.
+   Old-vLLM A/B abandoned as not-runnable on this host.
+
+**NEW failure mode — zombie KFD handle (event 4):** dead worker PID 44222
+(gone from /proc; `kill -9` is a no-op) still holds **10.99 GB on GPU0** per
+`rocm-smi --showpids`. Kernel-level amdgpu leak post-reset that userspace
+cannot clear — only a reboot releases it. Consequence: GPU0 has ~23 GB free,
+below the ~29.7 GB a TP=2 27B AWQ @util 0.93 needs → all remaining MTP-1 work
+(rocprofv3 decode kernel breakdown @120k) is blocked until reboot.
+
+**Takeaways:** (a) old-vLLM branches must not be pointed at this model on this
+host — they wedge the GPUs at load; (b) a GPU reset can leave an unreclaimable
+KFD VRAM handle even when rocm-smi shows "recovered" — always re-check
+`--showpids` + actual free VRAM before planning the next run, and treat
+"recovered but <N GB free with no live process" as a reboot-required state;
+(c) in-process weight-load wedges are chronic on boot Q too (event 2) — keep
+using serve-based systemd launches for load-sensitive work.
+
+
