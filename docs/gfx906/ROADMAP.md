@@ -169,12 +169,14 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     path (`forward_native`, aiter absent) sorts all ~248k logits/row (~0.35 ms @B=1).
     **IMPLEMENTED** on `gfx906/syv4-sort-free-sampler` (`e402e85192`, 2026-09-03):
     one `torch.topk(k)` replaces the full-vocab sort when all rows' k≤64 and B<8;
-    top-p threshold from restricted cumsum over each row's own top-k candidates
-    (mirrors the reference exactly). CPU equivalence vs `apply_top_k_top_p_pytorch`:
-    14 cases, 0 failures. Opt-out `VLLM_GFX906_SORT_FREE_SMALL_K=0`. **REMAINING:**
-    GPU equivalence+bench at 248k vocab (deferred — concurrent docker build load
-    caused transient HSA hardware exceptions; minimal op-repro passed), then A/B
-    decode t/s on a sampling workload.
+    top-p keep rule = count(cumsum < p)+1 over each row's own top-k candidates
+    (no argmax/bool — ROCm has no bool-argmax kernel). CPU equivalence vs
+    `apply_top_k_top_p_pytorch`: 14 cases, 0 failures. Opt-out
+    `VLLM_GFX906_SORT_FREE_SMALL_K=0`. **GPU bench (2026-09-03, canary 39.2 t/s
+    PASS):** 12/12 correctness cases exact vs reference at V=248k; perf — B=1 k=20:
+    0.91× (noise), B=1 k=64 p=.95: 1.17×, **B=4 mixed k≤64 p: 6.55×** (2.212→0.338
+    ms/call). Win scales with batch; ~neutral at B=1 greedy. REMAINING: end-to-end A/B
+    decode t/s on a sampling workload (SYV-5/SYV-7 window).
   - **SYV-5 — fp16 GDN recurrent state** (`--mamba-ssm-cache-dtype float16`).
     Config flag, trivial A/B; we run B=1 so mainly a concurrency win for future
     multi-request work. **Status: open (low effort).**
