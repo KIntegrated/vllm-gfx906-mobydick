@@ -222,6 +222,70 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     chunked-prefill sizing (`MAX_NUM_BATCHED_TOKENS`), and prefix caching
     (SYV-7) which eliminates redundant prefill entirely. **Next step: prefill
     phase profile before any port.**
+  - **Ideas from [1CatAI/1Cat-vLLM](RECON-1cat-vllm.md) (V100/SM70, "Make Volta
+    Fast Again" — same generation class as gfx906; runs Qwen3.6-27B-AWQ TP2, the
+    near-identical model to ours). Full recon + estimates in the linked doc.**
+  - **CAT-1 — draft-vocabulary shortlisting (GO — feeds SYV-3).** Their biggest MTP
+    win: shrink the *drafter's* lm_head vocab from full 248k to a static 131K or
+    dynamic 98K+2×512 shortlist → **+21.9% e2e** (80.1→97.7 tok/s) on their TP2
+    Qwen3.6-27B-AWQ, lossless by construction (target dist stays full-vocab for
+    accept/recover; one-time prefill `topk=2048` bootstrap builds the shortlist).
+    This is exactly SYV-3 lever 3 ("small draft vocab") we scoped but never built.
+    Stacks on our Triton K=1 skinny-GEMV (lever 1, 98% of BW ceiling) → halves the
+    bytes read → ~7× combined at the roofline. **Status: OPEN — scope the bootstrap
+    + reduced-draft-lm_head on `step3p5.py`; A/B with t/s + PPL/coherence gate.**
+  - **CAT-2 — FA prefill D256 Split-D + GQA multi-head packing (GO/ANALYZE — feeds
+    SYV-9).** Their Volta D=256 prefill kernel = **1.66–2.2× over generic FA2** on
+    the same D=256 shape. Techniques: Split-D (D=256→4×D64, paired warps share QK,
+    more PV parallelism), **N32 online-softmax as a *quality* requirement** (their
+    N64 variant's 1.27e-4 L2 error amplified across layers and changed sampled
+    tokens; N32 → ~4.6e-6), GQA multi-head packing (pack 6 GQA query heads into
+    wider Tensor-Core work — matches our Hq/Hkv=6 ratio), K-stage ping-pong,
+    prefix/causal-tail separation. Our SYV-9 profile: FA kernel = **45% of prefill
+    at 120k** → this is the direct target. **Status: OPEN — analyze our Triton
+    `gfx906_fa_forward` against head-packing + D-split axes before any port; HIGH
+    effort (real FA-kernel rebuild).**
+  - **CAT-3 — FP8 E5M2 KV via one-pass expansion (ANALYZE).** Their biggest *prefill*
+    FP8-KV speedup: **4.5–4.9×** by a single vectorized `fp8_e5m2_paged_kv_to_fp16`
+    gather/expansion into a shared FP16 page-784 workspace (old path re-converted E5M2
+    inside *every* query CTA → 96 KiB smem, 1 CTA/SM, ~4% tensor activity). Workspace
+    ~512 MiB/rank @256K, reused serially by all full-attn layers. We run **fp16 KV
+    today**, so bigger change — but halves KV bytes/bandwidth and the expand-once
+    pattern serves SYV-7 prefix caching + long-context decode. **Status: OPEN — needs
+    its own FP8-vs-FP16-KV model-level quality gate; HIGH effort.**
+  - **CAT-4 — 128-bit wide aligned KV loads in decode XQA (ANALYZE).** PR #268: one
+    aligned 128-bit load replaces narrow `half8` fragments, reusing page ID → L1
+    global-load requests **−41.5%**, kernel **−23%** (B16/17.8K). Our long-context
+    decode is memory-bound on the FA gather; gfx906 equivalent = `v_load_dwordx4`.
+    **Status: OPEN — LOW-MOD effort, good first probe for our decode FA path.**
+  - **CAT-5 — prefix/causal-tail separation for chunked prefill (ANALYZE).** Their
+    superlinear cold-prefill root cause: fixed 1024-token chunks each attend over an
+    increasingly long KV prefix → O(L²) work; last 32K of a 64K request = **75%** of
+    the prefix-attention sum. Fix: schedule the fully-visible prefix separately from
+    the exact causal tail, merge online-softmax state. Directly relevant to our SYV-9
+    (FA dominant at 120k prefill). **Status: OPEN — MOD-HIGH effort, pairs with CAT-2.**
+  - **CAT-6 — CTA-local K-parallel small-M GEMM (ANALYZE).** Their M=5 verify AWQ GEMM
+    = 6–12% occupancy (68 CTAs/72 SMs); intra-CTA K-split (`1x4x1`→`1x4x2`, FP32
+    partials reduced in smem, no extra global workspace). Their target-forward AWQ
+    GEMM = 44% of verifier forward (same as ours), but our decode GEMMs are near the BW
+    ceiling (SYV-3) so value is uncertain. **Status: OPEN — only if a decode-GEMM profile
+    shows occupancy loss at our shapes; MOD effort.**
+  - **CAT-7 — DFlash2 block drafter + LABD/ngram lookup (POSTPONE).** Their ~260 tok/s
+    headline uses the NVFP4 whole-block non-autoregressive DFlash2 drafter (+ optional
+    lookup-augmented / prompt-ngram drafting). Same idea as parked **SYV-8** (NVFP4
+    checkpoint doesn't transfer to our AWQ; needs V2 runner conflicting with FULLGRAPH).
+    The *ngram/lookup* sub-idea maps to **SYV-2** lookahead-drafting. **Status: POSTPONE —
+    revisit only if MTP stops delivering.**
+  - **CAT-8 — persistent partition-grid cap (NO-GO).** Their Flash-V100 fixed decode
+    grid-capping was bitwise-exact but *slower* (register growth + persistent control
+    ate the saving; regressed at 65K/262K). Recorded as a dead-end reference so we don't
+    re-tread it. **Status: NO-GO.**
+  - **CAT-9 — FP8 prefill tile-selection pitfall (ANALYZE — caution for SYV-9/CAT-3).**
+    Their FP8 prefill regressed with context until they fixed page-size→BM32-phase
+    selection and removed per-CTA E5M2 expansion. Adopt as a *design constraint* on any
+    int8/FP8 prefill port: right tile/phase at every page size, never convert inside each
+    query CTA. **Status: OPEN — design constraint, not a standalone task.**
+
   - **J2G-1 — persistent all-reduce** (from
     [joe2gaan/localaiservers](RECON-joe2gaan-localaiservers.md), TP=8 host).
     Attacks TP comm cost — the per-step work our phase profile could NOT
