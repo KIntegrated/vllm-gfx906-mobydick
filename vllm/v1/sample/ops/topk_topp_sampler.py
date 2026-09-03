@@ -448,9 +448,13 @@ def apply_top_k_top_p_sort_free(
         # `below` is monotone [1..1 0..0] (cum is non-decreasing), so its sum is
         # exactly that count — no argmax/bool op needed (ROCm has no bool kernels).
         below = (cum < p.unsqueeze(1)).to(torch.int32)
-        # clamp: at p=1.0 the final cum entry can round to just under 1.0,
-        # which would push keep_count to kk+1 (out of bounds).
-        keep_count = (below.sum(dim=1) + 1).clamp_(min=1, max=kk)
+        # keep_count = smallest n with cum[n-1] >= p, clamped to this row's own
+        # k: (a) at p=1.0 the final cum entry can round just under 1.0, pushing
+        # the count to kk+1; (b) when a row's top-k mass cannot reach its target
+        # p (e.g. top_k=3 with p=0.95), the reference keeps exactly that row's
+        # k candidates — without the per-row clamp the gather would land on a
+        # -inf slot and top-p would silently no-op for the row.
+        keep_count = torch.clamp(torch.minimum(below.sum(dim=1) + 1, k), min=1)
         p_thresh = vals.gather(1, (keep_count - 1).unsqueeze(1)).squeeze(1)
         logits.masked_fill_(logits < p_thresh.unsqueeze(1), -float("inf"))
 
