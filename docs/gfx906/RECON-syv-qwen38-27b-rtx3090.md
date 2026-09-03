@@ -51,7 +51,8 @@ negative unless a new measurement contradicts it.**
 vLLM's top-k/top-p sorts the whole 248k vocab per row + one-thread-block softmax
 (140 µs for a single 248k row, several calls/step). With top-k ≤ 64 known on host:
 one torch.topk + multi-block softmax. Their gain: +4% at default sampling.
-**Status: cheap to check whether our sampler path has the same shape; medium value.**
+**Status: IMPLEMENTED + MERGED to main (2026-09-03, `e402e85192`..`3d78149c6d`, default ON; opt-out `VLLM_GFX906_SORT_FREE_SMALL_K=0`).**
+GPU bench: 12/12 exact vs reference at V=248k; B=4 mixed-k 6.55× (2.212→0.338 ms/call), ~neutral at B=1. End-to-end A/B (TP=1 dense 27B, tg256): +0.6–3.4% t/s on sampling workloads (k-disabled control arm = noise floor). Full detail: ROADMAP.md SYV-4 entry.
 
 ### SYV-5 — fp16 GDN recurrent state (`--mamba-ssm-cache-dtype float16`)
 48 GDN layers keep fp32 recurrent state per request (~150 MB/req) read+written every
