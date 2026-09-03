@@ -165,9 +165,16 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     microbench measured lm_head-per-draft at +322 µs/step = 0.4% (memory-bound
     GEMV, not their compute-bound sm86 case). Closed negative unless a new
     measurement contradicts it.
-  - **SYV-4 — sort-free small-k top-k/top-p sampler.** Their gain +4%. Cheap to
-    check whether our sampler path has the same shape; medium value. **Status:
-    open (low effort).**
+  - **SYV-4 — sort-free small-k top-k/top-p sampler.** Their gain +4%. Our ROCm
+    path (`forward_native`, aiter absent) sorts all ~248k logits/row (~0.35 ms @B=1).
+    **IMPLEMENTED** on `gfx906/syv4-sort-free-sampler` (`e402e85192`, 2026-09-03):
+    one `torch.topk(k)` replaces the full-vocab sort when all rows' k≤64 and B<8;
+    top-p threshold from restricted cumsum over each row's own top-k candidates
+    (mirrors the reference exactly). CPU equivalence vs `apply_top_k_top_p_pytorch`:
+    14 cases, 0 failures. Opt-out `VLLM_GFX906_SORT_FREE_SMALL_K=0`. **REMAINING:**
+    GPU equivalence+bench at 248k vocab (deferred — concurrent docker build load
+    caused transient HSA hardware exceptions; minimal op-repro passed), then A/B
+    decode t/s on a sampling workload.
   - **SYV-5 — fp16 GDN recurrent state** (`--mamba-ssm-cache-dtype float16`).
     Config flag, trivial A/B; we run B=1 so mainly a concurrency win for future
     multi-request work. **Status: open (low effort).**
