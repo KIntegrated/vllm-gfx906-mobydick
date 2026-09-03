@@ -194,15 +194,54 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     non-autoregressive). Big effort, needs V2 runner (conflicts with our
     FULLGRAPH path). **Status: parked — revisit only if SYV-1/MTP-1b-0 + SYV-2
     don't deliver.**
-  - **SYV-9 — int8-QK prefill attention.** Prefill-only; not our bottleneck.
-    **Status: parked.**
+  - **SYV-9 — int8-QK prefill attention.** ~~Prefill-only; not our bottleneck.~~
+    **Status: HIGH PRIORITY (promoted 2026-09-03, Kevin: "prefill is also very
+    relevant to us").** Rationale: gfx906 compute is slow → prefill is
+    COMPUTE-bound (unlike decode, which is memory-bound GEMV), so prefill t/s
+    directly limits long-doc first-token latency and any batched-prefill regime.
+    Their int8-QK halves the QK^T MAC cost in prefill attention specifically.
+    Scope: (a) profile OUR prefill breakdown on gfx906 (FA kernel vs GEMM vs
+    GDN conv1d — we already have ~300 t/s TP=2 32k records to normalize
+    against), (b) port/adapt their int8-QK path if the FA share justifies it,
+    (c) broader prefill levers in scope too: Triton FA tile sizes for gfx906,
+    chunked-prefill sizing (`MAX_NUM_BATCHED_TOKENS`), and prefix caching
+    (SYV-7) which eliminates redundant prefill entirely. **Next step: prefill
+    phase profile before any port.**
   - **J2G-1 — persistent all-reduce** (from
     [joe2gaan/localaiservers](RECON-joe2gaan-localaiservers.md), TP=8 host).
     Attacks TP comm cost — the per-step work our phase profile could NOT
     attribute (outside any hookable module; hooked modules = ~38% of MTP step).
     Their prebuilt `.so` is topology-specific (TP=8); the env-only RCCL knobs
     (`NCCL_ALGO/PROTO/CHANNELS`) are the transferable first probe. **Status:
-    open — cheap env A/B before any port.**
+    open — cheap env A/B before any port.** (A0/A1/A2 running 2026-09-03.)
+
+  - **J2G-2 — AR residual pre-fold** (`VLLM_GFX906_AR_PREFOLD_ENABLE`, from
+    `communication_op.py`). Algebraic identity: `allreduce(partial + residual/TP)
+    == allreduce(partial) + residual` — fold the layer's residual into the AR
+    input so the *next* layer's reduction carries it, saving one fused add per
+    TP step (only where shape[-1]==5120, fp16/bf16, contiguous). Strict opt-in:
+    dtype/rounding semantics must be validated before trusting numbers. This is
+    a **decode** win (per-step comm + FLOPs), complementary to J2G-1's env knobs
+    and the persistent-AR port. **Status: new candidate — read their gate logic,
+    scope a strict A/B on our TP=2 dense 27B.**
+  - **J2G-3 — hand-tuned RCCL_TREES + custom librccl overlay.** Beyond the env
+    knobs in J2G-1, they ship a prebuilt `librccl.so.1` and an explicit
+    `RCCL_TREES='(0(1(3)(4))(2(5(6(7))))|...)'` (4 ring/tree permutations for 8
+    ranks). For our TP=2 there's only one edge, so the *trees* don't transfer —
+    but if J2G-1's env A/B shows a win, the next step is testing whether a
+    gfx906-specific RCCL build beats stock. **Status: new candidate — only worth
+    it if J2G-1 lands positive.**
+  - **J2G-4 — row-parallel mutable AR + boundary cut** (`VLLM_GFX906_ROWPAR_...`,
+    `ROWPAR_BOUNDARY_MLP_SHAPES=2176x5120`). Splits the row-parallel GEMM/AR
+    boundary at a specific MLP shape so the reduction overlaps the next compute.
+    Topology/shape-specific (their Qwen3.6 27B MLP); would need re-deriving for
+    our model's shapes. **Status: new candidate — low priority, high effort.**
+  - **J2G-5 — tuned Triton MoE block configs** (`vllm_tuned_moe_configs/
+    E=256,N=128,device_name=AMD_GFX906.json`). Per-batch-size BLOCK_M/N/K +
+    warps/stages/waves_per_eu/matrix_instr_nonkdim tuned for gfx906 MoE. Only
+    applies to MoE models (we run dense 27B now); note the shipped config is
+    Qwen3.6-shaped (E=256, N=128) — a Nemotron-H (g64) port would need its own
+    autotune sweep. **Status: new candidate — relevant when we serve a gfx906 MoE.**
 
 - **MTP-1c — dynamic MTP logic.** Investigate runtime-adaptive spec decode:
   (a) disable MTP when context length exceeds the crossover or draft
