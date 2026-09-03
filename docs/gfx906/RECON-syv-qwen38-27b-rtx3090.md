@@ -42,10 +42,15 @@ per extra draft; MTP-3 already slower than MTP-2. They requantized the drafter t
 int8/int4 and built a 40k-token draft vocab (97.5% coverage over model outputs) →
 draft cost ~0.5–1 ms, four drafts pay off.
 **Why it matters to us:** our step3p5.py proposer runs full lm_head per draft token —
-confirmed in-tree. BUT: our 2026-09-02 microbench measured lm_head-per-draft at only
-+322 µs/step = 0.4% at 120k (memory-bound GEMV, not their compute-bound sm86 case).
-**Status: LIKELY LOW VALUE on gfx906 — microbench already negative; keep as closed
-negative unless a new measurement contradicts it.**
+confirmed in-tree. Our 2026-09-02 microbench measured the *marginal* cost of extra draft
+rows (K1→K3) at +322 µs/step = 0.4% at 120k — that is what led to the original "closed"
+verdict, and it was the wrong number to judge on: the **absolute** B=1 lm_head read
+(~6.9 ms/GPU fp16 proxy, ~18% of MI50 peak BW) is memory-bound (AI = B ≪ ridge) and is
+exactly what int8/int4 quantization cuts 2–4×. Drafts are target-verified → perturbs
+acceptance rate, not correctness.
+**Status: RE-OPENED 2026-09-03 — OPEN.** Full roofline + ruled-out table + next steps:
+`/local/tmp/mtp1/drafter_memory_bound.md`; execution queued behind J2G-1 (see ROADMAP.md
+SYV-3 entry).
 
 ### SYV-4 — Sort-free small-k top-k/top-p sampler
 vLLM's top-k/top-p sorts the whole 248k vocab per row + one-thread-block softmax
