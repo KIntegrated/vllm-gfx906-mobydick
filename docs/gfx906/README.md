@@ -55,7 +55,7 @@ request (4 samples) unless noted. Recipes: §Bench recipes +
 | **Gemma-4-26B-A4B-it-AWQ-4bit** (MoE) | **well supported, optimized** | **67.79** | — | no-zero-point W4A16 expert kernel (`gfx906/gemma4-moe-nzp` work, 1.79× over Triton); chat template required (thinking model); PPL/prompt_logprobs unreliable on this model — gate on coherent text + logprob A/B |
 | **cyankiwi/Ornith-1.5-35B-A3B-AWQ-INT4** (MoE VLM) | **supported (2026-08-25, in main via `gfx906/moe-ct-asym-zp`)** | **65.03** (A/B mean; band 64.995–65.079; decode-only 81.1) | TTFT 0.77 s @2048 | first **asymmetric** (stored int8 zp) CT W4A16 checkpoint: oracle gate + pass-through zp repack, no kernel change; 18.6× over the Triton arm (3.50) — but the Triton W4A16 `has_zp` branch is pathologically slow on gfx906 (267 ms/tok, both zp layouts) — `DEVLOG-ornith-wna16.md`; PPL 16.67 gfx vs 16.45 triton (fp16-noise band); class-parity with the flagship 67.39 |
 | **cyankiwi/Muse-Glimmer-30B-AWQ-INT4** (dense hybrid: GDN + full + sliding-2048, CT W4A16) | **supported (2026-08-27; in main 2026-08-28; TP=1 + TP=2)** | TP=1 in-process: **27.90** @B=1 all-CUSTOM window FA (1.59× vs hybrid 17.54) · **20.53** @B=4 (1.23× vs 16.75). TP=2 ngram n=5 serving (repetitive filler, **100 % acceptance ceiling**): bt2048 (boot K): **114.6** @2k/256 · 112.0 @2k/512 · **79.1** @8k/256 · 79.2 @8k/512 · **57.0** @16k/256 · 56.8 @16k/512 · B=4 @2k/256: **45.3** aggregate (~11.3/req); bt4096 (boot L, post q_pad fix + M1 gather clip): **111.5** @2k/256 · **~99** @8k/256 · B=4 @2k/256: **46.7** aggregate · real-prompt checks ~11.5/req (1–4 parallel) | TP=2 prefill (prefix-cache WARM): bt2048 **542** @2k · **491** @8k · **438** @16k; bt4096 (boot L): 496.9 @8k (cold first-chunk 452.4); TP=1 in-process prefill baseline: **~240 t/s** (32k prompt pass 135–137 s, bt4096 — the TRUE TP=1 rate, re-measured on the fresh boot of 2026-08-29 after boot M's ~2×-vs-TP=2-records scare; the ~450–540 t/s figures are TP=2, prefill scales ~2× with TP; `degradation*.md` 2026-08-29 rows); TP=1 gates: pp2048 tg256, 4 samples, prefix cache off | **Working TP=2 example** (boot K, 2026-08-27): `HIP_VISIBLE_DEVICES=0,1 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE vllm serve <snap> --served-model-name Muse-Glimmer-30B --tensor-parallel-size 2 --dtype float16 --max-model-len 131072 --max-num-seqs 4 --max-num-batched-tokens 4096 --kv-cache-memory-bytes 6442450944 --speculative-config '{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_max":2}' --compilation-config '{"cudagraph_capture_sizes":[6,12,18,24]}' --enable-auto-tool-choice --tool-call-parser muse_glimmer --reasoning-parser muse_glimmer --generation-config auto` — pool 848–904k tok (6.5–7× the 128k max), weights 12.7 GiB/GPU, graphs ~0.9 GiB; 256k ctx: add `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` (boot J, 1.36M-tok pool). First-prefill memory: boot J/K's "bt4096 OOMs the first 4096-chunk prefill" was the **per-impl q_pad bug** (52 impls × 256 MiB [num_seqs,Hq,Sq_pad,D] fp32 grown per impl on first prefill — DEVLOG-muse-glimmer.md round 4; fixed 2026-08-27, ClassVar) — **bt4096 re-validated clean on boot L** (cold 452 t/s @8k, 8.7 GiB headroom/GPU); the byte cap is still required (at util 0.82 the pool is sized from that profile — the engine logs the correction itself: 7.59 GiB fits the line, 9.02 was allocated). The filler is 100 % ngram-accepted (acceptance length 6.0) — decode numbers are a ceiling, not real-text. 52 layers (13 full + 39 sliding window-2048): sliding-window Q8 FA (window arg, both kernel copies) + direct-paged split-K + Phase C clip (direct-paged B≥2 decode dispatch; `GFX906_FA_LEGACY` orthogonal); TP=1 bench gates need an explicit 0.75 GiB KV cap + bt1024; `muse_glimmer` tool/reasoning parsers; records: `DEVLOG-muse-glimmer.md`, `degradation*.md` boot J/K |
-| **Qwen3.8-27B-AWQ-INT4** (dense) | **fully functional (TP=1 + TP=2)** | MTP k=2 TP=2 (2026-08-24 final): **59.2** @2k / 44.9 @8k / 25.2 @32k / 16.6 @64k · greedy TP=2: 40.8/38.1/30.5/24.1 · 28.62 @4k TP=1 (record) · 104.2 (N=8, W4 on) | — | `--dtype float16` required (auto-bf16→fp16 fallback landed); **live-ctx tax: FA gather/attention O(Sk) — MTP < greedy beyond ~20k ctx** (agentic ~60k: 16.6 MTP / 24.1 greedy t/s); MTP k=2 41.41 TP=1 (record, 2026-08-23; lifecycle fix byte-identical in graph mode); N=8 needs `--gpu-memory-utilization 0.90` (64 layers, FA KV 655 KB/token); TP=2 needs the official amdgpu DKMS driver + trimmed capture `[1,2,3,4]`; 445k-token KV pool — **256k context validated** (FA gather fix 2026-08-24, `oom-256k-prefill.md` §9); non-deterministic at temp=0 (token-identity gates unusable); records: `DEVLOG-tp2-dense.md` S1–S9, `DEVLOG-masked-fa.md`, `DEVLOG-qwen38.md` |
+| **Qwen3.8-27B-AWQ-INT4** (dense) | **fully functional (TP=1 + TP=2)** | MTP k=2 TP=2 (2026-08-24 final): **59.2** @2k / 44.9 @8k / 25.2 @32k · **long-context post kv_split fix (2026-09-03): 37.95 @64k / 29.88 @96k / 25.70 @120k** · greedy TP=2: 40.8/38.1/30.5/24.1 @2k/8k/32k/64k · 28.62 @4k TP=1 (record) · 104.2 (N=8, W4 on) | — | `--dtype float16` required (auto-bf16→fp16 fallback landed); **kv_split clamp fix (`a6ff64a71b`) removed the old "MTP < greedy beyond ~20k ctx" live-ctx tax — MTP k=2 now ≈2× greedy at 64k+** (pre-fix 15.95/11.19/9.18 @64k/96k/120k vs post-fix 37.95/29.88/25.70; §Long-context decode with MTP below); MTP k=2 41.41 TP=1 (record, 2026-08-23; lifecycle fix byte-identical in graph mode); N=8 needs `--gpu-memory-utilization 0.90` (64 layers, FA KV 655 KB/token); TP=2 needs the official amdgpu DKMS driver + trimmed capture `[1,2,3,4]`; 445k-token KV pool — **256k context validated** (FA gather fix 2026-08-24, `oom-256k-prefill.md` §9); non-deterministic at temp=0 (token-identity gates unusable); records: `DEVLOG-tp2-dense.md` S1–S9, `DEVLOG-masked-fa.md`, `DEVLOG-qwen38.md` |
 | **Qwen3.6-27B / 3.6-35B-A3B** (fp16) | **not supported** | — | — | 52/67 GB fp16 checkpoints do not fit a 32 GB card; 3.6 GGUF only used as a llama.cpp reference point |
 | small AWQ models (e.g. Qwen3.5-9B-AWQ, 0.8B) | supported | — | 590–1483 (9B, eager) | fine on ≤0.85 util; FA prefill benchmarks in top-level README |
 
@@ -211,6 +211,36 @@ Qwen3.8 −17.8 % / −20.8 % (head_dim 256); Muse −11.6 % / −14.1 %.
 Cross-check: matches the ~500 t/s TP=2 32k prefill records (TP=1
 in-process is ~240 t/s, ~2× scaling holds). Raw logs:
 `/local/tmp/lcbench_{muse,qwen38}_grid*.log`.
+
+### Long-context decode with MTP k=2 (TP=2, 2× MI50, 2026-09-02/03)
+
+Companion to the prefill sweep above — same hardware, but **spec decode on**
+and at the regime where it used to hurt. The `seq_q>2` kv_split hard clamp
+(added with the 256k OOM fix) disabled KV-split for every spec-decode verify
+step (Sq = k+1 = 3), collapsing MTP long-context decode to ~half of greedy.
+The **kv_split byte-budget guard** (`a6ff64a71b`, branch
+`gfx906/mtp1b0-kvsplit-verify`; `GFX906_FA_KVSPLIT_MAX_BYTES`, default 512
+MiB; regression-tested in `tests/kernels/attention/test_gfx906_fa.py` with a
+32 MiB budget pin forcing the clamp path)
+replaces the hard clamp: verifies keep split parallelism when their KV bytes
+fit the budget; prefill OOM protection preserved. Correctness: kv_split
+1/8/16 bit-identical Sq≤1024 both paths + torch-ref match; PPL gate PASS.
+
+Qwen3.8-27B-AWQ-INT4, TP=2 (util 0.85, bt 1024, max-seqs 4, capture
+`[1,2,3,4]`, `disable_custom_all_reduce=True`, `--max-model-len 131072`),
+tg=256, temp 0, n=3 reps, filler corpus s9.
+
+| ctx (pp) | MTP k=2 pre-fix (clamp) | **MTP k=2 post-fix** | greedy TP=2 | fix gain | MTP vs greedy |
+|---:|---:|---:|---:|---:|---:|
+| 65,536 | 15.95 t/s | **37.95 t/s** | 18.86 | **2.38×** | 2.01× |
+| 98,304 | 11.19 t/s | **29.88 t/s** | 14.80 | **2.67×** | 2.02× |
+| 122,880 | 9.18 t/s | **25.70 t/s** | 12.74 | **2.80×** | 2.02× |
+
+The old "MTP < greedy beyond ~20k ctx" live-ctx tax (FA gather/attention
+O(Sk)) is gone at k=2: post-fix MTP leads greedy by ~2× at 64k+ and still
+leads at short context (59.2 t/s @2k). **Long-context serving of Qwen3.8-27B
+on TP=2 should enable MTP k=2.** Raw data: `/local/tmp/mtp1/data_mtp_bootQ.jsonl`
+(pre-fix, boot Q) / `data_mtp_k2fix_bootS.jsonl` (post-fix, boot S).
 
 ## Bench recipes
 

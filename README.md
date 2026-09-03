@@ -42,9 +42,9 @@ and bench recipes.
 | ↳ with MTP k=2 speculative decoding | recommended spec config | **39.4** (1.41×) |
 | Gemma-4-26B-A4B-it-AWQ-4bit | optimized | **67.8** |
 | Qwen3.8-27B-AWQ-INT4 (dense) | fully functional (TP=1 + TP=2) | **59.2** (MTP k=2, TP=2, 2k ctx; 2026-08-24 final) |
-| ↳ MTP k=2 context curve (TP=2) | live-ctx tax — MTP < greedy past ~20k ctx | 44.9/25.2/16.6 @ 8k/32k/64k (greedy 38.1/30.5/24.1) |
+| ↳ MTP k=2 context curve (TP=2) | **kv_split fix 2026-09-03 — MTP ≥ greedy at 64k+** | 8k/32k: 44.9/25.2 (2026-08-24); **64k/96k/120k: 37.95/29.88/25.70** (post-fix; greedy 18.86/14.80/12.74) |
 | ↳ N=8 concurrent decode | W4 (`VLLM_GFX906_SKINNY_M16=1`) | **104.2** (TP=1, util 0.90) |
-| ↳ 256k context | FA gather fix (2026-08-24) | 250k needle PASS; 16.6 t/s MTP @ ~64k ctx |
+| ↳ 256k context | FA gather fix (2026-08-24); kv_split fix (2026-09-03) | 250k needle PASS; **37.95 t/s MTP @ 64k ctx** (was 16.6 pre-fix) |
 | Qwen3.6 fp16 checkpoints (52–67 GB) | do not fit 32 GB | — |
 
 Details, per-model caveats, and bench recipes:
@@ -75,6 +75,34 @@ decode): Muse 30.5 → 26.3 → 21.9 t/s; Qwen3.8 25.6 → (–) → 13.3 t/s
 filler, a content artifact; TTFT is unaffected). KV budgets: 6 GiB
 (783,892-token pool) for Muse, 10 GiB (323,414-token pool) for
 Qwen3.8 — the 256k max-len needs ≥ 8.09 GiB of KV.
+
+### Long-context DECODE with MTP k=2 (TP=2, 2× MI50, 2026-09-02/03)
+
+The prefill sweep above ran without spec decode; here is the same regime
+with **MTP k=2 enabled** — and the kv_split clamp fix
+(`a6ff64a71b`, merged 2026-09-03) that made it fast: the old `seq_q>2`
+hard clamp forced KV-split off for every spec-decode verify step (Sq=3),
+so MTP long-context decode ran ~2× slower than greedy. The fix's byte-budget
+guard (`GFX906_FA_KVSPLIT_MAX_BYTES`, default 512 MiB) keeps split
+parallelism on k≥2 verifies while preserving the prefill OOM protection.
+
+Qwen3.8-27B-AWQ-INT4 (dense), TP=2, `--max-model-len 131072`, tg=256,
+temp 0, n=3 reps, synthetic filler corpus s9 (serving config: util 0.85,
+bt 1024, max-seqs 4, capture `[1,2,3,4]`, `disable_custom_all_reduce`).
+
+| ctx (pp) | MTP k=2 pre-fix (clamp) | **MTP k=2 post-fix** | greedy | fix gain | MTP vs greedy (post-fix) |
+|---:|---:|---:|---:|---:|---:|
+| 65,536 | 15.95 t/s | **37.95 t/s** | 18.86 | **2.38×** | 2.01× |
+| 98,304 | 11.19 t/s | **29.88 t/s** | 14.80 | **2.67×** | 2.02× |
+| 122,880 | 9.18 t/s | **25.70 t/s** | 12.74 | **2.80×** | 2.02× |
+
+The old "MTP < greedy past ~20k ctx" live-ctx tax is gone: with the fix,
+MTP k=2 beats greedy by ~2× at 64k+ context (it still leads at short
+context — 59.2 t/s @2k). **Recommendation for long-context serving of
+Qwen3.8-27B on TP=2: enable MTP k=2** (`--speculative-config
+'{"method":"mtp","num_speculative_tokens":2}'`). Raw data:
+`/local/tmp/mtp1/data_mtp_bootQ.jsonl` (pre-fix, boot Q) and
+`data_mtp_k2fix_bootS.jsonl` (post-fix, boot S).
 
 ### Benchmarks
 
@@ -160,8 +188,11 @@ vllm serve <model> \
 - cudagraph capture sizes = multiples of `num_speculative_tokens + 1`
   (6 for ngram n=5); use `[1,2,3,4]` for prefill/TTFT-focused or
   spec-free serving.
-- MTP/EAGLE are too heavy for these GPUs; ngram n=5 gives +15 % decode
-  on short outputs (48.5 vs 41.9 t/s @ tg256), neutral at tg1024.
+- EAGLE is too heavy for these GPUs; **MTP k=2** is the recommended spec
+  config on Qwen3.8-27B (≈2× greedy at 64k+ context after the kv_split fix
+  — §Long-context DECODE with MTP above); ngram n=5 gives +15 % decode on
+  short outputs (48.5 vs 41.9 t/s @ tg256), neutral at tg1024, and remains
+  the choice for Muse-Glimmer (100 % filler-acceptance ceiling).
 - Tool/reasoning parsers: Qwen 3.5/3.6/3.8 → `qwen3_coder` + `qwen3`;
   Muse-Glimmer → `muse_glimmer` for both.
 - `--gpu-memory-utilization`: 0.82 with the spec config above; 0.93 for
