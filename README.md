@@ -10,6 +10,15 @@ vendored from
 [**cassettesgoboom/gfx906-fa-vllm**](https://github.com/cassettesgoboom/gfx906-fa-vllm).
 See [`docs/gfx906/`](docs/gfx906/) for the full optimization record.
 
+### Ported optimizations (external sources)
+
+- **SYV-4 — sort-free small-k top-k/top-p sampler** (`vllm/v1/sample/ops/topk_topp_sampler.py`,
+  default ON, opt-out `VLLM_GFX906_SORT_FREE_SMALL_K=0`): technique ported from
+  [**syv-ai/qwen38-27b-rtx3090**](https://github.com/syv-ai/qwen38-27b-rtx3090)
+  (`docs/optimizations.md`, fetched 2026-09-02); implementation is ours for the
+  gfx906 ROCm path. +0.6–3.4% serving t/s on sampling workloads (TP=1 dense 27B
+  A/B, 2026-09-03). Recon: [`docs/gfx906/RECON-syv-qwen38-27b-rtx3090.md`](docs/gfx906/RECON-syv-qwen38-27b-rtx3090.md).
+
 ## Custom FlashAttention backend (gfx906 FA, `CUSTOM`)
 
 This fork vendors a custom Q8 FlashAttention attention backend for gfx906

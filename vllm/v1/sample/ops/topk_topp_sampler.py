@@ -362,9 +362,12 @@ def apply_top_k_top_p(
         return apply_top_k_top_p_triton(logits, k, p)
 
     # SYV-4 (gfx906): small-batch top-k/top-p without the full-vocab sort.
-    # The pytorch path below sorts all ~248k logits per row (~0.35 ms at
-    # B=1); when every row's k is small and host-known, torch.topk(k) + a
-    # threshold mask is O(V log k) and bit-equivalent modulo fp rounding.
+    # Technique ported from syv-ai/qwen38-27b-rtx3090 (docs/optimizations.md,
+    # fetched 2026-09-02; see docs/gfx906/RECON-syv-qwen38-27b-rtx3090.md
+    # SYV-4); implementation is ours for the gfx906 ROCm path. The pytorch
+    # path below sorts all ~248k logits per row (~0.35 ms at B=1); when every
+    # row's k is small and host-known, torch.topk(k) + a threshold mask is
+    # O(V log k) and bit-equivalent modulo fp rounding.
     if (
         _sort_free_small_k_enabled()
         and _can_use_sort_free_small_k(logits, k)
@@ -407,6 +410,10 @@ def apply_top_k_top_p_sort_free(
     logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
 ) -> torch.Tensor:
     """SYV-4: top-k/top-p without sorting the full vocabulary.
+
+    Technique ported from syv-ai/qwen38-27b-rtx3090 (docs/optimizations.md,
+    fetched 2026-09-02; see docs/gfx906/RECON-syv-qwen38-27b-rtx3090.md
+    SYV-4); implementation is ours for the gfx906 ROCm path.
 
     Equivalent to ``apply_top_k_top_p_pytorch`` for batches where every row's
     k is small (<= 64). The reference path sorts all ~248k logits per row
