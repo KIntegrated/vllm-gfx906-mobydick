@@ -161,3 +161,28 @@ reboot clears it. GPU0 now ~23 GB free → cannot host TP=2 @0.93 (~29.7 GB).
 `ATTN_K_MULT: 1.021 at S=122880 (KV bytes shared, query rows nearly free)`
 `BUDGET_PUZZLE: 78ms/step vs ~12ms BW floor = 6x unexplained`
 `OLD_VLLM: ABANDONED (code incompatible, GPU wedges at load, zombie KFD handle)`
+
+## 2026-09-02 (boot S) — MTP-1b: k=1 arm + kv_split verify fix (SUPERSEDES the 32k-64k crossover verdict)
+
+```
+K1_ARM:   k=1 beats greedy 1.68-1.73x and k=2 1.98-2.40x at 64k/96k/120k (n=3 each)
+          -> the "crossover" was K=2-specific; no crossover for k=1 in this range
+KV_SPLT:  root cause found — both FA paths clamped `if (seq_q > 2) kv_split = 1`
+          (a PREFILL OOM guard); spec-decode verify presents k+1 query tokens as
+          ONE sequence, so k=2 verify (seq_q=3->pad 4) lost ALL KV-split
+          parallelism on the O(Sk) full-attention that is ~73% of a long-ctx step
+FIX:      byte-budget guard (GFX906_FA_KVSPLIT_MAX_BYTES, default 512 MiB) in
+          both paths — verify keeps kv_split>1, real prefill still forced y=1
+A/B:      k=2 fixed vs baseline @64k/96k/120k: 37.95/29.88/25.70 vs
+          15.95/11.19/9.18 t/s = 2.38x / 2.67x / 2.80x (n=3, cold prefill)
+          -> k=2 is now the BEST static config at >=64k (beats k=1 at every point)
+CORRECT:  kv_split in {1,8,16} bit-identical for Sq in {1,2,3,4,256,1024}, both
+          paths; torch causal-ref match <=2.2e-4 (kvsplit_verify_test.py recipe)
+REVIEW:   self + claude CLI pre-merge review — no blockers, 2 minor fixed
+MERGED:   a6ff64a71b to main (branch gfx906/mtp1b0-kvsplit-verify)
+GPU0:     wedge #7 this session (SetDevice, pre-FA) — 7 non-deterministic wedges
+          across two boots, canaries passing between each -> HW-degradation signal,
+          RMA/replace question raised with Kevin
+PENDING:  PPL/coherence gate on k=2-fixed vs baseline on a CLEAN boot (power-cycle
+          fired for this); SYV/J2G recon ideas recorded in ROADMAP (SYV-1 superseded by fix)
+```
