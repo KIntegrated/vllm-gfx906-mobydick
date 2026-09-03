@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
 import torch
 import torch.nn as nn
 
@@ -360,8 +361,100 @@ def apply_top_k_top_p(
     if HAS_TRITON and logits.shape[0] >= 8:
         return apply_top_k_top_p_triton(logits, k, p)
 
+    # SYV-4 (gfx906): small-batch top-k/top-p without the full-vocab sort.
+    # The pytorch path below sorts all ~248k logits per row (~0.35 ms at
+    # B=1); when every row's k is small and host-known, torch.topk(k) + a
+    # threshold mask is O(V log k) and bit-equivalent modulo fp rounding.
+    if (
+        _sort_free_small_k_enabled()
+        and _can_use_sort_free_small_k(logits, k)
+    ):
+        return apply_top_k_top_p_sort_free(logits, k, p)
+
     # Use pytorch sort implementation for small batch sizes.
     return apply_top_k_top_p_pytorch(logits, k, p)
+
+
+def _sort_free_small_k_enabled() -> bool:
+    """Opt-out for the SYV-4 sort-free small-k path (default ON)."""
+    return os.environ.get("VLLM_GFX906_SORT_FREE_SMALL_K", "1") == "1"
+
+
+def _can_use_sort_free_small_k(
+    logits: torch.Tensor, k: torch.Tensor | None
+) -> bool:
+    """Preconditions for the sort-free path.
+
+    ``k`` is the per-row top-k from the input batch (GPU int32); rows whose
+    request does not use top-k are padded with ``vocab_size`` by
+    ``gpu_input_batch``. Such full-vocab rows cannot be handled here (top-p
+    over the whole vocabulary needs the sort), so any of them forces the
+    fallback. The max-k check is one small device reduction + sync — same
+    class of sync the reference path already performs.
+    """
+    if k is None or not k.is_cuda:
+        return False
+    if logits.shape[0] >= 8:
+        return False
+    if bool((k >= logits.shape[1]).any()):
+        return False
+    return int(k.max()) <= 64
+
+
+def apply_top_k_top_p_sort_free(
+    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+) -> torch.Tensor:
+    """SYV-4: top-k/top-p without sorting the full vocabulary.
+
+    Equivalent to ``apply_top_k_top_p_pytorch`` for batches where every row's
+    k is small (<= 64). The reference path sorts all ~248k logits per row
+    (~0.35 ms at B=1) and scatters back; here one ``torch.topk(k)`` gives the
+    descending candidates, from which both thresholds are derived:
+
+    - top-k: mask everything below the per-row k-th largest value (the
+      reference's ascending-sort gather picks the same value up to tie order,
+      and tied values are numerically equal);
+    - top-p: cumulative softmax mass over the row's own top-k candidates in
+      descending order; mask below the crossing value. This mirrors the
+      reference exactly — it masks the sub-k-threshold entries first (they
+      contribute 0 to the softmax), so its cumsum also runs over the top-k
+      survivors only.
+
+    Masked entries contribute exp(-inf) = 0 to the final softmax denominator,
+    so renormalized probabilities match the reference up to fp rounding.
+    At least one entry always survives (the crossing value itself is kept).
+
+    The logits tensor is updated in-place.
+    """
+    assert k is not None
+    kk = int(k.max())  # <= 64 by precondition; all rows partial here
+    vals, _ = logits.topk(kk, dim=1)  # [B, kk], descending per row
+
+    # Per-row top-k threshold: the k-th largest value.
+    k_thresh = vals.gather(1, (k - 1).unsqueeze(1)).squeeze(1)  # [B]
+    logits.masked_fill_(logits < k_thresh.unsqueeze(1), -float("inf"))
+
+    if p is not None:
+        # Per-row top-p over each row's own top-k candidates only. The reference
+        # softmaxes the full vocab with non-candidates masked to -inf, so its
+        # per-candidate probabilities equal this restricted softmax exactly.
+        cand = vals.masked_fill_(
+            torch.arange(kk, device=vals.device).unsqueeze(0) >= k.unsqueeze(1),
+            -float("inf"),
+        )
+        probs_desc = cand.softmax(dim=-1)          # [B, kk], descending order
+        cum = torch.cumsum(probs_desc, dim=-1)     # cum[j] = mass of top-(j+1)
+        # keep_count = smallest n with cum[n-1] >= p  ==  (# of j with cum[j] < p) + 1.
+        # `below` is monotone [1..1 0..0] (cum is non-decreasing), so its sum is
+        # exactly that count — no argmax/bool op needed (ROCm has no bool kernels).
+        below = (cum < p.unsqueeze(1)).to(torch.int32)
+        # clamp: at p=1.0 the final cum entry can round to just under 1.0,
+        # which would push keep_count to kk+1 (out of bounds).
+        keep_count = (below.sum(dim=1) + 1).clamp_(min=1, max=kk)
+        p_thresh = vals.gather(1, (keep_count - 1).unsqueeze(1)).squeeze(1)
+        logits.masked_fill_(logits < p_thresh.unsqueeze(1), -float("inf"))
+
+    return logits
 
 
 def apply_top_k_top_p_pytorch(
