@@ -166,13 +166,17 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     cost of extra draft rows; it missed the ABSOLUTE B=1 lm_head read.**
     Roofline (see `/local/tmp/mtp1/drafter_memory_bound.md`): drafter lm_head is
     a GEMV with arithmetic intensity = B (1–3) ≪ ridge (~26 gfx906, ~38 sm86) →
-    memory-bound on BOTH GPUs; our fp16 proxy measured the per-GPU read at
-    **~6.9 ms @ 18% of MI50 peak BW** — a suboptimal skinny-GEMV gap AND a
-    quantizable term: int8 → ~2×, int4 → ~4× on that read (drafts are
-    target-verified, so this perturbs acceptance rate, not correctness).
-    **Status: OPEN. Next steps queued behind J2G-1:** (1) confirm the ~18% gap
-    in-context (phase plugin v5.1); (2) A/B int8/int4 drafter lm_head
-    (acceptance + t/s); (3) bandwidth-optimal skinny-GEMV kernel if available.
+    memory-bound on BOTH GPUs. **Step 1 CONFIRMED 2026-09-03** (standalone bench
+    `syv3_gemv.py`, exact production shape + dispatch under TP=2 — in-process
+    profiler route hit the chronic weight-load wedge family, logged):
+    `torch.mm`/`F.linear` at **183 GB/s = 24.8% of the ~740 GB/s copy ceiling**
+    (6.9 ms vs ~1.9 ms achievable) → the skinny-GEMV dispatch is leaving
+    **~3.6× on the table**. Revised levers, ordered by headroom: (1)
+    **bandwidth-optimal skinny-GEMV kernel** for [K≤3,5120]×[5120,124k] — ~3.6×
+    on this term, no quantization/acceptance risk = PRIMARY lever; (2) int8
+    drafter lm_head — halves weight bytes, *stacks* with (1), needs acceptance
+    A/B; (3) draft-vocab reduction — last resort. **Status: OPEN — kernel work
+    next, serve-based measurement preferred on this host.**
   - **SYV-4 — sort-free small-k top-k/top-p sampler.** Their gain +4%. Our ROCm
     path (`forward_native`, aiter absent) sorts all ~248k logits/row (~0.35 ms @B=1).
     **IMPLEMENTED** on `gfx906/syv4-sort-free-sampler` (`e402e85192`, 2026-09-03):
