@@ -1535,4 +1535,46 @@ KFD VRAM handle even when rocm-smi shows "recovered" — always re-check
 (c) in-process weight-load wedges are chronic on boot Q too (event 2) — keep
 using serve-based systemd launches for load-sensitive work.
 
+## 2026-09-02 (boots R + S) — MTP-1b session: wedges #4–#7, all GPU0, all non-deterministic
+
+Boot R (~08:5x) and boot S (~15:4x) reboots were both user-authorized
+(`~/bin/hermes-reb.sh`) to clear host state before trusting MTP-1 data.
+Four more GPU0 wedges landed across them; every one recovered via BACO
+reset with a passing matmul canary immediately after, and VRAM returned to
+the ~11 MB baseline (no zombie KFD handles this time — the 06:10 leak did
+NOT recur).
+
+4. **2026-09-02 15:4x (boot S):** in-process TP=2 `LLM()` + mode-NONE
+   phase-profiler diagnostic run — `hipErrorLaunchFailure` at worker init →
+   BACO reset on 0000:0e:00.0. Same family as the boot-R 08:54/10:56 events.
+
+5. **2026-09-02 16:43:34 (boot S):** in-process MTP-arm profiler run —
+   `hipErrorLaunchFailure` at init → kernel wording escalated to **"The cp
+   might be in an unrecoverable state"** + failed queue evict/quiesce → BACO
+   reset. The greedy arm of the identical config completed clean minutes
+   earlier → non-deterministic race, not a deterministic code bug.
+
+6. **2026-09-02 19:57:57 (boot S):** standard `vllm serve` startup for the
+   MTP-1b k=1 arm — wedged at the CUDA-graph-capture phase, same "cp
+   unrecoverable" wording. **First serve-based TP=2 wedge on this host** —
+   all five prior were in-process LLM()+mode-NONE or old-vLLM code paths.
+   Retry started clean and served the full k=1 sweep.
+
+7. **2026-09-02 23:24:15 (boot S):** k=2 server on the kv-split-fixed build
+   with a `GFX906_FA_KVSPLIT=1` drop-in (a causation-check run) — worker
+   init failed at `SetDevice`, same "cp unrecoverable" + BACO reset. Hit
+   before ANY FA kernel ran → unrelated to the kv_split change.
+
+**Assessment:** seven non-deterministic GPU0 wedges across two boots,
+canaries passing between each, no config-family commonality (in-process
+mode-NONE, serve graph-capture, and bare SetDevice all hit). This is strong
+evidence of genuine GPU0 HW degradation — the RMA/replace question should be
+raised with Kevin rather than continuing to burn boots on retries. The
+kv-split A/B result stands regardless: it was measured on a healthy window
+(2.38–2.80× at 64k/96k/120k, n=3 each) and the causation question is
+answered by unit-level correctness (kv_split ∈ {1,8,16} bit-identical for
+Sq ≤ 1024 on both paths) plus that A/B.
+
+
+
 

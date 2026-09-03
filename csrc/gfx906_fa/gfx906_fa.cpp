@@ -25,6 +25,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <cstdlib>
+#include <climits>
 
 // ncols1 (Q-tile columns) ladder, llama.cpp's
 // launch_fattn_tile_q8_switch_ncols1. MUST stay in sync with the mirror in
@@ -103,6 +104,43 @@ static int get_fa_kv_split() {
         return e ? std::atoi(e) : -1;
     }();
     return v;
+}
+
+// MTP-1b-0: KV-split partial-buffer byte budget. The old hard clamp
+// `if (seq_q > 2) kv_split = 1` was an OOM guard for PREFILL, where Sq is
+// thousands and the per-split partial buffer [B, Sq, Hq, y, D] fp32 reaches
+// hundreds of MiB. But it also fired for spec-decode VERIFY, which presents
+// k+1 query tokens as one sequence (Sq = k+1, padded to {2,4,8}): there the
+// partial buffer is a few MB even at kv_split=16, and forcing y=1 stripped
+// all KV-split parallelism from exactly the O(Sk) full-attention that dominates
+// a long-context step (k=2 verify lost ~8-16x attention workgroups vs k=1).
+// Replace the seq_q threshold with a byte budget: keep kv_split>1 whenever the
+// partial buffer stays under GFX906_FA_KVSPLIT_MAX_BYTES (default 512 MiB),
+// which covers Sq<=~32 at B=1/Hq=24/D=256/split=16 (~24 MB) and still forces
+// y=1 for real prefill. Env override lets a test pin the budget.
+static int fa_kv_split_budget_bytes() {
+    static int v = [] {
+        const char *e = std::getenv("GFX906_FA_KVSPLIT_MAX_BYTES");
+        if (!e) return 512 * 1024 * 1024;
+        const long long parsed = std::strtoll(e, nullptr, 10);
+        // <=0 disables the guard (tests pin it off); clamp to int range.
+        return parsed > 0 ? (int)std::min<long long>(parsed, (long long)INT32_MAX) : -1;
+    }();
+    return v;
+}
+// Returns kv_split unchanged if the partial buffer [B, Sq, Hq, y, D] fp32 fits
+// the byte budget, else 1. A negative/zero budget disables the guard (always
+// allow) — used by tests. kv_split <= 1 passes through as-is; NOTE: an explicit
+// GFX906_FA_KVSPLIT=0/negative is NOT clamped here — it reaches the launcher,
+// which independently enforces kv_split >= 1 before building the grid
+// (gfx906_fa_launcher.cu, both launch sites). Do not remove that dependency.
+static int fa_apply_kv_split_budget(int kv_split, long batch, long seq_q,
+                                    long heads_q, long head_dim) {
+    if (kv_split <= 1) return kv_split;
+    const int budget = fa_kv_split_budget_bytes();
+    if (budget <= 0) return kv_split;
+    const long bytes = batch * seq_q * heads_q * (long)kv_split * head_dim * 4L;
+    return bytes > budget ? 1 : kv_split;
 }
 
 // M2 tile clip: per-q-tile k0_base window raise + per-q-tile causal
@@ -372,13 +410,14 @@ torch::Tensor gfx906_fa_forward(
     int kv_split = get_fa_kv_split();
     const int tile_clip = get_fa_tile_clip();
     if (kv_split < 0) kv_split = 16;  // gather-path default (B=1 tuning)
-    if (seq_q > 2) {
-        // KV-split is a B=1-decode parallelism trick (Sq=1 -> 16 blocks per
-        // head tile); at prefill the seq_q tiles already fill the machine and
-        // the partial-output buffer [B, Sq, Hq, kv_split, D] fp32 scales with
-        // Sq (588 MiB at Sq=1568, Hq=24, D=256, split=16) -- OOM on 32 GB.
-        kv_split = 1;
-    }
+    // MTP-1b-0: the old hard clamp `if (seq_q > 2) kv_split = 1` (a prefill
+    // OOM guard) also fired for spec-decode verify (Sq = k+1 padded to {2,4,8}),
+    // stripping KV-split parallelism from k>=2 verify's O(Sk) attention. The
+    // byte budget below protects against the real OOM case (prefill Sq~thousands)
+    // while letting small-Sq verify keep kv_split>1. An explicit
+    // GFX906_FA_KVSPLIT is still bounded by the budget, so it cannot OOM.
+    kv_split = fa_apply_kv_split_budget(
+        kv_split, batch, seq_q, heads_q, head_dim);
     // M3 #4b: the kernel's only dst_meta write is guarded by
     // `gridDim.y != 1` (gridDim.y == kv_split), so at kv_split==1 the
     // [B, Sq, Hq, 2] meta is never written — nor read back: it is a
@@ -1225,9 +1264,13 @@ torch::Tensor gfx906_fa_forward_paged_direct(
     if (kv_split < 0) {
         kv_split = std::max(2, std::min(8, 16 / std::max(1, batch)));
     }
-    if (seq_q > 2) {
-        kv_split = 1;
-    }
+    // MTP-1b-0: same fix as the gather path — the old `if (seq_q > 2)
+    // kv_split = 1` prefill OOM guard also fired for spec-decode verify
+    // (Sq = k+1 padded to {2,4,8}), stripping KV-split parallelism from k>=2
+    // verify. The byte budget protects against the real OOM case (prefill)
+    // while letting small-Sq verify keep kv_split>1.
+    kv_split = fa_apply_kv_split_budget(
+        kv_split, batch, seq_q, heads_q, head_dim);
     // M3 #4b (LOCKSTEP with gfx906_fa_forward): the dst_meta write is
     // guarded by `gridDim.y != 1` (gridDim.y == kv_split), so the [B, Sq,
     // Hq, 2] meta is dead at kv_split==1 (never written, never read back)
