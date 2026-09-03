@@ -175,8 +175,12 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     `VLLM_GFX906_SORT_FREE_SMALL_K=0`. **GPU bench (2026-09-03, canary 39.2 t/s
     PASS):** 12/12 correctness cases exact vs reference at V=248k; perf — B=1 k=20:
     0.91× (noise), B=1 k=64 p=.95: 1.17×, **B=4 mixed k≤64 p: 6.55×** (2.212→0.338
-    ms/call). Win scales with batch; ~neutral at B=1 greedy. REMAINING: end-to-end A/B
-    decode t/s on a sampling workload (SYV-5/SYV-7 window).
+    ms/call). Win scales with batch; ~neutral at B=1 greedy. **End-to-end A/B
+    (2026-09-03, TP=1 dense 27B, tg256, n=3 reps):** sort-free vs reference —
+    temp0 (k disabled, control): +0.5%/+0.4% (noise); sample k=32 p=.95:
+    B=1 +0.6%, **B=4 +3.4%**; sample k=8 p=.9: B=1 +1.4%, B=4 +1.6%. The
+    microbench win translates to serving on sampling workloads (control arm
+    confirms the delta is the sampler, not run noise). MERGED to main.
   - **SYV-5 — fp16 GDN recurrent state** (`--mamba-ssm-cache-dtype float16`).
     Config flag, trivial A/B; we run B=1 so mainly a concurrency win for future
     multi-request work. **Status: open (low effort).**
