@@ -105,7 +105,10 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
   token-identity gates unusable; use t/s + PPL/coherence).
 
   **MTP-1b-0 — fix the FA kv_split clamp for spec-decode verify (k>1). TOP
-  PRIORITY (user, 2026-09-02). DONE + VALIDATED (2026-09-02, boot S).** Both
+  PRIORITY (user, 2026-09-02). CLOSED (2026-09-03): merged to main a6ff64a71b +
+  review fixes 7eb8b5d08e; PPL/coherence gate GATE-PASS on clean boot T
+  (PPL drift 0.0; token divergence == kv_split FP noise floor, see
+  DEVLOG-mtp1.md 2026-09-03 entry).** Both
   `gfx906_fa_forward` (gather path) and `gfx906_fa_forward_paged_direct` forced
   `kv_split = 1` when `seq_q > 2`, which fired for k=2 verify (seq_q=3→pad 4)
   but NOT for greedy (seq_q=1) or k=1 verify (seq_q=2). The clamp was a prefill

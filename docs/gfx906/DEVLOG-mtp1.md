@@ -183,6 +183,35 @@ MERGED:   a6ff64a71b to main (branch gfx906/mtp1b0-kvsplit-verify)
 GPU0:     wedge #7 this session (SetDevice, pre-FA) — 7 non-deterministic wedges
           across two boots, canaries passing between each -> HW-degradation signal,
           RMA/replace question raised with Kevin
-PENDING:  PPL/coherence gate on k=2-fixed vs baseline on a CLEAN boot (power-cycle
-          fired for this); SYV/J2G recon ideas recorded in ROADMAP (SYV-1 superseded by fix)
+
+## 2026-09-03 (boot T) — PPL/coherence gate for the kv_split merge: GATE-PASS
+
+```
+GATE:     ppl_gate.sh on clean boot T (post-reboot, GPUs settled ~60s)
+ARMS:     greedy vs mtp k=2, in-process TP=2, enforce_eager, maxlen 32768,
+          12-prompt set (same as /local/tmp/ppl_nh5_090.py), prompt_logprobs=20
+PPL:      greedy 10.517902 vs mtp2 10.517902 -> rel drift 0.0
+COHERENCE: first naive check FAILED (14.8% token match, first diff @32) —
+          root cause: the two arms use DIFFERENT attention numerics (greedy
+          seq_q=1 keeps kv_split=8; mtp verify seq_q=4 uses kv_split=8 with a
+          different tile reduction order). Control: two PURE-GREEDY runs
+          differing only in GFX906_FA_KVSPLIT (8 vs 1) diverge IDENTICALLY
+          (first diff @32, 218/256 diffs) -> FP non-associativity across
+          KV-tile split orders is the floor; MTP adds ZERO extra divergence.
+VERDICT:  GATE-PASS (ppl_gate_verdict.py v2: mtp signature == noise floor)
+DATA:     /local/tmp/mtp1/ppl_gate_{greedy,mtp2}.jsonl, pk1_greedy.jsonl
+```
+
+**Wedge #8** at 06:47:08 (control-run mtp2 arm startup, BACO-recovered,
+canary passed after). 8 non-deterministic GPU0 wedges on 2026-09-02/03;
+4 of them at engine/server startup since boot R. HW-degradation assessment
+unchanged: escalate for RMA/replace decision.
+
+**MTP-1b-0 kv_split merge is now FULLY CLOSED**: fix + docs (a6ff64a71b),
+review fixes (7eb8b5d08e), DEVLOG (4d9a1d3b13), degradation logs
+(c183407df2 + this entry). k=2 on the fixed build is the best static config
+at >=64k context.
+
+DONE:     PPL/coherence gate GATE-PASS on clean boot T (see 2026-09-03 entry below);
+          SYV/J2G recon ideas recorded in ROADMAP (SYV-1 superseded by fix)
 ```
