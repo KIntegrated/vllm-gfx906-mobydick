@@ -119,9 +119,12 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
   whenever the partial buffer fits — covers Sq≤~32 at B=1/Hq=24/D=256/split=16
   (~24 MB) and still forces y=1 for real prefill.
 
-  **Correctness (branch `gfx906/mtp1b0-kvsplit-verify`):** kv_split=1 vs =8
-  outputs identical for Sq∈{1,2,3,4} on both paths (max|d| ≤ 4.6e-4) and match
-  a torch causal reference within 1.2e-4 (`/local/tmp/mtp1/kvsplit_verify_test.py`).
+  **Correctness:** kv_split=1 vs =8 outputs identical for Sq∈{1,2,3,4} on both
+  paths (max|d| ≤ 4.6e-4) and match a torch causal reference within 1.2e-4;
+  prefill shapes Sq∈{256,1024} also verified. In-repo regression test:
+  `tests/kernels/attention/test_gfx906_fa.py::test_forward_sq_multi_kv_split_vs_fp32_ref`
+  (7 cases: verify Sq∈{2,3,4}, serving split=16, prefill under budget, and the
+  clamped-to-y=1 path via a pinned low `GFX906_FA_KVSPLIT_MAX_BYTES`).
 
   **Serving A/B @120k-class points (n=3, cold prefill, S9 corpus):**
 

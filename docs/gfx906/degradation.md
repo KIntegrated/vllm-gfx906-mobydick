@@ -1,5 +1,10 @@
 # GPU wedge / host-degradation event log — 2× MI50 (gfx906), official amdgpu DKMS
 
+**Status (Kevin, 2026-09-03): tp=2 instability on this system is ACCEPTED as
+hardware-related — it is a dev system. No RMA escalation, no wedge-chasing;
+keep logging events + canary checks, and treat repeated wedges as an expected
+operational cost (stop/retry per house recipe), not a new investigation.**
+
 Protocol: **every** half-wedge, full wedge, and host-degradation
 observation gets a row here (timestamped UTC), with a pointer to the
 details in `degradation_details.md`. Sources: `journalctl -k` /

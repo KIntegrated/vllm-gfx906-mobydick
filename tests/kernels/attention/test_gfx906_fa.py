@@ -1418,6 +1418,110 @@ def test_forward_kv_split_gqa_pack_vs_fp32_ref(nc2, ys, sk, kv_max, hq, hkv):
 
 
 # ---------------------------------------------------------------------------
+# MTP-1b-0 (kv_split byte-budget guard): multi-query (Sq>1) causal attention.
+# The old hard clamp `if (seq_q > 2) kv_split = 1` meant the split-KV combine
+# path was NEVER exercised at Sq>2 — exactly the spec-decode verify shapes
+# (k+1 queries padded to {2,4,8}). This covers those shapes plus a prefill
+# shape that stays under the byte budget, on the gather path with causal
+# masking, vs an fp32 torch reference, across kv_split settings.
+# ---------------------------------------------------------------------------
+_SQ_SPLIT_CHECK_SRC = """
+import math
+import sys
+import torch
+
+nc2 = int(sys.argv[1])
+ysplit = int(sys.argv[2])
+sq = int(sys.argv[3])
+L = int(sys.argv[4])
+hq, hkv = int(sys.argv[5]), int(sys.argv[6])
+D = 256
+BLOCK = 16
+
+torch.manual_seed(0)
+dev = "cuda"
+scale = 1.0 / math.sqrt(D)
+
+from vllm import _gfx906_fa_C as fa
+
+n_blocks = L // BLOCK
+kc = torch.zeros(n_blocks, BLOCK, hkv, (D // 32) * 34,
+                 dtype=torch.uint8, device=dev)
+kv = torch.zeros(n_blocks, 2, BLOCK, hkv, D, dtype=torch.float16, device=dev)
+K = torch.randn(L, hkv, D, device=dev, dtype=torch.float16) * 0.5
+V = torch.randn(L, hkv, D, device=dev, dtype=torch.float16) * 0.5
+slot = torch.arange(L, dtype=torch.int64, device=dev)
+fa.reshape_and_cache_q8(K, slot, kc)
+staging = torch.zeros_like(kv[:, 1])
+staging.view(-1, hkv, D)[:L].copy_(V)
+kv[:, 1].copy_(staging)
+vc = kv.unbind(1)[1]
+bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, n_blocks)
+sl = torch.tensor([L], dtype=torch.int32, device=dev)
+
+# verify-style: the LAST sq rows of the sequence (q_abs_offset = L - sq),
+# causal. Sq in {2,3,4} are k+1 spec-decode verify shapes; 128/256 are
+# prefill shapes that stay under / exceed the kv_split byte budget.
+q = torch.randn(1, hq, sq, D, device=dev, dtype=torch.float32) * 0.5
+q_abs = torch.tensor([L - sq], dtype=torch.int32, device=dev)
+k_q8, v_b = fa.gather_paged_kv_q8(kc, vc, bt, sl, (L + 31) // 32 * 32)
+out = fa.forward(q, k_q8, v_b, scale, kv_max=sl, q_abs_offset=q_abs)[0]
+
+# torch reference: query row i sits at abs pos L-sq+i -> causal to j <= that.
+g = hq // hkv
+k, v = K.float(), V.float()
+rows = torch.arange(L, device=dev)
+ref = torch.empty(sq, hq, D, device=dev, dtype=torch.float32)
+for i in range(sq):
+    qpos = L - sq + i
+    per_h = []
+    for h in range(hq):
+        hk = h // g
+        s = (q[0, h, i].float() @ k[:, hk].T * scale)
+        s = torch.where(rows > qpos, torch.full_like(s, float("-inf")), s)
+        per_h.append(torch.softmax(s, -1) @ v[:, hk])
+    ref[i] = torch.stack(per_h, 0)
+
+rel = ((out.float() - ref).norm() / ref.norm()).item()
+print(f"nc2={nc2} ys={ysplit} sq={sq} L={L} rel={rel:.2e}")
+sys.exit(0 if rel < 5e-2 else 1)
+"""
+
+
+@pytest.mark.parametrize("ys, sq, L, hq, hkv, budget", [
+    # spec-decode verify shapes: the exact path the clamp used to kill.
+    (8, 2, 512, 16, 2, None),    # k=1 verify
+    (8, 3, 512, 16, 2, None),    # k=2 verify (pads to 4)
+    (8, 4, 512, 16, 2, None),    # k=3 verify
+    (16, 3, 512, 16, 2, None),   # serving gather default split
+    # prefill shape under the 512 MiB byte budget: kv_split>1 allowed.
+    (8, 128, 512, 16, 2, None),
+    # above the default budget -> clamped to y=1; must still be correct.
+    (16, 256, 512, 16, 2, None),   # prefill under default budget: split kept
+    # same shape with the budget pinned BELOW the partial buffer
+    # (1*256*16*16*256*4 = 64 MiB > 32 MiB) -> clamped to y=1; must still
+    # be correct. Pins the guard without needing a multi-thousand-Sq shape.
+    (16, 256, 512, 16, 2, 32 * 1024**2),
+])
+def test_forward_sq_multi_kv_split_vs_fp32_ref(ys, sq, L, hq, hkv, budget):
+    import os
+    import subprocess
+
+    env = {
+        **os.environ,
+        "GFX906_FA_NC2": "8",
+        "GFX906_FA_KVSPLIT": str(ys),
+    }
+    if budget is not None:
+        env["GFX906_FA_KVSPLIT_MAX_BYTES"] = str(budget)
+    r = subprocess.run(
+        [sys.executable, "-c", _SQ_SPLIT_CHECK_SRC, "8", str(ys),
+         str(sq), str(L), str(hq), str(hkv)],
+        env=env, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, f"stdout: {r.stdout}\nstderr: {r.stderr[-2000:]}"
+
+
+# ---------------------------------------------------------------------------
 # Sliding-window masking (window arg, Muse Glimmer iRoPE track).
 # Unmasked keys per query row r: [max(0, r - W + 1), r] (window + causal).
 # q_abs_offset is required for the window to apply (the backend always
