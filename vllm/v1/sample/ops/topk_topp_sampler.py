@@ -396,9 +396,11 @@ def _can_use_sort_free_small_k(
         return False
     if logits.shape[0] >= 8:
         return False
-    if bool((k >= logits.shape[1]).any()):
-        return False
-    return int(k.max()) <= 64
+    # One device reduction + sync (the reference path performs the same class
+    # of sync). gpu_input_batch only ever stores values in [1, vocab_size],
+    # so max(k) >= vocab_size iff some row is a disabled/padded full-vocab row.
+    kmax = int(k.max())
+    return kmax < logits.shape[1] and kmax <= 64
 
 
 def apply_top_k_top_p_sort_free(
