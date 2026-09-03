@@ -220,8 +220,28 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     Attacks TP comm cost — the per-step work our phase profile could NOT
     attribute (outside any hookable module; hooked modules = ~38% of MTP step).
     Their prebuilt `.so` is topology-specific (TP=8); the env-only RCCL knobs
-    (`NCCL_ALGO/PROTO/CHANNELS`) are the transferable first probe. **Status:
-    open — cheap env A/B before any port.** (A0/A1/A2 running 2026-09-03.)
+    (`NCCL_ALGO/PROTO/CHANNELS`) are the transferable first probe.
+
+    **ENV A/B COMPLETE 2026-09-03 — WIN, default ON.** Sequential TP=2 greedy
+    arms (corpus s9, n=5/point, medians; design + raw data in
+    `/local/tmp/j2g1/`):
+
+    | arm | env | @120k ctx | Δ vs A0 | @64k ctx | Δ vs A0 |
+    |-----|-----|----------:|--------:|---------:|--------:|
+    | A0 | none | 12.762 t/s | — | 18.916 t/s | — |
+    | **A1** | `NCCL_ALGO=Tree` + `NCCL_PROTO=LL` | **13.115 t/s** | **+2.77%** | **19.723 t/s** | **+4.27%** |
+    | A2 | A1 + `MIN/MAX_NCHANNELS=4` | 13.105 t/s | +2.69% | 19.759 t/s | +4.46% |
+
+    - Pass bar (≥2% @120k, no new wedges): **A1 PASSES** (+2.77%, all reps
+      within ±0.3% — not noise). A2 ≈ A1: channel pinning adds nothing; the win
+      is Tree+LL alone. No wedges in any arm; clean teardowns.
+    - MTP-workload check: canary with Tree+LL = 39.1 t/s (baseline class
+      ~39–47) → no regression on the real speculative path.
+    - **Applied default-on** in `run_server.sh` (`NCCL_ALGO=Tree`,
+      `NCCL_PROTO=LL`) with knob-source attribution to joe2gaan's profile
+      (standard env vars, no code port).
+    - **Remaining: full persistent-AR port** (their prebuilt `.so` is TP=8; a
+      gfx906 TP=2 build is the escalation — see J2G-3) and J2G-2 AR pre-fold.
 
   - **J2G-2 — AR residual pre-fold** (`VLLM_GFX906_AR_PREFOLD_ENABLE`, from
     `communication_op.py`). Algebraic identity: `allreduce(partial + residual/TP)
