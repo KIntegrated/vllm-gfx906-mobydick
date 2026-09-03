@@ -121,17 +121,19 @@ static int get_fa_kv_split() {
 static int fa_kv_split_budget_bytes() {
     static int v = [] {
         const char *e = std::getenv("GFX906_FA_KVSPLIT_MAX_BYTES");
-        return e ? (std::strtoll(e, nullptr, 10) > 0
-                        ? (int)std::min<long long>(std::strtoll(e, nullptr, 10),
-                                                   (long long)INT32_MAX)
-                        : -1)
-                 : 512 * 1024 * 1024;
+        if (!e) return 512 * 1024 * 1024;
+        const long long parsed = std::strtoll(e, nullptr, 10);
+        // <=0 disables the guard (tests pin it off); clamp to int range.
+        return parsed > 0 ? (int)std::min<long long>(parsed, (long long)INT32_MAX) : -1;
     }();
     return v;
 }
 // Returns kv_split unchanged if the partial buffer [B, Sq, Hq, y, D] fp32 fits
 // the byte budget, else 1. A negative/zero budget disables the guard (always
-// allow) — used by tests.
+// allow) — used by tests. kv_split <= 1 passes through as-is; NOTE: an explicit
+// GFX906_FA_KVSPLIT=0/negative is NOT clamped here — it reaches the launcher,
+// which independently enforces kv_split >= 1 before building the grid
+// (gfx906_fa_launcher.cu, both launch sites). Do not remove that dependency.
 static int fa_apply_kv_split_budget(int kv_split, long batch, long seq_q,
                                     long heads_q, long head_dim) {
     if (kv_split <= 1) return kv_split;
