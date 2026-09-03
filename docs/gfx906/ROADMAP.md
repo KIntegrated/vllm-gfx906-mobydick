@@ -171,12 +171,15 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     profiler route hit the chronic weight-load wedge family, logged):
     `torch.mm`/`F.linear` at **183 GB/s = 24.8% of the ~740 GB/s copy ceiling**
     (6.9 ms vs ~1.9 ms achievable) → the skinny-GEMV dispatch is leaving
-    **~3.6× on the table**. Revised levers, ordered by headroom: (1)
-    **bandwidth-optimal skinny-GEMV kernel** for [K≤3,5120]×[5120,124k] — ~3.6×
-    on this term, no quantization/acceptance risk = PRIMARY lever; (2) int8
-    drafter lm_head — halves weight bytes, *stacks* with (1), needs acceptance
-    A/B; (3) draft-vocab reduction — last resort. **Status: OPEN — kernel work
-    next, serve-based measurement preferred on this host.**
+    **~3.6× on the table**. **Lever 1 PROTOTYPED + MEASURED 2026-09-03**
+    (`syv3_gemv_triton.py`, plain Triton, K=1 — the production call pattern per
+    `step3p5.py`'s sequential draft steps): best config BN=128/BH=512/warps=4 →
+    **727 GB/s = 98% of ceiling, 3.97× vs torch.mm** (6937→1748 µs/call), max|err|
+    0.002 (fp32-accum). K≥2 `tl.dot` variants are slower than torch.mm (gfx906
+    64 KB smem staging) but irrelevant — B=1 serving = K=1 calls only. Remaining:
+    wire into drafter lm_head path (shape-gated, cudagraph-safe, preallocated
+    buffers), serve-based t/s + acceptance A/B; then int8 on top (halves bytes,
+    ~7× combined at ceiling). **Status: OPEN — kernel integration next.**
   - **SYV-4 — sort-free small-k top-k/top-p sampler.** Their gain +4%. Our ROCm
     path (`forward_native`, aiter absent) sorts all ~248k logits/row (~0.35 ms @B=1).
     **IMPLEMENTED** on `gfx906/syv4-sort-free-sampler` (`e402e85192`, 2026-09-03):
