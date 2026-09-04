@@ -1575,6 +1575,130 @@ kv-split A/B result stands regardless: it was measured on a healthy window
 answered by unit-level correctness (kv_split ∈ {1,8,16} bit-identical for
 Sq ≤ 1024 on both paths) plus that A/B.
 
+## 2026-09-03 (boot T) — SYV-3/SYV-9 session: wedges #8–#13; tp=2 instability accepted as HW-related
+
+Kevin's ruling for this boot (2026-09-03): tp=2 instability on this dev
+system is **accepted as hardware-related** — no RMA escalation, no
+wedge-chasing; keep canary checks + log entries. Wedges #8–#11 (earlier in
+the day) were the usual mix: 3× in-process `LLM()` mode-NONE weight-load
+hangs (06:47, 11:29 GPU0; 16:45 GPU1 — first GPU1 of the boot), all
+recovering via BACO reset with clean canaries after.
+
+12. **2026-09-03 22:34:52 (boot T):** serve-based TP=2 MTP arm0 weight load
+    (`mtp1srv@mtp`, util 0.85, k=2, skinny-GEMV drop-in OFF) — ~60s into
+    weight load, `unspecified launch failure` both ranks → fence-fallback +
+    BACO reset on GPU0 (reset #5). **First serve-based TP=2 weight-load wedge
+    this boot** (all prior serve launches today were clean). Confounder: a
+    standalone Triton GEMV microbench ran concurrently during the window —
+    first wedge with concurrent GPU work; unproven as cause. Process survived
+    but never became healthy; driver killed it at the 675s health timeout.
+
+13. **2026-09-03 22:45:56 (boot T):** arm1 weight load (same config, skinny
+    GEMV default ON — final reviewed code) — same signature ~11 min later,
+    **no concurrent GPU work** → the #12 confounder is not required; plain
+    weight-load coin-flip continues. Driver killed at 675s; SYV-3 A/B run
+    voided. Canary clean after (39–41 t/s).
+
+14. **2026-09-04 00:52:04 (boot T):** arm1 re-run via `mtp1srv-syv3arm1`
+    (run_server.sh wrapper, GFX906_SKINNY_GEMV=1) — worker init wedged at
+    `c10::cuda::SetDevice` ~60s in → fence-fallback + BACO reset on GPU0
+    (reset #7). Note: an earlier raw launch failed on a *different* error
+    (missing FLASH_ATTENTION_TRITON_AMD_ENABLE → flash-attn ImportError),
+    not a wedge. Canary immediately after: **38.2–38.3 t/s, down from 41.2
+    at 22:3x** — degradation trend on this boot.
+
+15. **2026-09-04 01:02:36 (boot T):** arm1 re-run #2 — identical SetDevice
+    wedge ~70s in, after a 3-min cooldown + canary recheck (38.2 t/s) and a
+    clean KFD check (no zombie handles). **4th GPU0 wedge since 22:34 and
+    3rd consecutive launch failure**; every reset "recovered" but the canary
+    trend is downward (41.2 → 39.2 → 38.2).
+
+**Assessment:** fifteen wedges this boot, all GPU0 except #11 (GPU1), all
+recovered via BACO reset with baseline VRAM afterward (no zombie KFD
+handles). Per Kevin's ruling this is the accepted HW-related tp=2
+instability of this dev system. Operational lessons carried forward:
+(1) no concurrent GPU work during a TP=2 weight-load window; (2) expect an
+occasional wedge on any serve launch — retry once, don't reboot; (3) health
+timeout 675s is too tight when a reset happens mid-load (a wedged-then-
+recovered process may still be compiling) — bump to ~1200s on retries.
+**New as of #14–#15:** three consecutive launch failures with a downward
+canary trend (41.2 → 38.2 t/s) is beyond the "retry once" band — decision
+taken: **reboot via ~/bin/hermes-reb.sh** for a clean state before the
+definitive SYV-3 arm1 run; if SetDevice wedges recur on a fresh boot, this
+exceeds the accepted-HW pattern and should be escalated (RMA conversation).
+
+## 2026-09-04 (boot U) — post-wedge-reboot SYV-3 A/B resume: wedge #16 at first launch
+
+Boot U started 01:06:52. Arrival state clean (31/32 °C, 0%/0% VRAM,
+938 MHz). mtp1canary@mtp **38.3 t/s ×2** (01:26, 01:29) — within the host's
+known passing band (38.2–39.3 across boots J–T), below the ~40–47 nominal
+but consistent with every recent boot; above the <35 hard stop.
+`syv3_final_test.py` ALL PASS on GPU at 01:30 (K=1 err 2.0e-3, K=1 kernel
+1.7 µs / 742 GB/s vs torch.mm 6.9 µs — 4.01×).
+
+16. **2026-09-04 01:31:41 (boot U):** SYV-3 A/B arm0 first launch
+    (`mtp1srv@mtp`, TP=2 MTP serve, util 0.85, k=2, skinny-GEMV drop-in OFF),
+    launched 01:30:35 — worker init wedged at `c10::cuda::SetDevice` ~68 s in
+    (userspace `unspecified launch failure` both ranks) → kernel `Fence
+    fallback timer expired on ring comp_1.0.0` + BACO reset on 0000:0b:00.0,
+    "device wedged, but recovered through reset", 01:31:41–01:31:44. VRAM back
+    to baseline; **no zombie KFD handle** (rocm-smi --showpids: only the
+    gpuagent daemon).
+
+    **This is the first SetDevice/weight-load wedge on a fresh boot — the
+    boot-T recurrence pattern has crossed the reboot boundary**, which is the
+    single event that triggers the pre-committed escalation clause in #15.
+    Context before judging: every fresh boot since Aug 24 (D, E, G, H, J, K,
+    M, O) also produced an early isolated wedge that recovered cleanly; what
+    exceeds the accepted-HW pattern is a BURST (consecutive failures) on the
+    fresh boot. House recipe authorizes exactly one retry — if arm0's retry
+    ALSO wedges at SetDevice/weight load, that is 2 consecutive launch
+    failures on boot U = burst → STOP all GPU work + escalate per #15.
+
+    **Mapping note (new pitfall):** the BDF↔GPU-index mapping FLIPPED vs
+    boot T. This boot's kernel says `Initialized amdgpu ... for 0000:0b:00.0
+    on minor 0` and rocm-smi reports GUID 10709 for GPU[0] — the same GUID
+    this machine has reported for its "GPU0" in recent rocm-smi output, so
+    0b:00.0 = GPU0 on boot U (boot T had 0e:00.0 = GPU0). The historical
+    table's BDF labels are boot-specific; always re-derive the mapping per
+    boot from the `Initialized ... on minor N` kernel line + rocm-smi GUIDs.
+
+17. **2026-09-04 01:39:21 (boot U):** SYV-3 A/B arm0 RETRY (driver's built-in
+    one-shot retry after #16; `mtp1srv@mtp`, same TP=2 MTP config) — worker
+    init wedged at `c10::cuda::SetDevice` again → kernel `qcm fence wait loop
+    timeout expired` + BACO reset on 0000:0e:00.0 (**GPU1** this time),
+    "device wedged, but recovered through reset", 01:39:21–01:39:24. VRAM back
+    to baseline; no zombie KFD handle.
+
+    **2 consecutive launch failures on boot U = BURST per house recipe → ALL
+    GPU WORK STOPPED.** The SetDevice/weight-load pattern crossed the reboot
+    boundary (#16) and recurred within ~8 minutes on the OTHER card (#17).
+    This is exactly the scenario #15 pre-committed as escalation-worthy: it
+    exceeds the accepted-HW "retry once" band. Post-stop canary 01:4x:
+    **38.3 t/s — no perf degradation**, so this is a launch-wedge burst, not a
+    DEG state; both cards probe-clean afterward (VRAM baseline, no zombies).
+
+    Non-wedge observation for the record: arm1's launch at 01:42 (after the
+    driver skipped arm0) **loaded weights cleanly** (5/5 shards 32 s + drafter
+    12.5 s) but then hung at shm-broadcast ("No available shared memory
+    broadcast block found in 60 seconds") — the known one-off init-deadlock
+    family (cf. 2026-08-23 ~11:36 entry). Stopped by operator per the burst
+    decision before it could resolve; NOT counted as a wedge.
+
+**Assessment (boot U):** two SetDevice wedges in the first ~9 minutes of GPU
+use, on both cards, both recovered via BACO with clean post-state and a flat
+canary (38.3 t/s ×3). Per Kevin's 2026-09-03 ruling tp=2 instability is
+accepted as HW-related for this dev system — but the pre-committed clause in
+#15 ("if SetDevice wedges recur on a fresh boot, escalate") has now been
+triggered. **Escalation to Kevin: RMA/replace conversation warranted.** No
+further GPU work until Kevin decides; SYV-3 A/B is blocked at arm0 (arm0
+skipped after 2 failed launches; arm1 never benched). Code state unchanged:
+the head_dtype gate fix + one-shot diagnostic remain in the working tree,
+verified by syv3_final_test.py ALL PASS (01:30) and by both canary runs
+showing "SYV-3 skinny GEMV activated" — so the A/B is runnable as soon as a
+launch window opens.
+
+
 
 
 

@@ -176,10 +176,23 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     `step3p5.py`'s sequential draft steps): best config BN=128/BH=512/warps=4 →
     **727 GB/s = 98% of ceiling, 3.97× vs torch.mm** (6937→1748 µs/call), max|err|
     0.002 (fp32-accum). K≥2 `tl.dot` variants are slower than torch.mm (gfx906
-    64 KB smem staging) but irrelevant — B=1 serving = K=1 calls only. Remaining:
-    wire into drafter lm_head path (shape-gated, cudagraph-safe, preallocated
-    buffers), serve-based t/s + acceptance A/B; then int8 on top (halves bytes,
-    ~7× combined at ceiling). **Status: OPEN — kernel integration next.**
+    64 KB smem staging) but irrelevant — B=1 serving = K=1 calls only. **SHELVED
+    2026-09-04 (C3 gate: no gain).** Full integration + TP=1 A/B completed and
+    the root-cause investigation killed the premise: **the standalone microbench
+    was misleading.** In-context CUDA-event timing at the exact production shape
+    (K=1 N=248320 H=5120 fp16, both arms): **stock GEMV path = 3.09 ms median
+    (~822 GB/s effective) vs our Triton kernel = 3.93 ms (~647 GB/s)** — the
+    production `torch.mm` dispatch already runs near/above the copy ceiling and
+    rocBLAS's GEMV beats the hand-rolled flat Triton kernel at N=248k on gfx906.
+    The "13 ms / 3.3× headroom" standalone number was a cold-cache artifact of
+    the microbench loop, not production behavior. TP=1 A/B (zero wedges): OFF
+    47.82/29.64 t/s @8k/32k vs ON 46.55/30.76; acceptance identical 0.50/step →
+    delta within noise, no gain. **Status: SHELVED** — code preserved on branch
+    `shelved/syv3-skinny-gemv` (e960be998c) incl. the head_dtype property-gate
+    fix + env-gated diagnostic timers; re-arm only if a future profile shows the
+    stock drafter lm_head regressing below ~700 GB/s effective. **The byte-count
+    lever survives as CAT-1** (smaller draft vocab halves bytes read — that is
+    where the remaining headroom actually is).
   - **SYV-4 — sort-free small-k top-k/top-p sampler.** Their gain +4%. Our ROCm
     path (`forward_native`, aiter absent) sorts all ~248k logits/row (~0.35 ms @B=1).
     **IMPLEMENTED** on `gfx906/syv4-sort-free-sampler` (`e402e85192`, 2026-09-03):
@@ -225,15 +238,19 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
   - **Ideas from [1CatAI/1Cat-vLLM](RECON-1cat-vllm.md) (V100/SM70, "Make Volta
     Fast Again" — same generation class as gfx906; runs Qwen3.6-27B-AWQ TP2, the
     near-identical model to ours). Full recon + estimates in the linked doc.**
-  - **CAT-1 — draft-vocabulary shortlisting (GO — feeds SYV-3).** Their biggest MTP
+  - **CAT-1 — draft-vocabulary shortlisting (GO).** Their biggest MTP
     win: shrink the *drafter's* lm_head vocab from full 248k to a static 131K or
     dynamic 98K+2×512 shortlist → **+21.9% e2e** (80.1→97.7 tok/s) on their TP2
     Qwen3.6-27B-AWQ, lossless by construction (target dist stays full-vocab for
     accept/recover; one-time prefill `topk=2048` bootstrap builds the shortlist).
-    This is exactly SYV-3 lever 3 ("small draft vocab") we scoped but never built.
-    Stacks on our Triton K=1 skinny-GEMV (lever 1, 98% of BW ceiling) → halves the
-    bytes read → ~7× combined at the roofline. **Status: OPEN — scope the bootstrap
-    + reduced-draft-lm_head on `step3p5.py`; A/B with t/s + PPL/coherence gate.**
+    This is SYV-3's surviving lever: the kernel-level route (SYV-3) was shelved
+    2026-09-04 because the stock GEMV path already runs at ~822 GB/s effective,
+    so **the byte count itself is the remaining headroom** — a 131K draft vocab
+    cuts the drafter lm_head read ~1.9× (in-context measured: full 248k =
+    3.09 ms/call at K=1), and int8 on top of that halves it again. **Status:
+    OPEN — scope the bootstrap + reduced-draft-lm_head on `step3p5.py`; A/B with
+    t/s + PPL/coherence gate.** (No longer depends on the shelved Triton kernel;
+    works directly against the stock path.)
   - **CAT-2 — FA prefill D256 Split-D + GQA multi-head packing (GO/ANALYZE — feeds
     SYV-9).** Their Volta D=256 prefill kernel = **1.66–2.2× over generic FA2** on
     the same D=256 shape. Techniques: Split-D (D=256→4×D64, paired warps share QK,
@@ -364,6 +381,94 @@ unmeasured crossover. (2) Long-context runs sit in the GPU-degradation-risk
 zone (`degradation.md`) — run the canary before each sweep and stop after any
 reset burst. (3) TP=2 requires the official amdgpu DKMS driver; if it is not
 the active driver, do not force a fallback and record it.
+
+## High priority — user-requested (2026-09-04): startup-time items
+
+Both items below were requested 2026-09-04 ("add to roadmap: improve graph
+and inductor creation speed; improve shard loading time"). Each item's
+**Step 0 is a search for existing work** (upstream + our repo) before any
+implementation — the seeds listed are starting pointers, not conclusions.
+
+### S1 — improve graph + inductor creation speed (startup compile/capture)
+
+**Scope:** cut the torch.compile (dynamo trace + inductor codegen/autotune)
+and CUDA-graph capture portion of engine startup on this host — cold cache
+first (new model / config change / venv rebuild), warm-start second.
+
+**Known baseline (boot U, 2026-09-04, TP=1 dense 27B A/B logs):**
+weight load 29–31 s/arm; graph capture **~1 s** (already trimmed to
+`cudagraph_capture_sizes [1,2,3,4]` — little left there); the compile phase
+is the open unknown for a COLD cache (warm runs hit
+`~/.cache/vllm/torch_compile_cache`, which persists on this host, so warm
+startup is not yet measured either). Multi-arm A/Bs pay startup per arm
+(~1 h of today's run was ~4 launches), so this compounds in dev workflow.
+
+**Step 0 — existing work (search before implementing):**
+- Upstream parent issue **vllm-project/vllm#19824 "Improve startup time UX"**
+  (breakdown: P2P check, weight load, dynamo trace, inductor compile +
+  autotune caching, cudagraph capture, PTX JIT; proposals: lazy cudagraph
+  capture, faster-startup regimes, Inductor parallel codegen).
+- Upstream RFC **#20283 / PR #26847 — `-O` optimization levels** (`-O1` fast
+  startup vs `-O2` full optimization): if our fork predates it, adopting a
+  dev-fast `-O1`-class mode is the cheapest win.
+- Upstream RFC **#27080 — Inductor partition**: 2–5× COLD compile cost on
+  torch 2.9; check whether our fork has `use_inductor_graph_partition` on —
+  if so, disabling it for dev iterations is a direct lever (warm start is
+  actually slightly faster with it).
+- PR **#10460** (reduce inductor compile time: single symbolic-shape graph),
+  **#10482** (limit inductor threads / lazy quant import).
+- Ours: `docs/gfx906/DEVLOG-boot-failure.md` (compile-cache-hit line on a
+  clean boot); verify the cache dir survives reboots and venv rebuilds, and
+  whether it is shared across TP=1/TP=2 arms (cache key includes parallelism).
+
+**Task:** (a) measure the cold-start phase breakdown on this host (clear
+`~/.cache/vllm/torch_compile_cache`, time import/config/compile/capture);
+(b) rank levers by effort÷gain (cache sharing across arms, `-O1`-class dev
+mode or equivalent flags, inductor thread/parallel settings, capture-size
+policy); (c) implement the top lever(s) behind env flags.
+
+**Gate:** measured cold-start reduction with **no decode t/s regression**
+(compile-mode changes must pass a same-boot t/s A/B per house recipe).
+Record in ROADMAP + relevant devlog; upstream-derived levers need
+attribution (README + inline comment).
+
+### S2 — improve shard loading time (weight load)
+
+**Scope:** cut the "Loading weights took" portion of startup for the dense
+27B AWQ checkpoint. It is currently the single largest measured startup cost.
+
+**Known baseline:** 29–31 s/arm on boot U (TP=1, NFS cache
+`/data/cache/huggingface`, ~5 shards ≈ 14.8 GB INT4 → effective read+copy
+≈ 0.5 GB/s). **Prior in-repo work — build on it, don't redo it:**
+`docs/gfx906/running.md` §0: `fastsafetensors` measured **41 s vs 117 s
+(2.6×)** but NOT adopted for the dense NFS model (GDS unsupported here;
+fork's one-line GDS-fallback fix = U1 below; +2.8 GiB live VRAM at init →
+forced util 0.95).
+
+**Step 0 — existing work (search before implementing):**
+- Our U1 item (upstream queue): fastsafetensors GDS-fallback catch, local
+  commit `128e948baf` — check whether it is in the fork's HEAD.
+- Upstream **PR #40183** — fastsafetensors `ParallelLoader` + pipelining
+  (`VLLM_FASTSAFETENSORS_QUEUE_SIZE`): ~10% on released fastsafetensors,
+  ~4× once fastsafetensors' unified-memory copier (#60) lands. Check our
+  fork's loader path against it (pre- or post-PR).
+- Upstream **PR #29410** (make fastsafetensors the default load format) and
+  the fastsafetensors paper (arXiv:2505.23072, 4.8–7.5× — but on local NVMe;
+  our storage is NFS).
+- **NFS-specific:** measure the actual read ceiling of
+  `192.168.33.240:/volume2/ai` (single-stream vs parallel-shard reads,
+  page-cache warm vs cold) before choosing a loader — if ~0.5 GB/s is the
+  NFS ceiling, no deserializer change helps and the lever becomes storage
+  (local mirror / tmpfs staging), which is an infra decision for Kevin.
+
+**Task:** (a) measure where the 29 s goes (NFS read vs deserialization vs
+H2D copy); (b) rank levers: parallel shard reads in the current default
+loader, porting #40183-class pipelining if absent from our fork, or storage
+change; (c) implement + A/B.
+
+**Gate:** load time ≤ baseline with no VRAM regression beyond a documented
+amount and identical loaded weights (greedy fingerprint match vs baseline).
+Record in ROADMAP + devlog; attribution per house rule for any ported code.
 
 ## Tier 0 — cheap, decisive, low-risk
 
