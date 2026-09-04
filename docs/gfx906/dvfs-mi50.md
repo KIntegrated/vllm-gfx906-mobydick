@@ -42,6 +42,58 @@ identify which kernel actually runs (profiler cpu-op stream or CUDA-event
 timers on the live path). A standalone ATen number is evidence about ATen mm
 only.
 
+## Missing rung CLOSED — direct measurement of the dispatched kernels (2026-09-04, post-review)
+
+The root-cause chain above was originally established by elimination (DVFS
+ruled out + dispatch code + cpu-op stream identity), never by directly timing
+the *actual* production kernels standalone. External review flagged exactly
+that gap; it is now closed (`/local/tmp/mtp1/syv3_gemv_standalone.py` — calls
+the **dispatcher functions themselves**, not hand-picked ops, hot loop,
+deciles, concurrent mclk sampling with a ≥900 MHz hard gate):
+
+| path (drafter lm_head [248320, 5120] fp16) | standalone median | BW | vs in-context / prior audit |
+|---|---:|---:|---|
+| ATen `torch.mm` (the misleading reference) | 12.83 ms | 198 GB/s (19.8%) | — |
+| n=1 `_llmm1_tiny_m` → LLMM1 | **3.098 ms** | **821 GB/s (82%)** | in-context 3.09 ms; DEAD-ENDS audit 3114 µs "HBM floor" — all three agree within 1% |
+| n=4 `_gfx906_spec_gemv_m4` → `dense_gemv_m4_gfx906` | **4.997 ms** | 509 GB/s (51%) | verify-rows path; weight-read bound as designed for M=2–4 |
+
+mclk gate: median 1000 MHz in all three timed windows → data valid.
+**Conclusion hardened:** the production kernels are directly measured at/near
+the HBM floor standalone AND in-context — SYV-3 shelve stands on direct
+measurement, not elimination. The only remaining lm_head lever is quantization
+(see DEAD-ENDS T1: int8 lm_head probe GO 1.93×), not kernel selection.
+
+## PROPOSED: dispatcher-faithful standalone benchmark protocol (2026-09-04)
+
+Proposed as the standard for any "is this op at the floor / how much headroom"
+question on gfx906 (external review + SYV-3 lessons). Not yet promoted to
+standard — needs validation at 2–3 context lengths before that.
+
+1. **Benchmark the dispatcher, never a hand-picked op.** Import and call
+   `vllm.model_executor.layers.utils._llmm1_tiny_m` / `_gfx906_spec_gemv_m4`
+   (or whatever the live dispatch is) so standalone and in-context exercise
+   the identical call path. Assert the result is not None (shape supported);
+   a silent fallback invalidates the run.
+2. **Hot loop, no per-iteration sync; decile stats, not just median.** 30+
+   warmup iters; report p05/p25/median/p75/p95 of per-call CUDA-event times
+   (block-of-10 event pairs amortize event overhead). Median hides bimodality
+   (autotune re-triggers, prefill/decode mix) — the decile spread is the canary.
+3. **Concurrent mclk sampling with a HARD gate.** Sample `rocm-smi --showclocks`
+   every 0.25 s during each timed window (regex: `mclk clock level.*?\((\d+)\s*Mhz\)`)
+   and FAIL LOUDLY if median mclk < 900 MHz — cold-clock data must not be
+   silently reusable. (Discipline-only mitigation is how the ~3× cold artifact
+   almost poisoned SYV-3.)
+4. **Cross-validate against ≥2 independent anchors** before trusting: an
+   in-context CUDA-event number and/or a prior audit figure. Agreement within
+   ~1–2% across instruments = floor confirmed; disagreement = investigate
+   queue-wait contamination (in-context module spans include stream wait) or
+   kernel-path mismatch.
+5. **Label evidentiary weight.** cpu-op-stream dispatch identity ≠ timing
+   evidence. Conclusions resting on it say "identity confirmed; timing
+   inferred" until rung 4 closes.
+
+Reference implementation: `/local/tmp/mtp1/syv3_gemv_standalone.py`.
+
 ## Profiling methods — official vLLM vs our CUDA-event harness
 
 Compared 2026-09-04 (boot U) against the upstream docs

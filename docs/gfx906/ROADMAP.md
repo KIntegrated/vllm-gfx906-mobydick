@@ -196,6 +196,17 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     "LLMM1 already at HBM floor 3114 µs; the lm_head GEMV lever does not
     exist"). The 3.09 ms vs 12.9 ms gap was two DIFFERENT kernels, not two
     clock states → default path is memory-bound, no custom kernel can win.
+    (3) **MISSING RUNG CLOSED post external review 2026-09-04**: the dispatched
+    kernels were then measured DIRECTLY standalone at hot clock by calling the
+    production dispatcher functions themselves (`/local/tmp/mtp1/syv3_gemv_standalone.py`,
+    deciles + concurrent mclk ≥900 MHz hard gate): n=1 LLMM1 = **3.098 ms
+    (821 GB/s ≈ 82% peak)** vs in-context 3.09 ms and the DEAD-ENDS audit 3114 µs
+    — three independent anchors agree within 1%; n=4 `dense_gemv_m4_gfx906` =
+    4.997 ms (509 GB/s, weight-read bound as designed for M=2–4); ATen mm
+    reference 12.83 ms (19.8%). The shelve now stands on direct measurement,
+    not elimination. Review also produced the **PROPOSED dispatcher-faithful
+    standalone bench protocol** (`dvfs-mi50.md` — benchmark the dispatcher,
+    deciles, hard mclk gate, ≥2-anchor cross-validation).
     TP=1 A/B (zero wedges): OFF 47.82/29.64 t/s @8k/32k vs ON 46.55/30.76;
     acceptance identical 0.50/step → delta within noise, no gain. **Status:
     SHELVED (confirmed)** — code preserved on branch
