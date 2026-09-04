@@ -162,6 +162,10 @@ vulnerability process.
   **Clocks/DVFS**: read [`docs/gfx906/dvfs-mi50.md`](docs/gfx906/dvfs-mi50.md)
   before trusting any standalone benchmark (idle mclk 350 MHz vs 1 GHz under
   load; ATen `mm` standalone ≠ the production dispatch — see the "standalone-≠production trap").
+  **Profiling methods**: same doc has the official-vLLM-vs-CUDA-event-harness
+  comparison + verdict (harness stays: only per-module GPU-time method on this
+  host; nsys untested/absent). Full process → skill
+  `mi50-kernel-time-benchmarking`.
   **Dev logs**: read
   [`AGENTS.md`](docs/gfx906/AGENTS.md) before writing/updating any
   `DEVLOG-*.md`/dev-log in `docs/gfx906/` (verdict-first entries, gate

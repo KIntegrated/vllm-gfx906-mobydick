@@ -4,6 +4,11 @@ Method: CUDA-event forward hooks in a vLLM general plugin (`mtp1_phase_plugin.py
 mode-NONE eager path, TP=2, util 0.85, 122880-token context, median aggregation.
 Full process → skill `mi50-kernel-time-benchmarking`.
 
+**Status (2026-09-04): harness RETAINED.** Official vLLM methods compared in
+`dvfs-mi50.md` ("Profiling methods" section) — none superior on this host:
+torch-profiler is CPU-only here, nsys not installed, cProfile is CPU-side.
+This harness remains the only per-module GPU-time attribution method available.
+
 ## VALID: Greedy @120k (run p9771)
 Median extrapolated total = **78.4 ms/step**, vs measured wall 78.7 ms/token
 (12.74 t/s graphed; 10.82 t/s in this eager run → 92.4 ms/token) → method validated.
