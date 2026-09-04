@@ -178,16 +178,27 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     0.002 (fp32-accum). K≥2 `tl.dot` variants are slower than torch.mm (gfx906
     64 KB smem staging) but irrelevant — B=1 serving = K=1 calls only. **SHELVED
     2026-09-04 (C3 gate: no gain).** Full integration + TP=1 A/B completed and
-    the root-cause investigation killed the premise: **the standalone microbench
-    was misleading.** In-context CUDA-event timing at the exact production shape
-    (K=1 N=248320 H=5120 fp16, both arms): **stock GEMV path = 3.09 ms median
-    (~822 GB/s effective) vs our Triton kernel = 3.93 ms (~647 GB/s)** — the
-    production `torch.mm` dispatch already runs near/above the copy ceiling and
-    rocBLAS's GEMV beats the hand-rolled flat Triton kernel at N=248k on gfx906.
-    The "13 ms / 3.3× headroom" standalone number was a cold-cache artifact of
-    the microbench loop, not production behavior. TP=1 A/B (zero wedges): OFF
-    47.82/29.64 t/s @8k/32k vs ON 46.55/30.76; acceptance identical 0.50/step →
-    delta within noise, no gain. **Status: SHELVED** — code preserved on branch
+    the root-cause investigation killed the premise. In-context CUDA-event
+    timing at the exact production shape (K=1 N=248320 H=5120 fp16, both arms):
+    **stock GEMV path = 3.09 ms median (~822 GB/s effective) vs our Triton
+    kernel = 3.93 ms (~647 GB/s)**. **ROOT CAUSE CONFIRMED 2026-09-04 (two
+    experiments):** (1) the standalone "torch.mm = 13 ms" number was ATen mm at
+    FULL clock — DVFS sampling showed mclk held 1000 MHz throughout sustained
+    AND per-iter-sync runs (idle is 350 MHz, so power-saving is real but did
+    NOT explain any SYV-3 number); ATen mm is simply pathological at this shape
+    (~194 GB/s ≈ 19% of the 1 TB/s HBM2 peak). (2) a production torch-profiler
+    trace (eager, 8k prompt, 256 decode tokens; note: this fork's torch-profiler
+    records CPU ops only — zero GPU kernel events, same broken HSA layer as
+    rocprofv3) shows the default path NEVER runs ATen mm for the drafter
+    lm_head: n=1 → `_rocm_C::LLMM1` (`utils.py:579`), n=2–4 →
+    `_rocm_C::dense_gemv_m4_gfx906` (`utils.py:340`) — the fork's custom gfx906
+    GEMV family, already at ~822 GB/s ≈ 80% of peak (matches DEAD-ENDS.md:
+    "LLMM1 already at HBM floor 3114 µs; the lm_head GEMV lever does not
+    exist"). The 3.09 ms vs 12.9 ms gap was two DIFFERENT kernels, not two
+    clock states → default path is memory-bound, no custom kernel can win.
+    TP=1 A/B (zero wedges): OFF 47.82/29.64 t/s @8k/32k vs ON 46.55/30.76;
+    acceptance identical 0.50/step → delta within noise, no gain. **Status:
+    SHELVED (confirmed)** — code preserved on branch
     `shelved/syv3-skinny-gemv` (e960be998c) incl. the head_dtype property-gate
     fix + env-gated diagnostic timers; re-arm only if a future profile shows the
     stock drafter lm_head regressing below ~700 GB/s effective. **The byte-count

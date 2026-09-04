@@ -159,6 +159,9 @@ vulnerability process.
   (`running.md`), and the roadmap (`ROADMAP.md` for open work,
   `REFRIGERATOR.md` for parked items). Read the kernel notes before
   writing or modifying gfx906 kernels or interpreting kernel benchmarks.
+  **Clocks/DVFS**: read [`docs/gfx906/dvfs-mi50.md`](docs/gfx906/dvfs-mi50.md)
+  before trusting any standalone benchmark (idle mclk 350 MHz vs 1 GHz under
+  load; ATen `mm` standalone ≠ the production dispatch — see the "standalone-≠production trap").
   **Dev logs**: read
   [`AGENTS.md`](docs/gfx906/AGENTS.md) before writing/updating any
   `DEVLOG-*.md`/dev-log in `docs/gfx906/` (verdict-first entries, gate
