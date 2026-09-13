@@ -1209,6 +1209,18 @@ class Qwen3VLDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3VLProcessingInfo]):
                 min(video_processor.max_frames, cdiv(video_max_pixels, per_frame_cap)),
             )
 
+        # Fork (gfx906): bound the dummy video pixels by the per-item token
+        # budget. Without it, dummy-MM profiling can raise
+        # ValueError("value too large") in vllm/multimodal/cache.py's
+        # get_and_update_item during init. (Upstream's expression is the local
+        # max; our min() adds the seq_len-derived cap.)
+        video_item_max_pixels = item_max_tokens * unit**2 // max(
+            target_num_frames // temporal_patch_size, 1
+        )
+        video_max_pixels_per_frame = min(
+            video_max_pixels // temporal_patch_size, video_item_max_pixels
+        )
+
         target_video_width, target_video_height = (
             self.info.get_image_size_with_most_features(
                 max_pixels=video_max_pixels_per_frame

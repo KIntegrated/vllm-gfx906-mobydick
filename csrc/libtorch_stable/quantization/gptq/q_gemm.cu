@@ -58,7 +58,6 @@ __host__ __forceinline__ hipblasStatus_t __compat_hipblasHgemm(
 // SYNC-COPY source: also copied (renamed dot22_8_f_m1mi) into
 // q_gemm_m1_maxilp.cu -- keep in lockstep. See that file's header.
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
-__forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
   half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
 #pragma unroll
