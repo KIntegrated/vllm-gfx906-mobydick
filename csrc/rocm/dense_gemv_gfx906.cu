@@ -785,7 +785,13 @@ __global__ void __launch_bounds__(KC / 16)
   static_assert(KC == 1024 || KC == 2048 || KC == 4096,
                 "KC must be 1024, 2048 or 4096 (whole wavefronts)");
   static_assert(RPT == 2 || RPT == 4, "RPT must be 2 or 4");
-  static_assert(M >= 1 && M <= 4, "M must be 1..4");
+  // M <= 8 (T-1.5, 2026-09-05): the original bound was M<=4; extending to 8
+  // covers full-acceptance k=4 verify (M=k+1=5) and batched small-M decode so
+  // they run int8 in-kernel instead of the cached-dequant + unquantized-GEMM
+  // fallback. Register cost at M=8/RPT=2: 16 fp32 accs + 16 x-slices (x is
+  // L2-resident, re-read per block) — occupancy drops vs M=4 but weight
+  // traffic is M-invariant and HALVED vs the fp16 path, so it still wins.
+  static_assert(M >= 1 && M <= 8, "M must be 1..8");
   constexpr int THREADS = KC / 16;
   static_assert(THREADS % 64 == 0, "KC/16 must be a whole number of wavefronts");
   constexpr int WARPS = THREADS / 64;
@@ -1309,7 +1315,9 @@ torch::Tensor dense_gemv_i8_m4_gfx906(torch::Tensor weight, torch::Tensor scale,
   const int64_t M = x.size(0);
   const int64_t N = weight.size(0);
   const int64_t K = weight.size(1);
-  TORCH_CHECK(M >= 1 && M <= 4, "M must be 1..4 (got ", M, ")");
+  // T-1.5 (2026-09-05): M<=8 (was <=4). Covers full-acceptance k=4 verify
+  // (M=k+1=5) in-kernel; the op name keeps "m4" for ABI stability.
+  TORCH_CHECK(M >= 1 && M <= 8, "M must be 1..8 (got ", M, ")");
   TORCH_CHECK(x.size(1) == K, "x/weight K mismatch");
   TORCH_CHECK(scale.numel() == N, "scale must have N elements");
   TORCH_CHECK(K % 16 == 0, "K (", K, ") must be a multiple of 16");
@@ -1359,14 +1367,25 @@ torch::Tensor dense_gemv_i8_m4_gfx906(torch::Tensor weight, torch::Tensor scale,
       LAUNCHM_I8_BY_RPT(MVAL, 1024);                                        \
   } while (0)
 
+  // T-1.5 (2026-09-05): explicit cases — the macro needs a compile-time M
+  // token, and each value is its own kernel instantiation (static register
+  // arrays sized to M).
   if (M == 1)
     LAUNCHM_I8_BY_KC(1);
   else if (M == 2)
     LAUNCHM_I8_BY_KC(2);
   else if (M == 3)
     LAUNCHM_I8_BY_KC(3);
-  else
+  else if (M == 4)
     LAUNCHM_I8_BY_KC(4);
+  else if (M == 5)
+    LAUNCHM_I8_BY_KC(5);
+  else if (M == 6)
+    LAUNCHM_I8_BY_KC(6);
+  else if (M == 7)
+    LAUNCHM_I8_BY_KC(7);
+  else
+    LAUNCHM_I8_BY_KC(8);
 
 #undef LAUNCHM_I8
 #undef LAUNCHM_I8_BY_RPT
