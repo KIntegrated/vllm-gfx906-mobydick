@@ -2494,70 +2494,123 @@ def test_gather_paged_kv_q8_clip_skips_prefix():
 # ncols1 so later q-tiles' window starts move).
 # ---------------------------------------------------------------------------
 
+# The check body runs in a FRESH subprocess: GFX906_FA_KVSPLIT is read once
+# per process (static local in get_fa_kv_split), so an in-process pin only
+# works when no FA call has happened yet in this process — the rest of this
+# file makes calls, and the bit-identity arm needs the pin from the first
+# call. (The pre-split-era in-process version of this test broke exactly this
+# way when the shape-aware default, dfed62f133, started splitting prefill.)
+_TILE_CLIP_BITIDENT_SRC = """
+import math
+import os
+import sys
+import torch
+
+sq = int(sys.argv[1])
+mode = sys.argv[2]  # "bitident" (kv_split pinned 1) | "split" (default)
+dev = "cuda"
+torch.manual_seed(23)
+from vllm import _gfx906_fa_C as fa
+
+BLOCK = 16
+d, hq, hkv, L, W = 128, 32, 2, 1504, 512
+q_abs = L - sq                     # chunk starts mid-context
+kv_start_val = max(0, q_abs + 1 - W)  # conservative chunk start
+scale = 1.0 / math.sqrt(d)
+n_blocks = L // BLOCK
+kc = torch.zeros(n_blocks, BLOCK, hkv, (d // 32) * 34,
+                 dtype=torch.uint8, device=dev)
+kv = torch.zeros(n_blocks, 2, BLOCK, hkv, d,
+                 dtype=torch.float16, device=dev)
+K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+slot = torch.arange(L, dtype=torch.int64, device=dev)
+fa.reshape_and_cache_q8(K, slot, kc)
+staging = torch.zeros_like(kv[:, 1])
+staging.view(-1, hkv, d)[:L].copy_(V)
+kv[:, 1].copy_(staging)
+vc = kv.unbind(1)[1]
+bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, n_blocks)
+sl = torch.tensor([L], dtype=torch.int32, device=dev)
+q_abs_t = torch.tensor([q_abs], dtype=torch.int32, device=dev)
+kv_start_t = torch.tensor([kv_start_val], dtype=torch.int32, device=dev)
+qf = torch.randn(1, hq, sq, d, device=dev, dtype=torch.float32) * 0.5
+Kf, Vf = K.float(), V.float()
+sk_pad = (L + 31) // 32 * 32
+k_q8, v_b = fa.gather_paged_kv_q8(kc, vc, bt, sl, sk_pad)
+
+def ref_row(t):
+    # Windowed causal reference for the row at abs pos q_abs+t
+    # (same einsum pattern as _windowed_ref in the parent file).
+    pos = q_abs + t
+    lo = max(0, pos - W + 1)
+    g = hq // hkv
+    qg = qf[0, :, t].view(hkv, g, -1).float()
+    kf = Kf[lo:pos + 1]
+    vf = Vf[lo:pos + 1]
+    s = torch.einsum("gjd,lgd->gjl", qg, kf) * scale
+    o = torch.einsum("gjl,lgd->gjd", torch.softmax(s, -1), vf)
+    return o.reshape(hq, -1)
+
+def run(clip):
+    os.environ["GFX906_FA_TILE_CLIP"] = clip
+    out_fwd = fa.forward(qf, k_q8, v_b, scale, kv_max=sl,
+                         q_abs_offset=q_abs_t, window=W,
+                         kv_start=kv_start_t)[0]
+    out_dir = fa.forward_paged_direct(
+        qf, kc, vc, bt, sl, scale, None, q_abs_t, W, kv_start_t)[0]
+    del os.environ["GFX906_FA_TILE_CLIP"]
+    return out_fwd, out_dir
+
+out_off_f, out_off_d = run("0")
+out_on_f, out_on_d = run("1")
+if mode == "bitident":
+    assert os.environ.get("GFX906_FA_KVSPLIT") == "1"
+    for name, on, off in (("fwd", out_on_f, out_off_f),
+                          ("direct", out_on_d, out_off_d)):
+        assert torch.equal(on, off), f"tile_clip on/off differs ({name})"
+# Boundary rows (first: raise no-op; middle; last: max raise + causal cap)
+# in BOTH modes — the split arm guards windowed correctness under the
+# shape-aware split default (not covered by the unwindowed sq test).
+worst = 0.0
+for t in (0, sq // 2, sq - 1):
+    ref = ref_row(t)
+    for name, out in (("fwd", out_on_f), ("direct", out_on_d)):
+        err = ((out[t].float() - ref).norm() / ref.norm()).item()
+        worst = max(worst, err)
+        assert err < 5e-2, f"{name} row {t}: {err}"
+print(f"sq={sq} mode={mode} worst_ref={worst:.2e}")
+"""
+
+
 @pytest.mark.parametrize("Sq", [256, 64])
 def test_m2_tile_clip_prefill_bit_identical(Sq):
     """Mid-context prefill chunk + conservative chunk-start clip:
     tile_clip on (default) and off are bit-identical, and both match the
     torch windowed reference on boundary rows. Sq=256 = 4 q-tiles
     (ncols1=64) so the per-tile raise moves tiles 1..3; Sq=64 = 1
-    q-tile (raise no-op, causal cap only)."""
-    dev = "cuda"
-    torch.manual_seed(23)
-    d, hq, hkv, L, W = 128, 32, 2, 1504, 512
-    q_abs = L - Sq                      # chunk starts mid-context
-    kv_start_val = max(0, q_abs + 1 - W)  # conservative chunk start
-    assert q_abs > W, "the window must bite for this test"
-    scale = 1.0 / math.sqrt(d)
-    n_blocks = L // BLOCK
-    kc = torch.zeros(n_blocks, BLOCK, hkv, (d // 32) * 34,
-                     dtype=torch.uint8, device=dev)
-    kv = torch.zeros(n_blocks, 2, BLOCK, hkv, d,
-                     dtype=torch.float16, device=dev)
-    K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
-    V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
-    slot = torch.arange(L, dtype=torch.int64, device=dev)
-    fa.reshape_and_cache_q8(K, slot, kc)
-    staging = torch.zeros_like(kv[:, 1])
-    staging.view(-1, hkv, d)[:L].copy_(V)
-    kv[:, 1].copy_(staging)
-    vc = kv.unbind(1)[1]
-    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, n_blocks)
-    sl = torch.tensor([L], dtype=torch.int32, device=dev)
-    q_abs_t = torch.tensor([q_abs], dtype=torch.int32, device=dev)
-    kv_start_t = torch.tensor([kv_start_val], dtype=torch.int32, device=dev)
-    qf = torch.randn(1, hq, Sq, d, device=dev, dtype=torch.float32) * 0.5
-    Kf, Vf = K.float(), V.float()
-    sk_pad = (L + 31) // 32 * 32
-    k_q8, v_b = fa.gather_paged_kv_q8(kc, vc, bt, sl, sk_pad)
+    q-tile (raise no-op, causal cap only).
 
-    def _run(clip, kapi):
-        os.environ["GFX906_FA_TILE_CLIP"] = clip
-        if kapi == "fwd":
-            return fa.forward(qf, k_q8, v_b, scale, kv_max=sl,
-                              q_abs_offset=q_abs_t, window=W,
-                              kv_start=kv_start_t)[0]
-        return fa.forward_paged_direct(
-            qf, kc, vc, bt, sl, scale, None, q_abs_t, W, kv_start_t)[0]
+    Two subprocess arms:
+      * bitident — kv_split pinned 1 (single pass): the bit-identity
+        premise only holds there (same aligned k-tiles, fully-masked
+        differences). Under the shape-aware split default (dfed62f133)
+        the arms reduce in different orders — correct, not bit-equal.
+      * split — the default (shape-aware, splits this shape): boundary
+        rows match the windowed reference within tolerance."""
+    import subprocess
 
-    try:
-        for kapi in ("fwd", "direct"):
-            out_off = _run("0", kapi)
-            out_on = _run("1", kapi)
-            assert out_on.shape == out_off.shape == (Sq, hq, d)
-            # Prefill runs kv_split=1 (single pass) — the two arms visit
-            # the same aligned k-tiles with fully-masked differences, so
-            # the result must be bit-identical.
-            assert torch.equal(out_on, out_off), \
-                f"tile_clip on/off differs ({kapi}, Sq={Sq})"
-            # Boundary rows: first (raise no-op), last (max raise +
-            # causal cap), and middle.
-            for t in (0, Sq // 2, Sq - 1):
-                ref = _windowed_ref(qf[0, :, t], Kf, Vf, scale,
-                                    q_abs + t, W)
-                err = ((out_on[t] - ref).norm() / ref.norm()).item()
-                assert err < 5e-2, f"{kapi} Sq={Sq} row {t}: {err}"
-    finally:
-        del os.environ["GFX906_FA_TILE_CLIP"]
+    for mode, extra_env in (("bitident", {"GFX906_FA_KVSPLIT": "1"}),
+                            ("split", {})):
+        env = {**os.environ, **extra_env}
+        env.pop("GFX906_FA_TILE_CLIP", None)
+        if mode == "split":  # must be the unpinned default
+            env.pop("GFX906_FA_KVSPLIT", None)
+        r = subprocess.run(
+            [sys.executable, "-c", _TILE_CLIP_BITIDENT_SRC, str(Sq), mode],
+            env=env, capture_output=True, text=True, timeout=300)
+        assert r.returncode == 0, \
+            f"{mode}: stdout: {r.stdout}\nstderr: {r.stderr[-2000:]}"
 
 
 @pytest.mark.parametrize("kapi", ["fwd", "direct"])
@@ -2930,3 +2983,171 @@ def test_q8_0_row_layout_planar_pin_fused_q8_gather():
                     "tile row != alias row"
                 _assert_planar_row(k_tile[b, h, t],
                                    K[b * nb * BLOCK + t, h])
+
+# ---------------------------------------------------------------------------
+# R3 (fa-decode-fp16-hunt-combined.md): the paged-direct path's kv_split
+# default must be aligned with the gather path's. Before this, the direct
+# path used clamp(16/batch, 2..8) (decode-measured) for EVERY shape, so a
+# GFX906_FA_LEGACY 1->0 flip would silently move the Sq>=4 verify shapes
+# from 32 (shape-aware, +~10% measured) down to <=8 — a silent FA
+# regression. The fa.kv_split_default probe exposes the exact C++ decision
+# functions (pure, no GPU work, env read per call — monkeypatch-safe
+# in-process, unlike the launch-site get_fa_kv_split static).
+# ---------------------------------------------------------------------------
+
+def test_r3_kv_split_defaults_aligned(monkeypatch):
+    monkeypatch.delenv("GFX906_FA_KVSPLIT", raising=False)
+    monkeypatch.delenv("GFX906_FA_KVSPLIT_SHAPEAWARE", raising=False)
+    # gather rule (unchanged): shape-aware 32 for Sq>=4, 16 otherwise.
+    for sq, want in ((2, 16), (4, 32), (8, 32), (1568, 32)):
+        assert fa.kv_split_default(sq, 1, False) == want, sq
+    # direct rule: verify shapes (Sq>=4) match the gather rule for every
+    # batch — this is the alignment R3 requires.
+    for sq in (4, 8, 1568):
+        for b in (1, 2, 4, 8):
+            assert fa.kv_split_default(sq, b, True) == 32, (sq, b)
+    # direct rule: decode shapes (Sq<4) keep the batch clamp — the measured
+    # S=8/8/5/2/2 for B=1/2/3/4/8 (MI50 micro-bench, DEVLOG-muse-glimmer).
+    for b, want in ((1, 8), (2, 8), (3, 5), (4, 4), (8, 2)):
+        assert fa.kv_split_default(2, b, True) == want, b
+    # kill switch: SHAPEAWARE=0 restores the old flat-16 gather rule on the
+    # verify shapes for BOTH paths; the decode clamp is unaffected.
+    monkeypatch.setenv("GFX906_FA_KVSPLIT_SHAPEAWARE", "0")
+    assert fa.kv_split_default(8, 1, False) == 16
+    assert fa.kv_split_default(8, 1, True) == 16
+    assert fa.kv_split_default(2, 1, True) == 8
+
+# ---------------------------------------------------------------------------
+# FIX-H2 (pad-tile clamp) + M3 (host cu_seqlens) - mixed-batch coverage.
+# The production mixed step is a 1024-row prefill chunk co-batched with
+# per-decode rows whose contexts are far longer than the chunk's own; the
+# clamp (kv_max=0 on fully-pad tiles) is exact, so these tests pin
+# CORRECTNESS under the pad pattern (the -41% serving A/B is the evidence
+# that the clamp also fires at scale - output equality cannot distinguish
+# clamped from unclamped pad tiles by construction).
+#
+# Layout: seq1 = 128-row chunk (ctx 2048), seq2 = 1 decode row (ctx 4096).
+# Sq_pad=128 for both; ncols1=64 -> seq2 has tile0 (row 0, straddling) and
+# tile1 (rows 64..127, FULLY PAD -> must be clamped).
+# ---------------------------------------------------------------------------
+def test_forward_mixed_batch_pad_tile_clamp_and_host_cu():
+    import math
+
+    dev = "cuda"
+    torch.manual_seed(7)
+    scale = 1.0 / math.sqrt(D)
+    L1, L2 = 2048, 4096
+    n1, n2 = 128, 1
+    g = HQ // HKV
+    cu = torch.tensor([0, n1, n1 + n2], dtype=torch.int32, device=dev)
+    seq_lens = torch.tensor([L1, L2], dtype=torch.int32, device=dev)
+    q_abs = torch.tensor([L1 - n1, L2 - n2], dtype=torch.int32, device=dev)
+    num_tokens = n1 + n2
+
+    # Per-seq block ranges: seq1 -> blocks [0, 128), seq2 -> [128, 384).
+    # Each block stores that seq's OWN tokens, so the references below use
+    # K_all[:2048] for seq1 and K_all[2048:6144] for seq2.
+    b1, b2 = L1 // BLOCK, L2 // BLOCK
+    n_blocks = b1 + b2
+    _, vc, kv = _make_paged_cache(n_blocks, dev)
+    K_all = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                        dtype=torch.float16) * 0.5
+    V_all = torch.randn(n_blocks * BLOCK, HKV, D, device=dev,
+                        dtype=torch.float16) * 0.5
+    kv[:, 0].copy_(K_all.view(n_blocks, BLOCK, HKV, D))
+    _write_v(kv, V_all)
+    K, V = K_all[:L1], V_all[:L1]          # seq1's own context
+    # rectangular block table; padding slots (0) are never read because
+    # kv_max = seq_len caps each row's walk at its own context.
+    bt = torch.zeros(2, b2, dtype=torch.int32, device=dev)
+    bt[0, :b1] = torch.arange(b1, dtype=torch.int32, device=dev)
+    bt[1] = torch.arange(b1, b1 + b2, dtype=torch.int32, device=dev)
+
+    from vllm.gfx906_fa.gfx906_fa_backend import (
+        Gfx906FAImpl,
+        Gfx906FAMetadata,
+    )
+    impl = Gfx906FAImpl(
+        num_heads=HQ, head_size=D, scale=scale,
+        num_kv_heads=HKV, alibi_slopes=None, sliding_window=None,
+        kv_cache_dtype="float16",
+    )
+    q = torch.randn(num_tokens, HQ, D, device=dev, dtype=torch.float16) * 0.5
+    out = torch.zeros(num_tokens, HQ, D, device=dev, dtype=torch.float16)
+
+    def run(with_host):
+        m = Gfx906FAMetadata(
+            num_actual_tokens=num_tokens,
+            max_query_len=n1,
+            max_seq_len=L2,
+            query_start_loc=cu,
+            seq_lens=seq_lens,
+            block_table=bt,
+            slot_mapping=torch.empty(0, dtype=torch.int64, device=dev),
+            query_start_loc_cpu=(cu.cpu() if with_host else None),
+        )
+        impl.forward(None, q, q, q, kv, m, output=out)
+        return out[:num_tokens].clone()
+
+    out_none = run(with_host=False)
+    out_host = run(with_host=True)
+    assert torch.equal(out_none, out_host), \
+        "M3: host cu_seqlens must not change outputs"
+
+    # fp32 per-head reference: row r of seq s sits at abs q_abs[s]+r and
+    # attends causally over its own sequence's K/V.
+    ref = torch.empty(num_tokens, HQ, D, device=dev, dtype=torch.float32)
+    for s, (n, L, qa, off) in enumerate(((n1, L1, L1 - n1, 0),
+                                         (n2, L2, L2 - n2, L1))):
+        kf, vf = K_all[off:off + L].float(), V_all[off:off + L].float()
+        rows = torch.arange(L, device=dev)
+        for r in range(n):
+            qpos = qa + r
+            per_h = []
+            for h in range(HQ):
+                hk = h // g
+                sc = (q[cu[s] + r, h].float() @ kf[:L, hk].T * scale)
+                sc = torch.where(rows > qpos,
+                                 torch.full_like(sc, float("-inf")), sc)
+                per_h.append(torch.softmax(sc, -1) @ vf[:L, hk])
+            ref[cu[s] + r] = torch.stack(per_h, 0)
+
+    rel = ((out.float() - ref).norm() / ref.norm()).item()
+    assert rel < 5e-2, f"mixed-batch rel={rel:.3e}"
+
+# ---------------------------------------------------------------------------
+# M3 follow-up (co-review F3): the headroom advisory for the unprofiled
+# long-context transients (gather buffers + kv_split partial buffer).
+# Pure helpers — CPU-only asserts.
+# ---------------------------------------------------------------------------
+def test_headroom_advisory_thresholds():
+    from vllm.gfx906_fa.gfx906_fa_backend import Gfx906FAImpl
+    GiB = 1024**3
+    err, warn = Gfx906FAImpl._headroom_advisory(
+        int(2.5 * GiB), int(2.0 * GiB))
+    assert err and not warn, (err, warn)
+    err, warn = Gfx906FAImpl._headroom_advisory(
+        int(1.5 * GiB), int(2.0 * GiB))
+    assert not err and warn, (err, warn)
+    err, warn = Gfx906FAImpl._headroom_advisory(
+        int(0.5 * GiB), int(2.0 * GiB))
+    assert not err and not warn, (err, warn)
+
+
+def test_kv_split_transient_cap_rules():
+    """Mirrors the C++ rules: budget forces y=1 on big-batch prefill;
+    verify shapes keep y=32 with a small transient."""
+    from vllm.gfx906_fa.gfx906_fa_backend import Gfx906FAImpl
+    budget = 512 * 1024 * 1024
+    # B=4 prefill (Sq=1024): 4x1024x12x32x256x4 = 1.6 GB > budget -> y=1.
+    assert Gfx906FAImpl._kv_split_transient_cap(
+        4, 1024, 12, 256, budget) == 0
+    # B=1 prefill: 403 MB < budget -> splits, capped at the budget.
+    cap = Gfx906FAImpl._kv_split_transient_cap(1, 1024, 12, 256, budget)
+    assert 0 < cap <= budget
+    # B=8 verify (Sq=8): small transient, grows linearly with B.
+    cap8 = Gfx906FAImpl._kv_split_transient_cap(8, 8, 12, 256, budget)
+    assert 0 < cap8 <= 64 * 1024 * 1024
+    # Empty batch.
+    assert Gfx906FAImpl._kv_split_transient_cap(
+        0, 1024, 12, 256, budget) == 0

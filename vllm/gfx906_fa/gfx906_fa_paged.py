@@ -50,6 +50,12 @@ _DBG   = (_os.environ.get("GFX906_FA_FWD_DEBUG", "0") == "1" or _FA_DEBUG)
 # через GFX906_FA_FUSED=0 — тогда работает старый путь через fancy-indexing
 # (для A/B-замеров и как быстрый safety-fallback при регрессиях).
 _FUSED = _os.environ.get("GFX906_FA_FUSED", "1") != "0"
+# M3 (2026-09-12): use the host-side cu_seqlens (query_start_loc_cpu) in the
+# variable-Q branches instead of int(cu[...]) device reads. Each int() is
+# a D2H sync that blocks on the queued GPU work (~10.8 syncs per layer
+# call in mixed steps = the post-FIX-H2 multi-batch residual, trace
+# 2026-09-12 08:23). Kill-switch for A/B.
+_HOST_QSEQ = _os.environ.get("GFX906_FA_HOST_QSEQ", "1") != "0"
 # Level 3c: direct-paged FA — FA kernel читает K/V напрямую из paged cache
 # через block_table indirection, без промежуточного gather.
 #
@@ -374,6 +380,8 @@ def forward_paged(
     k_gather_buf: torch.Tensor | None = None,  # [B,Hkv,Sk_pad,bytes_per_row] uint8
     v_gather_buf: torch.Tensor | None = None,  # [B,Hkv,Sk_pad,D]             fp16
     window: int = 0,  # sliding-window size in tokens (0 = off)
+    cu_seqlens_q_host: torch.Tensor | None = None,  # [B+1] CPU int — avoids
+    # the per-seq int(cu[...]) D2H syncs in the variable-Q branches (M3).
 ) -> torch.Tensor:
     """vLLM-совместимый paged-attention forward.
 
@@ -471,9 +479,12 @@ def forward_paged(
             q_padded[:, :, :n_q, :] = (
                 query.view(num_seqs, n_q, Hq, D).permute(0, 2, 1, 3))
         else:
-            cu = cu_seqlens_q.to(torch.long)
+            if _HOST_QSEQ and cu_seqlens_q_host is not None:
+                cu = cu_seqlens_q_host.to(torch.long).tolist()
+            else:
+                cu = cu_seqlens_q.to(torch.long).tolist()
             for s in range(num_seqs):
-                n = int(cu[s + 1] - cu[s])
+                n = cu[s + 1] - cu[s]
                 if n > 0:
                     q_seq = query[cu[s]:cu[s] + n]
                     q_padded[s, :, :n, :] = q_seq.permute(1, 0, 2)
@@ -561,11 +572,14 @@ def forward_paged(
             return out_padded[:, :n_q, :, :].permute(0, 2, 1, 3).reshape(
                 num_tokens, Hq * D)
 
-        cu = cu_seqlens_q.to(torch.long)
+        if _HOST_QSEQ and cu_seqlens_q_host is not None:
+            cu = cu_seqlens_q_host.to(torch.long).tolist()
+        else:
+            cu = cu_seqlens_q.to(torch.long).tolist()
         out_flat = torch.empty(
             (num_tokens, Hq * D), dtype=torch.float32, device=query.device)
         for s in range(num_seqs):
-            n = int(cu[s + 1] - cu[s])
+            n = cu[s + 1] - cu[s]
             if n > 0:
                 # BSHD: [:n] is a contiguous [n, Hq, D] -> plain view/reshape.
                 out_flat[cu[s]:cu[s] + n] = out_padded[s, :n, :, :].reshape(n, Hq * D)
@@ -840,9 +854,12 @@ def forward_paged(
         q_padded[:, :, :n_q, :] = (
             query.view(num_seqs, n_q, Hq, D).permute(0, 2, 1, 3))
     else:
-        cu = cu_seqlens_q.to(torch.long)
+        if _HOST_QSEQ and cu_seqlens_q_host is not None:
+            cu = cu_seqlens_q_host.to(torch.long).tolist()
+        else:
+            cu = cu_seqlens_q.to(torch.long).tolist()
         for s in range(num_seqs):
-            n = int(cu[s + 1] - cu[s])
+            n = cu[s + 1] - cu[s]
             if n > 0:
                 q_seq = query[cu[s]:cu[s] + n]
                 q_padded[s, :, :n, :] = q_seq.permute(1, 0, 2)
@@ -925,11 +942,14 @@ def forward_paged(
         n_q = max_seqlen_q
         return out_padded[:, :n_q].reshape(num_tokens, Hq * D)
 
-    cu = cu_seqlens_q.to(torch.long)
+    if _HOST_QSEQ and cu_seqlens_q_host is not None:
+        cu = cu_seqlens_q_host.to(torch.long).tolist()
+    else:
+        cu = cu_seqlens_q.to(torch.long).tolist()
     out_flat = torch.empty(
         (num_tokens, Hq * D), dtype=torch.float32, device=query.device)
     for s in range(num_seqs):
-        n = int(cu[s + 1] - cu[s])
+        n = cu[s + 1] - cu[s]
         if n > 0:
             # BSHD: [:n] is a contiguous [n, Hq, D] -> plain view/reshape.
             out_flat[cu[s]:cu[s] + n] = out_padded[s, :n, :, :].reshape(n, Hq * D)

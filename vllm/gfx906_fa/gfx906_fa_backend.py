@@ -75,6 +75,8 @@ class Gfx906FAMetadata:
     seq_lens: torch.Tensor             # [B]   int32
     block_table: torch.Tensor          # [B, max_num_blocks] int32
     slot_mapping: torch.Tensor         # [num_tokens] int64
+    query_start_loc_cpu: torch.Tensor | None = None  # [B+1] host int (M3:
+    # lets forward_paged skip the per-seq int(cu[...]) D2H syncs)
     use_cascade: bool = False
     common_prefix_len: int = 0
 
@@ -131,7 +133,6 @@ class Gfx906FAMetadataBuilder(
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_size = kv_cache_spec.block_size
-
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> Gfx906FAMetadata:
@@ -154,6 +155,8 @@ class Gfx906FAMetadataBuilder(
             seq_lens=common_attn_metadata.seq_lens,
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            query_start_loc_cpu=getattr(
+                common_attn_metadata, "query_start_loc_cpu", None),
             use_cascade=(common_prefix_len > 0),
             common_prefix_len=common_prefix_len,
         )
@@ -606,6 +609,77 @@ class Gfx906FAImpl(AttentionImpl):
                     cls._q_pad_captured or capturing)
 
     @classmethod
+
+    # ------------------------------------------------------------------
+    # M3 follow-up (co-review F3, 2026-09-12): headroom advisory for the
+    # long-context activation transients that live OUTSIDE the profiled
+    # pool — the gather buffers below (linear in B x Sk_pad) and the
+    # kv_split partial buffer (capped by GFX906_FA_KVSPLIT_MAX_BYTES).
+    # Both are allocated at first long-context use, after the KV pool is
+    # sized, from the (1 - gpu_memory_utilization) headroom.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _kv_split_transient_cap(
+        num_seqs: int,
+        max_seqlen_q: int,
+        num_heads: int,
+        head_size: int,
+        budget_bytes: int,
+    ) -> int:
+        """Worst-case kv_split partial-buffer transient
+        [B, Sq_pad, Hq, y, D] fp32 for the coming step; 0 when the byte
+        budget forces y=1 (large-batch prefill). Mirrors the C++
+        fa_kv_split_default / fa_apply_kv_split_budget rules via the
+        extension's kv_split_default binding (single source of truth for
+        the split rule; the budget constant is mirrored here — keep in
+        sync with GFX906_FA_KVSPLIT_MAX_BYTES in gfx906_fa.cpp)."""
+        if num_seqs <= 0 or max_seqlen_q <= 0:
+            return 0
+        from vllm import _gfx906_fa_C as gfx906_fa
+        try:
+            y = gfx906_fa.kv_split_default(max_seqlen_q, num_seqs, False)
+        except Exception:
+            return 0
+        if y <= 1:
+            return 0
+        # launcher ncols1 table (switch by Sq bucket), then pad to it
+        ncols1 = (64 if max_seqlen_q > 32 else 32 if max_seqlen_q > 16 else
+                  16 if max_seqlen_q > 8 else 8 if max_seqlen_q > 4 else
+                  4 if max_seqlen_q > 2 else 2)
+        sq_pad = ((max_seqlen_q + ncols1 - 1) // ncols1) * ncols1
+        t = num_seqs * sq_pad * num_heads * y * head_size * 4
+        # Over budget the C++ forces y=1 (fa_apply_kv_split_budget) — the
+        # transient disappears entirely rather than being capped.
+        return 0 if t > budget_bytes else t
+
+    @staticmethod
+    def _headroom_advisory(
+        demand_bytes: int, free_bytes: int
+    ) -> tuple[str | None, str | None]:
+        """(error, warning) for a pending allocation against the device's
+        free VRAM. error = deterministic failure; warning = >60% of the
+        remaining headroom (spikes may tip it)."""
+        if free_bytes <= 0:
+            return ("GFX906_FA: no free device memory reported before a "
+                    f"{demand_bytes / 2**30:.2f} GiB long-context "
+                    "activation allocation.", None)
+        if demand_bytes > free_bytes:
+            return (f"GFX906_FA: long-context activation demand "
+                    f"{demand_bytes / 2**30:.2f} GiB exceeds free device "
+                    f"memory {free_bytes / 2**30:.2f} GiB - the next "
+                    "allocation will fail. Levers: reduce "
+                    "gpu_memory_utilization, max_model_len or batch size; "
+                    "or lower GFX906_FA_KVSPLIT_MAX_BYTES to drop the "
+                    "KV-split transient.", None)
+        if demand_bytes > 0.6 * free_bytes:
+            return (None, f"GFX906_FA: long-context activation demand "
+                    f"{demand_bytes / 2**30:.2f} GiB is above 60% of free "
+                    f"device memory {free_bytes / 2**30:.2f} GiB - "
+                    "prefill transients may OOM at spikes. Levers: reduce "
+                    "gpu_memory_utilization, max_model_len or batch size.")
+        return None, None
+
+    @classmethod
     def _ensure_gather_buffers(
         cls,
         num_seqs: int,
@@ -613,6 +687,8 @@ class Gfx906FAImpl(AttentionImpl):
         max_seqlen_k: int,
         head_size: int,
         device: torch.device,
+        max_seqlen_q: int = 0,
+        num_heads: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """K_q8 + V_fp16 gather buffers, shared by all layers in a worker.
 
@@ -746,6 +822,23 @@ class Gfx906FAImpl(AttentionImpl):
             # first capture (post-capture generations are capture-baked
             # and take the keep path), so capture-time sizing — the
             # validated arm-B path — is unaffected.
+        # Headroom advisory (log once per demand signature): the fresh
+        # gather buffers + the kv_split transient cap both draw from the
+        # post-pool headroom; mem_get_info right here already reflects any
+        # retired generation.
+        import os as _os
+        demand = (new_b * num_kv_heads * new_sk * bytes_per_row
+                  + new_b * num_kv_heads * new_sk * head_size * 2
+                  + cls._kv_split_transient_cap(
+                      num_seqs, max_seqlen_q, num_heads, head_size,
+                      int(_os.environ.get("GFX906_FA_KVSPLIT_MAX_BYTES",
+                                          str(512 * 1024 * 1024)))))
+        _free = torch.cuda.mem_get_info(device)[0]
+        _err, _warn = cls._headroom_advisory(demand, _free)
+        if _err:
+            logger.error("%s", _err)
+        elif _warn:
+            logger.warning("%s", _warn)
         cls._k_gather_buf = torch.empty(
             (new_b, num_kv_heads, new_sk, bytes_per_row),
             dtype=torch.uint8, device=device,
@@ -876,6 +969,8 @@ class Gfx906FAImpl(AttentionImpl):
             max_seqlen_k=attn_metadata.max_seq_len,
             head_size=self.head_size,
             device=query.device,
+            max_seqlen_q=attn_metadata.max_query_len,
+            num_heads=self.num_heads,
         )
 
         # forward_paged returns [num_tokens, Hq*D] float32.
@@ -887,6 +982,7 @@ class Gfx906FAImpl(AttentionImpl):
             block_table=attn_metadata.block_table,
             seq_lens=attn_metadata.seq_lens,
             cu_seqlens_q=attn_metadata.query_start_loc,
+            cu_seqlens_q_host=attn_metadata.query_start_loc_cpu,
             max_seqlen_q=attn_metadata.max_query_len,
             max_seqlen_k=attn_metadata.max_seq_len,
             scale=self.scale,

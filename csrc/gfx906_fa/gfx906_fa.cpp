@@ -98,6 +98,37 @@ static int get_fa_nc2() {
 // Note: 0 is NOT the same as unset — 0 passes through and the launcher
 // clamps it to 1 (the unset defaults above are the way to select a
 // path's default).
+// KV-split default, shape-aware. The flat "16" was the B=1-decode (Sq=2)
+// tuning, but Sq and y interact: at Sq=2 the kernel is already ~88% HBM-bound
+// and y=32 costs +3.8% (extra split-combine traffic beats the parallelism
+// gain); at Sq>=4 (spec-decode verify, Sq_pad in {4,8}) it is ALU/compute-
+// bound and y=32 wins ~10% (fewer blocks each scanning a shorter KV range).
+// Measured on MI50 gfx906, Qwen27 per-rank Hq=12/Hkv=2/D=256, Sk=122880:
+//   Sq=2: y=16 1644 us vs y=32 1707 us  (keep 16)
+//   Sq=8: y=16 3094 us vs y=32 2765 us  (use 32)
+// So the default is 32 for seq_q>=4, 16 otherwise. GFX906_FA_KVSPLIT still
+// overrides unconditionally; GFX906_FA_KVSPLIT_SHAPEAWARE=0 restores the old
+// flat-16 default (A/B / kill switch). The byte budget below still bounds any
+// value, so prefill (Sq~thousands) is protected either way.
+static int fa_kv_split_default(long seq_q) {
+    const char *e = std::getenv("GFX906_FA_KVSPLIT_SHAPEAWARE");
+    if (e && std::atoi(e) == 0) return 16;   // kill switch: old flat default
+    return seq_q >= 4 ? 32 : 16;
+}
+// R3 (fa-decode-fp16-hunt-combined.md): the paged-direct default, aligned
+// with the gather path. Verify shapes (Sq>=4) take the shape-aware value
+// (32), so flipping GFX906_FA_LEGACY 1->0 does not silently change the
+// split (the old batch clamp capped at 8 — a measured ~10% regression on
+// the Sq=8 verify shapes). Decode shapes (Sq<4) keep this path's own
+// measured batch-aware clamp: its grid is batch*heads_q blocks at NC2=1
+// (the gather path's is not), so its decode optimum is S=8/8/5/2/2 for
+// B=1/2/3/4/8 (MI50 micro-bench, DEVLOG-muse-glimmer.md 2026-08-27
+// follow-up), not the gather path's 16.
+static int fa_paged_kv_split_default(long seq_q, long batch) {
+    if (seq_q >= 4) return fa_kv_split_default(seq_q);
+    const long b = std::max(1L, batch);
+    return static_cast<int>(std::max(2L, std::min(8L, 16L / b)));
+}
 static int get_fa_kv_split() {
     static int v = [] {
         const char *e = std::getenv("GFX906_FA_KVSPLIT");
@@ -409,7 +440,7 @@ torch::Tensor gfx906_fa_forward(
     const int nc2 = get_fa_nc2();
     int kv_split = get_fa_kv_split();
     const int tile_clip = get_fa_tile_clip();
-    if (kv_split < 0) kv_split = 16;  // gather-path default (B=1 tuning)
+    if (kv_split < 0) kv_split = fa_kv_split_default(seq_q);  // shape-aware (see fn)
     // MTP-1b-0: the old hard clamp `if (seq_q > 2) kv_split = 1` (a prefill
     // OOM guard) also fired for spec-decode verify (Sq = k+1 padded to {2,4,8}),
     // stripping KV-split parallelism from k>=2 verify's O(Sk) attention. The
@@ -459,6 +490,25 @@ torch::Tensor gfx906_fa_forward(
         // Expand [B] → [B, grid_x] (contiguous), каждая sequence получает
         // одинаковое значение для всех Q-tiles (без causal mask в MVP).
         kv_max_expanded = kvm.unsqueeze(1).expand({batch, grid_x}).contiguous();
+        // FIX (H2, 2026-09-11): pad Q-tiles — все строки за n_q[b], потому
+        // -INF-маскированы с отброшенным выходом — ранее наследовали
+        // kv_max = seq_len[b] и each pad tile walked the sequence's ENTIRE
+        // context KV from HBM only to produce discarded results. In mixed
+        // prefill+decode steps that streamed each decoding sequence's whole
+        // context once per chunk-token: the O(live-context) multi-batch
+        // prefill tax (~16 s/step tail at 4x120k, the 75-min "stall";
+        // docs/gfx906/ttft-prefill-stall.md §13.14–13.16). Clamp pad tiles
+        // (t*ncols1 >= n_q[b]) to 0 — the launcher already guards all-empty
+        // rows (kv_max=0 -> weights exp(-inf)=0, output rows unused).
+        // n_q[b] = seq_len[b] - q_abs_offset[b]; present exactly when the
+        // inline-causal path is active — without it grid_x == 1 (pure
+        // decode) and there are no pad tiles.
+        if (q_abs_offset.has_value() && grid_x > 1) {
+            auto tile0 = torch::arange(grid_x, kvm.options()) * ncols1;
+            auto pad = tile0.unsqueeze(0) >=
+                (kvm - q_abs_offset.value()).unsqueeze(1);
+            kv_max_expanded.masked_fill_(pad, 0);
+        }
         kv_max_ptr = kv_max_expanded.data_ptr<int32_t>();
     }
 
@@ -1250,20 +1300,21 @@ torch::Tensor gfx906_fa_forward_paged_direct(
     // machinery/guards as gfx906_fa_forward (the seq_q > 2 guard is the same
     // OOM protection: the partial buffer scales with Sq).
     //
-    // Default when GFX906_FA_KVSPLIT is unset: clamp(16/batch, 2, 8) —
-    // batch-aware because the paged grid-z is batch*heads_q blocks (NC2=1
-    // here), so the split that fills the 60-CU MI50 moves with the batch
-    // (MI50 micro-bench, B=4/Hq=32/D=128/L=2816, DEVLOG-muse-glimmer.md
+    // Default when GFX906_FA_KVSPLIT is unset: fa_paged_kv_split_default
+    // (R3) — shape-aware for the Sq>=4 verify shapes (aligned with the
+    // gather path), batch clamp for the Sq<4 decode shapes: batch-aware
+    // because the paged grid-z is batch*heads_q blocks (NC2=1 here), so
+    // the split that fills the 60-CU MI50 moves with the batch (MI50
+    // micro-bench, B=4/Hq=32/D=128/L=2816, DEVLOG-muse-glimmer.md
     // 2026-08-27 follow-up: S=8/8/5/2/2 best for B=1/2/3/4/8; the formula
     // matches the measured optimum at B in {1,2,3,8} and is within 4% at
-    // B=4). The gather-path default (16) is the WRONG value here: at B=4
-    // it costs +18% (267 vs 226 us) on combine traffic. GFX906_FA_KVSPLIT=1
-    // is the kill switch (old grid.y=1 behavior).
+    // B=4). The gather-path default (16) is the WRONG value for those
+    // decode shapes: at B=4 it costs +18% (267 vs 226 us) on combine
+    // traffic. GFX906_FA_KVSPLIT=1 is the kill switch (old grid.y=1
+    // behavior).
     int kv_split = get_fa_kv_split();
     const int tile_clip = get_fa_tile_clip();
-    if (kv_split < 0) {
-        kv_split = std::max(2, std::min(8, 16 / std::max(1, batch)));
-    }
+    if (kv_split < 0) kv_split = fa_paged_kv_split_default(seq_q, batch);
     // MTP-1b-0: same fix as the gather path — the old `if (seq_q > 2)
     // kv_split = 1` prefill OOM guard also fired for spec-decode verify
     // (Sq = k+1 padded to {2,4,8}), stripping KV-split parallelism from k>=2
@@ -1439,6 +1490,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("block_table"), py::arg("seq_lens"), py::arg("Sk"),
           py::arg("k_out") = c10::nullopt,
           py::arg("v_out") = c10::nullopt);
+    m.def("kv_split_default",
+          [](long seq_q, long batch, bool direct) {
+              return direct ? fa_paged_kv_split_default(seq_q, batch)
+                            : fa_kv_split_default(seq_q);
+          },
+          "kv_split chosen when GFX906_FA_KVSPLIT is unset, for the given "
+          "shape (direct = paged-direct path rule, gather = gather rule). "
+          "Test probe — no GPU work.",
+          py::arg("seq_q"), py::arg("batch"), py::arg("direct"));
     m.def("forward_paged_direct", &gfx906_fa_forward_paged_direct,
           "Level 3c: Direct-paged FA (no gather). Reads K/V from paged cache "
           "via block_table indirection. q: fp32 [B, Hq, Sq_pad, D]; output: "
