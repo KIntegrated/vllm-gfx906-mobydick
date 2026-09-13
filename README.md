@@ -264,8 +264,8 @@ vllm serve <model> \
   --max-num-seqs 4 \
   --max-num-batched-tokens 4096 \
   --gpu-memory-utilization 0.82 \
-  --compilation-config '{"cudagraph_capture_sizes":[6,12]}' \
-  --speculative-config '{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_max":2}' \
+  --compilation-config '{"cudagraph_capture_sizes":[4,8,12,16]}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
   --reasoning-parser qwen3 \
@@ -279,17 +279,22 @@ vllm serve <model> \
   `docs/gfx906/ROADMAP.md`.
 - `--dtype float16` is required: gfx906 has no bf16 hardware; bfloat16
   checkpoints would fall back to fp32 math.
-- cudagraph capture sizes = multiples of `num_speculative_tokens + 1`
-  (6 for ngram n=5); use `[1,2,3,4]` for prefill/TTFT-focused or
-  spec-free serving.
-- EAGLE is too heavy for these GPUs; **MTP k=3** is the recommended spec
-  config on Qwen3.8-27B at long context (same-corpus A/B: +9.3 % over k=2
-  @120k, tie at 64k — §Long-context DECODE above; k=2 stays best for
-  short-context/copy-light work, k=4 is a loss on real payloads). Both beat
-  greedy by ~2× at 64k+ after the kv_split fix. ngram n=5 gives +15 % decode
-  on short outputs (48.5 vs 41.9 t/s @ tg256, 2026-08-25 A/B — same-boot
-  re-check pending), neutral at tg1024, and remains the choice for
-  Muse-Glimmer (100 % filler-acceptance ceiling).
+- **cudagraph capture sizes = multiples of `num_speculative_tokens + 1`, up to
+  `max_num_seqs × (k+1)`.** MTP k=3 (width 4) with the 4-seq default →
+  `[4,8,12,16]`; ngram n=5 (width 6) with 4 seqs → `[6,12,18,24]`. The engine
+  rounds explicit entries **up** to that multiple, dedups and lowers
+  `max_cudagraph_capture_size` to the last entry, so an undersized list silently
+  leaves multi-request steps eager (`[1,2,3,4]` with k=3 collapses to `[4]` =
+  B=1). Use `[1,2,3,4]` only for prefill/TTFT-focused or spec-free serving.
+  Plain TP does not enter this calculation; **sequence parallelism** does
+  (`multiple_of = max(k+1, tp)`, which rejects some depths at tp=4).
+- EAGLE is too heavy for these GPUs; **MTP k=3 is the default spec config for
+  the Qwen3.5/3.8 family** (same-corpus A/B: +9.3 % over k=2 @120k, tie at 64k;
+  agentic-corpus headline 33.3 @64k / 25.0 @120k t/s). k=2 stays useful for
+  short-context/copy-light work, k=4 is a loss on real payloads, and both beat
+  greedy by ~2× at 64k+ after the kv_split fix. **ngram n=5 remains the choice
+  for Muse-Glimmer** (100 % filler-acceptance ceiling) and for filler/copy-heavy
+  short outputs (+15 % decode at tg256, neutral at tg1024 — 2026-08-25 A/B).
 - Tool/reasoning parsers: Qwen 3.5/3.6/3.8 → `qwen3_coder` + `qwen3`;
   Muse-Glimmer → `muse_glimmer` for both.
 - `--gpu-memory-utilization`: 0.82 with the spec config above; 0.93 for

@@ -138,6 +138,28 @@ docker run --rm \
   done
   ```
 
+### Spec-decode capture ladder (the rule, both 0.28 and 0.29 lines)
+
+`CompilationConfig.adjust_cudagraph_sizes_for_spec_decode` rounds every
+**explicit** `cudagraph_capture_sizes` entry **up to a multiple of
+`uniform_decode_query_len = k+1`** (MTP depth + 1), dedups, drops entries above
+`max_cudagraph_capture_size`, and finally lowers that max to the last remaining
+entry — so the list you pass is authoritative and nothing is auto-extended.
+
+- **Size the ladder to `max_num_seqs × (k+1)`**, i.e. multiples of `k+1`:
+  k=3 with `--max-num-seqs 4` → `[4,8,12,16]`; k=2 (width 3) → `[3,6,9,12]`;
+  k=4 (width 5) → `[5,10,15,20]`; ngram n=5 (width 6) → `[6,12,18,24]`.
+- **Under-sized lists fail silently**: `[1,2,3,4]` with k=3 collapses to `[4]`
+  (B=1 only), so 2–4-request steps run eager — on TP=2 that is the ~7 t/s
+  launch-overhead cliff. The generic `[1,2,3,4]` trimmed capture is correct
+  **only** for spec-free serving (width 1).
+- **TP does not enter the calculation** (token counts are global). Sequence
+  parallelism does: with `enable_sp` and `tp > 1`, `multiple_of =
+  max(k+1, tp)` and it must divide both — at tp=4 only k=1 (width 2) and k=3
+  (width 4) are legal; k=2/4/5 raise `ValueError` at startup.
+- Verified on both lines: the function is textually identical in
+  `v0.28.0rc2` and `v0.29.0` (the table above reproduces exactly).
+
 ### Container images (this fork)
 
 | image | code | ROCm | toolchain / arch override |
