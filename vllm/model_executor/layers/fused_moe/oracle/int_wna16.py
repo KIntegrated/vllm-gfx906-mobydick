@@ -69,7 +69,15 @@ class WNA16MoEBackend(Enum):
 # backend outside this set, so a backend that later gains zp support is
 # declared here rather than discovered in an unrelated assert.
 WNA16_BACKENDS_WITH_STORED_ZP = frozenset(
-    {WNA16MoEBackend.TRITON, WNA16MoEBackend.GFX906_HIP}
+    {
+        WNA16MoEBackend.TRITON,
+        WNA16MoEBackend.GFX906_HIP,
+        # 0.29.0's int4 emulation experts consume the stored zero points by
+        # baking them into the dequantized bf16 weights, so asymmetric
+        # checkpoints are valid there too (the resulting tensors carry no
+        # separate zp — see CompressedTensorsWNA16MoEMethod).
+        WNA16MoEBackend.EMULATION,
+    }
 )
 
 
@@ -1303,9 +1311,21 @@ def _humming_wna16_weight_schema(
             "desc_act": quant_config.desc_act,
             "sym": quant_config.is_sym,
         }
+    if isinstance(quant_config, QuantizationArgs):
+        quant_type = getattr(quant_config.type, "value", quant_config.type)
+        quant_strategy = getattr(quant_config.strategy, "value", quant_config.strategy)
+        return {
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "type": str(quant_type),
+            "num_bits": quant_config.num_bits,
+            "strategy": str(quant_strategy),
+            "group_size": quant_config.group_size,
+            "symmetric": quant_config.symmetric,
+        }
     raise TypeError(
-        "Humming WNA16 checkpoint schema requires AutoAWQConfig or "
-        "AutoGPTQConfig, "
+        "Humming WNA16 checkpoint schema requires AutoAWQConfig, "
+        "AutoGPTQConfig or QuantizationArgs, "
         f"got {type(quant_config).__name__}."
     )
 

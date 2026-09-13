@@ -9,7 +9,7 @@ Known Issues:
 """
 
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -27,6 +27,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
     QueryLenSupport,
     _DecodeConcatQuantFP8,
+    _use_masked_mha,
     build_mla_chunked_context_metadata,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
@@ -45,6 +46,9 @@ from vllm.v1.attention.backends.mla.prefill.base import MLADimensions
 from vllm.v1.attention.backends.mla.prefill.selector import (
     MLAPrefillSelectorConfig,
 )
+from vllm.v1.attention.backends.mla.prefill.trtllm_ragged import (
+    TrtllmRaggedPrefillBackend,
+)
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.ops.flashmla import is_flashmla_dense_supported
 from vllm.v1.kv_cache_interface import (
@@ -62,7 +66,169 @@ BACKENDS_TO_TEST = [
     AttentionBackendEnum.TOKENSPEED_MLA,
 ]
 
+if current_platform.is_rocm():
+    BACKENDS_TO_TEST.append(AttentionBackendEnum.ROCM_AITER_MLA)
+
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_trtllm_ragged_prefill_passes_cpu_sequence_lengths(monkeypatch):
+    calls = []
+
+    def fake_trtllm_ragged_attention_deepseek(**kwargs):
+        calls.append(kwargs)
+        if kwargs["return_lse"]:
+            query = kwargs["query"]
+            lse = torch.empty(query.shape[:2])
+            return kwargs["out"], lse
+        return kwargs["out"]
+
+    prefill_module = ModuleType("flashinfer.prefill")
+    prefill_module.__dict__["trtllm_ragged_attention_deepseek"] = (
+        fake_trtllm_ragged_attention_deepseek
+    )
+    flashinfer_module = ModuleType("flashinfer")
+    flashinfer_module.__dict__["prefill"] = prefill_module
+    monkeypatch.setitem(sys.modules, "flashinfer", flashinfer_module)
+    monkeypatch.setitem(sys.modules, "flashinfer.prefill", prefill_module)
+
+    backend = object.__new__(TrtllmRaggedPrefillBackend)
+    backend.scale = 0.125
+    backend._workspace_buffer = torch.empty(1, dtype=torch.uint8)
+    query_lens_cpu = torch.tensor([2, 3], dtype=torch.int32)
+    prefill_metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
+        query_lens_cpu=query_lens_cpu,
+        max_query_len=3,
+        output_dtype=torch.float16,
+    )
+    backend.prepare_metadata(prefill_metadata)
+
+    q = torch.empty(5, 2, 4)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    backend.run_prefill_new_tokens(q, k, v, return_softmax_lse=False)
+
+    assert calls[0]["q_seq_lens_cpu"] is query_lens_cpu
+    assert calls[0]["kv_seq_lens_cpu"] is query_lens_cpu
+
+
+@pytest.mark.parametrize(
+    ("tensor_parallel_size", "query_len", "expected"),
+    [
+        (1, 8192, True),
+        (1, 9216, False),
+        (2, 20480, True),
+        (2, 24576, False),
+        (4, 48 * 1024, True),
+        (4, 56 * 1024, False),
+        (8, 112 * 1024, True),
+        (8, 128 * 1024, False),
+    ],
+)
+def test_glm5_masked_mha_pure_prefill_routing(
+    tensor_parallel_size, query_len, expected
+):
+    assert (
+        _use_masked_mha(
+            backend_name="FLASHMLA_SPARSE",
+            tensor_parallel_size=tensor_parallel_size,
+            qk_head_dim=256,
+            v_head_dim=256,
+            query_len=query_len,
+            seq_len=query_len,
+            has_context=False,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("tensor_parallel_size", "query_len", "seq_len", "expected"),
+    [
+        (1, 8192, 8192, False),
+        (2, 4096, 6144, True),
+        (2, 4096, 8192, False),
+        (2, 8192, 10240, True),
+        (4, 16384, 24576, True),
+        (4, 16384, 32768, False),
+        (4, 32768, 34 * 1024, True),
+        (4, 32768, 36 * 1024, False),
+        (8, 32768, 49152, True),
+        (8, 32768, 65536, False),
+    ],
+)
+def test_glm5_masked_mha_context_routing(
+    tensor_parallel_size, query_len, seq_len, expected
+):
+    assert (
+        _use_masked_mha(
+            backend_name="FLASHMLA_SPARSE",
+            tensor_parallel_size=tensor_parallel_size,
+            qk_head_dim=256,
+            v_head_dim=256,
+            query_len=query_len,
+            seq_len=seq_len,
+            has_context=True,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("tensor_parallel_size", "query_len", "seq_len", "has_context", "expected"),
+    [
+        (4, 36 * 1024, 36 * 1024, False, True),
+        (4, 40 * 1024, 40 * 1024, False, False),
+        (4, 4 * 1024, 12 * 1024, True, True),
+        (4, 4 * 1024, 16 * 1024, True, False),
+        (4, 24 * 1024, 28 * 1024, True, True),
+        (4, 32 * 1024, 36 * 1024, True, False),
+        (8, 64 * 1024, 64 * 1024, False, True),
+        (8, 68 * 1024, 68 * 1024, False, False),
+        (8, 4 * 1024, 20 * 1024, True, True),
+        (8, 16 * 1024, 32 * 1024, True, True),
+        (8, 48 * 1024, 64 * 1024, True, True),
+        (8, 56 * 1024, 72 * 1024, True, True),
+        (8, 63 * 1024, 79 * 1024, True, False),
+    ],
+)
+def test_glm5_flashinfer_masked_mha_routing(
+    tensor_parallel_size, query_len, seq_len, has_context, expected
+):
+    assert (
+        _use_masked_mha(
+            backend_name="FLASHINFER_MLA_SPARSE",
+            tensor_parallel_size=tensor_parallel_size,
+            qk_head_dim=256,
+            v_head_dim=256,
+            query_len=query_len,
+            seq_len=seq_len,
+            has_context=has_context,
+        )
+        is expected
+    )
+
+
+def test_masked_mha_routing_is_dimension_specific():
+    assert _use_masked_mha(
+        backend_name="FLASHMLA_SPARSE",
+        tensor_parallel_size=1,
+        qk_head_dim=192,
+        v_head_dim=128,
+        query_len=1536,
+        seq_len=2048,
+        has_context=True,
+    )
+    assert not _use_masked_mha(
+        backend_name="FLASHMLA_SPARSE",
+        tensor_parallel_size=1,
+        qk_head_dim=128,
+        v_head_dim=128,
+        query_len=1536,
+        seq_len=2048,
+        has_context=True,
+    )
 
 
 @pytest.mark.parametrize(
@@ -172,9 +338,11 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
     layer.kv_b_proj.quant_method = None
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.is_amx_bmm_enabled = False
     layer.dcp_q_replicate = False
     layer.quant_config = None
     layer.layer_name = "test"
+    layer.impl = SimpleNamespace(process_weights_after_loading=lambda act_dtype: None)
 
     monkeypatch.setattr(
         mla_attention_module, "set_default_quant_scales", lambda *_, **__: None
@@ -199,13 +367,18 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
 
 
 # Validate parameter combinations during collection, before GPU fixtures run.
-PREFILL_BACKENDS_TO_TEST = [
-    MLAPrefillBackendEnum.ROCM_AITER_FA,
-    MLAPrefillBackendEnum.FLASH_ATTN,
-    MLAPrefillBackendEnum.FLASHINFER,
-    MLAPrefillBackendEnum.TRTLLM_RAGGED,
-    MLAPrefillBackendEnum.TOKENSPEED_MLA,
-]
+PREFILL_BACKENDS_TO_TEST: list[MLAPrefillBackendEnum] = []
+if current_platform.is_cuda():
+    PREFILL_BACKENDS_TO_TEST.extend(
+        [
+            MLAPrefillBackendEnum.FLASH_ATTN,
+            MLAPrefillBackendEnum.FLASHINFER,
+            MLAPrefillBackendEnum.TRTLLM_RAGGED,
+            MLAPrefillBackendEnum.TOKENSPEED_MLA,
+        ]
+    )
+elif current_platform.is_rocm():
+    PREFILL_BACKENDS_TO_TEST.append(MLAPrefillBackendEnum.ROCM_AITER_FA)
 
 MLA_DIMENSIONS_TO_TEST = [
     ("deepseek", 128, 128),
@@ -390,7 +563,7 @@ def create_and_prepopulate_kv_cache(
             kv_entry_size = head_size
 
         kv_cache = torch.zeros(
-            num_blocks, block_size, kv_entry_size, dtype=torch.uint8, device=device
+            num_blocks, 1, block_size, kv_entry_size, dtype=torch.uint8, device=device
         )
         scale_tensor = (
             scale
@@ -399,9 +572,9 @@ def create_and_prepopulate_kv_cache(
         )
         scale_tensor = scale_tensor.to(device=device, dtype=torch.float32)
     else:
-        # Create MLA KV cache: (num_blocks, block_size, head_size)
+        # Create MLA KV cache: (num_blocks, num_heads=1, block_size, head_size)
         kv_cache = torch.zeros(
-            num_blocks, block_size, head_size, dtype=dtype, device=device
+            num_blocks, 1, block_size, head_size, dtype=dtype, device=device
         )
         kv_cache_flat = kv_cache.view(-1, head_size)
 
@@ -422,7 +595,7 @@ def create_and_prepopulate_kv_cache(
             ops.concat_and_cache_mla(
                 kv_c_context,
                 k_pe_context.squeeze(1),
-                kv_cache,
+                kv_cache.squeeze(1),
                 slots,
                 kv_cache_dtype=kv_cache_dtype,
                 scale=scale_tensor,
@@ -540,6 +713,10 @@ class MockSparseMLAAttentionLayer:
         """Forward for sparse MLA - uses forward_mqa for all tokens."""
         kv_cache_dtype = getattr(self.impl, "kv_cache_dtype", "auto")
         fp8_attention = kv_cache_dtype.startswith("fp8")
+
+        # Impls see the bind-time-squeezed [B, N, C] cache; mirror bind_kv_cache.
+        if kv_cache.ndim == 4:
+            kv_cache = kv_cache.squeeze(1)
 
         # Write to KV cache
         if kv_cache.numel() > 0:
@@ -676,6 +853,10 @@ class MockMLAAttentionLayer(MLAAttention):
         output: torch.Tensor,
     ) -> torch.Tensor:
         """Replicates MLAAttention.forward_impl logic for testing."""
+        # Impls see the bind-time-squeezed [B, N, C] cache; mirror bind_kv_cache.
+        if kv_cache.ndim == 4:
+            kv_cache = kv_cache.squeeze(1)
+
         # Write to KV cache
         kv_cache_dtype = getattr(self.impl, "kv_cache_dtype", "auto")
         fp8_attention = kv_cache_dtype.startswith("fp8")
@@ -884,80 +1065,39 @@ def test_tokenspeed_mla_noncausal_capability():
     assert tokenspeed_mla_module.TokenspeedMLABackend.supports_non_causal()
 
 
-def test_flashinfer_mla_dcp_multi_token_decode_uses_per_query_bounds(monkeypatch):
+def test_flashinfer_mla_dspark_dcp_supports_target_and_draft(monkeypatch):
     flashinfer_mla_module = pytest.importorskip(
         "vllm.v1.attention.backends.mla.flashinfer_mla"
     )
-
-    decode_call = None
-
-    def fake_decode(**kwargs):
-        nonlocal decode_call
-        decode_call = kwargs
-        query = kwargs["query"]
-        output = torch.empty(*query.shape[:-1], 512, dtype=torch.bfloat16)
-        lse = torch.empty(query.shape[0], query.shape[-2], dtype=torch.float32)
-        return output, lse
-
-    monkeypatch.setattr(
-        flashinfer_mla_module,
-        "trtllm_batch_decode_with_kv_cache_mla",
-        fake_decode,
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="dspark"),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+        model_config=None,
     )
     monkeypatch.setattr(
         flashinfer_mla_module,
-        "_get_workspace_buffer",
-        lambda return_lse: torch.empty(1, dtype=torch.int8),
+        "get_current_vllm_config",
+        lambda: vllm_config,
     )
 
-    impl = object.__new__(flashinfer_mla_module.FlashInferMLAImpl)
-    impl.dcp_world_size = 2
-    impl.dcp_rank = 1
-    impl.cp_kv_cache_interleave_size = 1
-    impl.need_to_return_lse_for_decode = True
-    impl.kv_lora_rank = 512
-    impl.qk_nope_head_dim = 128
-    impl.qk_rope_head_dim = 64
-    impl.bmm1_scale = 1.0
-    impl.bmm2_scale = 1.0
-
-    block_table = torch.tensor([[1], [2]], dtype=torch.int32)
-    metadata = SimpleNamespace(
-        num_decodes=2,
-        num_decode_tokens=6,
-        max_seq_len=7,
-        causal=True,
-        decode=SimpleNamespace(
-            block_table=block_table,
-            seq_lens=torch.tensor([5, 6], dtype=torch.int32),
-            dcp_tot_seq_lens=torch.tensor([10, 13], dtype=torch.int32),
-            flattened_block_table=None,
-            flattened_seq_lens=None,
-            query_len=0,
-        ),
-    )
-    query = torch.empty(6, 2, 576, dtype=torch.bfloat16)
-    kv_cache = torch.empty(3, 16, 576, dtype=torch.bfloat16)
-
-    output, lse = impl.forward_mqa(
-        query,
-        kv_cache,
-        metadata,
-        SimpleNamespace(),
+    backend = flashinfer_mla_module.FlashInferMLABackend
+    builder = flashinfer_mla_module.FlashInferMLAMetadataBuilder
+    reason = backend.supports_combination(
+        head_size=576,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="fp8",
+        block_size=64,
+        use_mla=True,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        device_capability=SimpleNamespace(),
     )
 
-    assert output.shape == (6, 2, 512)
-    assert lse is not None
-    assert lse.shape == (6, 2)
-    assert decode_call is not None
-    assert decode_call["query"].shape == (6, 1, 2, 576)
-    torch.testing.assert_close(
-        decode_call["seq_lens"],
-        torch.tensor([4, 4, 5, 5, 6, 6], dtype=torch.int32),
-    )
-    torch.testing.assert_close(
-        decode_call["block_tables"], block_table.repeat_interleave(3, dim=0)
-    )
+    assert reason is None
+    assert backend.supports_non_causal()
+    assert builder.supports_non_causal_multi_token_decode
+    assert backend.supports_non_causal_dcp()
 
 
 @pytest.mark.parametrize(
@@ -1276,6 +1416,8 @@ def run_attention_backend(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
         )
+        if attn_metadata.prefill is not None:
+            assert attn_metadata.prefill.query_lens_cpu is not None
 
         # Create output buffer
         num_tokens = query.shape[0]
@@ -1660,6 +1802,12 @@ def _run_backend_correctness(
         kv_cache_per_block_size[block_size] = kv_cache
 
     # 4. Run vLLM backends and compare
+    rtol = 1e-2
+    atol = {
+        "auto": 1e-2,
+        "fp8": 1.5e-1,
+        "fp8_e4m3": 1.5e-1,
+    }[kv_cache_dtype]
     failures = []
     for backend_idx, backend_name in enumerate(backends_to_test):
         # Skip backends that don't support spec decode for spec decode tests
@@ -1723,10 +1871,6 @@ def _run_backend_correctness(
             assert torch.isfinite(backend_output).all(), (
                 f"[{backend_name}] produced non-finite values"
             )
-
-            # Check numerical similarity
-            rtol = 1e-2
-            atol = 5e-1
 
             max_diff = torch.max(torch.abs(backend_output - expected_output)).item()
             max_rel_diff = torch.max(
