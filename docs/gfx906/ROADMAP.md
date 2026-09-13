@@ -285,6 +285,10 @@ dropped ~40%; the 89-min/rep era is over), (2) TP-1/FD-1 (now cheaper too),
 kernel, (4) MBT-2 seqs2 re-check post-fix (optional — the A-tax may now be
 small enough that seqs4 vs seqs2 no longer matters), (5) E3 only if a
 residual host term is still suspected (it is not, per the census).
+(6) **Re-anchor the published B=1 prefill sweep**: one point (Qwen3.8-27B, 64k,
+prefix-cache off) on the current tree. FIX-H2/M3 only touch multi-batch
+prefill, so the numbers should stand — this is the one-point verify that makes
+that claim measured rather than argued (the sweep predates them).
 
 ## High priority — user-requested (2026-09-01)
 
@@ -912,6 +916,26 @@ deode data is mined first; future cells at pp=4096.**
     unchanged). Remaining before merge to main: Kevin's real corpus → our own
     ~131K list → final A/B acceptance gate on real traffic (s9 filler saturates
     both arms at perfect acceptance — validates mechanism+speed, not coverage).**
+    **UPDATE 2026-09-13 — MERGED (T2, `190bee0582`); our own corpus landed.**
+    Final artifact: `cat1_ids_v3.json`, **35,251 ids** (every id observed in our
+    own pi/hermes traffic + the tokenizer's 33-id control family), head 361 MB
+    vs 2.54 GB full. Raw-continuation coverage 97.7–98.0 % → **100 %** once the
+    added-token markup (`<tool_call>`, `<tool_response>`, `<think>`, …) is
+    forced — parsed logs can never contain it (`CAT1-corpus-build.md`).
+    Controlled A/B on identical prompts (11 agentic 8k prompts × 2 reps/arm,
+    TP=2 k=2): **−2.52 ms/step [−2.91, −1.94] ⇒ +4.8 % mean / +5.9 % median
+    t/s**, acceptance no detectable penalty (MWU z = −0.83). Agentic-coding
+    headline with MTP k=3: **33.25 @64k / 24.95 @120k t/s** (greedy
+    19.80/13.17 = 1.68×/1.89×).
+    *Follow-ups:* (a) **T2-5 hygiene** — move the lazy `draft_vocab_ids` device
+    migration out of `forward` (it relies on warmup preceding capture);
+    (b) **the shipped list is not reproducible** from `corpus15` with the
+    current builder (a recount gives 34,392 ids — the list predates the builder
+    hardening), so a rebuild is a *new* artifact that must re-run the
+    controlled A/B, and `cat1_manifest.json` carries the ids↔head pairing +
+    snapshot but **no provenance block** until a fresh build writes one;
+    (c) the 131K-list option is still unvalidated — our N = observed ids, and
+    only a corpus that demands more ids should justify re-gating it.
   - **CAT-2 — FA prefill D256 Split-D + GQA multi-head packing (GO/ANALYZE — feeds
     SYV-9).** Their Volta D=256 prefill kernel = **1.66–2.2× over generic FA2** on
     the same D=256 shape. Techniques: Split-D (D=256→4×D64, paired warps share QK,
@@ -1199,6 +1223,18 @@ Record in ROADMAP + devlog; attribution per house rule for any ported code.
 
 ## Tier 0 — cheap, decisive, low-risk
 
+### GDN-1 — SYV-10 bounds-port test coverage (T4-2 test debt)
+
+**Status: open, low effort, GPU tests.** The upstream PR #50021 port is
+merged (T4, `fd6895e789`) and is a real safety fix — the accepted-token-derived
+state index (`i_t = num_accepted − 1`) could read before/past the request's row
+and fault the SM, because the `state_idx <= 0` guard alone accepted a garbage
+positive int. It was **inspected but never gated**: add one test per zero-fill /
+early-out path (`causal_conv1d`, `mamba_ssm`, `fused_recurrent`,
+`fused_sigmoid_gating`), plus one that feeds an out-of-range accepted count and
+asserts the output is unchanged rather than a fault. Cheap, and it retires the
+only "shipped without a runnable check" item in the T4 train.
+
 ### DE-1 — dead-end register-spill / compiler-structural audit (HIGH PRIORITY)
 
 **User request 2026-08-31.** Every HIP-kernel row in `DEAD-ENDS.md` is
@@ -1455,6 +1491,28 @@ copy-free; this is a separate decode-specialized kernel and launcher
 change.
 
 ## Tier 2 — bigger / conditional bets
+
+### FA-STRUCT — remaining FA decode headroom (structural only)
+
+**Status: open, high effort.** Every config-level FA decoder lever is measured
+dead (`DEVLOG-fa-verify-sq8.md`), so what is left is structural:
+(1) **KV re-read elimination across q-tiles** — ~6–9 % of step, weeks-scale
+rewrite (ref llama.cpp/llaminar FA), and it only pays when grid_x>1 (moot at the
+Sq=5 verify shape); (2) **online-softmax rescale batching** (defer the max
+update across N KV tiles) — ~2.5–4 %, 1–2 weeks; (3) **M6: a Q4-KV format** to
+unlock native `v_dot8_i32_i4` (2× dot4 MAC rate at half the operand bytes, no
+unpack ALU) — the only instruction-level upside left, **PPL-gated**; the M5
+work showed the current Q8 dot is already full-rate and the B=1 path is
+gather-HBM-bound, so this is a numerics bet, not a free win
+(`DEVLOG-fa-kernel-batches.md`). Housekeeping: (i) `GFX906_FA_DIRECT_PAGED` still lacks the FIX-H2 pad-tile
+clamp (documented, not fixed — the path is default-off for the mixed
+shapes); add it if direct-paged is ever enabled at long context; (ii) the
+FIX-H2 test's length-hardening is unfixed (a length mismatch raises
+IndexError, not a clear assertion) — fold into the next touch of that test;
+(iii) drop the `GFX906_FA_GATHER_EXACT` kill switch at the next
+gather-lifecycle change
+(byte-for-byte pre-fix policy = the OOM-repro value), re-gated on a serving A/B
+(drop notes are in the code and in `plan-gfx906-fa-fix.md` §6).
 
 ### C7 — persistent/cooperative MoE block
 
