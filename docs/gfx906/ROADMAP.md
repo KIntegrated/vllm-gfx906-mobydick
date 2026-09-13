@@ -159,16 +159,42 @@ prefill-only (no decode), fp16 KV** — i.e. small head_dim, short seqs,
 batch-over-image-tiles: a very different kernel regime from the LLM path
 (head_dim 256, Hkv 4, 122k contexts, Q8 K).
 
-Work items: (1) extract the exact ViT tensor shapes + dtypes from a
-traced image-bearing forward (the Triton path's ViT entry, or
-`Qwen3_5VisionTransformer` in `qwen3_5.py`); (2) decide fp16-KV FA vs
-Q8-K for head_dim 72 — the Q8 path's int8 dot is tuned for D=256;
-D=72 may prefer plain fp16 FMA tiles or a D-padded variant; (3) route
-the ViT layers through `forward_paged`/dense-FA with the right tiling
-(ncols1 sweep at D=72); (4) screens: ViT output allclose vs the Triton
-path on a fixed image batch, then a boot-time + image-prompt TTFT A/B.
-Effort: medium (a new tiling/shape family in the kernel + launcher);
-risk: low (fallback stays).
+**Recon (2026-09-13, 0.29 tree) — the kernel work is essentially zero; the effort
+is an adapter + wiring:**
+
+- **Shapes confirmed from the shipped config** (`vision_config`: hidden 1152,
+  `num_heads 16`, depth 27, patch 16, merge 2, 2304 position embeddings) →
+  **head_dim = 1152/16 = 72**, bidirectional (no window mask), prefill-only,
+  fp16 KV, ragged batches (`cu_seqlens` / `max_seqlen`).
+- **No mask or tiling work needed.** The vendored kernel masks *either* via a
+  materialised mask *or* the inline-causal `q_abs_offset`; with **neither** it
+  computes **full bidirectional attention** (`mask=None`, `q_abs_offset=None`,
+  `window=0`, `k_VKQ_max` = per-seq length). The ViT is exactly that case.
+- **A dense, non-paged entry already exists**: `gfx906_fa_forward(q_fp32
+  [B,Hq,Sq,D], k_q8 [B,Hkv,Skv,D*34/32], v_fp16 [B,Hkv,Skv,D], scale, kv_max?,
+  mask?, q_abs_offset?, window, kv_start?)` — no block table, plain contiguous
+  K/V. `MMEncoderAttention` dispatches per backend (`forward_cuda` →
+  `_forward_fa` → `vit_flash_attn_wrapper` on ROCm), so this is a new
+  `_forward_gfx906_fa` arm plus a config default.
+- **D=72 must be padded** (launcher requires `head_size % 32 == 0`) → pad Q/K/V
+  72 → **96** (or 128 if the tile table lacks 96). Zero-padding is **exact**: the
+  padded dims contribute 0 to the QK dot, they quantise to zero Q8 blocks and
+  contribute 0 to P·V, and because the padding is in the *head* dim the softmax
+  denominator is untouched; padded query rows are sliced off.
+- **Contract detail**: the kernel wants Q in fp32 and K pre-quantised Q8, so the
+  adapter reshapes ragged → `[B, H, Sq_pad, D_pad]`, zero-pads, casts Q,
+  quantises K (`quantize_q8_0`), and passes V fp16.
+
+**Work items (revised):** (1) the `_forward_gfx906_fa` adapter + `CUSTOM`
+accepted by `MMEncoderAttention` and defaulted on gfx906 (env kill switch,
+FLASH_ATTN fallback for unsupported shapes); (2) ncols1/kv_split tuning at D=96
+using the existing ladders; (3) screens: a ViT-shaped call vs a torch-SDPA
+reference (bidirectional, ≤5e-2 rel like the FA suite), the FA suite staying
+green, then an image-prompt TTFT A/B **and** a boot-time measurement (killing the
+Triton-AMD ViT JIT/capture stall is half the win); (4) confirm the Triton-AMD
+flash-attn editable install can then be dropped from serving deps.
+**Effort: low-medium** (adapter + wiring + tests; the kernel needs nothing);
+**risk: low** (fallback stays).
 
 ### TP-1 — TP-scaling probe: prefill + decode vs TP, the TP=4 question (queued after the 120k×B4 campaign)
 
