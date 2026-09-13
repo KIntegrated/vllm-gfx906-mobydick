@@ -217,6 +217,15 @@ class Gfx906FABackend(AttentionBackend):
         # switched without re-allocating the KV cache.
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
+    @classmethod
+    def supported_kv_cache_layouts(cls):
+        # 0.29 (#51718): our kernels read head-major block interiors, i.e. the
+        # physical order [L, B, H, N, C] per layer with C = 2*head_size fused
+        # K||V (same words cpu_attn declares).
+        from vllm.v1.kv_cache_interface import KVCacheLayout
+
+        return (KVCacheLayout.LBHNC,)
+
     @staticmethod
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
@@ -866,7 +875,10 @@ class Gfx906FAImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ):
-        key_cache, value_cache = kv_cache.unbind(1)
+        # 0.29 KV-cache layout standardisation (#51718): the cache is a single
+        # tensor with a fused content axis, [B, H, N, 2*D] per layer, so K/V
+        # are the two halves of the last axis (not a separate axis-1 pair).
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
 
         # 1) Primary fp16 write — the vLLM-standard path for V (and for K
         #    in LEGACY mode).
@@ -938,8 +950,9 @@ class Gfx906FAImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Unbind KV cache: (..., 2, ...) → (K, V) each [num_blocks, block_size, Hkv, D]
-        key_cache, value_cache = kv_cache.unbind(1)
+        # Split the fused content axis: (B, H, N, 2*D) → (K, V) each
+        # [num_blocks, block_size, Hkv, D] (0.29 layout standardisation).
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
 
         # query [num_tokens, Hq, D] fp16 (forward_paged casts it into the
         # fp32 q_pad buffer inside the copy_ — a standalone .float() was

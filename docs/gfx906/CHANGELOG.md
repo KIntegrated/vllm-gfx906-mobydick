@@ -21,10 +21,26 @@ the date an investigation began.
   FA4-hd256 block sizes and the FlashInfer CuTeDSL BF16 path arrive with our
   GEMV dispatch kept intact; the WNA16 oracle keeps the fork's tested qzeros
   repack helper and learns about upstream's new `EMULATION` backend.
-  **Validation: static only** (no conflict markers, tree-wide `compileall`
-  clean, fork imports resolve) — build, FA suite, PPL probe and a V1 serving
-  smoke are the next gates, and `q_gemm_m1_maxilp.cu` must be re-synced with
-  upstream's updated `dot22_8_f`/`dot22_8_h`.
+  **Validation (2026-09-13, boot a27a894e, all three gates green):**
+  worktree build `rc=0`; **FA suite 89/89**; **PPL probe bit-identical to the
+  0.28.0 line — 10.5516 both** (Qwen3.8-27B-AWQ-INT4, fp16, 359 tokens, 0
+  top-20 misses); **V1 serving smoke**: coherent completion + clean teardown
+  (`VLLM_USE_V2_MODEL_RUNNER=0`). Three merge defects were found and fixed
+  *after* the static pass, each only by running something:
+  (1) `csrc/.../gptq/q_gemm.cu` duplicate `dot22_8_f` declaration (caught by the
+  build); (2) `qwen3_vl.py` `NameError: video_max_pixels_per_frame` in
+  `get_dummy_mm_data` — the merge kept one of the fork's lines inside the method
+  upstream rewrote; the fork's per-item video pixel cap was restored on top of
+  upstream's definitions (caught by the PPL probe); (3) the 0.29 **KV-cache
+  layout standardisation (#51718)** broke the FA backend's K/V split —
+  `kv_cache.unbind(1)` now sees heads on dim 1 because the content axis is
+  fused `K||V` (`[B, H, N, 2*D]`). Ported: both split sites now use
+  `kv_cache.transpose(1, 2).split(self.head_size, dim=-1)` (identical
+  `[blocks, block_size, Hkv, D]` view our kernels already took) and the backend
+  declares `supported_kv_cache_layouts()` = `(KVCacheLayout.LBHNC,)`; the
+  engine logs `Using LBHNC KV cache layout` (caught by the first PPL run).
+  `ops/rocm_aiter_mla_sparse.py` was taken wholesale from upstream (the fork's
+  fp16 sparse-MLA is half-ported, tracked as SMLA-1).
 
 ## 2026-09-02
 

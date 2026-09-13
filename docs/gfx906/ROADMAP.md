@@ -1502,6 +1502,18 @@ change.
 
 ## Tier 2 — bigger / conditional bets
 
+### KVLAYOUT-1 — verify the opt-in LEGACY=0 Q8 side-buffer under 0.29's fused layout
+
+**Status: unverified, opt-in path (default is LEGACY=1).** 0.29 standardised the
+KV-cache layout (#51718): one tensor with a fused content axis `[B, H, N, 2*D]`
+per layer. The default path is ported and validated (FA suite + PPL + smoke),
+and the opt-in `GFX906_FA_LEGACY=0` Q8 side-buffer *should* still be correct —
+its K view is the `split(D, -1)` half, whose last dim is stride-1 and whose
+`bytes_per_row <= row_bytes` guard (136 B into a 512 B K segment for D=256) still
+holds, so the uint8 byte-alias writes stay inside K's own segment and never
+touch V. That reasoning is static; the path has not been run on 0.29. Verify with
+one serving A/B before enabling LEGACY=0 for anything.
+
 ### SMLA-1 — re-port the fork's fp16 sparse-MLA to 0.29.0's ROCm path (only if needed)
 
 **Status: parked, inert.** The fork carries an fp16 variant of the ROCm AITER
