@@ -1509,7 +1509,11 @@ clamp (documented, not fixed — the path is default-off for the mixed
 shapes); add it if direct-paged is ever enabled at long context; (ii) the
 FIX-H2 test's length-hardening is unfixed (a length mismatch raises
 IndexError, not a clear assertion) — fold into the next touch of that test;
-(iii) drop the `GFX906_FA_GATHER_EXACT` kill switch at the next
+(iii) the `GFX906_FA_KVSPLIT_MAX_BYTES` default (512 MiB) carries a queued
+decision (packet F3): at B=1 it admits y=32 (403 MB transient is under the
+cap) while B=4 forces y=1 — leave it alone unless a same-boot serving A/B
+shows a y=32 loss at B=1; (iv) drop the `GFX906_FA_GATHER_EXACT` kill switch
+at the next
 gather-lifecycle change
 (byte-for-byte pre-fix policy = the OOM-repro value), re-gated on a serving A/B
 (drop notes are in the code and in `plan-gfx906-fa-fix.md` §6).
