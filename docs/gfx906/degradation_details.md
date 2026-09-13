@@ -3128,3 +3128,58 @@ Between #74 (15:51) and #75 (16:51) the session completed six full sweeps
 (greedy + MTP k=3 on the agent corpus, 4 reps each) with no event, i.e. two
 resets an hour apart on the same card with long clean stretches between —
 boot-wear/load-lottery behaviour, not an arm, model-dir or config dependency.
+
+## 2026-09-13 boot f27e8058 — wedge #76 (0.29.0 validation; GPU0, weight-load family, hung process)
+
+Context: after the upstream v0.29.0 merge, the worktree build succeeded and the
+FA suite passed (89/89, 18:16). The PPL probe (fresh merge, in-process Qwen3.8-27B)
+then died during checkpoint load:
+
+```
+terminate called after throwing an instance of 'c10::AcceleratorError'
+  what():  CUDA error: unspecified launch failure   (hipErrorLaunchFailure)
+amdgpu 0000:0b:00.0: Fence fallback timer expired on ring comp_1.0.0
+amdgpu 0000:0b:00.0: GPU reset(2) succeeded!
+amdgpu 0000:0b:00.0: [drm] device wedged, but recovered through reset
+```
+
+New detail worth recording: **the Python process survived the reset in a zombie
+state**, still holding 20.8 GB (KFD table showed it on the physical GPU that
+rocm-smi labels GPU[0] — note the numbering mismatch with `HIP_VISIBLE_DEVICES`),
+with the traceback already printed and the interpreter stuck in teardown.
+`SIGTERM` was ignored; `SIGKILL` released the memory immediately and VRAM
+returned to the 11 MB idle baseline. House recipe for the next session: after a
+wedge, check `rocm-smi --showpids` for a *live* holder of the model-sized
+allocation before relaunching — a recovered-but-hung client is otherwise
+indistinguishable from a clean state in the log alone.
+
+## 2026-09-13 boot f27e8058 — wedge #77 + BURST (0.29.0 validation; GPU0)
+
+Second consecutive genuine load failure on this boot, ~2 min after #76 and with
+no successful load in between (the FA suite's kernel-level tests do not load a
+checkpoint, so they do not count as a clean load for the wear tally):
+
+```
+terminate called after throwing an instance of 'c10::AcceleratorError'
+  what():  CUDA error: unspecified launch failure   (hipErrorLaunchFailure)
+Exception raised from SetDevice at /build/pytorch/c10/hip/HIPFunctions.cpp:334
+amdgpu 0000:0b:00.0: GPU reset succeeded, trying to resume
+amdgpu 0000:0b:00.0: VRAM is lost due to GPU reset!
+amdgpu 0000:0b:00.0: Fence fallback timer expired on ring comp_1.0.0
+amdgpu 0000:0b:00.0: GPU reset(4) succeeded!
+amdgpu 0000:0b:00.0: [drm] device wedged, but recovered through reset
+```
+
+Per the house recipe this is a BURST: all GPU work stopped, reboot before any
+further GPU work. Boot f27e8058 (up 14:23, ~4 h) has now recorded six events
+(#72–#77), five of them GPU0 weight-load failures — the same accelerating
+load-family wear seen on earlier boots. No hung holders this time (the smoke's
+engine-core process died with the accelerator error; VRAM returned to the
+10.9 MB baseline by itself).
+
+Validation status at the stop (for the resume): the 0.29.0 worktree **build
+succeeded**, all three compiled extensions import, the **FA suite passed
+89/89 twice**, and the static sweeps are clean (no conflict markers,
+`compileall`, ruff F821/F811 apart from one pre-existing upstream F811). The
+remaining gates — the PPL probe (blocked by #76) and the V1 serving smoke
+(blocked by #77) — need a fresh boot.
