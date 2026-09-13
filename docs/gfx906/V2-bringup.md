@@ -1,7 +1,23 @@
 # V2 model-runner bring-up on gfx906 (0.29.0 line)
 
-**Status: open. V2 is upstream's default from 0.29.0 (#53183); the fork pins V1
-everywhere (`VLLM_USE_V2_MODEL_RUNNER=0`) until this plan is signed off.**
+**Status: open — but points 1 and 2 below are now ANSWERED (2026-09-13, boot
+eefacc1e): V2 loads, serves and is numerically at parity on gfx906.**
+V2 is upstream's default from 0.29.0 (#53183); the fork still pins V1 everywhere
+(`VLLM_USE_V2_MODEL_RUNNER=0`) until the *perf* steps of this plan are signed off.
+
+**Session A result (2026-09-13).** A1 (V2 eager) died at engine-core init with
+`hipErrorLaunchFailure`, but the kernel logged a BACO reset in the same second —
+i.e. the load-lottery family, not V2 (wedge #79). A2 (**V2 graph mode**) then
+loaded clean, reached READY in ~300 s, returned a coherent completion and tore
+down cleanly, and **V2 in-process PPL = 10.5516 — bit-identical to V1's and to
+the 0.28.0 baseline** (Qwen3.8-27B-AWQ-INT4, fp16, 359 tokens, 0 top-20 misses).
+So the Y16 "V2 forced on GDN ⇒ unsupported-by-design" record was the lottery:
+V2 is viable here, and the remaining work is performance/spec-decode parity, not
+bring-up.
+
+*Runner identification trick for the logs* (the log does not print V1/V2): the
+V1 runner logs `[gpu_model_runner.py:…]` for the encoder-cache line, V2 logs
+`[encoder_runner.py:…]`. The smoke script should assert this tag.
 Plan owner: whoever runs the sessions below. Gate for each step is stated in the
 table; the house wedge rules apply to every session (canary first, one retry per
 wedge, 2 consecutive failures = burst → stop + reboot, log every event in

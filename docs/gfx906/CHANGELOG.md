@@ -42,6 +42,16 @@ the date an investigation began.
   `ops/rocm_aiter_mla_sparse.py` was taken wholesale from upstream (the fork's
   fp16 sparse-MLA is half-ported, tracked as SMLA-1).
 
+  **Parity + V2 status (boot eefacc1e, same day).** V1 restamp of the 0.29 line
+  against the 0.28 numbers: MoE **65.40 warm / 58.17 cold**, dense **24.90 /
+  16.33** t/s — all within ±0.8 % (mclk 1000 in every window), i.e. **0.29 V1
+  parity with 0.28 is established**. And **V2 is viable on gfx906**: the graph-mode
+  V2 serve returned a coherent completion with a clean teardown, and V2
+  in-process PPL = **10.5516**, bit-identical to V1's and to the 0.28 baseline
+  (the Y16 "unsupported-by-design" record was the box's load lottery — a BACO
+  reset landed in the same second as the eager attempt that failed). Remaining
+  V2 work is performance/spec-decode parity: `V2-bringup.md`.
+
 ## 2026-09-02
 
 - **MTP-1a closed: Qwen3.8-27B dense MTP k=2 crossover pinned at 32k–64k pp**
