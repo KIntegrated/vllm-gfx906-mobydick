@@ -1502,6 +1502,23 @@ change.
 
 ## Tier 2 — bigger / conditional bets
 
+### SMLA-1 — re-port the fork's fp16 sparse-MLA to 0.29.0's ROCm path (only if needed)
+
+**Status: parked, inert.** The fork carries an fp16 variant of the ROCm AITER
+sparse-MLA indexer (`VLLM_ROCM_MLA_SPARSE_FP16`, default **off**; gfx906 fp16
+logits path, optional MLA metadata, prev-extent tracking) spread over
+`v1/attention/backends/mla/rocm_aiter_mla_sparse.py`,
+`model_executor/models/deepseek_v2.py` and the ops file. The 0.29.0 merge kept
+upstream's restructured **ops file** (its local `rocm_fp8_mqa_logits` /
+`rocm_fp8_paged_mqa_logits` implementations are what upstream's indexer calls;
+the fork's variant had deleted them, so mixing the two was incoherent) while
+keeping the fork's backend/hook files. Consequence: the fp16 path is
+**half-ported** — inert at its default, and not expected to work if enabled.
+Re-port only if we ever serve a DeepSeek/GLM sparse-attention model on gfx906
+(needs AITER + gfx942/950 for the upstream path; our models are Qwen3.5/3.8,
+Muse-Glimmer, Ornith, Gemma-4 and Nemotron — none use sparse MLA). The fork's
+variant is preserved in git history (`main`) and in this branch's merge parents.
+
 ### FA-STRUCT — remaining FA decode headroom (structural only)
 
 **Status: open, high effort.** Every config-level FA decoder lever is measured
