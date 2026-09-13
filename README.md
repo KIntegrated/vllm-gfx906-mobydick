@@ -272,6 +272,11 @@ vllm serve <model> \
   --generation-config auto
 ```
 
+- **`VLLM_USE_V2_MODEL_RUNNER=0` is required on upstream 0.29.0+**: upstream
+  defaults to Model Runner V2 for all models, and V2 is not yet validated on
+  gfx906 (it wedged at engine init on the first smoke). V1 remains fully
+  supported; the fork's V2 bring-up is tracked as DFL2-2 in
+  `docs/gfx906/ROADMAP.md`.
 - `--dtype float16` is required: gfx906 has no bf16 hardware; bfloat16
   checkpoints would fall back to fp32 math.
 - cudagraph capture sizes = multiples of `num_speculative_tokens + 1`

@@ -25,7 +25,11 @@ cd /local/git/vllm-gfx906-mobydick
 case "$1" in
 start)
   tag="$2"; snap="$3"; name="$4"; maxlen="$5"; tool="$6"; reason="$7"
+  # 0.29.0: upstream defaults to Model Runner V2 for ALL models; V2 is still
+  # unvalidated on gfx906 (it wedged at init on the Y16 smoke), so pin V1 until
+  # DFL2-2 brings V2 up. Every fork recipe must carry this.
   env HIP_VISIBLE_DEVICES=0,1 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
+      VLLM_USE_V2_MODEL_RUNNER=0 \
       HF_HUB_OFFLINE=1 ${EXTRA_SERVE_ENV:-} \
     setsid nohup .venv/bin/vllm serve "$snap" \
       --served-model-name "$name" \

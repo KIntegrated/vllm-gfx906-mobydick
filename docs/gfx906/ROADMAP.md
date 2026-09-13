@@ -83,6 +83,16 @@ unlike V1's `[:num_reqs_padded+1]` — see the review-trains T1/M3 notes);
 (`vllm/v1/worker/gpu/model_runner.py`, archive-bound per T6) — V2 revival of
 SYV-12 needs those hunks.
 
+**0.29.0 merge (2026-09-13, `gfx906/v0.29.0` → merge `3c445dba56`).** Upstream
+now defaults V2 for **all** models (#53183) and its own ROCm V1 list covers only
+DeepSeek archs, so the fork must pin V1 explicitly: every recipe carries
+`VLLM_USE_V2_MODEL_RUNNER=0` (the env override wins inside
+`VllmConfig.use_v2_model_runner`). Bring-up target is now 0.29.0's V2, whose
+`_get_v2_model_runner_unsupported_features()` + `HAS_TRITON` gate replaces the
+fork's removed `_is_default_v2_model_runner_model()` helper. Also relevant from
+the release: ROCr/CLR update (#53712, graph-replay segfault fix, ~20 % TPOT
+class) and the TheRock 7.14 preview (#49925).
+
 **⚠ Re-investigate before closing (2026-09-13).** The branch currently records
 "V2 forced on Qwen3.8-GDN ⇒ init wedge ⇒ unsupported-by-design". A single
 `hipErrorLaunchFailure` at init is **not** architecture evidence on this box:

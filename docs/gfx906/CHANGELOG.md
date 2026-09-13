@@ -6,6 +6,26 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-13
+
+- **Upstream v0.29.0 merged** into `gfx906/v0.29.0` (merge `3c445dba56`; parents
+  `4b7e0b7eb2` + tag `98dff2a81d`). Upstream delta vs the merge base: 561
+  commits / 1848 files; 104 files touched by both sides, **23 conflicts**
+  resolved by hand (record: `/local/tmp/b4/v0290-resolutions.md`, condensed in
+  the merge message). Headlines: **Model Runner V2 is upstream's default for all
+  models** — the fork pins **`VLLM_USE_V2_MODEL_RUNNER=0`** in every recipe until
+  DFL2-2 brings V2 up; upstream now ships **dflash2** itself (the fork's backport
+  converged and its two superseded files went to upstream: `qwen3_dflash2.py`
+  and `dflash2/__init__.py` are byte-identical post-merge); native Hunyuan VL
+  moved to the Transformers backend (file deleted, our compat rename dropped);
+  FA4-hd256 block sizes and the FlashInfer CuTeDSL BF16 path arrive with our
+  GEMV dispatch kept intact; the WNA16 oracle keeps the fork's tested qzeros
+  repack helper and learns about upstream's new `EMULATION` backend.
+  **Validation: static only** (no conflict markers, tree-wide `compileall`
+  clean, fork imports resolve) — build, FA suite, PPL probe and a V1 serving
+  smoke are the next gates, and `q_gemm_m1_maxilp.cu` must be re-synced with
+  upstream's updated `dot22_8_f`/`dot22_8_h`.
+
 ## 2026-09-02
 
 - **MTP-1a closed: Qwen3.8-27B dense MTP k=2 crossover pinned at 32k–64k pp**

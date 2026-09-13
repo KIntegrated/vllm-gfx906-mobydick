@@ -302,6 +302,8 @@ posix.stat`). Allowlist them away for any bench:
 
 ```bash
 export VLLM_PLUGINS=quark_online_quant
+export VLLM_USE_V2_MODEL_RUNNER=0   # 0.29.0+: pin V1 (V2 is upstream's default,
+                                    # unvalidated on gfx906 — see ROADMAP DFL2-2)
 ```
 
 MoE (**`/data/models/QuantTrio/Qwen3.5-35B-A3B-AWQ`** — the `/local` copy is
