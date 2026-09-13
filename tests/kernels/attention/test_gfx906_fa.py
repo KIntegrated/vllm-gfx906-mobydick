@@ -2995,6 +2995,30 @@ def test_q8_0_row_layout_planar_pin_fused_q8_gather():
 # in-process, unlike the launch-site get_fa_kv_split static).
 # ---------------------------------------------------------------------------
 
+def test_legacy_zero_refused_until_verified(monkeypatch):
+    """GFX906_FA_LEGACY=0 (Q8 side-buffer) is fail-closed on 0.29.
+
+    0.29's fused KV-cache content axis (#51718) makes the byte alias
+    unverified, and a wrong alias corrupts K/V silently, so the mode must
+    refuse to start unless the operator sets the explicit override. See
+    ROADMAP KVLAYOUT-1.
+    """
+    from vllm.gfx906_fa.gfx906_fa_backend import _resolve_legacy_mode
+
+    monkeypatch.setenv("GFX906_FA_LEGACY", "0")
+    monkeypatch.delenv("GFX906_FA_LEGACY_ALLOW_UNVERIFIED", raising=False)
+    with pytest.raises(RuntimeError, match="not been verified"):
+        _resolve_legacy_mode()
+
+    monkeypatch.setenv("GFX906_FA_LEGACY_ALLOW_UNVERIFIED", "1")
+    assert _resolve_legacy_mode() is False  # opt-in accepted, warned
+
+    monkeypatch.setenv("GFX906_FA_LEGACY", "1")
+    assert _resolve_legacy_mode() is True
+    monkeypatch.delenv("GFX906_FA_LEGACY")
+    assert _resolve_legacy_mode() is True  # default is the validated path
+
+
 def test_r3_kv_split_defaults_aligned(monkeypatch):
     monkeypatch.delenv("GFX906_FA_KVSPLIT", raising=False)
     monkeypatch.delenv("GFX906_FA_KVSPLIT_SHAPEAWARE", raising=False)

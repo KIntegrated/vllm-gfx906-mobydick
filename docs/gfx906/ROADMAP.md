@@ -83,6 +83,12 @@ unlike V1's `[:num_reqs_padded+1]` — see the review-trains T1/M3 notes);
 (`vllm/v1/worker/gpu/model_runner.py`, archive-bound per T6) — V2 revival of
 SYV-12 needs those hunks.
 
+**Bring-up plan:** the concrete audit (what already rides shared code, the eight
+gaps, the test matrix and the session order) lives in
+[`V2-bringup.md`](V2-bringup.md). V2 stays pinned off until that plan's parity
+steps are signed off; the first question is the fresh-boot init retry (the Y16
+wedge is unresolved, not arch evidence).
+
 **0.29.0 merge (2026-09-13, `gfx906/v0.29.0` → merge `3c445dba56`).** Upstream
 now defaults V2 for **all** models (#53183) and its own ROCm V1 list covers only
 DeepSeek archs, so the fork must pin V1 explicitly: every recipe carries

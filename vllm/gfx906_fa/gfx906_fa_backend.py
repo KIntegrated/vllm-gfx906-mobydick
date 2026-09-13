@@ -81,6 +81,35 @@ class Gfx906FAMetadata:
     common_prefix_len: int = 0
 
 
+def _resolve_legacy_mode() -> bool:
+    """Resolve ``GFX906_FA_LEGACY`` (default 1) with a fail-closed guard.
+
+    0.29 failure mode: upstream's KV-cache layout standardisation (#51718) fused
+    the K/V content axis, so the LEGACY=0 Q8 side-buffer now aliases bytes inside
+    a *strided* 2*D content segment instead of the old contiguous K half. The
+    alias is expected to stay correct (the split half's last dim is stride-1 and
+    the ``bytes_per_row <= row_bytes`` guard holds: 136 B into a 512 B K segment
+    at D=256), but it has NOT been verified on 0.29 and a wrong alias corrupts
+    K/V **silently** (no crash). Refuse it unless the operator opts in.
+    """
+    if _os.environ.get("GFX906_FA_LEGACY", "1") == "1":
+        return True
+    if _os.environ.get("GFX906_FA_LEGACY_ALLOW_UNVERIFIED", "0") == "1":
+        logger.warning(
+            "GFX906_FA_LEGACY=0 forced ON despite being unverified on 0.29 "
+            "(ROADMAP KVLAYOUT-1): the Q8 side-buffer alias writes into a fused "
+            "K/V content segment and a wrong alias corrupts K/V silently."
+        )
+        return False
+    raise RuntimeError(
+        "GFX906_FA_LEGACY=0 is refused on 0.29: the Q8 side-buffer alias has not "
+        "been verified against 0.29's fused KV-cache layout (#51718), and a wrong "
+        "alias corrupts K/V silently. See docs/gfx906/ROADMAP.md (KVLAYOUT-1). "
+        "Set GFX906_FA_LEGACY_ALLOW_UNVERIFIED=1 to accept that risk, or keep the "
+        "validated default GFX906_FA_LEGACY=1."
+    )
+
+
 class Gfx906FAMetadataBuilder(
     AttentionMetadataBuilder[Gfx906FAMetadata]
 ):
@@ -100,7 +129,7 @@ class Gfx906FAMetadataBuilder(
         # copies and captured writes move both halves at once). Kept as a
         # separate env-gated mode because it is a different read path
         # (experimental status until the serving gates say otherwise).
-        if _os.environ.get("GFX906_FA_LEGACY", "1") != "1":
+        if not _resolve_legacy_mode():
             logger.warning(
                 "GFX906_FA_LEGACY=0: K is read from the Q8 side view "
                 "aliased into the fp16 K half (zero extra KV memory). "
@@ -444,7 +473,7 @@ class Gfx906FAImpl(AttentionImpl):
         # tensor (e.g. the profile-run dummy cache vs the live pool) means
         # the alias must be re-derived.
         self._k_cache_q8_src: torch.Tensor | None = None
-        self._legacy = _os.environ.get("GFX906_FA_LEGACY", "1") == "1"
+        self._legacy = _resolve_legacy_mode()
 
         # ------------------------------------------------------------------
         # q_pad buffers for forward_paged are CLASS-level (see the

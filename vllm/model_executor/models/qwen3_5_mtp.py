@@ -445,6 +445,15 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
                 self.model.draft_vocab_ids = ids
             full = sub.new_full((sub.shape[0], self.config.vocab_size), float("-inf"))
             full.index_copy_(1, ids, sub)
+            # Marker for the V2 bring-up check: V2's MTP path has its own top-k
+            # sharing, so a run that never logs this line is NOT using the
+            # shortlist (silent loss of CAT-1's read saving). Grep the server log
+            # for it when validating V2.
+            logger.info_once(
+                "MTP draft-vocab shortlist ACTIVE (%d ids; logits outside the "
+                "list are -inf)",
+                int(ids.numel()),
+            )
             return full
         return self.logits_processor(self.lm_head, hidden_states)
 
