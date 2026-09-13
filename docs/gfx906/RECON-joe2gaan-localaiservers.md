@@ -37,3 +37,17 @@ NOT necessarily in our tree — need to diff.
 If our 120k decode profiler shows all-reduce = large chunk of step time →
 porting persistent-AR (lead 1) is the highest-value gfx906-specific win.
 RCCL/NCCL tuning (lead 4) is a quick env-only A/B to try first.
+
+## Deep review follow-up (2026-09-07)
+
+The 2026-09-01 recon above covered the env file + bundle structure only. The
+deep review of the full docs set (`docs/gfx906-key-learnings-20260606.md`
+444 KB, `docs/gfx906-source-kernel-inventory-20260612.md` 109 KB, plus the
+GGUF set) added ROADMAP items **J2G-6** (post-AR consumer fusion),
+**J2G-7** (interleaved SwiGLU MLP GEMV), and a **J2G-negative evidence**
+block (SP serving rejection, custom-AR failure on gfx906, grouped-AR
+infeasibility, Marlin-tune wash under throttle, sidecar per-call 3.6 ms).
+Their TP8 numbers (62–63 backend TPS dense, NCCL 54–58 % of kernel time,
+sidecar 1x5120 median ~42–46 µs / p99 ~3.6 ms) are topology-specific
+context; the transferable content is the consumer-fusion + SwiGLU leads and
+the negative evidence.

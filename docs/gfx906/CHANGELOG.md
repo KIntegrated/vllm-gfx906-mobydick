@@ -117,7 +117,7 @@ the date an investigation began.
   its FA component is the 1.96–2.22× above). Decode/spec paths provably
   unchanged (cap = seq_len; raise ≡ the existing floor). Residual:
   per-row granularity within a 64-row tile (~1/32 of the effect) left
-  open. Records: `DEVLOG-fa-attention.md` (M2 + 2026-08-29 review-fix
+  open. Records: `DEVLOG-fa-kernel-batches.md` (M2 + 2026-08-29 review-fix
   entries, `m2-code-rev-glm5.md` findings closed by `04e6ab7c60`).
 - **M3: kernel hygiene batch merged (`feat/fa-m3-hygiene`).** #8
   device-side `k0_base = max(0, kv_start[seq])` clamp (a negative start

@@ -36,7 +36,9 @@ Reference point: llama.cpp (Q4_K_XL GGUF, full offload) — **70.3 t/s decode,
 | MoE concurrent decode (N=8) | 166.9 t/s (W4 off) | **191.0 t/s** | +14.5% | W4 skinny fp16 M≤16 (`VLLM_GFX906_SKINNY_M16`, flag on, soak-verified; `DEVLOG-fp16-skinny.md`) |
 
 Correctness gates: PPL on a fixed 442-token probe — MoE band 6.6817–6.6942,
-dense band 6.6993–6.7197. Kernel test suites: 28/28 FA, 43/43 MoE GEMM (2026-08-24).
+dense band 6.6993–6.7197. Kernel suites: **89 FA tests collected** (2026-09-13,
+post-A3-strip; the last full run was 92/92 on 2026-09-12) and 43/43 MoE GEMM
+(2026-08-24, not re-run since).
 
 ## Model support status (single MI50, MI60 numbers similar)
 
@@ -55,7 +57,7 @@ request (4 samples) unless noted. Recipes: §Bench recipes +
 | **Gemma-4-26B-A4B-it-AWQ-4bit** (MoE) | **well supported, optimized** | **67.79** | — | no-zero-point W4A16 expert kernel (`gfx906/gemma4-moe-nzp` work, 1.79× over Triton); chat template required (thinking model); PPL/prompt_logprobs unreliable on this model — gate on coherent text + logprob A/B |
 | **cyankiwi/Ornith-1.5-35B-A3B-AWQ-INT4** (MoE VLM) | **supported (2026-08-25, in main via `gfx906/moe-ct-asym-zp`)** | **65.03** (A/B mean; band 64.995–65.079; decode-only 81.1) | TTFT 0.77 s @2048 | first **asymmetric** (stored int8 zp) CT W4A16 checkpoint: oracle gate + pass-through zp repack, no kernel change; 18.6× over the Triton arm (3.50) — but the Triton W4A16 `has_zp` branch is pathologically slow on gfx906 (267 ms/tok, both zp layouts) — `DEVLOG-ornith-wna16.md`; PPL 16.67 gfx vs 16.45 triton (fp16-noise band); class-parity with the flagship 67.39 |
 | **cyankiwi/Muse-Glimmer-30B-AWQ-INT4** (dense hybrid: GDN + full + sliding-2048, CT W4A16) | **supported (2026-08-27; in main 2026-08-28; TP=1 + TP=2)** | TP=1 in-process: **27.90** @B=1 all-CUSTOM window FA (1.59× vs hybrid 17.54) · **20.53** @B=4 (1.23× vs 16.75). TP=2 ngram n=5 serving (repetitive filler, **100 % acceptance ceiling**): bt2048 (boot K): **114.6** @2k/256 · 112.0 @2k/512 · **79.1** @8k/256 · 79.2 @8k/512 · **57.0** @16k/256 · 56.8 @16k/512 · B=4 @2k/256: **45.3** aggregate (~11.3/req); bt4096 (boot L, post q_pad fix + M1 gather clip): **111.5** @2k/256 · **~99** @8k/256 · B=4 @2k/256: **46.7** aggregate · real-prompt checks ~11.5/req (1–4 parallel) | TP=2 prefill (prefix-cache WARM): bt2048 **542** @2k · **491** @8k · **438** @16k; bt4096 (boot L): 496.9 @8k (cold first-chunk 452.4); TP=1 in-process prefill baseline: **~240 t/s** (32k prompt pass 135–137 s, bt4096 — the TRUE TP=1 rate, re-measured on the fresh boot of 2026-08-29 after boot M's ~2×-vs-TP=2-records scare; the ~450–540 t/s figures are TP=2, prefill scales ~2× with TP; `degradation*.md` 2026-08-29 rows); TP=1 gates: pp2048 tg256, 4 samples, prefix cache off | **Working TP=2 example** (boot K, 2026-08-27): `HIP_VISIBLE_DEVICES=0,1 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE vllm serve <snap> --served-model-name Muse-Glimmer-30B --tensor-parallel-size 2 --dtype float16 --max-model-len 131072 --max-num-seqs 4 --max-num-batched-tokens 4096 --kv-cache-memory-bytes 6442450944 --speculative-config '{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_max":2}' --compilation-config '{"cudagraph_capture_sizes":[6,12,18,24]}' --enable-auto-tool-choice --tool-call-parser muse_glimmer --reasoning-parser muse_glimmer --generation-config auto` — pool 848–904k tok (6.5–7× the 128k max), weights 12.7 GiB/GPU, graphs ~0.9 GiB; 256k ctx: add `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` (boot J, 1.36M-tok pool). First-prefill memory: boot J/K's "bt4096 OOMs the first 4096-chunk prefill" was the **per-impl q_pad bug** (52 impls × 256 MiB [num_seqs,Hq,Sq_pad,D] fp32 grown per impl on first prefill — DEVLOG-muse-glimmer.md round 4; fixed 2026-08-27, ClassVar) — **bt4096 re-validated clean on boot L** (cold 452 t/s @8k, 8.7 GiB headroom/GPU); the byte cap is still required (at util 0.82 the pool is sized from that profile — the engine logs the correction itself: 7.59 GiB fits the line, 9.02 was allocated). The filler is 100 % ngram-accepted (acceptance length 6.0) — decode numbers are a ceiling, not real-text. 52 layers (13 full + 39 sliding window-2048): sliding-window Q8 FA (window arg, both kernel copies) + direct-paged split-K + Phase C clip (direct-paged B≥2 decode dispatch; `GFX906_FA_LEGACY` orthogonal); TP=1 bench gates need an explicit 0.75 GiB KV cap + bt1024; `muse_glimmer` tool/reasoning parsers; records: `DEVLOG-muse-glimmer.md`, `degradation*.md` boot J/K |
-| **Qwen3.8-27B-AWQ-INT4** (dense) | **fully functional (TP=1 + TP=2)** | MTP k=2 TP=2 (2026-08-24 final): **59.2** @2k / 44.9 @8k / 25.2 @32k · **long-context post kv_split fix (2026-09-03): 37.95 @64k / 29.88 @96k / 25.70 @120k** · greedy TP=2: 40.8/38.1/30.5/24.1 @2k/8k/32k/64k · 28.62 @4k TP=1 (record) · 104.2 (N=8, W4 on) | — | `--dtype float16` required (auto-bf16→fp16 fallback landed); **kv_split clamp fix (`a6ff64a71b`) removed the old "MTP < greedy beyond ~20k ctx" live-ctx tax — MTP k=2 now ≈2× greedy at 64k+** (pre-fix 15.95/11.19/9.18 @64k/96k/120k vs post-fix 37.95/29.88/25.70; §Long-context decode with MTP below); MTP k=2 41.41 TP=1 (record, 2026-08-23; lifecycle fix byte-identical in graph mode); N=8 needs `--gpu-memory-utilization 0.90` (64 layers, FA KV 655 KB/token); TP=2 needs the official amdgpu DKMS driver + trimmed capture `[1,2,3,4]`; 445k-token KV pool — **256k context validated** (FA gather fix 2026-08-24, `oom-256k-prefill.md` §9); non-deterministic at temp=0 (token-identity gates unusable); records: `DEVLOG-tp2-dense.md` S1–S9, `DEVLOG-masked-fa.md`, `DEVLOG-qwen38.md` |
+| **Qwen3.8-27B-AWQ-INT4** (dense) | **fully functional (TP=1 + TP=2)** | MTP k=2 TP=2 (2026-08-24 final): **59.2** @2k / 44.9 @8k / 25.2 @32k · **long-context post kv_split fix (2026-09-03): 37.95 @64k / 29.88 @96k / 25.70 @120k** · **depth default since 2026-09-11: k=3** (mixed corpus: 27.44 @64k / 24.76 @120k vs k=2 27.30/22.65 = +9.3 % @120k, tie @64k; k=4 a loss on real payloads — `DEVLOG-mtp-depth-matrix.md`) · **agentic Python-coding headline (our CAT-1 corpus, 2026-09-13): 33.3 @64k / 25.0 @120k t/s with k=3 + CAT-1 (greedy 19.8/13.2 = 1.68×/1.89×)** · greedy TP=2: 40.8/38.1/30.5/24.1 @2k/8k/32k/64k · 28.62 @4k TP=1 (record) · 104.2 (N=8, W4 on) | — | `--dtype float16` required (auto-bf16→fp16 fallback landed); **kv_split clamp fix (`a6ff64a71b`) removed the old "MTP < greedy beyond ~20k ctx" live-ctx tax — MTP k=2 now ≈2× greedy at 64k+** (pre-fix 15.95/11.19/9.18 @64k/96k/120k vs post-fix 37.95/29.88/25.70; §Long-context decode with MTP below); MTP k=2 41.41 TP=1 (record, 2026-08-23; lifecycle fix byte-identical in graph mode); N=8 needs `--gpu-memory-utilization 0.90` (64 layers, FA KV 655 KB/token); TP=2 needs the official amdgpu DKMS driver + trimmed capture `[1,2,3,4]`; 445k-token KV pool — **256k context validated** (FA gather fix 2026-08-24, `oom-256k-prefill.md` §9); non-deterministic at temp=0 (token-identity gates unusable); records: `DEVLOG-tp2-dense.md` S1–S9, `DEVLOG-masked-fa.md`, `DEVLOG-qwen38.md` |
 | **Qwen3.6-27B / 3.6-35B-A3B** (fp16) | **not supported** | — | — | 52/67 GB fp16 checkpoints do not fit a 32 GB card; 3.6 GGUF only used as a llama.cpp reference point |
 | small AWQ models (e.g. Qwen3.5-9B-AWQ, 0.8B) | supported | — | 590–1483 (9B, eager) | fine on ≤0.85 util; FA prefill benchmarks in top-level README |
 
@@ -193,7 +195,7 @@ Deep-prompt prefill for the two prime dense models at max context
 (256k / 128k). B=1, tg=128, 2 samples, prefix caching OFF, bt4096,
 float16, capture `[1,2,3,4]`, no spec decode; KV 6 GiB (Muse,
 783,892-token pool) / 10 GiB (Qwen3.8, 323,414 — 256k max-len needs
-≥ 8.09 GiB). Canary 38.9 t/s healthy. csrc @ `cf5ccbd685` (M2 + M3
+≥ 8.09 GiB). Canary 38.9 t/s healthy. csrc @ `cf5ccbd685` (2026-09-13 tree `bbb087b65a`; M2 + M3
 hygiene, bit-identical). Harness: `_serve_tp2_gfx906.sh` +
 `_bench_serve_grid_gfx906.py` (`'[[32768,128],[65536,128],[112640,128]]' 2`).
 
@@ -238,28 +240,87 @@ tg=256, temp 0, n=3 reps, filler corpus s9.
 
 The old "MTP < greedy beyond ~20k ctx" live-ctx tax (FA gather/attention
 O(Sk)) is gone at k=2: post-fix MTP leads greedy by ~2× at 64k+ and still
-leads at short context (59.2 t/s @2k). **Long-context serving of Qwen3.8-27B
-on TP=2 should enable MTP k=2.** Raw data: `/local/tmp/mtp1/data_mtp_bootQ.jsonl`
-(pre-fix, boot Q) / `data_mtp_k2fix_bootS.jsonl` (post-fix, boot S).
+leads at short context (59.2 t/s @2k). Raw data:
+`/local/tmp/mtp1/data_mtp_bootQ.jsonl` (pre-fix, boot Q) /
+`data_mtp_k2fix_bootS.jsonl` (post-fix, boot S).
+
+**Depth (3 vs 2): k=3 is the long-context default — 2026-09-09/11, same-corpus
+A/B on the production payload** (`DEVLOG-mtp-depth-matrix.md`; v2 corpus = 20 %
+chat). 120k: **k=3 24.76 > k=2 22.65 (+9.3 %)**, and > k=4 (21.87, v1) by
+13.2 %; 64k: k=3 27.44 vs k=2 27.30 = tie. On the pure s9 filler both are
+perfect-acceptance (s9 says nothing about depth — the k=5 s9 "+11.4 %" is a
+*ceiling*, not a prediction). Mechanism: k=3's 4-row verify pads into the same
+occ-2 FA tile as k=2; k=4 (5 rows → pad 8) crosses to the occ-1 slow tile.
+**Enable MTP k=3 for long-context serving on TP=2** (capture sizes multiples of
+k+1 = 4); k=2 for short/copy-light.
+
+### Headline: agentic Python coding on our own corpus (2026-09-13)
+
+The tables above use synthetic filler; this is the workload we actually serve.
+Qwen3.8-27B-AWQ-INT4, TP=2, `--max-model-len 131072`, tg=256, temp 0, **our own
+CAT-1 corpus** — 15.5 M tokens of pi/hermes **agentic Python coding** traffic
+(`docs/gfx906/CAT1-corpus-build.md`), 8 distinct bodies per point, prefix cache
+off so every rep pays its full prefill, 2 reps per cell (boot f27e8058, mclk
+verified 1000 MHz):
+
+| ctx | prefill | greedy | MTP k=3 | **MTP k=3 + CAT-1** | uplift |
+|---|---:|---:|---:|---:|---:|
+| 64k | 277 t/s | 19.80 | 33.28 | **33.26** | **1.68×** vs greedy |
+| 120k | 226 t/s | 13.17 | 24.74 | **24.95** | **1.89×** vs greedy |
+
+Acceptance (mean accepted per step) at 120k is the strongest in the fork's
+records — 2.05/2.15 for plain k=3, 1.99/2.07 with CAT-1 — because a long agentic
+tail is copy-heavy, which is exactly CAT-1's operating point. CAT-1 and plain
+k=3 are a tie here (within the arm's own rep spread); its benefit is the
+**per-step** one, measured under control on 11 identical 8k prompts × 2 reps:
+**−2.52 ms/step [−2.91, −1.94] ⇒ +4.8 % mean / +5.9 % median t/s**, acceptance
+no detectable penalty. So quote **~33 t/s @64k / ~25 t/s @120k** for agentic
+coding on TP=2, and read the CAT-1 gain from the controlled A/B, not from this
+session's 2-rep cells.
 
 ## Bench recipes
 
 Canonical environment is the **local editable `.venv`** (docker images are
-legacy; both documented in `running.md`). MoE:
+legacy; both documented in `running.md`). Harness: `docs/gfx906/_bench_gfx906.py`
+— prints `BENCH: {json}` with per-sample t/s and `mclk_median_mhz`.
+
+**Two things that change the answer more than the code does:**
+
+1. **Metric basis — `BENCH_PREFIX_CACHE` (default `0` = OFF since 2026-08-27).**
+   `=1` reproduces the historical DEVLOG numbers (the 4 samples share a prompt,
+   so samples 2-4 reuse the prefix and their prefill is nearly free); `=0` bills
+   every sample's full 2048-token prefill. Same build/boot: MoE 65.91 vs 58.43,
+   dense 24.82 vs 16.27 t/s. Always state which basis a number came from.
+2. **mclk — sampled per timed window by the harness** (idle 350 MHz inflates
+   cold-clock numbers ~3×; a median < 900 MHz prints a loud warning).
+   `dvfs-mi50.md` has the ground rules.
+
+Profiler plugins are installed as entry points (`agdn_phase`, `syv9_phase`,
+`t1_cap`, `mtp1_phase`, `pfk4_phase`); their hooks do file I/O in the hot path
+and make dynamo AOT fail (`Attempted to call function marked as skipped:
+posix.stat`). Allowlist them away for any bench:
 
 ```bash
-# /opt/rocm is the default ROCm toolchain — no env sourcing needed (HK-1).
-HIP_VISIBLE_DEVICES=0 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE HF_HUB_OFFLINE=1 \
-BENCH_EAGER=0 BENCH_PP=2048 BENCH_TG=256 BENCH_MAXLEN=3328 BENCH_GPU_UTIL=0.95 \
-BENCH_BATCHED_TOKENS=4096 BENCH_CG_MODE=FULL_DECODE_ONLY \
-BENCH_LOAD_FORMAT=fastsafetensors BENCH_SAMPLES=2 \
-.venv/bin/python /tmp/bench/_b.py /local/models/QuantTrio/Qwen3.5-35B-A3B-AWQ
+export VLLM_PLUGINS=quark_online_quant
 ```
 
-Dense 27B (NFS model; no fastsafetensors; smaller KV):
-`BENCH_GPU_UTIL=0.92 BENCH_KV_MEM=6442450944 BENCH_MAXSEQS=8
-BENCH_BATCHED_TOKENS=4096 BENCH_TEXT_ONLY=1` with model path
-`/data/models/qwen/Qwen3.5-27B-AWQ`.
+MoE (**`/data/models/QuantTrio/Qwen3.5-35B-A3B-AWQ`** — the `/local` copy is
+gone since 2026-09; a wrong path makes vLLM treat it as an HF repo id and abort
+with `HFValidationError`):
+
+```bash
+HIP_VISIBLE_DEVICES=0 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE HF_HUB_OFFLINE=1 \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 BENCH_EAGER=0 BENCH_SAMPLES=4 \
+BENCH_PP=2048 BENCH_TG=256 BENCH_GPU_UTIL=0.95 BENCH_MAX_SEQS=32 \
+BENCH_PREFIX_CACHE=1   # omit/0 for the cold-prefill basis \
+.venv/bin/python docs/gfx906/_bench_gfx906.py /data/models/QuantTrio/Qwen3.5-35B-A3B-AWQ
+```
+
+Dense 27B (`/data/models/qwen/Qwen3.5-27B-AWQ`, NFS): identical except
+`BENCH_MAX_SEQS=4` (the GDN state pool needs the room; higher OOMs on the first
+chunk). Harness knobs: `BENCH_PP/TG/GPU_UTIL/BATCHED_TOKENS/MAXLEN/SAMPLES/
+WARMUP/EAGER/MAX_SEQS/PREFIX_CACHE/CG_MODE/CG_MAX/KV_MEM/NREQS/DTYPE/
+SPEC_CONFIG/MOE_BACKEND/ATTN_BACKEND(+_KIND)/MODEL`.
 
 Long-context TP=2 serve sweep (2026-08-29 recipe):
 `_serve_tp2_gfx906.sh start <tag> <snap> <name> <max-len> <tool> <reason>`
@@ -291,16 +352,16 @@ targets matrix cores; gfx906 has none).
 
 | env | default | effect |
 |---|---|---|
-| `GFX906_FA_LEGACY` | 1 | fp16 KV cache + in-kernel Q8 quantize (validated serving default); `0` = Q8 pre-quantized at KV write into a side **view aliased into the fp16 K half** — zero extra KV memory, COW-safe (page copies move the Q8 bytes); attention reads the Q8 directly instead of re-quantizing per read. 2026-08-27: 46/46 suite + default-config and prefix-cache smokes clean. **Orthogonal to the read pattern** (`GFX906_FA_DIRECT_PAGED*`): direct-paged is LEGACY=0-only (round-7 erratum); LEGACY=0's distinct contribution is the Q8 read (no repeated inline quantize). **TP=2 bake executed 2026-08-28 (roadmap M5, boot M): LEGACY=0 was SLOWER than the LEGACY=1 control at every point** (B=1 decode −2.5…−3.7 % @2k/8k; B=4 @2k aggregate −27…−31 %; prefill wash). ****Default stays `1`**; `0` remains an experimental opt-in (zero-extra-KV-memory alias, COW-safe). Round 10 (M6 Part B, same day): rerouting LEGACY=0 B≥2 to the fused-Q8 gather (`GFX906_FA_DIRECT_PAGED_Q8=0`, now the default) recovered B=4 @2k to 35.7 → 46.3 t/s — parity with the 46.7 LEGACY=1 control (same-boot adjudication since run and closed: −6.3 %, see the row end) — with B=1/prefill unchanged; direct-paged is opt-in (=1) with no measured advantage. Mechanism (review-softened 2026-08-28): NOT an int8-compute gap (`v_dot4_i32_i8` is full-rate on gfx906, 4 int8 MAC/cyc, 2× packed fp16; both arms share the same dot — `DEVLOG-fa-attention.md` 2026-08-28 entry). The loss is **Sq>1-specific** — the in-process Sq=1 A/B on the identical strided-read path was a wash, which the read-layout theory alone cannot explain; direct-paged's strided Q8-slice reads (136 B slices inside 256-B row strides, 34-B block strides → sector waste) remain the **leading but unconfirmed** hypothesis, with the Sq>1 machinery (round-8 Q-pad/unpad fast paths, graph-capture interaction) at least a co-contributor — devlog round-10 erratum. The flip gate's B=4 half is green; the B=1 same-boot adjudication ran 2026-08-29 (boot O): LEGACY=0 −6.3 % (−6.4 % with direct-paged) — flip CLOSED, default stays 1 (`DEVLOG-fa-legacy0-b1-decode.md`) |
+| `GFX906_FA_LEGACY` | 1 | fp16 KV cache + in-kernel Q8 quantize (validated serving default); `0` = Q8 pre-quantized at KV write into a side **view aliased into the fp16 K half** — zero extra KV memory, COW-safe (page copies move the Q8 bytes); attention reads the Q8 directly instead of re-quantizing per read. 2026-08-27: 46/46 suite + default-config and prefix-cache smokes clean. **Orthogonal to the read pattern** (`GFX906_FA_DIRECT_PAGED*`): direct-paged is LEGACY=0-only (round-7 erratum); LEGACY=0's distinct contribution is the Q8 read (no repeated inline quantize). **TP=2 bake executed 2026-08-28 (roadmap M5, boot M): LEGACY=0 was SLOWER than the LEGACY=1 control at every point** (B=1 decode −2.5…−3.7 % @2k/8k; B=4 @2k aggregate −27…−31 %; prefill wash). ****Default stays `1`**; `0` remains an experimental opt-in (zero-extra-KV-memory alias, COW-safe). Round 10 (M6 Part B, same day): rerouting LEGACY=0 B≥2 to the fused-Q8 gather (`GFX906_FA_DIRECT_PAGED_Q8=0`, now the default) recovered B=4 @2k to 35.7 → 46.3 t/s — parity with the 46.7 LEGACY=1 control (same-boot adjudication since run and closed: −6.3 %, see the row end) — with B=1/prefill unchanged; direct-paged is opt-in (=1) with no measured advantage. Mechanism (review-softened 2026-08-28): NOT an int8-compute gap (`v_dot4_i32_i8` is full-rate on gfx906, 4 int8 MAC/cyc, 2× packed fp16; both arms share the same dot — `DEVLOG-fa-kernel-batches.md` M5 entry). The loss is **Sq>1-specific** — the in-process Sq=1 A/B on the identical strided-read path was a wash, which the read-layout theory alone cannot explain; direct-paged's strided Q8-slice reads (136 B slices inside 256-B row strides, 34-B block strides → sector waste) remain the **leading but unconfirmed** hypothesis, with the Sq>1 machinery (round-8 Q-pad/unpad fast paths, graph-capture interaction) at least a co-contributor — devlog round-10 erratum. The flip gate's B=4 half is green; the B=1 same-boot adjudication ran 2026-08-29 (boot O): LEGACY=0 −6.3 % (−6.4 % with direct-paged) — flip CLOSED, default stays 1 (`DEVLOG-fa-legacy0-b1-decode.md`) |
 | `GFX906_FA_FUSED_QUANT` | 1 | fuse quantize into the decode KV gather (bit-equal); `0` kill switch |
 | `GFX906_FA_NC2` | 8 (auto-downgrade) | GQA heads packed per KV block; instantiated {1,2,8}; invalid explicit value = error |
-| `GFX906_FA_KVSPLIT` | gather 16; direct-paged `clamp(16/B,2,8)` | decode KV-split factor (one knob, two paths — an exported value pins BOTH; safe explicit values: gather `16`, direct-paged `8` at B≤2 / `2` at B≥4); `1` disables; `0` is NOT the unset default (it clamps to 1). The gather path's fixed `16` is B=1-tuned: at B=4 it costs ~+18 % extra combine-traffic vs the batch-scaled formula (documented in `csrc/gfx906_fa/gfx906_fa.cpp`) — the round-10 reroute's +29.7 % net win is *despite* this; a batch-aware gather split is a follow-up candidate |
+| `GFX906_FA_KVSPLIT` | shape-aware per path (2026-09-06): gather **32 @ Sq≥4 / 16 @ Sq<4** (`dfed62f133`); direct-paged `fa_paged_kv_split_default(seq_q, batch)` = 32 @ Sq≥4, its own batch clamp (8/8/5/2/2 at B=1/2/3/4/8) below that (`fa7e1e20b9`) | decode KV-split factor (one knob, two paths — an exported value pins BOTH; safe explicit values: gather `16`, direct-paged `8` at B≤2 / `2` at B≥4); `1` disables; `0` is NOT the unset default (it clamps to 1). The gather path's fixed `16` is B=1-tuned: at B=4 it costs ~+18 % extra combine-traffic vs the batch-scaled formula (documented in `csrc/gfx906_fa/gfx906_fa.cpp`) — the round-10 reroute's +29.7 % net win is *despite* this; a batch-aware gather split is a follow-up candidate |
 | `GFX906_FA_CG` | UNIFORM_SINGLE_TOKEN_DECODE | FA cudagraph-support mode |
 | `GFX906_FA_DIRECT_PAGED` / `_MIN_BATCH` / `_MAX_SQ` | auto / 2 / 16 | direct-paged decode path gating |
 | `GFX906_FA_DIRECT_PAGED_Q8` | 0 | LEGACY=0-only B≥2 route selector: `0` (default since round 10, 2026-08-28) = fused-Q8 gather (B=4 @2k ngram serving 35.7 → 46.3 t/s, parity with the 46.7 LEGACY=1 control within cross-boot uncertainty; the M1 gather clip stays active); `1` = direct-paged (opt-in experiment route — it lost the M5 bake −27…−31 % at B=4 @2k and was a wash in the in-process Sq=1 A/B; the in-process harness cannot see the loss, only the ngram serving regime). Validated on Muse-Glimmer TP=2 ngram n=5 only — other LEGACY=0 configs (TP=1, MTP Sq=2) are unmeasured. `=0` gives up direct-paged's zero-gather-allocation property: a one-time bounded shared-buffer grow (~0.1–0.4 GiB at B=8/Sk=61k — the same grow-only buffer production LEGACY=1 already runs at every batch size; the stale 24 GiB OOM figure in the header comment predates the ClassVar sharing fix) |
 | `GFX906_FA_WINDOW_CLIP` | 1 | Phase C window-start clip (kernel floors to the KV-tile boundary when the gained keys are mask-killed, so the result is bit-identical to the masked full scan); `0` kill switch (numerically identical, slower). **Since M2 (2026-08-28) it covers prefill chunks too, both dispatch paths**: decode (direct-paged, auto B≥2/Sq≤16 — LEGACY=0 only, round-7 erratum) and the DIRECT_PAGED prefill chunk-start clip (the `max_seqlen_q == 1` gate was dropped); under the LEGACY=1 default prefill B=1 the gather path's clip (`GFX906_FA_GATHER_CLIP`) is the active source. e2e gate +3.6% @ pp8192/B=2 (DEVLOG-muse-glimmer 2026-08-27 round 3) |
 | `GFX906_FA_GATHER_CLIP` | 1 | M1: the same window-start clip for the **gather path** (persistent gather, B≤16, any Sq — the B=1 decode default and all prefill): the persistent gather writes only rows `[kv_start, seq_len)` at absolute positions (a 128-row margin covers the kernel's tile-boundary floor) and the FA kernel starts its k-loop there — rows `[0, kv_start)` are never written or read. Bit-identical to the unclipped full gather + scan (unit-gated, `_GATHER_CLIP` 0/1 A/B at Sq=1/6, B=1/2, unaligned L/W); `0` kill switch. The gather work and the FA k-loop both shrink by `min(seq_len, seq_len - 1 + 1 - window)` rows |
-| `GFX906_FA_TILE_CLIP` | 1 | M2 (2026-08-28, branch `feat/fa-m2-tile-clip`): the two **per-q-tile** FA scan bounds — (1) raise `k0_base` to the tile's own window start (clip mode only, complements the sequence-level clips above, which stay the kill switches for the *source*), (2) cap `k_VKQ_max` at the tile's last row + 1 (fires for **any** chunked prefill with q_abs_offset, window or not — a general prefill win: the causal cap alone cuts first-chunk FA work ~2×). Skipped tiles are exact no-ops (P=0, KQ_max unchanged) → bit-identical; `0` disables both M2 bounds only (the M1 floors stay). A/B: read per call — eager A/B works in-process; FULL-captured graphs bake the value (M2 is prefill-only, so that never matters today). Gate (DEVLOG-fa-attention.md 2026-08-28/29 M2 entries): 65/65 suite + kernel A/B 3.19×/2.81× windowed, **2.22×/1.96× causal-only first-chunk (a general prefill win for any model)** + e2e A/B **+11.8 % wall / +14.8 % prefill @ pp16384 windowed**, +0.73 % @ pp2048 full-attention-hybrid (GEMM-dominated; both samples agree in direction) |
+| `GFX906_FA_TILE_CLIP` | 1 | M2 (2026-08-28, branch `feat/fa-m2-tile-clip`): the two **per-q-tile** FA scan bounds — (1) raise `k0_base` to the tile's own window start (clip mode only, complements the sequence-level clips above, which stay the kill switches for the *source*), (2) cap `k_VKQ_max` at the tile's last row + 1 (fires for **any** chunked prefill with q_abs_offset, window or not — a general prefill win: the causal cap alone cuts first-chunk FA work ~2×). Skipped tiles are exact no-ops (P=0, KQ_max unchanged) → bit-identical; `0` disables both M2 bounds only (the M1 floors stay). A/B: read per call — eager A/B works in-process; FULL-captured graphs bake the value (M2 is prefill-only, so that never matters today). Gate (DEVLOG-fa-kernel-batches.md 2026-08-28/29 M2 entries): 65/65 suite + kernel A/B 3.19×/2.81× windowed, **2.22×/1.96× causal-only first-chunk (a general prefill win for any model)** + e2e A/B **+11.8 % wall / +14.8 % prefill @ pp16384 windowed**, +0.73 % @ pp2048 full-attention-hybrid (GEMM-dominated; both samples agree in direction) |
 | `GFX906_FA_NO_WINDOW` | 0 | truthy = disable sliding-window masking on all layers (wrong output beyond the window; warns; perf A/B arm only) |
 | `VLLM_GFX906_DENSE_GEMV` | 1 | M=1 dense GEMV dispatch; `0` kill switch |
 | `GFX906_GDN_EMPTY_CORE_OUT` | 1 | skip the dead GDN core_attn_out zero-fill |

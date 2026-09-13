@@ -75,6 +75,17 @@ major ongoing theme, with the model/branch/date in the file header:
 
 - `DEVLOG-moe-*.md` — the MoE expert-kernel train (Qwen35, M=1 sprint, gemm1 retiling)
 - `DEVLOG-fa-attention.md` — the custom Q8 FA / decode backend + fused-gather track
+- `DEVLOG-fa-kernel-batches.md` — FA kernel batches: M5 ISA-rate refutation, M3
+  hygiene, M2 per-q-tile prefill clip (2026-08-28/29)
+- `DEVLOG-fa-verify-sq8.md` — FA verify-shape deep-dive: KVSPLIT shape-aware
+  default, the closed no-win option space, R3
+- `DEVLOG-syv12.md` — SYV-12 fill-from-draft-buffer (+ SYV-13); parked/stripped
+- `DEVLOG-mtp-depth-matrix.md` — MTP depth on the real payload (k=2/3/4/5); k=3
+  serving default
+- `DEVLOG-draft-vocab.md` — CAT-1 draft-vocabulary corpus + list (see also
+  `CAT1-corpus-build.md`)
+- `DEVLOG-ttft-prefill-stall.md` / `ttft-prefill-stall.md` — TTFT / prefill-stall
+  campaign (incl. the B=4/120k envelope)
 - `DEVLOG-fa-splitk-accuracy.md` — the FA split-K accuracy track (M4 closure;
   split-defaults-vs-fp32-ref pins)
 - `DEVLOG-fa-legacy0-b1-decode.md` — the LEGACY=0 B=1 decode-gap track

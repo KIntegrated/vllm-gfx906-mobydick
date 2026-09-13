@@ -10,6 +10,282 @@ E=256, topk=8, hidden=2048, W4A16 group-128 experts; B=1 decode step
 ≈ 15 ms at 66.5 t/s. Priority = expected gain × confidence ÷ effort+risk;
 tiers are do-order, sections within a tier are ordered the same way.
 
+## High priority — user-requested (2026-09-12)
+
+### DFL2-1 — DFlash2 n-gram chains: drafter-free verify blocks while a request copies its context (**HIGH PRIORITY**, Kevin 2026-09-12)
+
+**Kevin 2026-09-12.** Port `patches/dflash2-ngram-chains.patch` from
+`../qwen38-27b-rtx3090` (`VLLM_DFLASH2_CHAIN=1`): while a request keeps
+reproducing its context, whole verify blocks are proposed from the request's
+own token history and **the drafter's forward plus its graph replay are
+skipped** until the first rejected token. Upstream evidence: **+7 % on the copy
+cell** (256.9 → 276 tok/s at `DFLASH_TOKENS=7`), flat on prose, greedy-only by
+default (`VLLM_DFLASH2_CHAIN_GREEDY_ONLY=1`), requires `LOOKUP=1`.
+
+**Why this one, not SYV-12.** It *removes* work (a whole drafter pass per copy
+step) where SYV-12 *adds* a verify row to every step. Our MI50 stack is
+launch/bandwidth-bound and the always-paid row is what sank SYV-12
+(`/local/tmp/b4/syv12-structural-analysis.md`: 16 % fill fire rate on our own
+pi traffic, ≤ +4 % tokens/step gross against a +1-row-every-step cost). Our
+traffic also has **more copy-tail headroom than upstream's chat prompts**
+(≈3.7–4 % of accepted tokens vs their measured 0.65 %), because agentic turns
+write files back out — so a mechanism that is free when idle and big when
+copying is the right shape here.
+
+**Prerequisites (a stack port, not one patch).** (1) V2 runner up to speed on
+gfx906 — see **DFL2-2** (DFlash2 drafts force V2); (2) a DFlash2 draft
+checkpoint — the W4A16-GPTQ `syvai/Qwen3.8-27B-DFlash2-W4A16` (1.2 GB) is
+*plausibly* runnable here now that the gfx906 GPTQ path is confirmed
+(`gptq_gemm`, `gptq_gemm_rdna3`, `moe_gptq_gemm_gfx906`; `auto_gptq.py:192`
+restricts act dtypes to fp16 on gfx906 and `:256` routes MoE to WNA16 — so the
+bf16 3.85 GB drafter is no longer the only option); (3) the lookup patch
+(`dflash2-lookup-drafting.patch`) — it targets
+`v1/worker/gpu/spec_decode/dflash2/speculator.py`, `v1/worker/gpu/model_runner.py`
+and `cudagraph_utils.py`, **the same layout we already carry** (the dflash2
+backport is in our main: `vllm/model_executor/models/qwen3_dflash2.py`,
+`vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py`, registry
+`DFlash2DraftModel`, `config/vllm.py:642` force-V2).
+
+**Gate:** serving A/B on a copy-dense payload (document reproduction /
+apply-edit) showing the upstream-class gain, plus a chat/agentic payload
+confirming flat, plus a token-identity check (upstream: 7/9 long greedy prompts
+identical). Do **not** gate this on our current chat/agentic corpora alone —
+by upstream's own table the copy cell is the only place it pays.
+
+**Effort:** medium-high (V2 + 3 patches + a 1.2 GB checkpoint); **risk:**
+medium (V2 never measured on gfx906 for our models — DFL2-2 de-risks it first).
+
+### DFL2-2 — V2 runner up to speed on gfx906 (0.29.0 makes V2 the default; V1 removal scheduled) (**HIGH PRIORITY**, Kevin 2026-09-12)
+
+**Why now.** vLLM 0.29.0 makes the V2 model runner the default and V1 is
+scheduled for removal in a few releases; DFlash2 and DSpark drafts **force V2
+today** (`config/vllm.py:642`). Every gfx906 optimization and serving gate on
+record — custom FA backend metadata, GDN/mamba ops (incl. the SYV-10 bounds
+port), mamba state-pool sizing, the trimmed capture ladder, default-ON FIX-H2
+and M3 — has only ever been validated on **V1**. V2 carries a `mamba_hybrid`
+model state, so it *claims* our Qwen3.5/3.8 GDN hybrids, but it has never been
+measured here.
+
+**First datapoint (in flight, 2026-09-12):** `VLLM_USE_V2_MODEL_RUNNER=1` +
+MTP k=2 + the real agentic payload, one weight load
+(`/local/tmp/mtp1/v2_probe_driver.sh`), compared against the V1 baseline
+measured minutes earlier on the same boot.
+
+**Work items if it loads:** (a) confirm the gfx906 FA backend is actually
+selected under V2 (log the attention backend name); (b) re-run the standard
+gates — single-card dense-27B and MoE-35B `docs/gfx906/_bench_gfx906.py`,
+then a TP=2 serving A/B at parity vs V1; (c) re-check the trimmed-capture
+assumption (`cudagraph_capture_sizes`) against V2's cudagraph utils;
+(d) re-validate the default-ON fixes under V2's metadata construction (V2
+passes *full-length* host/device `query_start_loc` slices in `mamba_hybrid`,
+unlike V1's `[:num_reqs_padded+1]` — see the review-trains T1/M3 notes);
+(e) decide the fate of the branch's V2 SYV-12 wiring
+(`vllm/v1/worker/gpu/model_runner.py`, archive-bound per T6) — V2 revival of
+SYV-12 needs those hunks.
+
+**⚠ Re-investigate before closing (2026-09-13).** The branch currently records
+"V2 forced on Qwen3.8-GDN ⇒ init wedge ⇒ unsupported-by-design". A single
+`hipErrorLaunchFailure` at init is **not** architecture evidence on this box:
+wedges #67–#71 hit the pristine snapshot and non-GDN work with the identical
+signature (load lottery; one authorized retry normally loads clean), so the V2
+conclusion needs a **fresh-boot retry** before GDN is written off — with 0.29.0
+making V2 the default this is a cadence risk, not a detail. Related: the fork's
+**A3 fused-draft opt-in was stripped** (2026-09-13, `VLLM_GFX906_FUSED_DRAFT`;
+brief `/local/tmp/b4/a3-strip-decision.md`, archive `archive/a3-fused-draft`).
+A3 is a V2-only accelerator (the fused loop lives in
+`v1/worker/gpu/spec_decode/autoregressive/speculator.py`, upstream), so if V2
+becomes our path the strip has to be revisited: re-add the ~7-line opt-in and
+re-run the no-op contract audit at the serving k (A3's own k=4 gate was NEUTRAL,
+k=7 was never measured).
+
+**V2 revival detail — variable draft width (2026-09-13).** The branch's V2
+footprint is now **zero**: the SYV-12 ext-column wiring and the two hunks it
+required in V2 files — the truncating draft assign in
+`vllm/v1/worker/gpu/model_runner.py`
+(`draft_tokens[idx_mapping, :draft_tokens.shape[1]] = draft_tokens`, which
+leaves the tail columns holding *stale drafts from the previous step*) and the
+relaxed per-position assert in `vllm/v1/spec_decode/metrics.py` — are reverted
+and preserved on `archive/syv12`. If a future V2 feature reintroduces a
+variable draft width (renewed ext column, or upstream's per-request
+adaptive-verification budgets), **do not** re-apply the truncating assign:
+size the buffer to the max, zero/pad the tail (or pass an explicit per-request
+count downstream), assert the width, and add a test. Upstream's whole-row
+assign fails loudly on a width mismatch — a feature to keep, not to paper over.
+
+**Gate:** same-boot V2-vs-V1 serving A/B at parity or better on both served
+models; otherwise V2 readiness becomes a merge-cadence blocker at 0.29.0.
+
+**Effort:** medium (mostly measurement + fixing whatever V2-specific gaps
+appear); **risk:** low-medium (probe first, one load, no new code).
+
+## High priority — user-requested (2026-09-10)
+
+### VIT-1 — serve the Qwen3.5-family ViT shapes from the custom FA (user request 2026-09-12: kill the Triton ViT path)
+
+**Kevin 2026-09-12.** Extend `gfx906_fa` (the CUSTOM attention backend) to
+also serve the vision-tower shapes of the Qwen3.5 VL family so the ViT
+stops going through the Triton-AMD flash-attention path. Wins: (a) **no
+per-boot Triton JIT compile / graph-capture stall for the ViT** (the
+`__triton_launcher.c` first-boot compile + capture adds ~tens of seconds
+to every fresh boot and every fresh container), (b) **ViT prefill
+performance** — the ViT runs on the critical path of every image-bearing
+prompt (text+image prefill pays it), and the Triton FA is not MI50-tuned,
+(c) one attention code path — the triton-AMD flash-attn package (editable
+install, `flash_attn_2_cuda` build) becomes removable from the serving
+deps.
+
+Shapes (Qwen3.5/3.8 ViT, SigLIP-style, from the shipped config:
+`hidden_size=1152`, `num_position_embeddings=2304` (48×48 patches),
+`patch_size=16`, `spatial_merge_size=2`, `out_hidden_size=5120`,
+`deepstack_visual_indexes=[]`): **full attention (no window mask in this
+cfg), ~16 heads × head_dim 72, sequences ≈ 2304/merge-tile positions,
+prefill-only (no decode), fp16 KV** — i.e. small head_dim, short seqs,
+batch-over-image-tiles: a very different kernel regime from the LLM path
+(head_dim 256, Hkv 4, 122k contexts, Q8 K).
+
+Work items: (1) extract the exact ViT tensor shapes + dtypes from a
+traced image-bearing forward (the Triton path's ViT entry, or
+`Qwen3_5VisionTransformer` in `qwen3_5.py`); (2) decide fp16-KV FA vs
+Q8-K for head_dim 72 — the Q8 path's int8 dot is tuned for D=256;
+D=72 may prefer plain fp16 FMA tiles or a D-padded variant; (3) route
+the ViT layers through `forward_paged`/dense-FA with the right tiling
+(ncols1 sweep at D=72); (4) screens: ViT output allclose vs the Triton
+path on a fixed image batch, then a boot-time + image-prompt TTFT A/B.
+Effort: medium (a new tiling/shape family in the kernel + launcher);
+risk: low (fallback stays).
+
+### TP-1 — TP-scaling probe: prefill + decode vs TP, the TP=4 question (queued after the 120k×B4 campaign)
+
+**User request 2026-09-10.** How well do prefill and decode scale with TP;
+would TP=4 pay off? Expectation to test: memory-bw-bound decode should still
+improve with TP (memory access spread over the aggregate HBM of the GPUs).
+**2× MI50 only → TP=4 is not available; TP=2 is the ceiling** (TP=4 answered
+counterfactually). Full analysis + probe design:
+[`ttft-prefill-stall.md` §13.11](ttft-prefill-stall.md).
+
+- **Prefill** = compute-bound → scales ~linearly (measured ~2× at TP=2,
+  Muse 240→500 t/s @32k). TP=4 → ~4×.
+- **Decode** = memory-bw-bound; the bandwidth term (weights ~20 GB loaded LM
+  [21 GB on-disk VL ckpt] + KV 64 KB/token, weight-dominated to ~234k ctx)
+  **does** halve at TP=2 (expectation holds), but a large TP-invariant term
+  (CPU fixed cost + 64-layer per-layer all-reduce, latency-bound at M=1)
+  blunts the net to ~parity at short ctx (measured 39.74 → 39.7 t/s). KV term
+  grows with ctx → scaling should improve at long ctx, but stays
+  weight+fixed-bound for this model to ~234k.
+- **Probe** (two wedge-light loads, GPU0 only), **1 sample/point** (Kevin's
+  2026-09-10 cut, applied — the handoff is low-risk): **(a)** TP=1 greedy, no
+  spec, util 0.93, B=1, at **pp ∈ {32768, 65536} × tg=256** → prefill
+  TTFT/t·s (clean TP ratio vs 442/364) + decode t/s (long-ctx decode scaling,
+  never measured at TP=1). **(b)** TP=1 MTP k=3, B=1, same grid → the
+  **compute-regime test**: MTP verify runs M=1+k (k=3→4/req, more
+  compute-bound than greedy M=1), so TP=2 MTP decode should beat TP=1 MTP by
+  *more* than the greedy parity — compare vs the existing TP=2 MTP k=3 B=1
+  anchors (09-09: 64k×3, 120k×2).
+- **120k point DROPPED — does not fit TP=1.** 21 GB on-disk weights (LM-only
+  loads ~20 GB) leave only ~6 GB KV at util 0.93 ≈ **~90k tokens** (correcting
+  the earlier "~160k / fits 120k" — that assumed ~15 GB weights). 64k fits
+  with headroom and still answers the scaling question. B=4 MTP is also not
+  runnable at TP=1 (4×120k=480k ≫ 90k).
+- **Driver ready** (`/local/tmp/b4/run_postcampaign.sh`, safe startup tears
+  down the orphaned campaign server itself). **Queued after the 120k×B4
+  campaign** (TP=1 = the canary load pattern, least wedge-prone).
+
+### FD-1 — measure the MTP fused-draft path at B=4/TP=2 (queued after campaign, 2026-09-10)
+
+**STATUS 2026-09-13 — EXECUTED: VERDICT NEUTRAL, stack-confounded.** FIX arm
+2377.6 s vs non-FD *serving* 2447.8/2464.9 s at 4×122880 (offline arm vs
+serving control — the comparison is confounded, `DEVLOG-spec-decode.md`
+2026-09-12). The flag's only reader in-tree was A3's opt-in, **stripped
+2026-09-13** (`f8a9400789`), so **do not re-queue this arm as-is** — it would
+silently duplicate the non-FD arm. Revival: restore from
+`archive/a3-fused-draft` (`A3-REVIVAL.md`) and re-gate **same-stack** (same
+build/harness, flag on/off). Keep-or-strip analysis:
+`/local/tmp/b4/fd1-keep-strip-decision.md`.
+
+**Context (Kevin, 2026-09-10).** Most branch perf work is ON by default in the
+B=4 bench (FA fused/persistent/fused-quant/CG-decode, direct-paged auto → on
+for B=4 decode, kv_split shape-aware clamp, GDN opts, max-ilp, J2G-1 RCCL
+Tree+LL). The one MTP perf improvement that is **OFF** is
+`VLLM_GFX906_FUSED_DRAFT` (default `0`; the code marks it as still needing a
+serving A/B before default-on). It fuses the draft-decode metadata path and is
+likely to help *more* at B=4 (bigger verify M → more compute to fuse).
+**Measurement:** **mtp3b4 + `VLLM_GFX906_FUSED_DRAFT=1`** same config as
+mtp3b4 (port 8141, k=3, capture [4,8,12,16], util 0.93, NOCACHE=1) at 122880
+B=4 ×1, A/B vs the plain mtp3b4 arm. Single variable = the env flag. SYV-12 is
+**not** in scope (gated off + k=2-only, the mtp3b4 arm is k=3 — see TP-1 note
+/ item 2). **LAST + OPTIONAL arm** (highest run-risk: activates a default-OFF
+unvalidated serving path — skip if any wedge has occurred first).
+
+**Wedge budget (tonight, 1 sample/arm per Kevin's 2026-09-10 cut):** campaign
+greedy4 ×2 (in progress, undisturbed) → mtp3b4 ×1 (1 load) → TP-1 greedy (1
+load) → TP-1 MTP (1 load) → FD-1 ×1 (1 load, optional) = 4 more loads. House
+rules: 1 retry per genuine wedge, 2 consecutive → stop + reboot. **The cut is
+applied only because the handoff is low-risk** (the post-campaign driver tears
+down the orphaned server itself; if the handoff state looks risky, run mtp3b4
+×2 instead — do not force the cut).
+
+### MBT-1/2/3 — cut the multi-batch prefill O(live-context) tax (analysis 2026-09-11)
+
+**Analysis:** [`prefill-multibatch-tax.md`](prefill-multibatch-tax.md).
+The B=4/120k clean wall (75.4 min/sample, s0) is dominated by a **per-step
+cost ∝ the SUM of live request contexts (A)** — the validated step model
+`c(n)=2.63 s + 34.1 µs·n` (`ttft-prefill-stall.md` §10) gives ~5320 s for the
+480k batch vs ~568 s lone (the tax is the whole B=4-vs-4×B=1 gap). The slope
+owner is **UNRESOLVED — host pass vs GPU-side pool-wide op** (CORRECTED
+2026-09-11, arbiter review: "CPU-side, §11 T1 strengthened / T2 weakened" was
+wrong — T1 is refuted at `ttft-prefill-stall.md` §12.3/§13.3, there is no §11,
+and D1c's cross-request taxation excludes per-request own-KV work: the owner
+walks ALL live contexts per prefill step; the corrected CPU census shows no
+ramping host thread, leaning GPU-side). Three experiments (queued **after**
+the campaign arms, E1/E2 cheap flag A/Bs, E3 the owner-pinning that unlocks
+the real fix):
+
+- **MBT-1 (E1) — prefill-chunk A/B at B=4/120k. OWNER DISCRIMINATOR —
+  RESULT (2026-09-11, boot Y8): CHUNK-INVARIANT.**
+  `--max-num-batched-tokens`
+  ∈ {1024, 2048, 4096}, same 4×122880 simultaneous, prefix OFF. bt=2048
+  clean run = 4868.7 s (81.1 min) vs bt=1024 75.3 min, staggered ttfts ≈
+  identical (511/1501/2943/4824 s), prefill agg 101.0 vs 108.6 t/s — the
+  per-step-repeated overhead model is REFUTED (predicted ~48 min); the tax
+  is **per-PREFILL-TOKEN × live-context work** (each prefill token streams
+  the live KV pool from HBM — ~10–20× the attention-FLOP floor; H2 in
+  `ttft-prefill-stall.md` §13.14). **THEN ROOT-CAUSED AND FIXED SAME-DAY**
+  (kv_max pad-tile expansion, §13.16 + §13.16.1): the clamp was built and
+  **VALIDATED on boot Y9 — 120k×B4 wall 75.3 → 44.8 min (−41%), prefill
+  agg 108.6 → 182.9 t/s (+68%), outputs fingerprint-identical, decode/spec
+  unaffected.** The bt4096 arm never ran (chronic wedges #57/#58 — burst;
+  its OOM question is moot — the fix removes the incentive). Remaining
+  slope (~1.2 ks) = own-context per-token streaming (M=1-shaped KV reads)
+  — FA-line follow-up, ~3× smaller than the fix. O1 stays dead
+  (chunk-invariant).
+- **MBT-2 (E2) — concurrency A/B at B=4/120k.** `--max-num-seqs` ∈ {4, 2}.
+  GATE: batch wall. 2×B=2 halves the quadratic term (480² → 2·240²) → expect
+  ~1.5–1.6×; confirms the tax ∝ (concurrent batch tokens)².
+- **MBT-3 (E3) — pin the 34.1 µs/tok owner IF host-side.** cProfile +
+  py-spy during a B=4/120k prefill (engine core + workers), target the
+  per-step pass. GATE: a named op + its µs/tok — or an EMPTY profile, which
+  (with E1 chunk-invariant) moves the owner to a GPU-side pool-walk and makes
+  the kineto per-kernel breakdown (parked on the torch build) the arbiter. If
+  it IS a Python walk / un-vectorized CPU op, fusing/vectorizing/state-size-
+  reducing it cuts the slope 10–100× and takes the B=4/120k wall toward the
+  ~15–25 min floor. Run AFTER MBT-1: E1's outcome picks the interpretation of
+  an empty E3. **E1 outcome recorded (chunk-invariant) ⇒ the live candidates
+  are GPU-side per-token live-KV streaming (H2, ttft §13.14) — the H2 kernel
+  hunt (where does the pool-wide read happen: varlen metadata, paged gather,
+  or the custom Q8 FA long-query path) is now the primary owner search; E3
+  only rules the engine-core host spot in/out.**
+
+**Priority (boot Y9, post-FIX-H2 validation):** (0) **FIX-H2 DONE AND
+VALIDATED** (§13.16.1: 120k×B4 wall 75.3 → 44.8 min, prefill agg +68%,
+outputs fingerprint-identical; commit this build) — (1) re-run the
+campaign 120k×B4 cells + mtp3b4 on the fixed build (their prefill walls
+dropped ~40%; the 89-min/rep era is over), (2) TP-1/FD-1 (now cheaper too),
+(3) FA-line follow-up: the residual own-context per-token streaming
+(~1.2 ks @120k×B4) — larger effective Q-batch per KV read in the prefill
+kernel, (4) MBT-2 seqs2 re-check post-fix (optional — the A-tax may now be
+small enough that seqs4 vs seqs2 no longer matters), (5) E3 only if a
+residual host term is still suspected (it is not, per the census).
+
 ## High priority — user-requested (2026-09-01)
 
 ### MTP-1 — Qwen3.8-27B dense MTP long-context decode: crossover, remaining wins, dynamic depth (HIGH PRIORITY)
@@ -232,14 +508,37 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     microbench win translates to serving on sampling workloads (control arm
     confirms the delta is the sampler, not run noise). MERGED to main.
   - **SYV-5 — fp16 GDN recurrent state** (`--mamba-ssm-cache-dtype float16`).
-    Config flag, trivial A/B; we run B=1 so mainly a concurrency win for future
-    multi-request work. **Status: open (low effort).**
+    **Status: CLOSED as dead end (2026-09-08, A6 profile,
+    `PROFILE-gdn-bucket-breakdown.md`)** — the rec kernel runs 3.7× the
+    pure-BW state-traffic floor (28.8 µs/layer vs 7.7 µs floor: latency-
+    bound, not state-BW-bound), so fp16 state saves ≤ 0.4–1.6 % of the
+    step even in the impossible fully-traffic-bound case (realistic ≪ 1 %).
+    The flag is live for this model family but sub-1 % levers don't clear
+    the PPL-gate bar. Flag verified in-tree: `get_mamba_state_dtype_from_config`
+    (`models/qwen3_5.py:378/590`).
   - **SYV-6 — int8 activations (W4A8 Marlin) + negative-scale bug fix.**
     Batch-mode only (we run B=1); park until multi-request resumes. The bug fix
     is model-portable if we ever hit it. **Status: parked.**
-  - **SYV-7 — hybrid-model prefix caching** (`PREFIX_CACHE=1`). Biggest
-    real-workload win for chat-on-docs; our sweep uses cold prefill so it doesn't
-    change MTP-1 numbers. **Status: open (real-workload, not MTP-1).**
+  - **SYV-7 — hybrid-model prefix caching.** Biggest real-workload win for
+    chat-on-docs; our sweep uses cold prefill so it doesn't change MTP-1 numbers.
+    **Status: DONE (2026-09-04) — nothing to port or enable:** the flag is ON by
+    default in our fork (`enable_prefix_caching=True`, `cache.py`) and the model
+    config auto-promotes mamba cache mode to `align` when PC is on
+    (`models/config.py:602-610`). Verified working WITH MTP (Marconi pattern:
+    1st req full prefill, state cached at completion, 3rd+ hit) — see
+    DEVLOG-spec-decode.md 2026-08-19. Known minor subtlety: under MTP only ~800 of
+    1600 aligned tokens hit vs baseline's 1568/1631 (num_reprefillable_tokens
+    finalization × single cached state) — not chased.
+    **Follow-up task (SYV-7b, Kevin 2026-09-04): measure whether a SMALLER
+    `--mamba-block-size` is a win for agentic payloads that cache well.**
+    Rationale: prefill on gfx906 is slow, so when the shared prefix length falls
+    short of a block boundary (e.g. 1.9k prefilled vs 2k block size), the whole
+    tail re-prefills — seconds added to interactive/agentic turns. Test matrix:
+    mamba-block-size {default(=block_size), 256, 512} × agentic workload (shared
+    system+tools prefix, growing conversation) → measure per-turn TTFT + hit rate
+    (`prefix_cache_stats` / num_scheduled prefilled tokens). Needs a real agentic
+    corpus (pair with the CAT-1 corpus capture when it lands). Low effort:
+    config-only A/B, no code. **Status: open (config-only, needs agentic corpus).**
   - **SYV-8 — DFlash2 block drafter.** Different drafter arch (whole-block
     non-autoregressive). Big effort, needs V2 runner (conflicts with our
     FULLGRAPH path). **Status: parked — revisit only if SYV-1/MTP-1b-0 + SYV-2
@@ -257,10 +556,344 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     chunked-prefill sizing (`MAX_NUM_BATCHED_TOKENS`), and prefix caching
     (SYV-7) which eliminates redundant prefill entirely. **Next step: prefill
     phase profile before any port.**
+  - **SYV-10 — GDN spec-decode bounds checks (upstream PR #50021; VERIFY).**
+    Their vendored `vllm-pr50021-gdn-spec-bounds.patch` fixes an
+    illegal-memory-access in the DeltaNet/GDN speculative-decode kernels hit
+    with several *concurrent* MTP requests. We run B=1 (low exposure) but the
+    agent-corpus arms and any future multi-request work hit the same kernels.
+    **Status: PORTED (2026-09-07, boot Z).** Step 0 result: the fork carried
+    the PRE-PR code in all four kernels — the unmasked
+    `i_t = num_accepted_tokens - 1` state-index load was byte-identical in
+    `mamba/ops/causal_conv1d.py` (spec branch), `mamba/ops/mamba_ssm.py`
+    (zero-clamp only, no row bound), and BOTH
+    `third_party/flash_linear_attention/ops/{fused_recurrent,
+    fused_sigmoid_gating}.py` (the latter is the kernel the Qwen GDN
+    spec path actually calls, `fused_sigmoid_gating_delta_rule_update`) —
+    also correcting the SYV-13 note that `third_party/flash_linear_attention`
+    is absent: it exists in this fork (the missing piece SYV-13 refers to is
+    `chunk_o.py`). Patch applied verbatim (`git apply --directory=vllm`,
+    clean); behavior-identical on valid inputs (mask=true load; the
+    zero-fill store fires only on the invalid-state early-out). No runnable
+    GPU test on ROCm (test_gdn_fused_mtp.py is CUDA-gated); the `launch_pdl`
+    guard matches existing in-file usage (constexpr-compiles-out on ROCm).
+    Compile-check lands at the next MTP server launch (boot-Z+1 chat-frac
+    arms); field-verify there. Still the B=4 prerequisite.
+  - **SYV-11 — KV-cache compression for capacity (KVarN tier / stock int4·int8
+    tier; ANALYZE).** Deep-review find (2026-09-07). Their 24 GB 3090 is
+    capacity-bound; ours is not *yet* (131k ctx, 64 KB/token fp16 KV = 7.5 GB
+    @120k — matches our 7.4 GiB bench records) — so this is a **context
+    extension** item, not a speed item (their 3090 data: KVarN decode ~20 %
+    *slower* than fp8 at 100k — the dequant eats the bandwidth saving). Two
+    tiers, same model family (they run Qwen3.8-27B, so the quality data
+    transfers directly):
+    - **KVarN** (Huawei CSL, Apache-2.0; ported to vLLM 0.28 in their repo
+      `kvarn/`): Hadamard rotation + iterative variance normalization,
+      4-bit K / 2-bit V per 128-token tile → **12 KB/token (vs 64 fp16)**:
+      131k → ~500k-token pool. Their measured: 262k ctx fits, needle-in-haystack
+      correct 4k–240k, **PPL +0.16 %**, MTP works. 1/8 the KV bytes.
+    - **Stock `int4_per_token_head` / int8 KV** (their
+      `int4-kv-per-token-head.patch` + `spec-decode-int8-kv.patch` fix boot
+      blockers on the stock Triton backend): 1/2–1/4 the KV bytes, stock
+      machinery, ~20 % decode cost on their box (Triton backend + per-step
+      unpack).
+    **Status: OPEN — LOW-MED priority; only worth it if Kevin wants >131k
+    single-request context or multi-request KV capacity. Gate: PPL probe band
+    + needle + serving A/B; the gfx906 port of the KVarN Triton kernels needs
+    its own validation (dense path only; hybrid page-alignment hunks exist in
+    their port).**
+  - **SYV-12 — context-lookup verify extension for MTP ("long block from the prompt"); ANALYZE — the new idea from the deep review. CLOSED negative 2026-09-08 (v1 as built: production-payload A/B net loss −9.3 %/−5.3 %, verified lossless, env-gated default-OFF; the copy-saturated case is UNVERIFIED — the fill's yield was never measured; attribution correction + resurrection gate at the end of the entry; reopen note in `REFRIGERATOR.md`).** Their DFlash2
+    lookup drafting (`dflash2-lookup-drafting.patch`) generalizes to our MTP
+    stack: keep the drafter at k (MTP k=5), but let the **target verify a
+    longer block** (k+8) when a prompt-lookup fires — positions past the
+    drafter's k are filled from the most recent earlier occurrence of the
+    just-generated suffix in the request's own token history (one Triton
+    program per request; point-mass proposal keeps the rejection sampler
+    lossless; scheduled only while two consecutive saturated steps indicate a
+    genuine copy, not a prose near-tie). Their measured (25k ctx, greedy,
+    same model family): **reproduce-a-document 159 → 381 tok/s (+47 %)**,
+    rewrite/quote +10 %, prose +2–3 %, quality unchanged (GSM8K 96.5 %
+    flat, 7/9 prompts token-identical). This is exactly the agentic shape our
+    corpus arms target (code edits, RAG-quote turns), and the agent corpus
+    (built 2026-09-07) can measure the copy-fraction before we build anything.
+    Pairs with SYV-2 (lookahead drafting) + CAT-7 (ngram) — this item is the
+    *verify-block extension* mechanism those two were missing.
+    **Copy-fraction measured (CPU-only, 2026-09-07, `/local/tmp/mtp1/syv12_copy_fraction.py`;
+    MIN_MATCH=5, EXT=8, last-occurrence n-gram scan over the 8 bodies/corpus):**
+    full-body hit_frac (steps with ≥1 fillable position): agent 10.1 % @64k /
+    15.9 % @120k; mixed 12.0 % / 16.8 %; tail-32k @120k 18.3 % (both
+    corpora). Post-scheduling (run of ≥2 consecutive hits, the mechanism's
+    trigger): 7.7–13.7 %. Mean fills per hit step 4.0–4.9 of the 8 budget
+    (≈2.5–2.9 effective past a k=2 drafter); mean_fills amortized over all
+    steps 0.41–0.79. The corpus scan measures payload self-repetition, not
+    generation-time copying — the generation-time re-measure was the real
+    gate. **GENERATION-TIME MEASURED (boot W', 2026-09-07, `/local/tmp/mtp1/syv12_gen_gate.py`
+    over the 39-convo Qwen3.8 replay, `chat_replay_qwen38.jsonl`; same
+    last-occurrence rule, MIN_MATCH=5, EXT=8, 205,091 generated positions
+    = 99.98 % of the 205,173 completion tokens):** hit_frac **25.3 %**,
+    run_frac (≥2 consecutive, the scheduler trigger) **21.1 %**, mean_fills
+    1.39/step, run_mean_fills 5.52 of the 8 budget. **VERDICT: GO — clears
+    the ≥15 % gate by ~10 points** (the corpus proxy's 10–18 % was an
+    underestimate: generations re-quote context more than the corpus
+    self-repeats — the "quote/reproduce turns run hotter" side of the bound).
+    Caveats: 36/62 turns truncated at the replay's max_tokens=4096 (rate is
+    per-step, so truncation shortens the sample but does not bias the rate);
+    sample is temp-0 Qwen3.8 on the same seeds the v2 corpus is built from.
+    **Instrument bug caught in the process (recorded for the log):** the
+    first gate run read `rec["reasoning_content"]`, but this stack's qwen3
+    parser emits the thinking text in the raw message's `reasoning` field —
+    36/62 records had empty record fields, the sample silently shrank to 16k
+    positions of short turns, and the verdict read PARK (5.1 %). Fixed gate
+    reads the raw message (`syv12gen_w1_fixed.log`); `chat_replay_client.py`
+    patched to record `reasoning` + re-send it as `reasoning_content` in the
+    next-turn context. SYV-12 moves to the build queue after the boot-W' v2
+    arms land. **DESIGN CONSTRAINT (review, 2026-09-07) — GO crossed, this
+    pins the build spec: the fills are NOT free verify rows on our FA
+    kernel.** At the k=2/3 operating point the base verify is Sq_pad=4
+    (fast occ-2 tile, 8.64 ns/token); EXT=8 with generation-time
+    run_mean_fills 5.52 (corpus: 4.0–4.9) pushes
+    hit-steps to Sq 6–10 → pad 8 or 16 → slow occ-1 tiles (19 ns/token) —
+    the whole verify step crosses the measured tile cliff. So (1) the
+    economics must count marginal verify cost including the tile
+    step-function, and the first design constraint should be a fill-cap that
+    keeps the block on the Sq_pad=4 tile (k=2 + ≤2 fills; k=3 can only add
+    ≤1 — re-derive the yield numbers under that cap before committing to a
+    build), and (2) capture shapes interact: Sq varies per hit-step, so
+    either a fixed max-fill shape (always paying the slow tile) or multiple
+    verify graph shapes. **Status: GO (2026-09-07, boot W') — generation-time
+    gate passed (25.3 % ≥ 15 %); build scheduled after the boot-W' v2 arms
+    land; build spec = the design constraint above (fill-cap on the Sq_pad=4
+    fast tile, yield re-derived under the cap, capture-shape decision
+    included).**
+    **FILL-CAP CORRECTION (2026-09-07, at implementation): the parenthetical
+    above was off by one.** The fast tile holds 4 rows (padded Sq ≤ 4); the
+    verify block is 1 anchor + k drafts + f fills, so the constraint is
+    f ≤ 3 − k: **k=2 → f ≤ 1; k=3 → f ≤ 0** (k=3 + 1 fill = 5 rows →
+    pad 8 → slow tile; k=2 + 2 fills = 5 rows → likewise). The v1 build
+    takes the only positive cell: k=2 + EXT=1.
+    **IMPLEMENTED v1 (2026-09-07, boot W''; env `GFX906_SYV12`, default OFF
+    until the same-boot serving A/B passes):** the extension slot is
+    *always* scheduled (uniform shape — every MTP-k=2 decode step verifies
+    1+k+ext = 4 rows), so the fill consumes the row the k=2 verify already
+    pays for when padded 3→4: per-step FA cost is unchanged, a fired+accepted
+    fill is +1 token/step, a fired-but-rejected or unfired slot (the -1
+    placeholder) costs nothing. Fill = last-occurrence continuation of the
+    trailing 5-gram in the request's own history (one stream-ordered Triton
+    program per request, no CPU-GPU sync; `GFX906_SYV12_WINDOW` default
+    8192), gated on the previous step having been fully accepted
+    (num_sampled == k+1). The single-step gate (vs their two-consecutive-
+    saturated-steps trigger) is deliberately looser: with the always-extended
+    shape, extra firings are free, so the gate only needs to avoid fills
+    with near-zero acceptance. Fills go through the standard one-hot draft
+    path of the standard rejection method → lossless (asserts off for
+    `synthetic`). Files: `vllm/v1/spec_decode/utils.py` (`syv12_ext`, single
+    source of truth), `vllm/v1/worker/gpu/spec_decode/syv12.py` (fill
+    kernel), scheduler pad sites, `RequestState.draft_tokens` width,
+    `decode_query_len`, `RejectionSampler.num_speculative_steps`. k=3
+    stays unextended (f ≤ 0) — its 4 rows leave no room on the fast tile.
+    **BOOT-Y CORRECTION (2026-09-08): the worker-side files above are the
+    V2 model runner's — NOT the live path.** Live ROCm workers use the V1
+    runner (`vllm/v1/worker/gpu_model_runner.py`; V2 is behind
+    `VLLM_USE_V2_MODEL_RUNNER`, default off) — the probe's ON arm was a
+    no-op (its fill kernel never executed; the kernel also had a Triton
+    `break` bug + a 4-token occurrence-window off-by-4, both fixed and the
+    kernel is now GPU unit-verified 9/9, `/local/tmp/syv12/kernel_test.py`).
+    Inert at default OFF; flag-ON was inconsistent (scheduler pads, V1
+    worker does not) → staged A/B was withheld.
+    **BOOT-Y2 UPDATE (2026-09-08): V1 port COMPLETE.** Worker side now
+    on the live V1 runner (`gpu_model_runner.py`): the fill runs
+    GPU-side — a per-request 2.1 MB history buffer (`_syv12_hist`,
+    stable rows, mapping rebuilt per launch) + new
+    `_syv12_append_history_kernel` (compacts the step's non-(-1)
+    rejection output into the row) + the fill kernel at the common tail
+    of `propose_draft_token_ids` — the CPU history is unusable in async
+    mode (placeholder -1s). Also: both async placeholder sites,
+    `draft_token_ids_cpu` width, zero-fallback width, mamba
+    `num_speculative_blocks` = k+ext, drafter `CudagraphDispatcher` unit;
+    kernels moved to neutral `vllm/v1/spec_decode/syv12.py` (V1+V2
+    share); fill kernel's draft store fixed to batch-index (was
+    row-index → OOB on batch-sized drafts). Rejection/
+    `_calc_spec_decode_metadata`/`_prepare_input_ids` needed no changes
+    (data-driven on per-request draft count). Unit-verified 16/16 on
+    GPU (`/local/tmp/syv12/kernel_test.py`). **Probe run on Y2:** OFF
+    PASS (25.335 t/s decode); the ON arm exposed + fixed two more
+    software bugs — scheduler spec-stats sizing (k vs k+ext) and the
+    **GDN state-slot width**: the GDN attention backend's `num_spec`
+    (`vllm/v1/attention/backends/gdn_attn.py`) and the GDN layer's
+    conv-state width (`vllm/model_executor/layers/mamba/gdn/base.py`)
+    must also add `syv12_ext` (lockstep with MambaSpec) — without it
+    the ext verify token is under-processed (`max_query_len` = k+1 in
+    `causal_conv1d_update`) and the GDN state corrupts (all-zero
+    output, self-consistent zero fixed point). 16k debug probe
+    post-fix: correct loop, both kernels fired. The 120k ON re-run
+    wedged at weight load (#42; #41 at 07:49) → wear-based stop (2
+    spontaneous chronic-family resets on boot Y2, the #40 criterion).
+    **BOOT-Y3 FINAL (2026-09-08): probe PASS + same-boot A/B = NET LOSS,
+    CLOSED.** 120k probe: identity 512/512 vs the boot-Y2 OFF reference,
+    both kernels fired, decode 24.561 t/s (s9 ceiling, −3 % vs OFF's
+    25.335). Serving A/B (`mtp` k=2, TP=2, mixed-v2 64k+120k ×3, OFF
+    first as canary 28.97/22.84 — the 120k within +0.8 % of the W''
+    record): **ON 26.27/21.62 → −9.3 % @64k, −5.3 % @120k (medians;
+    5/6 reps negative).** Port verified lossless (no crashes) and
+    stays env-gated default-OFF. Dev log: SYV-12 entries, boot Y2/Y3.
+    **ATTRIBUTION CORRECTION (2026-09-08, verdict review — the
+    "mechanism-predicted / ~5 % accepted vs ~100 % on s9" text above
+    is RETRACTED):** per-position acceptance shows the fill row at
+    **0.000 in every s9 probe window** (drafted 3/step, accepted
+    never; mean capped 3.00) and 0.006 step-weighted on mixed-v2 —
+    the yield path never produced a meaningful acceptance, so the
+    measured A/B loss is the pure always-paid 4th-row cost (GDN +33 %
+    state traffic; FA unchanged — both pad to Sq_pad=4) and the
+    mechanism's true yield was never measured. A static
+    reconstruction proves the correct s9 fill value is 511/511 = 100 %
+    on the real history, and an end-to-end wiring audit (gate, history
+    append, fill kernel, input scatter, sampler alignment; the
+    "sampler caps at k" candidate refuted by the boot-Y2 spec-stats
+    IndexError + "Drafted: 3/step") found no static flaw — a
+    **runtime defect** was declared open at that point. **ROOT CAUSE
+    FOUND + FIXED (2026-09-08, boot Y3, pre-probe; static derivation +
+    unit-verified — the "runtime" defect was a static CONTRACT bug the
+    wiring audit's link checks and the 16/16 unit test had both baked
+    in):** the v1 fill kernel built its lookup suffix from the trailing
+    history only, which ends at the step's ANCHOR, so its continuation
+    targets the d0 slot — but the value is stored in the FILL slot
+    (after d0..d_{k-1}), off by k=2 positions. s9 (period-9 loop): the
+    old fill ≈ the d0 value, never equal to the FILL-slot argmax →
+    0.000 at every position; mixed-v2: accepted only when a token
+    repeats across the anchor→d1 span → the measured ~0.6 % incidental
+    hits. The recorded "511/511 static reconstruction" measured the
+    kernel's own contract (d0-continuation vs the next token), not
+    FILL correctness — corrected here. Fix: suffix = last
+    (MIN_MATCH−k) history tokens + the k base drafts (which end at
+    d_{k-1}, the token before the FILL position); unit-verified 16/16
+    under the corrected contract. The close stands for **v1-as-built**;
+    the copy-saturated-payload case is **UNVERIFIED, not closed as
+    structural** (s9 is where MTP already saturates — the revival
+    regime is verbatim-span-heavy generation where the MTP head
+    misses). **Resurrection gate (updated):** the instrumented s9
+    probe is now a VALIDATION run (per-step debug dump landed
+    in-tree; expect s9 pos3 ≈ 1.000 and mean acceptance ≈ 4.0) —
+    blocked on a reboot by wedges #44/#45 (burst, 2026-09-08 21:22)
+    → then s9 + copy-heavy corpus same-boot A/B before any
+    copy-saturated claim. Reopen note in `REFRIGERATOR.md` (SYV-12
+    entry). **VALIDATION PROBE PASS (2026-09-09, boot Y4 — gate step 1
+    DONE):** after wedge #46 (probe attempt 1) and a diagnosed software
+    failure on the retry (Triton compile assert: the fixed kernel's
+    match if/else mixed the int32 history load with the int64 live
+    draft-tensor load — the unit test had compiled only the all-int32
+    signature; fixed `fb971c54a0`, test now uses the live int64 draft
+    dtype, 16/16), the probe passed on all three links: (A)
+    kernel-write-vs-reference 96/96, (B) input path 65/65,
+    gate/append inconsistencies 0/0 (on the rank-separated dump — both
+    TP ranks were interleaving into one file, `2eacd8e8ed`); **pos3
+    (FILL) = 0.987 steady state** (engine window 1.000/1.000/0.987;
+    the single miss is the prefill->decode boundary step, where the
+    gate is off by design), mean acceptance ~3.99 (vs ~3.0 under v1),
+    identity perfect (512-token exact s9 loop), eager decode 31.65
+    t/s (vs 24.56 for v1-as-built, +28.9%). The copy-saturated case
+    is now MECHANISM-VERIFIED on the saturation payload; next gate
+    step: the production (compiled) same-boot A/B (mtp2 OFF vs ON,
+    mixed-v2 64k+120k — directly comparable to boot Y3: OFF
+    28.97/22.84, broken-ON 26.27/21.62 — plus the s9 120k point).
+    **PRODUCTION A/B DONE (2026-09-09, boot Y4 — gate step 2):**
+    same-boot, boot-Y3 protocol (mtp k=2 TP=2, mixed-v2 64k+120k ×3,
+    OFF first): **ON 27.99/23.80 vs OFF 29.55/22.37 → −5.3 % @64k,
+    +6.4 % @120k (medians)**; @120k clean separation (min ON 23.28 >
+    max OFF 23.06), @64k overlapping. Realized fill acceptance
+    ≈25 % of steps @120k (above the review's 15–20 % bar) vs ≈0–5 %
+    @64k (fill effectively never fires → ON = OFF + the 4th-row GDN
+    cost). **GATE VARIABLE ADJUDICATED (2026-09-09, research agent,
+    CPU-only windowed-copy-density analysis on the served corpus —
+    handover `/local/tmp/handover-syv12-context-vs-payload.md`,
+    repro `/local/tmp/mtp1/syv12_content_vs_context.{py,log}`): the
+    flip is a PAYLOAD-POSITION effect, NOT context scaling** — the
+    fill's 8,192-token lookup window is structurally blind to context
+    length; the served 64k point front-slices the bodies (windowed
+    5-gram repeat density 12.6 %) while generation at 120k sits in
+    the document tails (21.5 %; same bodies first-64k-sliced: 13.6 %).
+    Amended parked verdict: payload-conditional,
+    position-of-generation-tail-gated; NOT context-length-gated. Both arms self-canary vs Y3 (OFF within ±2 %); text probes
+    clean both arms (lossless in serving). **VERDICT: the fixed fill
+    is a PAYLOAD-CONDITIONAL win, NOT a uniform default.** Boot Y4
+    ended here on the #40/#42 wear criterion (3 spontaneous
+    chronic-family wedges #46/#47/#48, GPU1, all self-recovered; 3/8
+    TP=2 loads). **PARKED by Kevin 2026-09-09 until further review**
+    (no crossover A/B, no compiled s9 120k for now); the B=4 campaign
+    runs first (Kevin-directed, same boot) — **RE-ORDERED 2026-09-09
+evening (handover #2, `ttft-prefill-stall.md` §11): the TTFT stall
+    investigation now runs BEFORE the campaign's remaining cells —
+    120k×B4 ×2 + the mtp3b4 grid are DEFERRED (65536-point cells done
+    and valid). The per-step O(f) model is characterized (2.63 s +
+    34.1 µs/tok per 1024-token step); the owner hunt leads with T6
+    (torch intra-op thread cap, `Reducing Torch threads from 8 to 1`)
+    + an in-process 2×2 matrix (OMP × pp, 2 loads); existing B=4
+deode data is mined first; future cells at pp=4096.**
+    **UPDATED 2026-09-09 late evening (matrix load A, `ttft-prefill-stall.md`
+    §12): OMP 1→8 = ratio 1.00 (T6 out). The per-step owner is the
+    previous step's GPU tail, observed through a 100% spin-wait on
+    `num_accepted_tokens_event.synchronize()` (gpu_model_runner.py:2213)
+    — T1 (CPU O(n)) refuted. **VERDICT (fresh boot, §13): the
+    production chunk-size A/B (pp=1024 vs 256, 8k prefill: 2.74 vs
+    0.79 s/step; total 21.9 vs 25.4 s) shows ~92 % of the per-step
+    cost is chunk-linear GPU work + a 0.14 s fixed per-step overhead,
+    at an effective ~10.3–10.4 TFLOPS ≈ 78 % of MI50 fp16 peak in
+    both regimes — the "stall" is raw W4A16 prefill throughput
+    (GEMM-dominated) + the 34.1 µs/tok long-context FA slope (~62 % of
+    a 120k step): a throughput question, not a bug.** Levers: GEMM
+    mass/efficiency at prefill M (T-1 int8 direction, re-bench at
+    M≥256), the long-context FA slope, and only secondarily chunk
+    size (fixed-overhead saving ≈ 0.42 s per 4k). The per-kernel
+    split is parked: torch 2.13.0+gfx906 (2026-08-02) ships no kineto
+    GPU backend (zero GPU-domain events on every profiler route,
+    §13.1). **SLOPE-OWNERSHIP UPDATE (2026-09-09, §13.4): the 34.1 µs/tok
+    slope is CUMULATIVE (pool-wide), NOT per-request** — 4×64k: the
+    own-context model 964 s vs the cumulative model 1822 s vs the
+    observed 1770 s (both reps). The §13.3 verdict holds for the GEMM
+    bulk but is PREMATURE for the slope term: a pool-wide per-step op
+    (dense rebuild/gather candidate class, prefill-only, decode-immune)
+    would be a REAL fixable inefficiency at ~62–63 % of long-context
+    prefill time. OPEN discriminators (§13.5): D1 holder+probe
+    (minutes — batch-local ~5.4 s vs persistent ~9.7 s probe ttft) →
+    per-kernel breakdown (parked on the kineto gap). **Campaign note:
+    the 120k×B4 cells run AFTER the slope question is resolved (or with
+    clocks logged) — the slope is the dominant term at that scale.**
+    If SYV-12 is revisited
+    (per the adjudication): the gate is PAYLOAD/RUNTIME density, not
+    context tokens — enable per request when the recent fill-hit rate
+    (or a host-side trailing-window copy-density estimate) is
+    sustained above ~10 %; the runtime fill path already computes the
+    match statistics, so the gate is nearly free. If the crossover A/B
+    runs: FRONT-SLICES of the 122880-point bodies (same text, shallow
+    vs deep — only front-slices isolate depth) at 80k+100k, with the
+    served-64k point as the content control (2×2 content × depth,
+    2 loads) + compiled-mode s9 120k (2 loads) + the B=4-era question
+    (the 4th row adds the same cost at B=4; B=4 cells run at pp=4096 per
+    the §11 re-order above).
+  - **SYV-13 — mamba/GDN chunked-prefill align fixes (CLOSED 2026-09-08 as
+    N/A — verify-only, no code change).** Diffed their
+    `mamba-chunked-prefill-align.patch` (qwen38-27b-rtx3090) against our tree,
+    both parts: (1) **`src_col` fix** — the live V1 path
+    (`preprocess_mamba`, `vllm/v1/worker/mamba_utils.py`) already implements
+    all three of the patch's guard conditions on the CPU side: fresh request
+    → `prev_state_idx = (0-1)//block_size = -1` → no copy; unchanged column
+    → `prev_state_idx != curr_state_idx` false → no copy; the GPU `src_col`
+    tensor is defaulted to -1 and only written when a copy is actually
+    needed — functionally identical to the patch's
+    `src_col = where((num_computed==0)|(state_idx<0)|(state_idx==new_state_idx), -1, state_idx)`.
+    The standalone GPU kernel the patch modifies
+    (`preprocess_mamba_align_fused_kernel`) is reached only via
+    `vllm/v1/worker/gpu/model_states/mamba_hybrid.py` — the V2 runner, not
+    live on ROCm. (2) **`chunk_o.py` NaN guard** — absent in our tree, but
+    our file is the faithful pre-patch upstream state (not a fork
+    divergence): the load already carries `boundary_check` (default
+    other=0.0), and no NaN has ever been observed on this stack's chunked
+    GDN prefill (identity-verified 120k probes + months of replay/sweep/chat
+    serving). The RTX3090 fix targets a codegen artifact on their stack; if
+    NaNs ever appear in a partial-chunk GDN prefill here, the one-line
+    `tl.where(m_t, b_g, 0.0)` mask is the cheap reviver.
   - **Ideas from [1CatAI/1Cat-vLLM](RECON-1cat-vllm.md) (V100/SM70, "Make Volta
     Fast Again" — same generation class as gfx906; runs Qwen3.6-27B-AWQ TP2, the
     near-identical model to ours). Full recon + estimates in the linked doc.**
-  - **CAT-1 — draft-vocabulary shortlisting (GO).** Their biggest MTP
+  - **CAT-1 — draft-vocabulary shortlisting (DONE — PASS, merge candidate).** Their biggest MTP
     win: shrink the *drafter's* lm_head vocab from full 248k to a static 131K or
     dynamic 98K+2×512 shortlist → **+21.9% e2e** (80.1→97.7 tok/s) on their TP2
     Qwen3.6-27B-AWQ, lossless by construction (target dist stays full-vocab for
@@ -270,9 +903,15 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     so **the byte count itself is the remaining headroom** — a 131K draft vocab
     cuts the drafter lm_head read ~1.9× (in-context measured: full 248k =
     3.09 ms/call at K=1), and int8 on top of that halves it again. **Status:
-    OPEN — scope the bootstrap + reduced-draft-lm_head on `step3p5.py`; A/B with
-    t/s + PPL/coherence gate.** (No longer depends on the shelved Triton kernel;
-    works directly against the stock path.)
+    DONE — ported + validated (branch `cat1-draft-vocab`, devlog
+    DEVLOG-draft-vocab.md): k=2 pilot with syv's 40,960-id list = +3.86/4.38%
+    zero acceptance loss; k=4 stacking A/B (2026-09-05) = +5.6/+3.9/+3.8% at
+    64k/96k/120k, perfect 4/4 acceptance at every draft position → gain holds at
+    depth and stacks on the k=4 win (total ≈ +20–24% over plain k=2 decode).
+    Env-gated by construction (sliced work-dir; plain dir = full-vocab path
+    unchanged). Remaining before merge to main: Kevin's real corpus → our own
+    ~131K list → final A/B acceptance gate on real traffic (s9 filler saturates
+    both arms at perfect acceptance — validates mechanism+speed, not coverage).**
   - **CAT-2 — FA prefill D256 Split-D + GQA multi-head packing (GO/ANALYZE — feeds
     SYV-9).** Their Volta D=256 prefill kernel = **1.66–2.2× over generic FA2** on
     the same D=256 shape. Techniques: Split-D (D=256→4×D64, paired warps share QK,
@@ -381,6 +1020,58 @@ forks cited in each): [RECON-syv-qwen38-27b-rtx3090](RECON-syv-qwen38-27b-rtx309
     Qwen3.6-shaped (E=256, N=128) — a Nemotron-H (g64) port would need its own
     autotune sweep. **Status: new candidate — relevant when we serve a gfx906 MoE.**
 
+  - **J2G-6 — post-AR consumer fusion (allreduce + residual + RMS epilogue).
+    ANALYZE.** Deep-review find (2026-09-07, `gfx906-key-learnings-20260606.md`
+    + source inventory). Their dense 27B TP8 profile: the post-AR
+    residual/RMSNorm consumer costs 0.0325 ms of the 0.0893 ms
+    `1x5120` MLP-down boundary; a fused `allreduce → add+RMS` kernel beat the
+    decomposed chain by 0.023–0.217 ms/call (lower bound ~1.47 ms/token over
+    64 boundaries) — but **no serving win at TP8** because NCCL itself
+    dominates (54 %). Our TP2 geometry inverts that ratio: the single P2P
+    edge is far cheaper than their 3-channel TP8 primitive, so the consumer
+    pass is a bigger fraction of our boundary. J2G-2 (pre-fold) is the
+    algebraic variant; this is the fused-kernel variant. **Status: OPEN —
+    LOW-MED; needs a per-boundary profile of OUR TP2 AR+consumer first
+    (we have no TP2 AR-cost measurement — our phase profile couldn't
+    attribute the unexplained 1.55 ms/step, G1 territory).**
+  - **J2G-7 — custom interleaved SwiGLU MLP GEMV (weight-interleave repack +
+    fused activation epilogue). ANALYZE.** Their "native interleaved SwiGLU"
+    is 13 % of TP8 decode kernel time (2.8 s of 21.7 s profiled) and part of
+    their high-water stack: gate/up rows interleaved in the weight layout so
+    one GEMV pass + fused SiLU-mul epilogue replaces GEMV + activation
+    kernels; their corrected lower bound = ~3.2–3.5 µs/layer saved, and the
+    serving form needs a packed/interleaved weight repack. For us: the Qwen
+    MLP is AWQ INT4 — the same interleave applies to the packed layout
+    (gate/up rows interleaved in the INT4 pack), with the fused activation in
+    our existing dequant-GEMV epilogue. Our decode GEMMs are near the BW
+    ceiling (SYV-3), so the win is launch/epilogue elimination, not bytes:
+    ~3.5 µs × 48 dense layers ≈ 0.17 ms/step ≈ ~1.2 % of a 14 ms step. ISA
+    note from their work: the gfx906 assembler rejects `v_dot2c_f32_f16`; a
+    valid `v_dot2_f32_f16`-style half-dot replacement exists (their
+    `gfx906_llmm1_dot2` / wvSplitK patches) — but their own dot2 replacement
+    *regressed* the dominant shape, so treat it as an available instruction,
+    not an automatic win. **Status: OPEN — MED-HIGH effort (weight repack +
+    GEMV variant + serving gate); value ~1 % class — do only if a decode-step
+    profile confirms the MLP activation pass is still a separate kernel on
+    our path.**
+  - **J2G-negative evidence (deep review 2026-09-07, recorded so we don't
+    re-walk it):** (1) sequence parallelism — token-shard SP is a 35–59 %
+    boundary win in microbench but **rejected in serving**: vLLM overrides
+    SP cudagraph capture sizes to [8,16], killing the c1 num_tokens=1 graph
+    path; reduce-scatter for c1 decode is slower than allreduce on
+    gfx906. (2) vLLM's CUDA custom-allreduce substrate is not a gfx906 path
+    (peer IPC init faults / post-prefill hangs; matches our
+    `--disable-custom-all-reduce`). (3) grouped/coalesced allreduces are
+    infeasible on the Qwen dense graph: 128/128 adjacent AR boundaries are
+    blocked by true hidden-state dependencies (64 MLP + 64 attention
+    producers). (4) Marlin tile autotuning is a wash end-to-end under
+    sustained power/clock throttling (+2–20 % standalone, +0.4 % e2e on
+    their 250 W-capped 3090) — the DVFS analog of our standalone-≠production
+    trap. (5) their persistent-AR sidecar history: per-call AR start/stop is
+    ~3.6 ms/call (resident worker required); sub-1 % descriptor/primitive
+    tweaks never promote at serving scale — the gate is launch count / p99
+    tail, not median latency.
+
 - **MTP-1c — dynamic MTP logic.** Investigate runtime-adaptive spec decode:
   (a) disable MTP when context length exceeds the crossover or draft
   acceptance is low, or (b) change MTP depth dynamically (k=2 → k=1/k=0) by
@@ -411,7 +1102,19 @@ and inductor creation speed; improve shard loading time"). Each item's
 **Step 0 is a search for existing work** (upstream + our repo) before any
 implementation — the seeds listed are starting pointers, not conclusions.
 
-### S1 — improve graph + inductor creation speed (startup compile/capture)
+### S1 — improve graph + inductor creation speed (startup compile/capture) — **COMPLETE (2026-09-04)**
+
+**Result:** the startup bottleneck was NOT compile/capture. The 27B checkpoint is
+multimodal (`Qwen3_5ForConditionalGeneration`, 333 `vision.*` tensors) and every
+startup ran a max-feature-size **dummy image through the ViT** in `profile_run()` —
+measured at ~213 s of the 234 s warm engine-init (stack-dump proof in
+`DEVLOG-s1-startup.md`). Fix = stock flag `--language-model-only`, now the arm
+default in `/local/tmp/mtp1/run_server.sh` (`FULL_MM=1` opts out). **Measured:
+warm engine init 233.85 s → 14.54 s (16×)**; dev boot is now weights-load-bound
+(~90–100 s end-to-end — S2 territory, deprioritized). KV pin (`KV_MEM_BYTES`)
+opt-in for dev boots; `-O1` deprioritized (cache audit: AOT cache survives reboots,
+cold compile is one-time per config key). No code port → no README attribution
+needed (flag-only adoption; documented in the dev log).
 
 **Scope:** cut the torch.compile (dynamo trace + inductor codegen/autotune)
 and CUDA-graph capture portion of engine startup on this host — cold cache
@@ -454,7 +1157,9 @@ policy); (c) implement the top lever(s) behind env flags.
 Record in ROADMAP + relevant devlog; upstream-derived levers need
 attribution (README + inline comment).
 
-### S2 — improve shard loading time (weight load)
+### S2 — improve shard loading time (weight load) — **DEPRIORITIZED (Kevin, 2026-09-04)**
+
+> **Status:** "Shard loading time improvements are not high priority though so do not spend too much time on it." fastsafetensors — the main existing lever — is ruled out: it reserves more VRAM than the usual loaders ("This is not a good solution if this is the case"). Everything below is retained for reference; do not execute without a new trigger (e.g. load >3 min cold, or NFS-backed serving).
 
 **Scope:** cut the "Loading weights took" portion of startup for the dense
 27B AWQ checkpoint. It is currently the single largest measured startup cost.

@@ -116,3 +116,17 @@ recon in `/local/tmp/mtp1/joe2gaan_recon.md` (source fork cited there too). Deta
 - **Relevant because:** our phase-profile shows hooked modules = only ~38% of the MTP
   step wall time; the rest is comm + CPU dispatch. Before porting persistent AR (a big
   lift), an env-only RCCL A/B is the cheap first probe.
+
+## Deep review follow-up (2026-09-07)
+
+Beyond the initial recon (optimizations.md → SYV-1..9), the patch set review
+added ROADMAP items: **SYV-10** (GDN spec-decode bounds, upstream PR #50021 —
+verify), **SYV-11** (KVarN 4-bit-K/2-bit-V KV compression + stock
+int4/int8-per-token-head KV — capacity/context-extension tier; their data:
+PPL +0.16 %, needle OK to 240k, decode ~20 % slower than fp8), **SYV-12**
+(context-lookup verify-block extension for MTP — the new idea: verify
+k+8 from prompt-lookup fills when a copy is running, +47 % on reproduce
+tasks, lossless), **SYV-13** (mamba chunked-prefill align fixes — verify
+only; our fork has the newer V2-align path). Not new: their sort-free
+sampler = our shipped SYV-4 (2026-09-03); their Marlin-tune wash under
+power cap matches our DVFS standalone-≠production trap.

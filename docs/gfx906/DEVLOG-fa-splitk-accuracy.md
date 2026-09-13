@@ -89,3 +89,44 @@ materialize because the partials are fp32, not fp16.
   this entry covers the Q8 production paths only.
 
 VERDICT: SHIPPED
+
+## 2026-09-06 — tile-clip bit-identity test rework (pre-existing failure at HEAD; two subprocess arms)
+
+**VERDICT:** SHIPPED (test infra) · **GATE:** n/a — correctness test; both
+arms match the windowed fp32 reference (worst rel 2.5e-3 @ Sq=256)
+
+## HYPOTHESIS
+The bit-identity failure of test_m2_tile_clip_prefill_bit_identical[256]
+(pre-existing at HEAD, reproduced on the clean tree) is a premise break from
+the shape-aware kv_split default (dfed62f133) plus the per-process-static
+env read — not a masking bug in tile-clip.
+
+## What was done
+
+Two-part root cause:
+
+1. **Premise break.** The test asserted tile_clip on/off bit-identity on the
+   premise "prefill runs kv_split=1 (single pass) — the two arms visit the
+   same aligned k-tiles". dfed62f133 made prefill SPLIT (Sq>=4 → 32, under
+   the 512 MiB budget), so the arms reduce in different orders. Verified the
+   split outputs are CORRECT: clip on/off, fwd+direct, Sq=256, default
+   split → worst rel vs the windowed fp32 reference 2.5e-3 (tol 5e-2).
+   Reduction-order difference, not a masking bug.
+2. **Static env read.** GFX906_FA_KVSPLIT is a per-process static
+   (get_fa_kv_split in gfx906_fa.cpp), so an in-process env pin only works
+   before the first FA launch in the process — this test file makes launches
+   constantly, so the pin could never work in-process under pytest.
+
+Rework (commit 880390ecf5): the test now runs in fresh subprocesses with two
+arms — **bitident** (GFX906_FA_KVSPLIT=1 from process start; bit-identity
+fwd+direct, Sq in {64,256}) and **split** (unpinned default; windowed
+reference within tolerance — this covers windowed+split, which the
+unwindowed sq-multi test does not). Both arms pass; full FA suite 89/89.
+
+## Note (not changed)
+
+The windowed-NaN test (~line 2031, `forward_paged_direct` fully-masked row)
+also pins GFX906_FA_KVSPLIT=1 in-process with the same latent ineffectiveness
+(the static may already be frozen). Its assertions (fully-masked row → exact
+0; sibling row correct) are split-invariant, so it passes regardless. Left
+as-is: fixing it would need the subprocess treatment for no coverage gain.

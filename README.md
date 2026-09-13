@@ -19,6 +19,28 @@ See [`docs/gfx906/`](docs/gfx906/) for the full optimization record.
   gfx906 ROCm path. +0.6–3.4% serving t/s on sampling workloads (TP=1 dense 27B
   A/B, 2026-09-03). Recon: [`docs/gfx906/RECON-syv-qwen38-27b-rtx3090.md`](docs/gfx906/RECON-syv-qwen38-27b-rtx3090.md).
 
+- **CAT-1 — MTP draft-vocab shortlist** (`vllm/model_executor/models/qwen3_5_mtp.py`,
+  `tools/build_draft_vocab.py`; **default OFF**, enabled per-deploy via a work-dir + env — see
+  [`docs/gfx906/DEVLOG-draft-vocab.md`](docs/gfx906/DEVLOG-draft-vocab.md)): technique ported from
+  [**syv-ai/qwen38-27b-rtx3090**](https://github.com/syv-ai/qwen38-27b-rtx3090) (draft-LM-head
+  vocabulary reduction for the MTP drafter; arXiv 2506.22694 VocabTrim is the training-free
+  reference), adapted to this fork's bf16/TP=2 path — implementation ours. Final A/B on our own
+  traffic (Qwen3.8-27B, TP=2, k=2, list = **35,251 ids** = every token observed in the corpus plus
+  the added-token control family): **−2.52 ms/step [−2.91, −1.94]** ⇒ **+4.79 % t/s mean / +5.90 %
+  median** (9/11 prompts positive), acceptance **no detectable penalty** (mean −2.07 pp,
+  Mann-Whitney z = −0.83), raw-continuation coverage **97.7–98.0 % → 100 %**. The list is **paired to its
+  draft head by a manifest** (`cat1_manifest.json`: ids_sha1 + head sha1 +
+  snapshot) that the serving loader verifies at startup — an equal-length ids
+  swap or a mismatched head fails loudly instead of serving wrong draft logits
+  (`tools/draft_vocab_manifest.py`). The corpus-provenance block is written by
+  `count` when a list is rebuilt; the shipped 35,251-id list predates that field
+  (list built 08:42, manifest support landed 10:35 same day), so it carries the
+  ids↔head pairing and its snapshot but no provenance block — a fresh build
+  records the corpus. Building it correctly requires a **raw-continuation** capture —
+  parsed logs can never contain the markup the model emits, which is what an earlier parsed-log list
+  silently missed (`docs/gfx906/CAT1-corpus-build.md`). Still **not enabled by default**
+  (per-workload list).
+
 ## Custom FlashAttention backend (gfx906 FA, `CUSTOM`)
 
 This fork vendors a custom Q8 FlashAttention attention backend for gfx906
@@ -36,7 +58,11 @@ path (B=1 parallelism via GQA head-packing + KV split, fused
 gather-and-quantize, native BSHD output), making `CUSTOM` the default for
 **decode** as well: 18.9 → 25.6 t/s serving on dense Qwen3.5-27B, and the
 MoE flagship at 66.1 t/s single-request (67.4 record) / 193 t/s concurrent
-(N=8, 191.0 record) — final-build restamps 2026-08-24.
+(N=8, 191.0 record) — final-build restamps 2026-08-24. **Basis:** these are
+*historical-bench* numbers (prefix caching at vLLM's default ON, so samples 2-4
+reuse the prompt prefix); the harness default has been prefix caching OFF since
+2026-08-27 — same build, cold basis: MoE 58.4 / dense 16.3 t/s (2026-09-13,
+mclk-verified). See the note under the model table.
 See [`docs/gfx906/`](docs/gfx906/) for the full change inventory, numbers,
 and bench recipes.
 
@@ -56,6 +82,18 @@ and bench recipes.
 | ↳ 256k context | FA gather fix (2026-08-24); kv_split fix (2026-09-03) | 250k needle PASS; **37.95 t/s MTP @ 64k ctx** (was 16.6 pre-fix) |
 | Qwen3.6 fp16 checkpoints (52–67 GB) | do not fit 32 GB | — |
 
+**Decode-t/s basis (2026-09-13).** The rows above use the *historical bench
+basis*: `enable_prefix_caching` left at vLLM's default (ON), so in the 4-sample
+protocol samples 2-4 reuse the prompt prefix and their prefill is nearly free.
+`_bench_gfx906.py` defaults to prefix caching **OFF** since 2026-08-27
+(`BENCH_PREFIX_CACHE=0`, per the "prefix caching off for benchmarks" rule), which
+bills the full prefill to every sample. One build, one boot, mclk verified at
+1000 MHz in every timed window: **MoE 65.91 warm / 58.43 cold · dense 27B 24.82
+warm / 16.27 cold** — identical hardware, ~11 %/~34 % metric difference, no
+regression. Use `BENCH_PREFIX_CACHE=1` to compare with the table, `=0` for
+serving-shaped prefill-honest numbers; the fork-base deltas (3.49 → 67.39,
+18.89 → 25.60) are unaffected because both arms were measured on one basis.
+
 Details, per-model caveats, and bench recipes:
 [`docs/gfx906/README.md`](docs/gfx906/README.md) §Model support status.
 
@@ -66,7 +104,9 @@ Prefill sweep for the two prime dense models at their max context
 tg=128, mean of 2 samples; prefix caching OFF, `--max-num-batched-tokens
 4096`, float16, trimmed cudagraph capture `[1,2,3,4]`. 2026-08-29,
 boot N (canary 38.9 t/s healthy); csrc @ `cf5ccbd685` (M2 merged + M3
-hygiene, bit-identical). Re-run recipe: `docs/gfx906/_serve_tp2_gfx906.sh`
+hygiene, bit-identical) — tree as of 2026-09-13 `bbb087b65a`; the later
+FIX-H2 / host-`cu_seqlens` work only affects multi-batch prefill, so these
+B=1 numbers stand (one-point re-verify pending). Re-run recipe: `docs/gfx906/_serve_tp2_gfx906.sh`
 (start/wait/stop; Qwen3.8 at 256k needs `KVBYTES=10737418240`) +
 `docs/gfx906/_bench_serve_grid_gfx906.py` with
 `'[[32768,128],[65536,128],[112640,128]]' 2`.
@@ -106,12 +146,52 @@ bt 1024, max-seqs 4, capture `[1,2,3,4]`, `disable_custom_all_reduce`).
 | 122,880 | 9.18 t/s | **25.70 t/s** | 12.74 | **2.80×** | 2.02× |
 
 The old "MTP < greedy past ~20k ctx" live-ctx tax is gone: with the fix,
-MTP k=2 beats greedy by ~2× at 64k+ context (it still leads at short
-context — 59.2 t/s @2k). **Recommendation for long-context serving of
-Qwen3.8-27B on TP=2: enable MTP k=2** (`--speculative-config
-'{"method":"mtp","num_speculative_tokens":2}'`). Raw data:
-`/local/tmp/mtp1/data_mtp_bootQ.jsonl` (pre-fix, boot Q) and
-`data_mtp_k2fix_bootS.jsonl` (post-fix, boot S).
+MTP beats greedy by ~2× at 64k+ context (it still leads at short context —
+59.2 t/s @2k). Raw data: `/local/tmp/mtp1/data_mtp_bootQ.jsonl` (pre-fix,
+boot Q) and `data_mtp_k2fix_bootS.jsonl` (post-fix, boot S).
+
+**Depth: k=3, not k=2 (2026-09-09/11, same-corpus A/B, mixed agent+chat
+payload — `docs/gfx906/DEVLOG-mtp-depth-matrix.md`).** The k=2 row above is the
+kv_split-fix evidence; the *depth* call came later, on the production payload,
+where k=2's perfect-acceptance advantage does not transfer:
+
+| arm | 64k | 120k | note |
+|---|---:|---:|---|
+| greedy | 19.76 | 13.11 | v1 corpus |
+| k=2 | **27.30** | 22.65 | v2 (20 % chat) |
+| **k=3** | 27.44 | **24.76** | v2 — **+9.3 % vs k=2 @120k**, tie at 64k |
+| k=4 | 29.37 | 21.87 | loses on real payloads (s9 win did not transfer) |
+
+Mechanism: k=3's verify block (1 anchor + 3 drafts = 4 rows) pads to the same
+occ-2 FA tile as k=2 (3 rows), while k=4 (5 rows → pad 8) crosses to the slow
+occ-1 tile. **Recommendation for long-context serving of Qwen3.8-27B on TP=2:
+enable MTP k=3** (`--speculative-config
+'{"method":"mtp","num_speculative_tokens":3}'`, capture sizes multiples of 4);
+k=2 remains the choice for short-context / copy-light workloads.
+
+### Headline: agentic Python coding on our own corpus (2026-09-13)
+
+The tables above use synthetic filler; this is the workload we actually serve.
+Qwen3.8-27B-AWQ-INT4, TP=2, `--max-model-len 131072`, tg=256, temp 0, **our own
+CAT-1 corpus** — 15.5 M tokens of pi/hermes **agentic Python coding** traffic
+(`docs/gfx906/CAT1-corpus-build.md`), 8 distinct bodies per point, prefix cache
+off so every rep pays its full prefill, 2 reps per cell (boot f27e8058, mclk
+verified 1000 MHz):
+
+| ctx | prefill | greedy | MTP k=3 | **MTP k=3 + CAT-1** | uplift |
+|---|---:|---:|---:|---:|---:|
+| 64k | 277 t/s | 19.80 | 33.28 | **33.26** | **1.68×** vs greedy |
+| 120k | 226 t/s | 13.17 | 24.74 | **24.95** | **1.89×** vs greedy |
+
+Acceptance (mean accepted per step) at 120k is the strongest in the fork's
+records — 2.05/2.15 for plain k=3, 1.99/2.07 with CAT-1 — because a long agentic
+tail is copy-heavy, which is exactly CAT-1's operating point. CAT-1 and plain
+k=3 are a tie here (within the arm's own rep spread); its benefit is the
+**per-step** one, measured under control on 11 identical 8k prompts × 2 reps:
+**−2.52 ms/step [−2.91, −1.94] ⇒ +4.8 % mean / +5.9 % median t/s**, acceptance
+no detectable penalty. So quote **~33 t/s @64k / ~25 t/s @120k** for agentic
+coding on TP=2, and read the CAT-1 gain from the controlled A/B, not from this
+session's 2-rep cells.
 
 ### Benchmarks
 
@@ -197,11 +277,14 @@ vllm serve <model> \
 - cudagraph capture sizes = multiples of `num_speculative_tokens + 1`
   (6 for ngram n=5); use `[1,2,3,4]` for prefill/TTFT-focused or
   spec-free serving.
-- EAGLE is too heavy for these GPUs; **MTP k=2** is the recommended spec
-  config on Qwen3.8-27B (≈2× greedy at 64k+ context after the kv_split fix
-  — §Long-context DECODE with MTP above); ngram n=5 gives +15 % decode on
-  short outputs (48.5 vs 41.9 t/s @ tg256), neutral at tg1024, and remains
-  the choice for Muse-Glimmer (100 % filler-acceptance ceiling).
+- EAGLE is too heavy for these GPUs; **MTP k=3** is the recommended spec
+  config on Qwen3.8-27B at long context (same-corpus A/B: +9.3 % over k=2
+  @120k, tie at 64k — §Long-context DECODE above; k=2 stays best for
+  short-context/copy-light work, k=4 is a loss on real payloads). Both beat
+  greedy by ~2× at 64k+ after the kv_split fix. ngram n=5 gives +15 % decode
+  on short outputs (48.5 vs 41.9 t/s @ tg256, 2026-08-25 A/B — same-boot
+  re-check pending), neutral at tg1024, and remains the choice for
+  Muse-Glimmer (100 % filler-acceptance ceiling).
 - Tool/reasoning parsers: Qwen 3.5/3.6/3.8 → `qwen3_coder` + `qwen3`;
   Muse-Glimmer → `muse_glimmer` for both.
 - `--gpu-memory-utilization`: 0.82 with the spec config above; 0.93 for

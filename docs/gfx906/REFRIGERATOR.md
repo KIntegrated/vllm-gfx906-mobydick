@@ -54,6 +54,100 @@ n=5 (repo serving defaults). Completed phases are in `CHANGELOG.md`;
 detailed evidence in `DEVLOG-spec-decode.md`,
 `DEVLOG-gdn-mixed-decode.md`, `DEVLOG-fp16-skinny.md`.
 
+### SYV-12 — context-lookup verify extension (MTP fill slot)
+
+**Parked: v2 (post fill-fix) +6.4 % @120k / −5.3 % @64k, payload-conditional — parked by Kevin 2026-09-11; earlier v1 (k=2 + EXT=1) CLOSED negative for v1-as-built (2026-09-08,
+boot Y3 same-boot A/B: −9.3 % @64k / −5.3 % @120k, mixed-v2, 5/6 reps
+negative; lossless 512/512; code stays env-gated `GFX906_SYV12`
+default-OFF). The close does NOT establish the mechanism fails
+structurally — its yield was never measured. As of 2026-09-09 the
+root-caused fill fix is VALIDATED on s9 (pos3 0.987, mean ~3.99;
+see reopen gate below) — parked pending the production A/B.** Attribution correction
+(2026-09-08, verdict review of the close): per-position acceptance
+shows the fill row at **0.000 in every s9 probe window** (drafted
+3/step, accepted never; mean acceptance capped 3.00) and 0.006
+step-weighted on mixed-v2 — while a static reconstruction of the fill
+kernel over the real s9 history proves the correct fill value is
+511/511 = 100 % there, and an end-to-end wiring audit (gate, history
+append, fill kernel, input scatter, sampler alignment) found no static
+flaw (the "sampler caps at k" candidate is refuted) — a **runtime
+defect** was declared open at that point. **2026-09-08 (pre-probe,
+boot Y3): root cause found + fixed — it was a static CONTRACT bug the
+wiring audit and the 16/16 unit test had both baked in:** the v1
+fill's lookup suffix was the trailing history only, which ends at the
+step's ANCHOR, so its continuation targets the d0 slot while the value
+is stored in the FILL slot (after d0, d1) — off by k=2 positions. That
+single off-by-k explains both observed regimes: s9 (period-9 loop) →
+old fill ≈ the d0 value, never the FILL-slot argmax → 0.000 in every
+window; mixed-v2 → accepted only when a token repeats across the
+anchor→d1 span → the ~0.6 % incidental hits. (The "511/511 static
+reconstruction" measured the kernel's own contract — d0-continuation
+vs the next token — not FILL correctness.) Fix: suffix = last
+(MIN_MATCH−k) history tokens + the k base drafts (which end at
+d_{k-1}, the token before the FILL position); unit-verified 16/16
+under the corrected contract. The measured A/B loss is
+the pure always-paid 4th-row GDN cost (+33 % per-step state traffic;
+FA unchanged — both blocks pad to Sq_pad=4) with ~zero fill yield. The
+point-mass draft-probs fallback (all drafts, while SYV-12 is active)
+showed no measurable base-draft degradation in the recorded A/B but
+must be removed in any v2. Note the revival regime is NOT s9-class
+(s9 is where MTP already saturates: pos1/pos2 = 1.000) — it is
+verbatim-span-heavy generation where the MTP head misses (syv's +47 %
+reproduce-a-document case). **Reopen gate (in order, updated 2026-09-09 post-validation):** (1)
+the instrumented s9 in-process probe (per-step dump landed in-tree,
+env-gated default-OFF; driver + analyzer under /local/tmp/syv12/) —
+now a VALIDATION run of the fixed fill, with the dump's
+(A) kernel-write / (B) input-path / (C) sampler-verdict decomposition
+as the fallback localizer if anything still misses — **PASSED
+2026-09-09 (boot Y4)**: (A) 96/96, (B) 65/65, gate/append 0/0;
+pos3 = 0.987 steady state (single miss = the prefill->decode boundary
+step, gate off by design), mean acceptance ~3.99 (vs ~3.0 under v1),
+identity perfect, eager decode 31.65 t/s (vs 24.56 v1-as-built,
++28.9%). Two boot-Y4 defects found on the way, both fixed: a Triton
+compile assert (mixed int32/int64 phi in the match loads — the unit
+test had compiled only the all-int32 signature; `fb971c54a0`, test now
+uses the live int64 draft dtype) and the TP-rank dump interleaving
+(`2eacd8e8ed`, per-pid suffix). (2) — **DONE 2026-09-09 (boot Y4): PAYLOAD-CONDITIONAL.** Same-boot
+production A/B, boot-Y3 protocol (mtp k=2 TP=2, mixed-v2 64k+120k
+×3, OFF first): ON 27.99/23.80 vs OFF 29.55/22.37 → **−5.3 % @64k,
++6.4 % @120k (medians)**; @120k clean separation (min ON 23.28 > max
+OFF 23.06), @64k overlapping. Realized fill acceptance ≈25 % of
+steps @120k (above the review's 15–20 % bar) vs ≈0–5 % @64k (fill
+effectively never fires there; ON = OFF + the always-paid 4th-row
+GDN cost). Lossless in serving (text probes clean both arms). The
+bar "ON ≥ OFF at the mixed points" is met at 120k only — the
+mechanism is payload-conditional exactly as the review predicted,
+so SYV-12 v2 stays PARKED — **park confirmed by Kevin 2026-09-09
+until further review; the B=4 campaign runs first (same boot)**;
+(2b) **gate variable adjudicated 2026-09-09 (research agent,
+CPU-only; handover
+`/local/tmp/handover-syv12-context-vs-payload.md`, repro
+`/local/tmp/mtp1/syv12_content_vs_context.{py,log}`)**: the 64k→120k
+flip is a **payload-position (copy-density) effect, not context
+scaling** — the 8,192-token lookup window cannot see context length.
+Windowed 5-gram repeat density on the served corpus: served 64k
+bodies 12.6 %; same 120k bodies first-65,536 13.6 %; same 120k
+bodies LAST 65,536 **21.5 %**; realized acceptance tracks the tail
+(≈25 % @120k vs the 21.5 % tail; ≈0–5 % @64k vs the 12.6 %).
+Amended parked verdict (one line): *payload-conditional,
+position-of-generation-tail-gated (+6.4 % @120k, tail density
+≈21 %; −5.3 % @64k, ≈13 %); NOT context-length-gated.*
+Consequence: any enablement gate is on payload/runtime density (the
+fill path already computes the match statistics — gate on sustained
+recent fill-hit rate > ~10 %), NOT on a context-token threshold
+(which breaks silently on front-sliced payloads, e.g. the B=4
+16k/32k/64k envelope);
+(3) if pursued, in order: the crossover A/B as a 2×2 (content ×
+depth) — FRONT-SLICES of the 122880-point bodies at 80k+100k (same
+text, shallow vs deep; only front-slices isolate depth) + the served
+64k point as content control (2 loads) + compiled-mode s9 120k
+(2 loads), then the B=4-era default discussion
+(the 4th row adds the same cost at B=4 — the campaign should know
+whether SYV-12 is in the picture). Small-n caveat (8 bodies/point)
+currently fine: per-body spread ±0.002 on the A/B/C/D ordering. Dev
+log: `DEVLOG-fa-attention.md` SYV-12 entries (boot Y/Y2/Y3 +
+correction); ROADMAP SYV-12 entry.
+
 ### SD-L2 — AWQ M≤4 draft-step GEMV
 
 **Parked: estimate says small win.** The M=1-to-M=4 AWQ cost is
@@ -66,6 +160,22 @@ estimated at 2–8 ms. **Reopen gate:** MTP is no longer the preferred
 drafter, or a serving profile shows the estimate is materially wrong.
 Gates if reopened: per-shape microbenchmark, the gfx906 MoE/GPTQ tests,
 a PPL or greedy gate as appropriate, and an agentic serving A/B.
+
+### T-1.5/A5 — M≤8 W8A16 GEMV kernel (orphaned infrastructure)
+
+**Parked: method layer removed, kernel intentionally kept (2026-09-07, A5
+CLOSED — `e289ff17dc`).** `dense_gemv_i8_m4_gfx906`
+(`csrc/rocm/dense_gemv_gfx906.cu`, in-kernel fast path for M≤8 int8-W/
+fp16-A GEMV) has NO in-repo caller anymore — reachable only via the
+`_custom_ops` binding. Do not re-derive it and do not delete it as dead
+code: it is the only in-tree W8A16 GEMV for the verify head at M=5..8
+(the M>8 path is a per-call dequant fallback). A/B was NO-WIN at k=4
+(−0.40/−0.44/−0.13 %, token-identical — the int8 head flipped no
+argmax). Full transform spec + probe recipe in
+`DEVLOG-t1-int8-fp16-mass.md` (2026-09-07 closure entry). **Reopen
+gate:** a B=1 deep-k≤3 head-quant need (the k=2/3 operating point keeps
+M ≤ 8, where the kernel's in-kernel path applies) or a serving profile
+showing the verify head GEMV back in the critical path.
 
 ### SD-suffix — suffix draft-quality probe
 
@@ -97,3 +207,37 @@ work before all four.
 - LEGACY=0 Q8-write fusion into `triton_reshape_and_cache_flash` —
   parked in `DEVLOG-fa-legacy0-b1-decode.md`; gated on ROADMAP G1
   (node-overhead measurement).
+
+## Archive branches (gfx906/fa-decode-fp16 closure, 2026-09-12)
+
+Dead-ended / parked experiments stripped-or-stripped-at-merge from the
+main line, kept as named branches. Revival = checkout, rebase on then-
+main, re-gate per the preconditions.
+
+- **`archive/syv12`** — constructed branch (main + SYV-12 code + dev
+  log). 2026-09-12 corpus-agent finding: NOT workable in the current
+  kernel/architecture shape (corpus-independent). Revival only if
+  the fill/verify SHAPE changes. See `DEVLOG-syv12.md`.
+- **`archive/t1-int8-mass`** (pointer @ `a0bb358670`) — int8 W8A16
+  drafter mass, NOT PASS at k=4 serving. Revival: only if the serving
+  depth regime or the lm_head cost share changes materially; quality
+  gate was clean (0/120 argmax flips). Range `e1a57e9a17..a0bb358670`.
+- **`archive/a3-fused-draft`** (pointer @ `3fbb4e3f81`; revival recipe in
+  `A3-REVIVAL.md` on that branch) — fused
+  multi-step draft metadata, NEUTRAL @k=4; **the fork's opt-in was stripped from
+  the branch 2026-09-13** (`vllm/gfx906_fa/gfx906_fa_backend.py` reverted to
+  upstream's default `False`; brief `/local/tmp/b4/a3-strip-decision.md`).
+  Revival: V2 becomes the consuming runner (the fused loop is upstream, V2-only)
+  and the draft-step host cost share grows (bigger k or B) — then re-add the
+  ~7-line opt-in and re-audit the no-op contract at the serving k. The branch is
+  the permanent home of the A3 work (code + tests + the measured verdict + the
+  revival recipe) — `archive/*` branches are never deleted. 
+- **`archive/fd1-fused-draft-meta`** (pointer @ `abc9d8ded9`) —
+  FD-1 decode-metadata path, NEUTRAL @B=4/120k offline (stack-confounded:
+  offline arm vs serving control). **FD-1's code IS A3's code** — one flag,
+  two gates; FD-1 was the offline B=4/120k gate of it, and the flag has **no
+  reader** in-tree since the 2026-09-13 strip. Roles: the A3 entry above is
+  the **code + revival-recipe home** (`A3-REVIVAL.md`); this branch is the
+  **era snapshot** (full tree @ `abc9d8ded9`, superset — it also holds the
+  `bdcbd8ec3a` kv_max clamp fix). Revival: pair with A3; re-gate **same-stack**
+  (never offline-vs-serving again). Analysis: `/local/tmp/b4/fd1-keep-strip-decision.md`.

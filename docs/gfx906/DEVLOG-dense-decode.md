@@ -279,6 +279,33 @@ close (187-230% of floor vs exllama 87-97%). **W4A16 stays rejected;
 exllama gptq remains the dense W4 path.** Prototype lives in
 `/tmp/bench/w4a16/` (not in-tree) for the record.
 
+### 2026-08-15 — M=1 W16A16 GEMV (`dense_gemv_gfx906.cu`, P3-2b): K-split refuted, RPT=2 single-pass LANDED
+
+*(moved 2026-09-13 from DEVLOG-fa-attention.md — same kernel as the entries below)*
+
+Built for the small-row pile (gate_up/down/router/GDN-small, ~150 calls/step,
+3.6–14× floor, launch/latency-bound). Op `_rocm_C.dense_gemv_gfx906(weight[N,K]
+fp16, x[1,K], kchunk)`: row-parallel LLGemm1-style, `__ockl_fdot2`, fp32 acc,
+templated `RPT×KCHUNK`; K-split >1 accumulates packed fp16 CAS (pre-zeroed out).
+
+- **v1 (K-split) hypothesis WRONG:** kc=512 splits are 2.4–4.2× *slower* than
+  LLMM1 on every K=2048 shape (o_proj 3.5×) — fp16-CAS + `zero_` + tiny-block
+  latency dominates at M=1. Small rows are launch/latency-bound, not
+  CU-occupancy-bound, so a better GEMM cannot close them.
+- **v2 (RPT=2, kc=4096 single pass) won:** qkv 9216×2048 **−23 %**, router
+  256×2048 **−17 %**, in_proj −6 %, LM head −6 % (0.9× floor); o_proj / shared
+  gate_up / down keep LLMM1 (RPT=2 is pathological at N=1024). **Weighted step
+  5203 vs 5604 µs = −401 µs/step (−7.2 %)** — the plan's 0.7–1.1 ms estimate
+  missed because of the launch-bound reframing. Shape rule
+  `K==2048 ∧ (N==256 ∨ N≥2048)` through the `_llmm1_tiny_m` choke point; kill
+  switch `VLLM_GFX906_DENSE_GEMV=0`.
+- v1 review bugs caught pre-landing: 64-thread K-split CAS overcount (4 lanes
+  CAS the same 8 B → guard `t==0`), 256-thread OOB LDS read in the sibling-row
+  epilogue, host accepting `N%4!=0` with K-split.
+- **Build gotcha:** a missing `\` on an interior macro line silently truncated
+  `LAUNCH_BY_RPT`; `clang -E | grep` on the file alone found it — use that for
+  macro surgery, not a full rebuild.
+
 ### down_proj GEMV (K=17408) LANDED (2026-08-17)
 
 - `csrc/rocm/dense_gemv_gfx906.cu`: auto-RPT rule now

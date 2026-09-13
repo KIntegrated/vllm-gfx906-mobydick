@@ -39,7 +39,7 @@ the unrecorded F2 numbers.
 gather-vs-gather question is closed at parity and the B=1 gap is
   the entire remaining LEGACY=0 deficit — proceed per the test
   plan.
-- **Decode-path regime (DEVLOG-fa-attention 2026-08-28) — and the
+- **Decode-path regime (DEVLOG-fa-kernel-batches.md 2026-08-28) — and the
   tension it creates:** B=1 decode is *assessed*
   gather-HBM-bound (~2.7× at D=128, NC2=8) — ALU-only fixes cannot
   surface there; a layout fix must reduce *read* cost. **The tension

@@ -71,3 +71,16 @@ DEVLOG) + `DEVLOG-int8-transfer.md` (the P1/P2 session record).
    verdicts; eager A/B can tie even when kernels differ (launch-bound).
 3. PPL/prompt_logprobs is an unreliable gate on Gemma-4 (hybrid attention);
    gate on coherent text + logprob A/B (`GA`).
+
+## Branch gfx906/fa-decode-fp16 (2026-09-10 → 2026-09-12) — rows added at branch closure
+
+| Hyp | Gate | Verdict | Commit/revert | Comment | Refs |
+|-----|------|---------|---------------|---------|------|
+| T-1 int8-mass: int8 W8A16 the unquantized drafter fp16 mass | serving k=4 A/B | **NOT PASS** (final k=4 re-test parity −1%; earlier +15-18% was a cold-start misread) | code stays env-gated `T1_INT8_MASS=1` default OFF; archive candidate | quality gate was clean (0/120 argmax flips) — speed didn't transfer | DEVLOG-t1-int8-fp16-mass.md |
+| SYV-12 context-lookup verify (MTP k=2 + fill) | production A/B @120k/64k | **DEAD-END** (v1 net loss; v2 payload-conditional; 2026-09-12 corpus agent: not workable in the current shape, corpus-independent) | deep-scrubbed; code grouped on `archive/syv12` | revival only if the fill/verify SHAPE changes | DEVLOG-syv12.md |
+| FA ncols1=5/6 native tiles for Sq=5 verify | standalone VGPR/spill + wall @120k | **NO-WIN** (VGPR=128, spill 171/167; wall flat) | experiment code reverted | occupancy needs a build; config levers exhausted for Sq=5 | DEVLOG-fa-verify-sq8.md |
+| KVSPLIT=32 uniform (all Sq) | same-boot A/B | **REJECTED** (bit-exact −10%) | shape-aware default shipped instead (32 for Sq≥4, 16 for Sq=2) | — | DEVLOG-fa-verify-sq8.md |
+| MTP k=4 on real (agent+chat) payload | boot-Y mtp4ag 9/9 | **LOSS** (synthetic-payload win did not transfer) | depth set to k=3 | — | DEVLOG-mtp-depth-matrix.md |
+| A3 fused multi-step draft metadata | serving A/B @k=4 | **NEUTRAL** | fork opt-in **stripped** 2026-09-13 (upstream default `False`); archived to `archive/a3-fused-draft` (@ `3fbb4e3f81`, code + tests + verdict + `A3-REVIVAL.md`); revival = V2 path + re-audit (k=7 never measured) | — | a3-strip-decision.md |
+| FD-1 fused-draft decode-metadata path @B=4/120k | offline 4×122880 wall | **NEUTRAL** (stack-confounded: offline arm vs serving control) | **same code as A3** — opt-in **stripped** 2026-09-13 (`f8a9400789`); `VLLM_GFX906_FUSED_DRAFT` has **no reader** in-tree now (records retained; revival = restore A3 from `archive/a3-fused-draft`, then re-gate **same-stack**) | — | DEVLOG-spec-decode.md, fd1-keep-strip-decision.md |
+| P1 (stall theory: prefix-cache/padding artifact) | D1a cached-KV probe | **DEAD** (5.327 vs 5.324 s control) | — | — | DEVLOG-ttft-prefill-stall.md |

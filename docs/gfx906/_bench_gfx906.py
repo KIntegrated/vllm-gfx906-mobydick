@@ -11,11 +11,51 @@ Prints "BENCH: {json}". Robust to cross-version SamplingParams differences.
 
 import json
 import os
+import re
+import subprocess
 import sys
+import threading
 import time
 
 WARMUP = os.environ.get("BENCH_WARMUP", "1") == "1"
 SAMPLES = int(os.environ.get("BENCH_SAMPLES", "1"))
+
+# DVFS gate (docs/gfx906/dvfs-mi50.md): idle mclk is 350 MHz and cold-clock
+# benches are inflated ~3x. Sample mclk concurrently with the timed windows and
+# report the median per sample; a median < 900 MHz invalidates the number.
+class _MclkSampler:
+    def __init__(self, period=0.3):
+        self.period, self.samples, self._stop = period, [], threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+
+    @staticmethod
+    def _read():
+        try:
+            out = subprocess.run(
+                ["rocm-smi", "--showclocks"], capture_output=True, text=True, timeout=5
+            ).stdout
+        except Exception:
+            return None
+        vals = [int(v) for v in re.findall(r"mclk clock level.*?\((\d+)\s*Mhz\)", out)]
+        return max(vals) if vals else None
+
+    def _run(self):
+        while not self._stop.is_set():
+            v = self._read()
+            if v is not None:
+                self.samples.append((time.time(), v))
+            self._stop.wait(self.period)
+
+    def start(self):
+        self._t.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    def median_between(self, t0, t1):
+        vals = [v for t, v in self.samples if t0 <= t <= t1]
+        return (sorted(vals)[len(vals) // 2], len(vals)) if vals else (None, 0)
 
 
 def model_arg():
@@ -171,6 +211,7 @@ def main():
         llm.generate(prompts, gen_params(min(tg, 8)))
         print("BENCH warmup_pass done", flush=True)
 
+    sampler = _MclkSampler().start()
     results = []
     for s in range(SAMPLES):
         t0 = time.time()
@@ -180,6 +221,10 @@ def main():
         # token_ids-based: text re-encoding collapses on degenerate/garbage
         # output (e.g. '!!!!...') and undercounts.
         elapsed = t1 - t0
+        mclk, nsamp = sampler.median_between(t0, t1)
+        if mclk is not None and mclk < 900:
+            print(f"BENCH WARNING: sample {s} median mclk {mclk} MHz < 900 "
+                  f"(cold-clock; number INVALID) - see dvfs-mi50.md", flush=True)
         results.append(
             {
                 "sample": s,
@@ -187,8 +232,11 @@ def main():
                 "out_tokens": n_out,
                 "elapsed_s": round(elapsed, 3),
                 "tokens_per_s": round(n_out / elapsed, 3) if elapsed else 0.0,
+                "mclk_median_mhz": mclk,
+                "mclk_n": nsamp,
             }
         )
+    sampler.stop()
 
     print(
         "BENCH: "

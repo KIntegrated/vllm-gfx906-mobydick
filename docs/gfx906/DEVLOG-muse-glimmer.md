@@ -1261,7 +1261,7 @@ launch belongs on a fresh boot.
 `fa-legacy-m0-m6-code-rev.md`): the mechanism as committed does not
 survive this round's own data.** The "What was done" / "VERDICT"
 text above states the B=4 loss as "direct-paged's strided Q8-slice
-reads", escalating the 2026-08-28 `DEVLOG-fa-attention.md`
+reads", escalating the 2026-08-28 `DEVLOG-fa-kernel-batches.md`
 inference ("code-level attribution") to settled fact. This round's
 own in-process A/B contradicts the claim as stated: arm 1
 (LEGACY=0 direct-paged — the IDENTICAL strided-read path) at B=4/

@@ -527,3 +527,32 @@ B-TTFT +50%.
   .venv python for GPU probes.
 - vLLM in-proc probes: the spawn/guard/max_model_len/late-binding
   checklist is in DEVLOG-moe-opt.md "PROBE PITFALLS".
+
+## 2026-09-11 — Qwen3.8-27B (Qwen3.5-family) MTP depth matrix + campaign depth call (mtpv2)
+
+**VERDICT:** SHIPPED (k=3 as the campaign/serving depth) · **GATE:**
+same-corpus (v2, mixed agent+chat) production A/B @120k/64k, TP=2.
+k=3 wins @120k, ties @64k; **k=4 is a loss on real payload** (boot-Y
+mtp4ag 9/9 worse; the synthetic-payload k=4 win did not transfer);
+k=5 s9 ceiling recorded (A1). Draft-vocab interplay: CAT-1 k=4 stacking
+PASS (+5.6/3.9/3.8%, zero acceptance loss) — see DEVLOG-draft-vocab.md.
+Refs: hunt-combined doc (branch history), `b77dd5de43`, `5ded61eca1`.
+
+## 2026-09-12 — FD-1 fused-draft path (VLLM_GFX906_FUSED_DRAFT=1) at B=4/120k
+
+**VERDICT:** NEUTRAL · **GATE:** offline 4×122880 wall, mtp3b4 shape.
+FIX arm 2377.6 s vs non-FD serving 2447.8/2464.9 s — stack-confounded
+(offline vs serving), within run spread. rep_frac8 differences across
+arms are batch-composition variability (non-FD s0 vs s1 differ too).
+`supports_draft_decode_metadata_update` is host-logic-free by
+construction.
+
+**STATUS 2026-09-13 — the gate's code is gone; this record stands.** FD-1's
+only in-tree reader of `VLLM_GFX906_FUSED_DRAFT` was A3's opt-in (same code,
+two gates), stripped with A3 (`f8a9400789`) and archived to
+`archive/a3-fused-draft` (@ `3fbb4e3f81`, code + tests + verdict +
+`A3-REVIVAL.md`). Setting the flag now changes nothing — a re-run of this arm
+would silently duplicate the non-FD control. Keep the confound too: the
+verdict above compares an **offline** arm against **serving** controls, so any
+revival must re-gate same-stack. Keep/strip analysis:
+`/local/tmp/b4/fd1-keep-strip-decision.md`.

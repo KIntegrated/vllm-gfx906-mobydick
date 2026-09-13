@@ -3,6 +3,16 @@
 > These instructions apply to **all** AI-assisted contributions to `vllm-project/vllm`.
 > Breaching these guidelines can result in automatic banning.
 
+## 0. Repository model (local fork)
+
+`main` on this box is a **permanent local fork** of upstream vLLM, not a
+candidate for direct upstream merge. It periodically pulls upstream
+`main`; gfx906 work lands here via reviewed trains from long-lived topic
+branches (dead-ended experiments go to `archive/*` branches, never
+deleted). Section 1's contribution policy governs the separate,
+selective process of contributing upstreamable wins back upstream —
+local train merges follow the review-train checklists instead.
+
 ## 1. Contribution Policy (Mandatory)
 
 ### Duplicate-work checks

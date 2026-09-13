@@ -65,7 +65,7 @@ Readings:
 
 - **Layout work does not pay on byte-bound single-token streaming
   paths** — confirmed independently of our own roofline analysis
-  (`DEVLOG-fa-attention.md` 2026-08-28). Price layout changes for
+  (`DEVLOG-fa-kernel-batches.md` 2026-08-28). Price layout changes for
   the multi-token/issue-bound side of the stack, or don't price
   them at all.
 - Their one single-token win (dense +6.4 %) is a **fused GLU/bias

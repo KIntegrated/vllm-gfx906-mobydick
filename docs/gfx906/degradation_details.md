@@ -1698,7 +1698,1433 @@ verified by syv3_final_test.py ALL PASS (01:30) and by both canary runs
 showing "SYV-3 skinny GEMV activated" — so the A/B is runnable as soon as a
 launch window opens.
 
+## 2026-09-04 (boot U) — CAT-1 pilot A/B: wedge #18 mid-decode @120k (silent, no kernel event)
 
+**Context:** CAT-1 draft-vocab pilot driver (`/local/tmp/mtp1/cat1_pilot_driver.sh`),
+arm0 = stock MTP k=2 TP=2 `mtp1srv@mtp` :8123 (util 0.85, maxlen 131072, capture
+[1,2,3,4], NCCL Tree+LL). Canary pre-flight 39.2 t/s (~11:56, healthy band).
 
+**Timeline:**
+- 12:02:35 driver start (SKIP_CANARY=1 — canary passed minutes earlier)
+- 12:12:20 arm0 ready after ~585s (weights 34.0+14.8 s; torch.compile 87.7 s
+  backbone + 12.6 s eagle_head on WARM 31 GB AOT cache; graph capture 9 s)
+- bench pp=65536: reps 38.9/38.8/38.8 t/s (median 38.85, n=3) — matches the
+  known k=2-fixed @64k class (37.95 on boot S); coherence sample clean
+- ~12:24:35 last server log line (`Running: 1`, gen throughput 25.6 t/s logger)
+  while rep at pp=122880 was in flight → **both GPUs pinned 100%**, bench client
+  (pid 34530) stuck in `do_sys_poll` with only 8 s CPU time, zero new log lines
+- ~12:27 teardown: systemd stop + SIGTERM; my first manual pkill self-matched its
+  own shell command line (`pkill -f "vllm serve"` contains the pattern) and
+  SIGTERM'd itself mid-loop — sloppy but harmless (systemd's stop completed,
+  GPU quiesced within seconds)
+- post-teardown: no zombie KFD handle (only arm1's new PIDs on /dev/kfd);
+  kernel journal window has NO amdgpu events for this hang
 
+**Signature:** first serve-based wedge NOT at weight-load/SetDevice/prefill —
+this one hit during DECODE at 120k ctx, silently (no BACO, no kernel log).
+Long-context zone per the degradation.md risk note; cf. boot-R 10:56
+(prefill@122880 crash, GDN-Triton-decode path active). Non-deterministic HW
+per Kevin's 2026-09-03 ruling (tp=2 accepted as HW-related on this dev system).
 
+**Consequence:** arm0 pp=122880 point lost; re-run that single point after arm1
+completes. Driver continued to arm1 (CAT-1 pilot work-dir, :8125) which loaded
+weights cleanly (50.6 s + 18.1 s — the extra `model_extra_tensors.safetensors`
+419 MB draft head included).
+
+**Assessment:** single event, canary healthy minutes before and after; no burst.
+Continue per house recipe (retry the lost point once arm1 is done). If decode-
+zone wedges recur in this session, stop + report rather than rebooting mid-pilot.
+
+## 2026-09-04 (boot U) — S1 startup-time session: wedge #19 at profile stage with --language-model-only
+
+**Context:** S1 (startup compile/capture speed) instrumented-boot session. Baseline
+stock boot (`s1base`, 15:13–15:20) completed cleanly: init engine 233.85 s,
+compilation counter 0.95 s (warm AOT cache hit — vs 100.3 s on the 12:0x pilot
+boot whose config-key cache was cold). Stack dumps (in-process SIGUSR1/dumper)
+proved the ~213 s "pre-compile gap" is the **vision-encoder dummy forward**:
+Worker_TP0 pinned in `gpu_model_runner.py:6611 profile_run → qwen3_vl.py:2882
+embed_multimodal → vit_attn_wrappers.py vit_flash_attn_wrapper` for
+15:15:26→15:18:51 (42 consecutive 5 s samples). The checkpoint is
+`Qwen3_5ForConditionalGeneration` with `vision_config: true` + 333 `model.visual.*`
+tensors, so every startup profiles a max-feature-size dummy image even for
+text-only serving.
+
+**The wedge:** L3 lever probe (`LANG_ONLY=1` → `--language-model-only`, stock
+config otherwise) launched 15:55 under `systemd-run --user -p MemoryMax=infinity`.
+Flag applied cleanly (both TP workers logged "All limits of multimodal modalities
+supported by the model are set to 0, running in text-only mode" at 15:57:12).
+At ~15:57:35 Worker_TP1 threw `c10::AcceleratorError: CUDA error: unspecified
+launch failure` (`hipErrorLaunchFailure`) during init; kernel journal:
+`Fence fallback timer expired on ring comp_1.0.0` → `GPU reset(2) succeeded!
+[drm] device wedged, but recovered through reset` on 0000:0e:00.0 (GPU1).
+API server then raised "Engine core initialization failed".
+
+**Attribution:** NOT the flag's code path — `language_model_only` only zeroes
+modality limits in config before any GPU work; the stock boot 10 minutes earlier
+ran the identical init sequence cleanly, and this is the same chronic TP=2 HW
+instability family (#16/#17 SetDevice, #18 mid-decode). Per Kevin's 2026-09-03
+ruling: accepted HW-related on this dev system; no RMA escalation.
+
+**State after:** GPU quiesced (both 0%), VRAM baseline, `fuser /dev/kfd` empty
+(no zombie KFD handles — reboot not required). L3 startup win still unmeasured;
+retry after a fresh canary, or measure the same lever on the TP=1 text-only path
+(lower wedge risk per Kevin's "one GPU first" guidance).
+
+**Instrumentation note (for future sessions):** v1 stack dumper (daemon thread +
+`faulthandler.dump_traceback(all_threads)`) labels the *dumper* thread as
+"Current thread", hiding the main thread — parse `Thread 0x…` blocks instead.
+v2 (SIGUSR1 handler, no dumper thread) fixed this but needs an age-gate before
+signaling: a bare SIGUSR1 to the bash launcher pre-`exec` kills it (default
+action), and spawned workers only arm their handler at interpreter startup.
+
+## 2026-09-04 (boot U) — wedge #20: L3 re-run dies at the same stage (post-reset degradation suspected)
+
+**Context:** S1 startup-time session, ~83 min after wedge #19. L3 probe re-run
+(`LANG_ONLY=1` = `--language-model-only`, stock config otherwise), launched under
+`systemd-run --user -p MemoryMax=infinity` via the fixed sampler (age-gated
+SIGUSR1 + shell exclusion). Unit `s1lang.rerun.service`.
+
+**Timeline:**
+- 17:19:31 APIServer up; both workers log "All limits of multimodal modalities ... set to 0, running in text-only mode" (flag active, as intended)
+- NO "Encoder cache will be initialized" line → vision-encoder profiling correctly skipped (hypothesis confirmed again at the log level)
+- ~17:20:30 both workers throw `c10::AcceleratorError: CUDA error: unspecified launch failure` from `SetDevice` (HIPFunctions.cpp:334); EngineCore reports "WorkerProc initialization failed due to an exception in a background process"
+- 17:20:31 kernel: `Fence fallback timer expired on ring comp_1.0.0` → BACO `GPU reset(3) succeeded! device wedged, but recovered through reset` on 0000:0e:00.0 (**GPU0**)
+
+**Stack-dump evidence (decisive for the flag's innocence):**
+- 233 dumps written across 5 pids; **zero** contain vision frames (`vit_flash_attn|embed_multimodal|qwen3_vl|vision_encoder|image_processor`) — the ViT forward was genuinely not running, consistent with `--language-model-only` doing its job.
+- Last EngineCore sample: idle in `wait_for_ready`; APIServer in `wait_for_engine_startup`. The dying work was in the C-level worker-init/profile path (no Python frames), same shape as #19.
+
+**Why this is NOT attributed to `--language-model-only`:**
+1. Its code path only zeroes modality limits at config time — before any GPU work. A software fault there would surface as an assertion/shape/value error, not a fence timeout + BACO reset.
+2. The stock baseline boot 90 min earlier (no flag) ran the identical init to healthy (39.2 t/s canary later confirmed the system fine at 15:1x).
+3. Kernel history for this boot: GPU0 already BACO-reset at 15:57 (#19); GPU1 reset twice earlier (01:31, 15:12). Pattern = chronic TP=2 HW instability family; **post-reset degradation of GPU0** is the leading hypothesis (a card that just went through a BACO reset may be flaky until reboot).
+
+**Recovery:** automatic via BACO. No zombie vLLM KFD handles post-run (only `gpuagent` monitor at 0 VRAM), so no reboot *required* for handle hygiene — but the prudent next step before any further TP=2 GPU work is a **canary probe**, and if stock also wedges, stop + reboot via `~/bin/hermes-reb.sh`.
+
+**S1 consequence:** L3 end-to-end startup number remains unmeasured. The 213 s vision-profiling gap it targets stays PROVEN by the clean baseline dumps (Worker_TP0 pinned in `profile_run → embed_multimodal → vit_flash_attn_wrapper`, 15:15:26→15:18:51). L3 is expected to remove ~213 s of a 234 s init; exact post-fix number pending a healthy GPU window.
+
+**Do NOT:** retry L3 (or any TP=2 boot) immediately — canary first, reboot if the canary itself wedges.
+
+## 2026-09-04 (boot U, evening) — T-1 session: wedge #21 on in-process probe launch
+
+T-1 work resumed ~22:15 UTC on boot U (still the same boot as the morning
+SYV-3 burst; no reboot in between). Sequence:
+
+1. 22:15:54 `mtp1canary@mtp` started (fresh, post-morning-burst clean state).
+   Model load 39.2 s; canary **39.2 t/s** — healthy band, PASS. Clean KFD after
+   (only gpuagent), VRAM 0% both cards.
+2. 22:19 `t1probe` service started — in-process TP=2 `LLM()` (util 0.85,
+   maxlen 131072, compilation mode NONE, MTP k=2) with the t1_phase plugin armed
+   (hooks target lm_head + drafter). Wedged at weight-load shard ~2/5:
+   userspace `c10::AcceleratorError: unspecified launch failure` on both ranks →
+   kernel `amdgpu 0000:0b:00.0: qcm fence wait loop timeout expired` +
+   `The cp might be in an unrecoverable state due to an unsuccessful queues
+   preemption` + `Failed to evict process queues` + `GPU reset begin!`. Source 4.
+3. After teardown: VRAM back to 0% baseline both cards, KFD clean (only gpuagent),
+   no zombie vllm PID.
+
+**Assessment:** same chronic in-process-LLM() weight-load-hang family as wedges
+#9/#10/#11 (all boot T) and the morning #16/#17 burst. Non-deterministic; a clean
+canary passed ~4 min before, so this is not a code fault (the plugin only attaches
+hooks AFTER load_model returns — it cannot affect weight loading). The in-process
+weight-load path remains the trigger family on this host.
+
+**Decision per house recipe:** one retry authorized. If the retry wedges → stop GPU
+work + reboot via `~/bin/hermes-reb.sh`, then re-run the probe SERVE-BASED (the
+serve path booted clean 6× today and is the cleaner family). The probe itself is a
+one-shot measurement; it does not need to be in-process.
+
+## 2026-09-04 (boot U, evening) — T-1 session: wedge #22 on serve-based probe launch
+
+**Context.** Per #21's decision, the probe was moved off the in-process `LLM()`
+path onto a **serve-based** launcher (`run_t1probe_serve.sh`, `vllm serve` TP=2
+util 0.85, mode-NONE eager, MTP k=2) + the `t1_phase` plugin armed via
+`/local/tmp/t1/t1_arm.cfg`. The plugin's hook-attach bug (shared-lm_head double
+hook) was fixed and synced to site-packages before launch.
+
+**Timeline.**
+1. 22:46 canary `mtp1canary@mtp` **39.2 t/s PASS** (healthy band), clean SIGTERM
+   shutdown, VRAM released.
+2. 22:49 `t1probe-serve.service` started under systemd (MemoryMax=inf).
+3. ~59s in, worker init wedged at `c10::cuda::SetDevice`: userspace
+   `c10::AcceleratorError: CUDA error: unspecified launch failure` on BOTH ranks →
+   kernel `amdgpu 0000:0b:00.0: qcm fence wait loop timeout expired` + `The cp
+   might be in an unrecoverable state due to an unsuccessful queues preemption` +
+   `Failed to evict process queues` + `GPU reset begin!` (Source 4) → **BACO reset**
+   → `GPU reset succeeded, trying to resume`. EngineCore raised
+   `WorkerProc initialization failed`; API server exited code 1.
+
+**Post-wedge state.** VRAM back to 0% baseline both cards; KFD clean (only
+`gpuagent`); no zombie vllm PID. **Kernel SELF-recovered** — unlike the
+reboot-only zombie-KFD states, this one needs no reboot.
+
+**Assessment.** This is the **serve-based family** (worker-init `SetDevice`),
+distinct from #21's in-process-LLM() weight-load family. Non-deterministic; a clean
+canary passed ~4 min before. The plugin cannot be the cause — it attaches hooks only
+AFTER `load_model` returns, and this wedged during worker init (before model load).
+Consistent with the chronic non-deterministic tp=2 weight-load/SetDevice wedge family
+that Kevin has accepted as HW-related on this dev system.
+
+**Decision per house recipe:** post-reset canary gate, then **ONE** serve-based probe
+attempt (first of its family on boot U). If it wedges again → full stop + report to
+Kevin (do not keep relaunching a repeatedly-wedging GPU without direction).
+
+## 2026-09-05 (boot U) — T-1 A/B arm1 launches: wedges #23/#24, pre-transform weight-load failures
+
+**Context.** T-1 Task 3 serving A/B on branch `gfx906/t1-int8-fp16-mass`. Design:
+same branch for both arms; the single variable is the `T1_INT8_MASS` env flag
+(arm0 = OFF via `mtp1srv@mtp`, arm1 = ON via the new `mtp1srv-t1on@` unit with an
+`Environment=T1_INT8_MASS=1` line). Unit check re-run first: 31/31 ALL PASS.
+
+**Timeline.**
+1. ~07:44 arm0 (`mtp1srv@mtp`, flag OFF) booted clean; log verified to contain NO
+   "int8 mass armed" line (transform correctly skipped).
+2. 07:46–08:49 arm0 sweep complete: s9 @64k/96k/120k ×3 reps, medians
+   **38.83 / 30.43 / 26.14 t/s**, acceptance 2.0 (per-pos 1.0/1.0) on all 9 reps —
+   matches the k2fix reference band (37.95 / 29.88 / 25.70). Clean SIGTERM teardown,
+   GPUs to 0%.
+3. 08:51 arm1 (`mtp1srv-t1on@mtp`, flag ON) started; ~70s into weight load both ranks
+   died with `c10::AcceleratorError: CUDA error: unspecified launch failure`
+   (hipErrorLaunchFailure); EngineCore init failed, unit exited 1.
+
+**Why this is NOT a T-1 fault.** The "T-1 int8 mass armed" log line never appeared —
+the transform runs post-load in `load_model` and was never reached; the crash is in
+weight loading itself. Grep-verified: `T1_INT8_MASS` is read only at load_model time
+(`t1_int8_mass_enabled()`), the module has no import-time side effects, and arm0 ran
+the identical code path with the flag false ~75 min earlier on this same boot. The
+only code delta vs a main-branch boot is gated behind that false check.
+
+**Post-wedge state.** KFD clean (only `gpuagent`), VRAM 10.8 MB baseline both cards,
+no zombie PID — driver self-recovered. Boot U uptime ~13.4 h at the event; arm0's
+full cycle (boot + 9 long-ctx reps) completed healthy in between.
+
+**Assessment.** 23rd non-deterministic wedge; serve-based TP=2 weight-load family
+(same as #22, and the chronic load-hang family generally). Per Kevin's standing
+position: accepted HW-related on this dev system — log + canary + retry, no
+wedge-chasing.
+
+**Decision per house recipe:** post-wedge canary gate (`mtp1canary@mtp`, PASS bar
+per boot-U band 38.2–39.3), then **ONE** arm1 retry; if it wedges again → stop +
+report (no blind third launch).
+
+### Outcome of the authorized retry (09:00)
+
+Canary `mtp1canary@mtp` at 08:58 = **39.3 t/s PASS** (top of boot-U band, well above
+the <25 degraded line). Arm1 retry launched ~08:59; it progressed FURTHER than attempt
+1 — main-model weights loaded clean ("Loading weights took 31.69 seconds", both ranks
+past the attempt-1 SetDevice crash point) — then `c10::AcceleratorError: CUDA error:
+unspecified launch failure` on both ranks during post-load init (drafter load /
+graph-capture window); EngineCore init failed, unit exited 1 at 09:00:22. The "T-1
+int8 mass armed" line was **again absent** → the transform never ran; T-1 still not
+implicated (crash is in weight-load/init, before `load_model` returns).
+
+**2nd consecutive arm1 launch failure (wedges #23/#24) = BURST per house recipe → ALL GPU WORK STOPPED.**
+GPUs clean after (0%/0%, KFD only `gpuagent`, no zombie PID) — non-deterministic HW,
+not host degradation (canary passed between the two attempts) and not code.
+
+**T-1 A/B state at stop:** arm0 COMPLETE (38.83 / 30.43 / 26.14 t/s @64k/96k/120k
+medians, acc 2.0 all 9 reps). **arm1 BLOCKED — needs a fresh boot** to clear the
+wedge burst before the `T1_INT8_MASS=1` server can come up. Reboot is Kevin's call
+(`~/bin/hermes-reb.sh`); on the next clean boot, re-run arm1 (canary first), then the
+comparator. The arm0 data + arm1 unit + comparator are all persisted and reusable as-is.
+
+## 2026-09-05 ~15:4xZ (boot U) — T-1 x k=4 boot attempt: wedge #25 at worker init
+
+**Context.** After the k=4 depth A/B landed as a decisive win (mtp4 arm, T-1 OFF:
++15.4/+17.6/+18.4% vs k=2 baseline, perfect 4/4 acceptance), the next experiment was
+the T-1 x k=4 interaction: same config with `T1_INT8_MASS=1` armed (unit
+`mtp1srv-t1on@mtp4`, port 8128).
+
+**Attempt 1 — operator error, not HW.** mtp4 teardown race: my stop-wait loop matched
+the wrong process pattern and declared "down" while the old server still held :8128;
+the new instance died at bind. No GPU damage.
+
+**Attempt 2 — wedge #25.** On verified-clean GPUs (0% VRAM, KFD only gpuagent):
+`c10::AcceleratorError: CUDA error: unspecified launch failure` (hipErrorLaunchFailure)
+at `c10::cuda::SetDevice`, both ranks, ~60 s into worker init. EngineCore init failed.
+The T-1 transform (post-load hook) was never reached — "int8 mass armed" line absent —
+so no T-1 code executed; only config deltas vs the clean mtp4 boot are spec depth +
+capture sizes, both of which that arm already served 9/9 reps with ~35 min earlier.
+
+**Classification.** Serve-based worker-init family (like #23/#24). Non-deterministic:
+mtp4 served clean all morning on this boot; GPUs read healthy after (temps 32-40 C,
+no zombie handles, driver self-recovered). Per house pattern this is the accepted
+TP=2 HW instability — no RMA escalation. Reboot required to clear GPU0 state before
+retrying.
+
+**State at stop.** k=4 win data complete + committed (`fc548cba19`). T-1 x k=4 test
+BLOCKED on reboot; everything needed for the retry is persisted (unit, launcher mtp4
+config, sweep client). Post-reboot: canary gate, then ONE T-1@k=4 boot attempt, then
+sweep vs the mtp4 baseline.
+
+## Wedges #30/#31 (boot X, 2026-09-07 08:35–08:37 UTC) — mtp4ag burst
+
+**Context.** Boot X (up since ~05:49, post-reboot from the boot-W burst).
+Sequence: canary 38.8 t/s PASS (05:58) → mtp4@s9 TP=2 9/9 reps clean
+(06:01–07:14) → mtp5@s9 TP=2 9/9 reps clean (07:14–08:32, sweep + text
+probe) → background swap: old driver killed 08:32:58 on verified-clean
+GPUs (VRAM 0/0) → lean queue launched (pid 38641) → canary 38.9 t/s PASS
+(08:32:58–08:35:04) → mtp4ag launch.
+
+**Attempt 1 — wedge #30 (08:35:53, GPU0 only).** mtp4ag = the mtp4 server
+config with an agent-corpus *client* (the corpus name never reaches the
+server; server config byte-identical to the arm that ran clean 1.7 h
+earlier). Died ~49 s into worker init: userspace
+`c10::AcceleratorError: CUDA error: unspecified launch failure`
+(hipErrorLaunchFailure), EngineCore init failed. Kernel (0000:0b:00.0 =
+GPU0, minor 0 this boot): `qcm fence wait loop timeout expired` +
+"The cp might be in an unrecoverable state due to an unsuccessful queues
+preemption" + `Failed to evict process queues` + `Failed to quiesce KFD` +
+BACO reset, "GPU reset succeeded, trying to resume", "VRAM is lost due to
+GPU reset!". Strongest kernel wording of the family so far (cf. boot-S #5),
+but the driver self-recovered (clean VRAM/KFD at the 08:36:00 teardown
+check).
+
+**Attempt 2 — wedge #31 (08:37:23–08:37:32, BOTH GPUs).** Launched
+08:36:41 on verified-clean GPUs (one retry per house recipe). Progressed
+to weight load (shard 0/5 at 08:37:12), then hipErrorLaunchFailure both
+ranks; EngineCore init failed at 08:37:37. Kernel: identical
+fence/cp-unrecoverable/queue-evict sequence on GPU0 (0b:00.0) at
+08:37:23 and GPU1 (0e:00.0) at 08:37:32; both BACO reset, both self-
+recovered. GPUs clean at 09:52 (VRAM 0/0, KFD only gpuagent, 31–32 °C).
+
+**Classification.** Same chronic serve-based TP=2 weight-load/SetDevice
+family as #12–#17/#21–#29. This boot's signature: two full clean TP=2
+arms + two passing canaries first, then two consecutive launch failures —
+the 5th occurrence of the "post-long-serve, later launch" pattern on this
+host (cf. #23, #25, #26, #28). The mtp4ag config is indistinguishable
+from the clean mtp4@s9 boot (client-side corpus only), so there is no code
+or config delta to suspect. Non-deterministic HW per the accepted
+classification.
+
+**State at stop.** mtp4@s9 and mtp5@s9 numbers complete and valid
+(deterministic filler corpus; boot-independent): mtp5 medians
+50.47/40.80/35.72 t/s @64/96/120k vs mtp4 45.43/36.63/31.77 =
++11.1/+11.4/+12.4%; acceptance 1.0 at all positions (0–4), all 9 reps
+each; acc_mean 5.0; text probe token-identical to mtp4 (1568 chars,
+trigram_rep 0.965). mtp7@s9 gate (pos-4 acc ≥ 0.8) passed with wide
+margin — but the s9 mtp7 arm was deliberately skipped (filler ceiling
+adds nothing; agent corpus is the decision data). **Agent-corpus queue
+(mtp4ag → mtp5ag → cat1k4ag → mtp7ag-gated → final canary) BLOCKED —
+fresh boot required** (reboot via ~/bin/hermes-reb.sh, root; kread has no
+sudo). Post-reboot: `run_arms3.sh` as-is (canary-gated; one retry per
+arm; abort-on-2-failures).
+
+## Wedge #32 + driver double-launch bug (boot Y, 2026-09-07 11:33–11:41 UTC)
+
+**Context.** Boot Y (up since ~11:31, Kevin's reboot after the boot-X abort).
+Canary (mtp2 TP=1, GPU0) PASS 38.4 t/s 11:33–11:36. mtp4ag (mixed corpus —
+client-side only; server config identical to boots V/W/X) launched 11:36:07.
+
+**Attempt 1 — wedge #32 (11:37:13, GPU1 only).** Single-instance launch on
+clean GPUs (VRAM 0/0, KFD gpuagent only). Died ~66 s into weight load:
+fence timeout + cp-unrecoverable + queue-evict failure + KFD quiesce
+failure + BACO reset on 0000:0e:00.0 (GPU1, minor 1 this boot), self-
+recovered 11:37:15. Chronic serve-based weight-load family. Notable: this
+was the FIRST TP=2 launch of the boot (no prior long serve), so the
+"post-long-serve, later launch" pattern (cf. #23/#25/#26/#28) does not
+hold for #32 — the family is broader than that pattern.
+
+**"Attempt 2" — the double-launch bug (11:38:10–11:40:29, NOT a wedge).**
+The run_arm retry loop in run_arms2.sh/run_arms3.sh launched the server at
+BOTH the top and the bottom of the for-loop body. After attempt 1 failed:
+teardown → sleep 30 → launch at loop bottom (instance A, APIServer 4084) →
+loop iteration 2 → launch at loop top (instance B, APIServer 4085) — two
+`vllm serve` processes ~simultaneously. Both loaded the full TP=2 model
+concurrently on the same GPUs; both engines' KV-cache checks then failed
+(4.74 GiB needed for one 131072 request vs 4.28 / 3.54 GiB available; a
+clean single instance measures **15.29 GiB** available — the boot-X mtp4
+log). Journal clean in the window (no fence/reset events) — pure memory
+contention from the duplicate instance, no hardware event. Signature for
+future logs: two "ROCm switched to: /opt/rocm" lines at the server-log
+head, consecutive APIServer PIDs, two EngineCores, two "Initializing a V1
+LLM engine" lines.
+
+**Consequence + correction.** Boot X's "wedge #31" has the same signature
+in its (since-overwritten) attempt-2 log — 2 APIServers + 2 EngineCores —
+and is reclassified as a double-launch artifact; the fence events on both
+GPUs there are consistent with two concurrent weight loads. Genuine wedges
+stand at #30 (boot X, GPU0) and #32 (boot Y, GPU1).
+
+**Fix (run_arms3.sh, 2026-09-07):** one launch per attempt (bottom-of-loop
+launch removed), pre-launch alive guard (teardown if anything is already
+running), and the "ROCm switched" line count is logged at READY (must be
+1). **Procedural lesson: the burst rule counts genuine single-instance
+launch failures; a diagnosed software failure is fixed and retried on the
+same boot — a reboot is only for genuine wedge pairs.**
+
+**State at write (12:2x UTC).** GPUs clean: VRAM 0/0, KFD gpuagent only;
+both cards probe 9.9/9.8 TFLOPS fp16 (no residual damage from #32).
+Reranker: NO llama-server process exists on this boot (Kevin authorized
+stopping it; nothing to stop — it is not a factor in any of these
+failures). Mixed-corpus queue re-launching on the fixed driver (canary
+gate first). If the re-run produces two genuine single-instance wedge
+launches on boot Y, stop + reboot per rule.
+
+## Boot Y burst — wedges #33/#34, ABORT + reboot (2026-09-07 14:07–14:11 UTC)
+
+**Context.** Boot Y re-run (12:50, fixed driver, patched client): canary
+38.8 PASS → mtp4ag (mixed) completed 9/9 clean (29.37/23.89/21.87 t/s
+@64/96/120k; acc_mean 2.0–2.98; see DEVLOG-fa-attention.md) → mtp5ag
+launch fired from the still-running queue (Kevin had just decided to skip
+it; the safe-kill watcher was armed but mtp4ag's teardown finished ~1 min
+before the window check would have fired… in practice the driver reached
+the mtp5ag launch first — the 30 s window was consumed by the text probe
++ teardown timing this time).
+
+**#33 (14:08:45, GPU0 0b:00.0) + #34 (14:10:26, GPU1 0e:00.0).** Two
+consecutive single-instance mtp5 launches, each dying ~70–90 s into weight
+load with the full chronic signature (fence timeout → cp-unrecoverable →
+queue-evict/KFD-quiesce failure → BACO → self-recover → fence-fallback
+timer). Different GPUs, ~100 s apart. No software failure candidate this
+time: config identical to boot X's clean mtp5@s9 run, single instance
+verified, VRAM 0/0 pre-state on both attempts, journal clean between them.
+
+**Burst per rule → ABORT 14:10:33.** The run_arms3 driver's mechanical
+2-failure abort fired; the new watch_tail_and_plain watcher detected the
+driver's self-exit and HELD (exit 2, no tail/plain launch) for a human
+decision — the exact path it was designed for. Boot Y's genuine-wedge
+total: #32 (11:37, GPU1, first TP=2 launch of the boot) + #33 + #34 =
+THREE. Reboot per house rule (Kevin executes via ~/bin/hermes-reb.sh).
+
+**Pattern note (open question list).** Three wedges in one boot, all in
+serve-based TP=2 weight loads, spanning the boot's first and ~2.5 h later;
+the ~2.5 h between #32 and #33 included a full 9/9 clean sweep on the same
+arm family. Cumulative-reset → degradation model (see top of file) remains
+the working hypothesis; per-boot wedge budget empirically ≈ 2–3.
+
+**Post-mortem findings (all fixed/recorded, 14:3x UTC):**
+1. **Abort-path log loss**: run_arm's `rm -f "$slog"` ran before the
+   ABORT check, deleting the attempt-2 server log (only the journal
+   survives). run_tail.sh/run_plain.sh patched: abort check before rm.
+   (run_arms3 has served its life; boots Z+ use run_tail.sh.)
+2. **Client flat/nested corpus fix** verified in production: mtp4ag swept
+   9/9 (boot Y pass 1 swept 0/27 — see dev log).
+3. **Watch-window timing**: the W1 kill window (post-teardown, pre-next-
+   launch, 30 s) can be missed when the preceding arm's text probe +
+   teardown run long; the watcher's driver-exit fallback (hold for human)
+   covered it safely. For boot Z the skip is already out of the queue —
+   no intercept needed.
+
+**State at write.** GPUs VRAM 0/0, no GPU processes, no stragglers
+(checked 14:17). All boot-Z queue artifacts persistent in /local/tmp/a3
+(run_tail.sh, run_plain.sh, sweep logs, driver logs). Mixed-corpus v2
+(chat replay) queued after the tail + plain baseline on boot Z.
+
+## Boot Z — wedge #35 on the chat-replay launch (2026-09-07 17:20:59 UTC)
+
+**Context.** Boot Z (up ~14:47) ran the reduced depth matrix cleanly:
+canary 38.8 PASS → mtp2ag 6/6 (30.95/20.71 t/s @64k/120k) → mtp3ag 3/3
+(24.80 t/s @120k — the depth winner) → final canary 38.8 PASS → plain
+6/6 (19.76/13.11). Five clean TP=2-equivalent launches. The 6th launch —
+the chat-replay server (plain TP=2, port 8132, maxlen 65536; launched
+17:19:47 on a verified-clean VRAM 0/0) — wedged.
+
+**#35 (17:20:59, GPU1 0e:00.0).** Single instance (one "ROCm switched"
+line, no other GPU processes). Rank 0 completed its weight load clean
+(29.45 s, 9.15 GiB); the failure surfaced in the other rank's
+`SetDevice` copy as `c10::AcceleratorError: CUDA error: unspecified
+launch failure` (`hipErrorLaunchFailure`). Kernel: `qcm fence wait loop
+timeout expired` → "cp might be in an unrecoverable state due to an
+unsuccessful queues preemption" → `Failed to evict process queues` →
+`Failed to quiesce KFD` → PSP `UNLOAD_TA(0x2) failed (0x117)` → BACO
+reset → "GPU reset succeeded, trying to resume" 17:21:01, devcoredump
+written. Full chronic family signature, GPU1.
+
+**Disposition.** Boot Z's first genuine launch failure → house rule
+allows one retry for the arm. Pre-retry verification: no stragglers,
+VRAM 0/0, GPU1 matmul probe 9.7 TFLOPS fp16 OK (the canary only covers
+GPU0 — the post-GPU1-wedge probe was required and passed). A 2nd
+consecutive genuine failure = BURST → reboot per rule (Kevin executes).
+Note: 6 weight loads in this boot — the family's per-boot accumulation
+pattern is tracking boots W–Y (2–3 wedges/5–6 loads).
+
+## Boot Z burst — wedge #36 + the watcher exec/pgrep false positive (2026-09-07 17:37–17:39 UTC)
+
+**#36 (17:38:41, GPU1 0e:00.0).** The replay retry (launched 17:37:37 on a
+verified-clean post-#35 state) died in the same phase, same GPU, same
+signature: rank-0 load clean (5/5 shards in 24 s), other rank's SetDevice
+copy → `hipErrorLaunchFailure` 17:38:43; kernel fence timeout →
+cp-unrecoverable → KFD-quiesce failure → BACO → "GPU reset(2) succeeded"
++ "device wedged, but recovered through reset" 17:38:44. Two consecutive
+genuine single-instance failures (#35 17:20:59, #36 17:38:41) = **BURST**
+→ all GPU work stopped, reboot per house rule. Boot Z's launch record:
+5 clean TP=2-equivalent launches (canary, mtp2, mtp3, canary, plain) +
+2 wedged replay launches — the family is now biting on the 6th–7th
+weight load of the boot, consistent with the 2–3 wedges/5–6 loads pattern
+of boots W–Y.
+
+**Watcher bug (why #35's driver line was a false positive).**
+`run_replay_server.sh` line 22 `exec .venv/bin/vllm serve …` replaces the
+bash process image — after exec, NO process carries the
+`run_replay_server.sh` cmdline, so the watcher's death check
+(`pgrep -f "run_replay_server[.]sh"`) is guaranteed to false-positive on
+its first poll. On attempt 1 the watcher logged "replay server died
+during startup" at 17:19:47 — the SAME SECOND it launched the server —
+and exited, orphaning the setsid'd server (which kept loading and wedged
+genuinely at 17:20:59, #35). Consequences: (a) #35's driver log line
+mislabels the timing (the wedge is 72 s later, in the journal); (b) the
+retry script had the same bug and false-positived the same way at
+17:37:37, while the real death came at 17:38:41. Fix: death checks must
+match the exec'd process (`pgrep -f "[v]llm serve .*max-model-len
+65536"`); `run_replay_retry.sh` patched, `run_replay_attach.sh`
+(attach-to-already-running, launch-free) written as the safe pattern for
+orphaned servers.
+
+**State at stop.** No vllm/replay procs, VRAM 0/0, attach driver never
+launched. Boot-Z results all safe on disk: tail_driver.log,
+sweep_mtp2ag.client.log (6/6), sweep_mtp3ag.client.log (3/3),
+sweep_plainag.client.log (6/6), canary logs. Replay output
+(`chat_replay_qwen38.jsonl`) not started. Next boot (W'): the replay
+sequence (fixed driver) + the v2-mixed-corpus build + the SYV-12
+generation-time gate + the mtp3ag@64k cell + the chat-frac arms; the
+SYV-10 GDN-bounds port (fb0fc766e4) compile-checks on the first MTP
+launch there.
+
+## Boot W' burst — wedges #37/#38 on the mtpv2 launch (2026-09-07 20:27–20:31 UTC)
+
+**Context.** Boot W' (up since ~17:46, Kevin's reboot after the boot-Z
+burst) ran the post-replay queue: chat replay 18:13 (62/62 turns, 205,173
+completion tokens, zero failures), v2 mixed-corpus build (20 % chat),
+SYV-12 generation-time gate, canary 38.7 t/s, mtp3 launch 19:35 (clean,
+KV 15.43 GiB single instance) — 3 clean TP=2-equivalent weight loads
+before the burst.
+
+**Harness bug (mtp3v2 first sweep run, 19:37:49).** `run_w1.sh`'s arm
+function set `MTP1_PTS` but forgot `MTP1_PORT`, so the sweep client used
+its default port 8123 (nothing listening there) and died on
+connection-refused with rc=1; the original driver held for human by
+design. Software failure, NOT a wedge — the mtp3 server was (and stayed)
+healthy on 8134. A continuation driver ATTACHED to the running server
+(launch-free, the boot-Z lesson) and re-ran the sweep with the correct
+port: 6/6 reps, medians **27.44 @64k / 24.76 @120k** (acc_median
+1.38/2.15). The 120k rep0 (20.76) is a warm-up outlier that includes the
+first-ever compile of the SYV-10 ported GDN spec kernels (commit
+fb0fc766e4) — reps 1–2 (24.76/25.07) are steady-state. **The port ran
+thousands of MTP draft steps across the sweep with zero server errors:
+compile-check + runtime check PASS.** (The mtp3v2 text probe was lost to
+a `Permission denied` on text_probe.py — a harness chmod bug; re-run
+post-reboot if wanted.)
+
+**#37 (20:28:55, GPU1 0e:00.0) / #38 (20:30:26, GPU0 0b:00.0).** The
+mtpv2 arm (k=2, the remaining chat-frac arm) wedged twice in the
+chronic weight-load family: attempt 1 (launched 20:27:56 on verified-clean
+GPUs) and attempt 2 (launched 20:29:25 post-#37, matmul probes
+10.0/9.8 TFLOPS OK) both died at safetensors shard 0/5 —
+`hipErrorLaunchFailure` at the SetDevice copy, single instance each (1
+"ROCm switched" line). Kernel signature per #30–#36: fence timeout →
+cp-unrecoverable → queue-evict/KFD-quiesce failure → GPU reset → BACO,
+self-recovered both times. Two consecutive GENUINE single-instance
+launch failures = **BURST** → continuation driver stopped all GPU work at
+20:30:50 by design; **reboot required (Kevin executes)**.
+
+**Wear pattern (update).** Genuine wedges per boot: X=1, Y=3, Z=2,
+**W'=2**; bursts always at the 2nd consecutive genuine failure. Load
+position of the first wedge varies (boot Y: first TP=2 launch of the
+boot; boot Z/W': after 5/3 clean loads) — no reliable load-count
+predictor; the 2-failures-stop rule remains the right instrument.
+
+**State at stop.** No vllm procs, VRAM 0/0, both cards BACO-recovered.
+Boot-W' data safe on disk: `chat_replay_qwen38.jsonl` (205k tokens),
+v2 `corpus.json`, `syv12gen_w1_fixed.log` (gate GO, 25.3 % hit_frac),
+`sweep_mtp3v2_w1.client.log` (6/6), canary logs, driver logs with the
+MTP1_PORT correction line. **Remaining queue (post-reboot, ~2 weight
+loads — well inside the per-boot budget):** mtpv2 6 reps (k=2 @ v2,
+the same-corpus comparison arm for the k=2-vs-k=3 call) + final canary.
+
+---
+
+**Boot W'' (post-#37/#38 reboot, 2026-09-07 ~20:47).** Clean boot:
+preflight 9.9/9.8 TFLOPS, canary 38.8 t/s, mtpv2 launched clean
+attempt 1 (KV 15.57 GiB), 6/6 sweep rc=0, clean SIGTERM teardown
+21:35 (VRAM 0/0). **Event #39 (22:23, GPU1 0e:00.0): SYV-12 probe
+arm-1 launch wedged with the chronic SetDevice signature —
+harness-induced.** Sequence: arm 0 (SYV-12 OFF, in-process TP=2 `LLM()`)
+finished its 512-token run (result line + token ids saved) but its
+multiproc EXECUTOR SHUTDOWN HUNG ("[shutdown] Executor: workers still
+running after grace period; sending SIGTERM count=2" at 22:22:51); the
+probe driver's inter-arm wait was only `sleep 10` + a VRAM% check
+(0/0 — the workers had already released VRAM) and launched arm 1 at
+22:23:02, 11 s after the SIGTERM. Arm 1 died ~10 s in at SetDevice
+(`c10::AcceleratorError: unspecified launch failure`, both ranks);
+kernel 22:24:15 on 0e:00.0: fence timeout → cp-unrecoverable →
+queue-evict fail → `Failed to quiesce KFD` → UNLOAD_TA(0x2) 0x117 →
+BACO reset, self-recovered. This is the documented TP=2 teardown hazard
+(AGENTS.md: "SIGKILL leaves the driver mid-P2P-op and the next init
+wedges GPU1 (hipErrorLaunchFailure; needs BACO reset + retry)") fired
+through a hung-shutdown SIGTERM instead of a manual SIGKILL — i.e. a
+mid-op kill of arm 0's workers, self-inflicted by the driver's
+insufficient inter-arm drain. **Classification (per the boot-Y refined
+burst rule): diagnosed software trigger → NOT counted toward the
+genuine-failure burst pair; fix + retry on the same boot.** Driver fix:
+inter-arm wait now (a) polls until ALL prior-arm python/worker procs
+are gone (not just VRAM) and (b) re-runs both-GPU matmul probes before
+the next launch. Post-#39 state verified 22:32: VRAM 0/0, matmul
+9.9/9.8 TFLOPS both cards. Arm-0 reference result safe:
+`/local/tmp/syv12/tokens_arm0.json` (512 ids, 478 s wall incl. 120k
+prefill — the probe's decode-only split needs the RequestMetrics
+first/last-token times; see the SYV-12 devlog).
+
+**Event #40 (22:36:28, GPU1 0e:00.0): the probe RE-RUN arm 0 (OFF)
+wedged SPONTANEOUSLY 56 s after launch, on a verified-clean pre-state**
+(the fixed driver's pre-arm check passed at 22:35:28–32: no stragglers,
+VRAM 0/0, matmul 10.0/9.7 both cards). Identical kernel signature to
+#39 (fence → cp-unrecoverable → KFD-quiesce fail → UNLOAD_TA 0x117 →
+BACO, self-recovered). Single instance. This is the 1st GENUINE
+spontaneous launch failure of boot W'' (#39 was harness-induced and
+doesn't count) — one retry is authorized per the burst rule, but
+**decision: STOP GPU work pre-emptively (wear-based, not a formal
+burst).** Rationale: two chronic-family BACO resets on GPU1 15 min
+apart after 5 TP=2-equivalent loads; the remaining SYV-12 verification
+is 4 more loads (probe off+on, A/B off+on) — running them on a
+demonstrably wearing GPU1 buys little (the probe is a sanity check, and
+its OFF reference is already captured from the 22:05 run) at real
+wedge risk. The formal gate (serving A/B) only matters on a healthy
+boot anyway (the degradation canary rule). Post-stop state verified
+22:46: VRAM 0/0, matmul 10.0/9.8 TFLOPS, no stragglers. **Next boot:
+Kevin reboots → staged verification = `run_probe.sh` (2 loads) then
+`run_syv12_ab.sh` (2 loads); both drivers are final (drain + pre-launch
+probes + MTP1_PORT explicit). If #40 recurs as the 2nd consecutive
+genuine failure on the fresh boot, treat it as burst-grade per the
+standing rule (reboot again + escalate the RMA question).**
+
+## Boot Y2 — wedge #41 on the SYV-12 probe ON arm (2026-09-08 07:49:51 UTC)
+
+**Event #41 (07:49:51, GPU1 0e:00.0): the SYV-12 probe arm 1 (ON) attempt
+1 wedged SPONTANEOUSLY during weight load, on a verified-clean pre-state.**
+Boot Y2 (up since ~06:31, 2nd clean reboot of the SYV-12 verification
+campaign). Sequence: probe driver launched 07:34:48 with the #39-hardened
+drain; arm 0 (OFF) ran a FULL clean pass — 120k prefill + 512-token decode
+(25.335 t/s decode-only, 20.21 s) + graceful multiproc shutdown 07:48:39;
+post-drain verified 07:48:53–57 (all procs gone, VRAM 0/0, both-GPU
+matmul probes 9.9/9.7 TFLOPS OK); arm 1 (ON, `GFX906_SYV12=1`) launched
+07:48:57 and both TP ranks died at safetensors shard 2–4/5 with
+`hipErrorLaunchFailure` at the SetDevice copy. Kernel: fence timeout →
+cp-unrecoverable → `Failed to evict process queues` → `Failed to quiesce
+KFD` → UNLOAD_TA(0x2) 0x117 → BACO, "GPU reset succeeded" 07:49:53
+(self-recovered). Single instance (no other processes on the GPUs).
+Identical signature to the chronic serve-based weight-load family
+(#34–#40); GPU1 0e:00.0 is again the victim (the recurring card).
+Nothing SYV-12-specific runs during weight load (the extension's buffers
+are trivial allocations made in the runner `__init__` before load; the
+fill/append kernels fire only in the spec-verify step) — the OFF arm ran
+the identical shape 30 s earlier and was fully clean, so this is
+classified **GENUINE/spontaneous HW-family**, 1st genuine failure of boot
+Y2.
+
+**Action: one retry authorized per house rule** (`run_arm1_retry.sh`,
+launched 07:52:07, same hardened pre-checks: proc-drain, VRAM 0/0,
+both-GPU matmul probes). Arm 0's result + identity reference are safe
+(`result_arm0.line`, `tokens_arm0.json`). **If the retry wedges
+spontaneously: 2nd consecutive GENUINE launch failure on boot Y2 (with
+#41) = BURST → stop all GPU work + reboot (Kevin), per the standing rule.**
+
+**Boot Y2 continuation — #41 retry history + #42 (08:57:24, GPU1
+0e:00.0): pre-emptive wear-based stop.** The one retry authorized after
+#41 did not wedge — it hit two consecutive SOFTWARE bugs in the SYV-12
+V1 port, each diagnosed and fixed on the same boot (diagnosed software
+failures don't count toward the burst per the refined rule):
+
+1. **Scheduler spec-stats sizing** (`SpecDecodingStats` sized by base k;
+   the extended scheduled drafts are k+ext → `IndexError` in
+   `observe_draft`; masked on the boot-Y probe because LLM() disabled
+   log_stats). Fixed: sized by k+ext; asserts made length-based.
+2. **GDN state-slot under-provisioning (the zero-output bug).** The ON
+   arm ran end-to-end (both SYV-12 kernels fired per jit_monitor) but
+   emitted an all-zero output stream from decode token 2, with near-
+   saturated acceptance (3.94 — a self-consistent zero fixed point).
+   A 16k debug probe (env-gated runner dump of the spec-decode input
+   assembly; removed after diagnosis) showed the input assembly was
+   correct ([bonus, d1, d2, fill(-1)]; the -1 fill slot is rejected by
+   the standard one-hot path and the bonus is taken from the right
+   position) — but the MTP draft was off by one loop position from
+   step 1, i.e. the GDN state was corrupt. Root cause: the V1 port
+   widened `MambaSpec.num_speculative_blocks` to k+ext (state pool +
+   block table = 4 columns) but two GDN consumers still sized per-
+   draft state by the BASE k: (a) the GDN attention backend's
+   `num_spec` (`vllm/v1/attention/backends/gdn_attn.py`) —
+   `spec_state_indices_tensor` [bs, k+1] (one column short), the
+   spec token-index capacity, and — decisively —
+   `max_query_len=spec_state_indices_tensor.size(-1)` in
+   `causal_conv1d_update`, which capped the GDN conv kernel at 3 of the
+   4 verify tokens; (b) the GDN layer's conv-state shape
+   (`mamba/gdn/base.py`) — `conv_kernel-1 + k` snapshot columns, one
+   short. Fixed both by adding `syv12_ext` (lockstep with
+   MambaSpec). Post-fix 16k debug probe: correct 8-token s9 loop from
+   decode token 1, 128/128 tokens. The full 120k ON re-run then wedged
+   at weight load = #42 (same chronic family, GPU1, self-recovered).
+
+**Stop decision (08:59):** two spontaneous chronic-family BACO resets
+on boot Y2 (07:49, 08:57 — 68 min apart, 4 fully clean loads between)
+meets the #40 pre-emptive criterion even though the formal burst pair
+(2 *consecutive* genuine launch failures) was never formed. Remaining
+verification = 3 more loads; at this boot's ~25 % per-load wedge rate
+that's a coin-flip. Fresh boot + 3 loads is the lower-risk path. State
+for next boot: OFF reference + identity reference persist
+(`/local/tmp/syv12/tokens_arm0.json`, `result_arm0.line`); only the 120k
+ON arm (`run_arm1_retry.sh`) + the guarded A/B (`run_syv12_ab.sh`,
+unblock by touching `/local/tmp/syv12/V1_PORT_DONE` after the probe
+PASSes) are owed.
+
+**Boot Y3 — #43 (13:14:37, GPU1 0e:00.0).** First genuine launch failure on
+boot Y3 (after 4 clean loads, including the SYV-12 probe + full A/B sweep
+pair). A6 profiling server, EAGER k=3 MTP TP=2. Same chronic weight-load
+signature (fence timeout → cp-unrecoverable → BACO, self-recovered in
+~2 s). Retry 13:21:57 after the hardened pre-checks. Not a burst pair
+yet — this boot's tally is 1. (The 13:11 agdn crash before this was the
+harness wrapper arg-shift bug, diagnosed + fixed on the same boot.)
+
+**Boot Y3 — #44 (21:16:40, GPU1 0e:00.0).** Second spontaneous
+chronic-family BACO reset on boot Y3 (first: #43 at 13:14:37, 8 h
+earlier; clean loads in between, including the A6 retry run and a
+standalone GPU unit test of the new SYV-12 fill kernel at ~21:12).
+Victim: the instrumented SYV-12 s9 probe (resurrection gate), attempt
+1 — same chronic weight-load signature (qcm fence timeout →
+cp-unrecoverable → queue-evict failure → KFD quiesce failure →
+UNLOAD_TA 0x117 → BACO, self-recovered in ~3 s), single instance,
+verified-clean pre-state (both-GPU matmul probes passed at 21:15).
+Per-boot wedge rate now ~2/8 weight loads (25 %). The #40 pre-emptive
+criterion (two spontaneous chronic-family resets on one boot) is met in
+form; the retry was executed because (a) the house rule authorizes one
+retry per arm, (b) the user explicitly directed this probe on this
+boot, and (c) the retry's failure mode (burst → reboot) is identical to
+the alternative (pre-emptive stop → reboot) while its success mode
+delivers the resurrection-gate data. If the retry wedges spontaneously
+→ burst pair with #44 → all GPU work stops and the SYV-12 fix + probe
+carry to a fresh boot (all state is under /local, nothing lost).
+
+**Boot Y3 — #45 (21:22:12, GPU1 0e:00.0) + BURST + STOP.** The
+authorized retry of the instrumented SYV-12 probe (launched 21:21:22 on
+verified-clean GPUs: 10.0/9.8 TFLOPS both cards at 21:21:17–22, no
+procs, VRAM 0/0) wedged 50 s in at the same phase as #44 (safetensors
+shard ~1/5, SetDevice hipErrorLaunchFailure both ranks) with the same
+chronic kernel signature (fence timeout → cp-unrecoverable → queue-evict
+→ KFD-quiesce-failure → BACO, self-recovered ~3 s). Single instance,
+spontaneous. **2nd consecutive genuine single-instance launch failure
+(with #44) = BURST per the house rule.** All GPU work stopped 21:24;
+reboot requested (Kevin executes).
+
+Session state at stop (all committed / staged under /local, nothing
+lost): (1) the SYV-12 fill-contract root cause was identified and fixed
+in-tree before the first wedge — the v1 fill kernel computed the
+lookup suffix from the trailing history only, which ends at the anchor
+and therefore continues into the d0 slot, off by k=2 positions from the
+FILL slot it is stored in (derivation from the s9 loop structure; fully
+consistent with both observed regimes: 0.000 on the period-9 s9 loop,
+~0.6 % incidental hits on code). Fix: suffix = last (MIN_MATCH−k)
+history tokens + the k base drafts (which end at d_{k-1}, the token
+before the FILL position). Unit-verified 16/16 under the corrected
+contract; the offline analyzer + synthetic healthy-pipeline simulation
+validate end-to-end (synthetic s9-like stream: pos3 0.975, mean 3.95).
+(2) SYV-13 closed as N/A (verify-only, no code change). (3) The B=4
+harness extension landed (`_bench_serve_grid_gfx906.py`: n-ary cells,
+corpus mode, /metrics acceptance deltas, stop/repetition screens;
+offline unit checks pass). The next boot's SYV-12 probe is therefore a
+VALIDATION run (expect s9 pos3 ≈ 1.000, mean acceptance ≈ 4.0), not a
+localization run — gate step 2 of the resurrection ladder is what it
+tests. Boot Y3 final: 3 spontaneous chronic-family wedges
+(#43/#44/#45) across ~9 weight loads.
+## Boot Y4 — wedge #46 on the SYV-12 validation probe attempt 1 (2026-09-09 06:45:03 UTC)
+
+Boot Y4 (2026-09-08 21:31, after the Y3 burst reboot). Preflight
+clean: VRAM 0/0, no procs, both-GPU matmul 10.0/9.8 TFLOPS, kernel
+log clean since boot; BDF map 0b:00.0=GPU0, 0e:00.0=GPU1 (same as
+Y2/Y3). Canary mtp2 TP=1 @38.7 t/s (mid healthy band 38.4–38.9).
+
+**~9 h gap** between canary (21:36) and the first probe attempt
+(2026-09-09 06:43:34) — an ssh outage; the machine idled cleanly
+through it.
+
+Wedge #46: instrumented SYV-12 s9 validation probe attempt 1
+(in-process TP=2 `LLM()`, k=2, util 0.93, EAGER + per-step debug; the
+fill-contract fix from 7b2fba0754 in tree) launched 06:43:34 on
+verified-clean GPUs (prelaunch matmul 10.0/9.8). Both ranks died 89 s
+in at the safetensors shard ~1/5 phase (SetDevice copy) with
+`hipErrorLaunchFailure`; kernel 06:45:03 on 0000:0e:00.0 (**GPU1**,
+drm-card minor 1): "qcm fence wait loop timeout expired" + "cp might
+be in an unrecoverable state due to an unsuccessful queues preemption"
++ "Failed to evict process queues" + "Failed to quiesce KFD" + "GPU
+reset begin" + "BACO reset" → "GPU reset(1) succeeded" + "device
+wedged, but recovered through reset" 06:45:06. Self-recovered in ~3
+s. Single instance, spontaneous — the chronic TP=2 weight-load
+family, GPU1 again (the recurring victim). This is the 3rd weight
+load of the in-process-TP=2 probe config to wedge (#44, #45 boot Y3);
+every chronic-family wedge on this host is a TP=2 launch (canaries
+are TP=1).
+
+Post-drain verified clean (06:47): no procs, VRAM 0/0, both-GPU
+matmul 10.0/9.8. ONE retry authorized per house rule.
+
+**The retry exposed a software failure, not a wedge** (clean weight
+load; Triton compile assert on the first extended step — see the dev
+log SYV-12 boot-Y4 entry). Fixed in-tree (fb971c54a0) and re-run:
+the validation probe then PASSED (attempt 2, 06:59:15 launch, 07:12
+finish; 0 wedges; post-run VRAM 0/0).
+
+Boot Y4 tally at the probe's completion: 1 spontaneous wedge (#46) +
+1 diagnosed software failure (not counted) across 3 weight loads;
+canary clean. Next: the SYV-12 v2 production A/B (2 more loads).
+
+**Wedge #47** (07:29:13, GPU1 0e:00.0): the A/B's OFF arm (mtp2o4,
+`mtp` k=2 TP=2 server, util 0.85) attempt 1, launched 07:28:12 on
+verified-clean GPUs — died 71 s in at weight load; kernel 07:29:13:
+fence timeout + BACO, self-recovered 07:29:16. Single instance,
+spontaneous (log kept:
+/local/tmp/a3/server_mtp2o4_syv12.log.attempt1). The driver's
+authorized retry loaded clean (07:31:17, KV 15.56 GiB) and completed
+the full 6-rep sweep + text probe + clean teardown.
+
+**Wedge #48** (08:24:06, GPU1 0e:00.0): the A/B's ON arm (mtp2n4,
+same server + GFX906_SYV12=1) attempt 1, launched 08:23:00 after the
+OFF arm's clean teardown — died 66 s in at weight load; kernel
+08:24:06: fence timeout + BACO, self-recovered 08:24:08. Single
+instance, spontaneous (log kept:
+/local/tmp/a3/server_mtp2n4_syv12.log). The driver's authorized
+retry loaded clean (08:26:14, KV 15.42 GiB) and completed its sweep.
+
+**Boot Y4 FINAL (at 09:17): 3 spontaneous chronic-family wedges
+(#46 06:45, #47 07:29, #48 08:24 — all GPU1, all self-recovered) + 1
+diagnosed software failure (not counted), across 8 TP=2 weight loads
+(canary, probe x3 attempts [1 wedge, 1 software, 1 pass], A/B x4
+attempts [2 wedges, 2 passes]) ≈ 38 % per-load wedge rate — the
+highest per-boot rate recorded (Y3: ~33 % over 9 loads).** The A/B
+verdict itself landed clean (SYV-12 v2: +6.4 % @120k, −5.3 % @64k —
+payload-conditional; dev log boot-Y4 A/B entry). Per the pre-decision
+recorded with #47 (and the #40/#42 wear criterion): ALL GPU WORK
+STOPPED after the A/B (09:17 teardown verified VRAM 0/0); the B=4
+campaign defers to the next boot.
+
+## Boot Y4 (continued) — Kevin-directed B=4 campaign on the same boot; wedge #49 (2026-09-09 10:09–10:58 UTC)
+
+Kevin overrode the stop at 10:0x: run the B=4 campaign now (same boot,
+clean GPUs — no resident llama-servers this boot; UTIL=0.93; 120k
+B=4 cell enabled). Campaign state at #49:
+
+- **mtp3 B=1 anchor arm: COMPLETE.** Loaded clean 10:09 (KV 507,446
+tokens/rank — +6.6 % vs the 0.85 pool), bench 64k×3 + 120k×2:
+decode 26.7/31.1/39.0 @64k, 23.6/24.7 @120k (anchors match boot W'
+mtp3v2 within spread). Clean SIGTERM teardown 10:51 (VRAM 0/0).
+  Data: /local/tmp/b4/bench_mtp3_0909_1009.log.
+- During this arm the driver's bench client surfaced the **~240 s
+  @64k / ~580 s @120k per-request prefill stall** that every past TP=2
+  sweep's ttft column hid (longstanding — all archive ttfts show the
+  same values). Investigation (worker CPU 114 % during the stall,
+  idle 0 %, no JIT, frozen-then-burst prefill): dev log
+  `docs/gfx906/ttft-prefill-stall.md` (committed bdf1d814c4) with the
+  T1–T4 theory matrix. Kevin's clarification: his long-standing
+  "two pythons at 100 % during inference" observation means
+  "not during idle", phase unspecified.
+- **Wedge #49** (10:56:27, GPU1 0e:00.0): the cProfile diagnostic
+  probe (in-process TP=2 `LLM()`, the dev log's §6.2 next step)
+  launched ~10:52:30 after the clean mtp3 teardown — both ranks died
+  at weight load; kernel 10:56:27: fence timeout + cp-unrecoverable +
+  queue-evict + `Failed to quiesce KFD` + UNLOAD_TA 0x117 + BACO,
+  self-recovered 10:56:29. Single instance, verified-clean pre-state —
+  **SPONTANEOUS** (log: /local/tmp/b4/prof_64k.log). 4th spontaneous
+  chronic-family reset on boot Y4 (4/9 loads ≈ 44 %).
+- **Decision:** no retry spent on the diagnostic (it is not campaign
+critical; the cProfile step stays queued for the next agent/boot).
+  Next load = the campaign's greedy4 arm, under the standing directive.
+  Burst rule unchanged: greedy4 attempt 1 wedging spontaneously = 2nd
+  consecutive GENUINE launch failure (with #49) = BURST → stop +
+  reboot (Kevin).
+
+## Boot Y4 (continued) — wedge #50 on the kernel-breakdown probe launch (2026-09-09 19:06 UTC)
+
+- **Context:** since #49 (10:56): ONE clean in-process TP=2 load — the
+  TTFT matrix load A (`prof_64k.py`, 18:14:00 launch, full run1+run2
+  data, clean atexit ~18:40; dev log `ttft-prefill-stall.md` §12,
+  commit e867cdb1c0). Its three earlier launch attempts (18:08,
+  18:11, 18:18) were all SELF-INFlicted (two my-profiler bugs aborted
+  mid-load, one clean VRAM rejection against my own orphaned workers
+  — no GPU event, not counted).
+- **Event:** the per-step GPU kernel-breakdown probe (`kb_probe.py`,
+  in-process TP=2 `LLM()`, mtp3 k=3, util 0.93, pp=1024, 8k traced
+  prefill — the §12.6 next step) launched 19:06:10 on verified-clean
+  GPUs (19:05: no python procs, VRAM 10.9 MB/card, KFD only gpuagent):
+  weights reached ~60 % (shard 3/5, 19:06:40); both ranks then died
+  with `c10::AcceleratorError: CUDA error: unspecified launch failure`
+  (hipErrorLaunchFailure) — terminate() in both workers; the probe
+  exited with leaked-shared-memory warnings. Self-recovered: 19:07
+  check VRAM 10.9 MB/card, KFD only gpuagent, no stragglers. Single
+  instance, verified-clean pre-state — **SPONTANEOUS**, chronic
+  weight-load family (boot Y4's 5th; per-load rate 5/11 TP=2 loads ≈
+  45 %). Log: /local/tmp/b4/kb_run.log. dmesg unreadable to kread
+  (no sudo) — kernel-event BDF not recorded this time.
+- **Decision (per house rule):** ONE retry authorized — this is the
+  1st consecutive GENUINE single-instance launch failure since #49
+  (the clean matrix load between resets the pair). Post-retry state
+  verified before relaunch: no procs, VRAM baseline, both-GPU matmul
+  probes (15.9/15.6 TFLOPS fp16).
+- **OUTCOME (19:17:15–19:18:08): the retry WEDGED — same family,
+  same phase** (weights ~60–80 %, both ranks `unspecified launch
+  failure`, workers exited gracefully 19:18:08, self-recovered). Log:
+  /local/tmp/b4/kb_run2.log. **2nd consecutive GENUINE single-instance
+  launch failure (with #50) = BURST per house rule → ALL GPU WORK
+  STOPPED; REBOOT required (Kevin executes — kread has no sudo).**
+  Post-stop verified 19:21: no vllm/probe procs, VRAM baseline both
+  cards, KFD only gpuagent. Nothing lost: §12 committed
+  (e867cdb1c0); the kernel-breakdown step stays queued for the next
+  boot (script staged at /local/tmp/b4/kb_probe.py +
+  run_kernel_breakdown.sh). Boot Y4 final tally: 5 spontaneous
+  chronic-family wedges (#46 06:45, #47 07:29, #48 08:24, #49 10:56,
+  #50 19:06) + this burst retry, across ~14 TP=2 weight-load attempts
+  (incl. 3 self-inflicted matrix aborts and the clean matrix load)
+  ≈ 36 % per-attempt spontaneous wedge rate (6/14 incl. the retry).
+
+## 2026-09-09 20:55:25 UTC — wedge #51 (boot Y5)
+
+**Context:** boot Y5 (fresh boot after the #50 burst), up since ~19:22;
+canary 38.8 t/s PASS at 19:26; then four fully clean TP=2 loads
+(kb_run3 in-process, kb_run4 in-process, kb-serve serving, pp256
+serving — all clean SIGTERM teardowns, VRAM to baseline).
+
+**Event:** the §13.5 D1+D2+D3 combined session
+(`/local/tmp/b4/run_stall3_session.sh`; mtp3 TP=2 serve, util 0.93,
+pp=1024, port 8152 — a diagnostic/discriminator run, no campaign
+data) launched 20:54:25 on verified-clean GPUs. TP0 reached
+safetensors shard 3/5 (60 %); both ranks then threw
+`c10::AcceleratorError: CUDA error: unspecified launch failure`
+(hipErrorLaunchFailure) at the SetDevice copy; EngineCore init
+failed; the APIServer exited cleanly. Self-recovered: 21:01 check
+shows VRAM 0 % on both cards, temps 31/33 °C, sclk 938 / mclk 350
+idle, rocm-smi fully nominal, no KFD stragglers. Single instance
+(verified: the only process on the GPUs; one server launch).
+
+**GPU:** dmesg unreadable to kread (dmesg_restrict) — BDF not
+recorded, as with #50. GPU1 per the family's recurring-victim
+pattern, unconfirmed.
+
+**Classification:** GENUINE spontaneous, chronic serve-based
+weight-load family. Boot Y5's 1st genuine failure (1/5 loads ≈ 20 %
+— within clean-boot range). House rule: ONE retry after post-state
+verification (no procs, VRAM baseline, both-GPU matmul probes); a
+spontaneous wedge on the retry = 2nd consecutive GENUINE failure =
+BURST → stop + reboot (Kevin).
+
+**Session state:** fully staged under /local/tmp/b4/
+(run_stall3.sh, stall3_client.py — holder+probe corrected design,
+per_tid_sampler.py, stall3_analyze.py, run_stall3_session.sh). A
+failed retry costs only the load; the pre-wedge work (D1 design
+correction, D3 preliminary: the shim is a yield-poll synonym and
+covers event syncs, the "100 % hot thread" re-analysis) is recorded
+in `ttft-prefill-stall.md` §13.5 and survives.
+
+## 2026-09-09 21:04:36 UTC — wedge #52 (boot Y5) — BURST
+
+**Context:** retry authorized by the #51 entry. Pre-launch verification
+complete at ~21:02: 0 vllm procs, VRAM baseline (0 %), both-GPU
+matmul probes 15.9/15.6 TFLOPS fp16 (freshly probed, both cards).
+Launch 21:03:29 (single instance — one server process, verified).
+
+**Event:** progressed further than #51 — weight load reached 100 %
+(5/5 shards on both ranks, ~6 s each); the crash moved to the
+post-load init window (drafter load / graph-capture boundary): both
+ranks `c10::AcceleratorError: unspecified launch failure`
+(hipErrorLaunchFailure); EngineCore init failed 21:04:36; the
+APIServer exited. Self-recovered: 21:07 check — VRAM 0 % both cards,
+31/33 °C, sclk 938/mclk 350 idle, rocm-smi fully nominal, 0
+stragglers. dmesg unreadable to kread — BDF not recorded (GPU1 per
+family pattern, unconfirmed).
+
+**Classification:** GENUINE spontaneous, chronic weight-load /
+post-load-init family. **2nd consecutive GENUINE single-instance
+launch failure (with #51, 9 min apart, a verified-clean inter-check
+between them) = BURST per house rule.** ALL GPU WORK STOPPED 21:07;
+REBOOT required (Kevin — kread has no sudo).
+
+**Boot Y5 final:** 2 spontaneous wedges (#51 20:55, #52 21:04) across
+5 TP=2 loads ≈ 40 %/load — worse than Y4 (36 %). Notable: the 4
+pre-#51 loads on this boot (kb_run3, kb_run4 in-process; kb-serve,
+pp256 serving) were all clean, so the wear manifested as a
+consecutive pair at the 4th/5th load — the same shape as Y4's
+#49→#50 pair (clean loads, then a pair).
+
+**Session state (staged for the next boot):** /local/tmp/b4/ —
+run_stall3.sh (mtp3 serve, port 8152, no profiler),
+stall3_client.py (corrected D1: hold→complete→D1a warm-pool probe→
+reset_prefix_cache→D1b cold control), per_tid_sampler.py,
+stall3_analyze.py, run_stall3_session.sh (orchestrator with the
+1 Hz clock logger + per-TID sampler + 30 s strace at t+90 s).
+One launch + ~5.5 min wall. Expected reads: D1a ttft ~5.4 s
+(batch-local) vs ~9.7 s (standing pool tax); per-TID CPU + strace
+classify the §12.3 burner (yield-poll vs spin vs blocking KFD);
+clocks pin the 78 %-MFU reference's clock state (D2, also the s0
+outlier's clock-correlation baseline).
+
+## 2026-09-10 10:45:17 UTC — wedge #53 (boot Y6)
+
+**Context:** boot Y6 (fresh boot after the #52 burst), up since
+~09:54; canary 38.8 t/s PASS 10:07; then two fully clean TP=2
+serving sessions (stall3 10:08-10:16: D1a/D2/D3; stall4 10:31-10:40:
+D1c + idle census + burner onset; both clean SIGTERM teardowns, VRAM
+to baseline).
+
+**Event:** the short stall5 burner-identity session (same mtp3 TP=2
+server as stall4 plus `VLLM_STALL_PROF=1` with the new 20 s periodic
+stack-dump; client: one 2k-in/4096-out request) launched 10:43:38 on
+verified-clean GPUs (0 procs, VRAM baseline). Worker_TP0 reached
+safetensors shard 4/5 (~80 %); both ranks then threw
+`c10::AcceleratorError` terminate; EngineCore init failed 10:45:17;
+the EngineCore exit path additionally segfaulted in
+`__hipUnregisterFatBinary` (secondary — during exit handling after
+the failure, not the cause). The known-benign cpuinfo
+`JSONDecodeError` in the usage-reporting thread also appears (noise,
+seen on clean boots). Self-recovered: 10:50 check — VRAM 0 % both
+cards, 31/33 °C, sclk 938/mclk 350 idle, 0 stragglers. dmesg
+unreadable to kread — BDF not recorded (GPU1 per family pattern,
+unconfirmed).
+
+**Classification:** GENUINE spontaneous, chronic weight-load family
+— 3rd observed phase variant in this family across boots: #51 at
+weights 60 %, #52 after weights 100 % (post-load init), #53 at
+weights ~80 %. Boot Y6's 1st genuine failure (3rd TP=2 load). House
+rule: ONE retry after post-state verification; a spontaneous wedge on
+the retry = 2nd consecutive GENUINE failure = BURST → stop + reboot
+(Kevin).
+
+**Session state:** periodic stack dumps confirmed working (worker
+profsamp files survived the unclean exit — the 20 s snapshot design
+is exactly what SIGTERM-kill atexit-skip needs). Retry is the same
+`run_stall5_session.sh`; the load is the only cost.
+
+## 2026-09-10 10:52 UTC — wedge #54 (boot Y6) — BURST
+
+**Context:** retry authorized by the #53 entry. Pre-launch
+verification ~10:50:50: 0 vllm procs, VRAM baseline (0 %), both-GPU
+matmul probes 15.9/15.6 TFLOPS fp16. Launch 10:51:15 (single
+instance).
+
+**Event:** died earlier than #53 — Worker_TP0 reached safetensors
+shard 1/5 (20 %) and the crash hit by the 20→40 % boundary; both
+ranks `c10::AcceleratorError` terminate; EngineCore init failed.
+Self-recovered: 10:54:20 check — VRAM 0 % both cards, 31/33 °C,
+sclk 938/mclk 350 idle, rocm-smi nominal, 0 stragglers. dmesg
+unreadable to kread — BDF not recorded (GPU1 per family pattern,
+unconfirmed).
+
+**Classification:** GENUINE spontaneous, chronic weight-load family
+(earliest failure phase yet in the family's observed spread:
+#51 60 %, #53 80 %, #52 100 %+post-load, #54 ~20-40 %). **2nd
+consecutive GENUINE single-instance launch failure (with #53, 9 min
+apart, verified-clean inter-check between) = BURST per house rule.**
+ALL GPU WORK STOPPED 10:54; REBOOT required (Kevin — kread has no
+sudo).
+
+**Boot Y6 final:** 2 spontaneous wedges (#53 10:45, #54 10:52)
+across 4 TP=2 loads (stall3 10:08, stall4 10:31 clean) ≈ 50 %/load
+— worst of the recent boots (Y4 36 %, Y5 40 %, Y6 50 %). Same
+within-boot shape as Y4/Y5: clean loads first, then a consecutive
+pair at the tail.
+
+**Session state (staged for the next boot):** /local/tmp/b4/
+run_stall5_session.sh (short burner-identity session: same mtp3 TP=2
+server + VLLM_STALL_PROF with 20 s periodic stack dumps, one
+2k-in/4096-out request, ~5 min wall). The periodic-dump mechanism is
+proven (worker dumps survived #53's unclean SIGTERM-less exit). The
+only open item it closes: the burner thread's dominant Python frame
+(~1 core/worker, request-driven, onset 1 s after first request).
+
+## Wedge #55 (2026-09-10 15:03, boot Y7)
+
+**Timeline.** Boot Y7 up since 14:09. Canary 38.7 t/s PASS ~14:11.
+stall5 (burner-identity, mtp3 TP=2 + VLLM_STALL_PROF) 14:14–14:16
+clean — 51.3 s request, 0 AcceleratorErrors; TP0/TP1 stack dumps
+collected (TP0 `async_output_busy_loop` 69 % of its samples in
+`Stream.synchronize`; TP1's burner invisible to the frame sampler).
+stall6 (wchan-sniffer attempt) 14:24–14:27 clean — 51.4 s request;
+its external sniffer CSVs came back empty (diagnosed next, non-GPU).
+~35 min of non-GPU /proc-debugging, then stall7 attempt 1 launched
+15:02:01; kernel family event 15:03:11 on **0000:0e:00.0 (GPU1)** —
+fence timeout → cp-unrecoverable → queue-evict fail → quiesce-KFD
+fail → UNLOAD_TA(0x2) 0x117 → BACO → "GPU reset succeeded" 15:03:13;
+userspace `c10::AcceleratorError` (hipErrorLaunchFailure) both ranks;
+EngineCore init failed. Worker was at safetensors shard 4/5 in flight
+(~60 % weights; 3/5 completed 15:03:01). Self-recovered; verified
+15:06: VRAM 10.8 MB both cards, 0 vllm procs, KFD only gpuagent.
+
+**Classification.** GENUINE spontaneous, chronic serve-based
+weight-load family. **BDF confirmed via `journalctl -k`** (readable
+to kread this boot — unlike boots Y5/Y6 where dmesg/journal were
+unavailable): 0e:00.0 = GPU1, matching the family's recurring-victim
+pattern.
+
+**Bonus data from the unclean exit (the 20 s periodic dumps worked
+again):**
+- Worker census (profsamp_5229/5230, atexit): the per-tid
+  comm/wchan reads were unreadable (proc view churn during teardown),
+  but the TID LISTS survived: main + a first 15-TID group created at
+  interpreter start (5235–5249) + three later groups of exactly 7
+  (5275–5281, 5309–5315, 5332–5338) + scattered late TIDs. The 7-TID
+  groups = torch OMP pool batches; OMP probe (new in sitecustomize
+  v4): **`torch.get_num_threads()=8`, `OMP_NUM_THREADS='8'`** in both
+  workers — 7 pool threads per worker.
+- **`thread.ident` is NOT the OS TID on this platform**: ident values
+  are pthread_self() addresses (e.g. 137047297746624) while the
+  census TIDs are 5229–5444 (verified standalone: main ident
+  136770900471936 vs tid 5961; the venv python also lacks
+  `os.gettid` — custom/stripped build). profsamp's per-thread keys
+  therefore cannot be joined to /proc TIDs; use thread NAMES
+  (threading._active) + birth-order instead.
+- **/proc sandbox churn (non-GPU observation, boot Y7 14:1x–15:0x):**
+  interactive one-liner processes intermittently saw foreign pid
+  ranges in `/proc/<pid>/task`, transient ENOENT on
+  `/proc/<pid>/<tid>/stat`, and `$!`/Popen pids that did not match
+  the content-view pids (off-by-a-few). Long-lived session
+  infrastructure (stall5/6 samplers, in-process dumps) was
+  unaffected in both directions. Guarded the stall7 census + per-TID
+  sampler with a `stat.num_threads` cross-check (fail-closed SUSPECT
+  marking / scan skip). Attributed to the tool's command sandbox,
+  not host degradation — no GPU symptom; flagging here for
+  completeness since it initially masqueraded as wedge fore-shadowing.
+
+**Decision.** 1st genuine failure on boot Y7 → house rule authorizes
+ONE retry of stall7 after post-state verification. If the retry
+wedges spontaneously: 2nd consecutive GENUINE single-instance
+launch failure (with #55) = BURST → stop + reboot (Kevin). The
+stall7 experiment (burner-thread identity: birth-order census +
+1 Hz per-TID CPU + in-process names) is fully staged; its value is
+the last open item of the D3 stall-investigation arc.
+
+## Wedge #56 (2026-09-10 15:29, boot Y7)
+
+**Timeline.** Post-#55: the stall7 retry (15:13:38) loaded clean and
+served the full session (45 s idle + 51.3 s request + 30 s post,
+clean SIGTERM 15:18:04) — the D3 burner-identity data landed (see
+`ttft-prefill-stall.md` §13.9). ~10 min of non-GPU analysis + two
+standalone (no-vLLM) hip-spin burner-repro probes (both negative —
+neither sustained matmul bursts nor per-iteration event syncs
+reproduce the burn), then the stall8 shim-OFF A/B launched 15:28:34
+(same mtp3 TP=2 session + `VLLM_GFX906_HIP_BLOCKING_SYNC=0`).
+Weights 5/5 completed; post-load init (mamba page padding) 15:29:35;
+kernel family event 15:29:44 on **0000:0e:00.0 (GPU1)**; userspace
+SetDevice `hipErrorLaunchFailure` Worker_TP0 (pid 7450); EngineCore
+init failed. Self-recovered; verified 15:33: VRAM baseline, 0 procs.
+
+**Classification.** GENUINE spontaneous, chronic serve-based
+weight-load family, post-load-init phase (cf. #52). The shim-OFF env
+var cannot plausibly be the trigger (it only defers .pth context
+creation to torch init_device; the family has hit every phase and
+config on this host, and the pre-state was verified clean).
+
+**Decision (wear-based stop, #40/#42 criterion).** Boot Y7 now carries
+TWO spontaneous chronic-family BACO resets — #55 15:03 (GPU1) and
+this 15:29 (GPU1 again, 26 min apart). Per the #40/#42 precedent the
+authorized retry is NOT spent: the remaining experiment (the shim-OFF
+A/B, exactly 1 load) tests a D3 nicety (burner causality), not a core
+result — the burner identity itself is closed on the shim-ON data.
+GPU1 showing two BACO resets in 26 min on one boot is the same shape
+that ended Y3 (#44/#45, 50 s apart) and Y4's runs. REBOOT
+recommended; the shim-OFF A/B (run_stall8_session.sh, ~6 min wall,
+1 load) is the first job of the next boot after the canary, alongside
+the 120kxB4 campaign decision.
+
+**Boot Y7 final (pending Kevin's reboot):** 2 spontaneous wedges
+(#55 15:03, #56 15:29) across 6 loads (canary, stall5, stall6,
+stall7a, stall7b, stall8a) ≈ 33 %/load; GPU1 was the victim of both
+(journal-confirmed 0e:00.0 — first journal-readable recent boot).
+
+## Boot Y8 burst — wedges #57/#58 (2026-09-11): MBT-1 bt4096 arm, chronic weight-load family claims its 4th consecutive boot
+
+**Session context.** Boot Y8 (fresh post-#56, up 09-10 ~16:23) had been the
+best boot in days: ~5 clean TP=2 loads over two days (S13.10 shim-OFF A/B
+2/2, S13.13 120k×B4 campaign server, 2026-09-11 stall5 burner session 08:29,
+MBT bt2048 server 08:38→10:04 with a full clean 81-min 4×120k prefill). The
+MBT-1 matrix (prefill-multibatch-tax.md) was ⅔ done — bt=1024 baseline
+(§13.13, 75.4 min) and bt=2048 (81.1 min, chunk-INVARIANT — the decisive E1
+result) — when the bt=4096 arm hit the family.
+
+**#57 (10:10:03, GPU1 0e:00.0).** bt4096 attempt 1, launched 10:08:5x on
+verified-clean GPUs (driver pre-probes 10.0/9.7 TFLOPS, VRAM 0/0, kernel log
+clean). Worker_TP0 died ~90 s into weight load; kernel: qcm fence wait loop
+timeout expired → cp-unrecoverable → Failed to evict process queues → Failed
+to quiesce KFD → UNLOAD_TA(0x2) 0x117 → BACO, GPU reset (Source: 4).
+Userspace: `hipErrorLaunchFailure` (CUDA error: unspecified launch failure)
+from c10::cuda::SetDevice during a copy_ — the same SetDevice→copy_ weight-
+load signature as the 2026-08-25 family entry. journalctl -k readable
+(0e:00.0 confirmed — Y7's journal readability persists on Y8). Self-
+recovered: driver post-check probes 10.0/9.8 TFLOPS, VRAM 0/0.
+
+**#58 (10:12:4x, GPU1 again).** The authorized retry, same config, verified-
+clean pre-state (post-#57 probes clean): died the same way ~70 s into weight
+load; same fence-timeout/BACO signature on 0e:00.0 (~2.5 min after #57).
+Post-check clean again.
+
+**Decision (house rule + wear criterion).** 2nd consecutive genuine
+single-instance launch failure (with #57) = BURST → all GPU work stopped.
+Independently, Y8 now carries TWO spontaneous chronic-family BACO resets on
+GPU1 in one boot — the #40/#42/#56 wear criterion says stop regardless.
+**REBOOT required (Kevin).** NOT an OOM and NOT bt=4096-specific: both deaths
+are the standard weight-load fence timeout at the standard phase; bt=4096's
+prefill behavior remains untested (both attempts died before the first
+chunk — the inductor-buffer OOM risk never got a chance to matter).
+
+**Boot Y8 final:** 2 spontaneous wedges (#57 10:10, #58 10:12) across ~7
+TP=2 loads ≈ 29 %/load; GPU1 victim of both; first wedges appeared only
+after ~5 clean loads (late-boot wear shape, consistent with Y7).
+
+**What the boot delivered despite the burst** (see
+prefill-multibatch-tax.md E1 RESULT + ttft-prefill-stall.md §13.14):
+stall5 burner outcome (native KFD/HIP thread, python-invisible — D3 final);
+**E1 MBT-1 bt2048 = 4868.7 s (81.1 min) vs bt1024 75.3 min — the O(live-
+context) tax is CHUNK-INVARIANT** (per-step-repeated overhead model refuted;
+per-prefill-token × live-context work confirmed; predicts ~10–20× attention-
+FLOP cost → kernel-efficiency target in long-context prefill attention).
+Queued post-reboot: MBT-2 (seqs2), MBT-1-complement bt4096 (optional — bt2048
+already establishes invariance), campaign 120k×B4 go, TP-1/FD-1.
+
+## 2026-09-12 boot Y10 — fast-degrading morning (hold-trace session)
+
+Timeline (UTC):
+- 05:15:42 attempt 1 (mtp3b4 serve, port 8143, py-spy record --subprocesses
+  --nonblocking as launcher wrapper): py-spy bailed at ~52 s ("process
+  exited" false positive right at the EngineCore/Worker spawn; 25 sampling
+  errors; server unaffected by py-spy's exit). Server weight load then
+  faulted ~05:16:4x: c10::AcceleratorError "unspecified launch failure"
+  (hipErrorLaunchFailure) in both workers ~40 s after Worker init. VRAM
+  self-drained to 0/0. [degradation.md #60]
+- 05:28:02 attempt 2 (retry, blocking-mode py-spy): engine loaded CLEAN
+  (KV 501,558 tokens, 91% VRAM both GPUs, inductor artifacts reused) but
+  the APIServer never opened its socket: uvicorn printed the full startup
+  ladder ("Started server process" / "Waiting for application startup" /
+  "Application startup complete") yet "Uvicorn running on ..." never
+  appeared; ss + /proc/22536/net/tcp show NO listener on 8143; the main
+  thread sat in do_epoll_wait (idle, utime 12.3 s total) for 7+ min.
+  Health polls all refused; driver aborted at the 10-min cap. py-spy's
+  speedscope (661 KB) holds only early-load samples — py-spy excludes
+  idle threads by default, so the stall window (an IDLE epoll wait) was
+  invisible to it. [degradation.md #61]
+- 05:42:37 attempt 3 (py-spy-FREE discrimination, port 8144): Worker_TP0
+  died at 05:43:45 in SetDevice — hipErrorLaunchFailure at the FIRST
+  device touch, before weights. EngineCore aborted. [degradation.md #62]
+
+Assessment:
+- #60 + #62 are GPU-wedge-class and bracket the boot: faults at load and
+  then at bare init = the AGENTS.md degraded-host signature. Reboot
+  required; no GPU work attempted after #62.
+- #61 is qualitatively different (software stall, engine healthy). Two
+  hypotheses: (a) py-spy ptrace interference with uvicorn's startup
+  (attempt 2 was the only py-spy-wrapped run that reached the API stage);
+  (b) intrinsic vLLM async race — same flavor as the hold anomaly
+  (R2/FD-1/mtp3b4-s1: a request admitted but never scheduled for minutes;
+  here: a startup coroutine never resumed). The discrimination run was
+  swallowed by #62; redo on a clean boot: first a plain launch, then a
+  py-spy-wrapped one if the plain launch is clean.
+- Tooling findings for gfx906-rocprofv3-kernel-trace / py-spy usage:
+  py-spy 0.4.2 --nonblocking as a vLLM-launcher wrapper false-positives
+  "process exited" at the multiprocessing spawn (~52 s); blocking mode
+  survives but records only BUSY samples of short-lived phases unless
+  --idle is passed; stall hunts on serving stacks need --idle + rate >=2.
+
+## 2026-09-12 boot Y13 — wedge #67 (CAT-1 K2 A/B session; chronic weight-load family)
+
+Context: boot Y13 was fresh (uptime 6 h) with no prior GPU work. Session was
+the CAT-1 K2 serving arm (MTP k=2 + a 32,768-row draft head built from the
+own-model corpus). Sequence of CUDA inits:
+
+1. 20:06 canary (in-process TP=2, MTP k=2): **PASSED 38.9 t/s** at 20:09:21
+   (`/local/tmp/mtp1/canary_mtp.log`); unit exited clean, VRAM back to
+   10,924,032 B on both GPUs (verified before the next launch).
+2. 20:09:22 `systemctl --user start mtp1srv@cat132k` (init #2). Worker died at
+   20:10:27, ~65 s into engine init:
+
+```
+terminate called after throwing an instance of 'c10::AcceleratorError'
+  what():  CUDA error: unspecified launch failure
+Search for `hipErrorLaunchFailure' in .../HIP/ ... for more information.
+```
+   → `EngineCore initialization failed ... WorkerProc initialization failed
+   due to an exception in a background process` (full trace:
+   `/local/tmp/mtp1/server_cat132k.log` lines 55-120, 168-225).
+3. Kernel log in the same second (20:10:26), both cards:
+
+```
+amdgpu 0000:0b:00.0: Fence fallback timer expired on ring comp_1.0.0
+amdgpu 0000:0b:00.0: GPU reset(1) succeeded!
+amdgpu 0000:0b:00.0: [drm] device wedged, but recovered through reset
+amdgpu 0000:0e:00.0: Fence fallback timer expired on ring comp_1.0.0
+amdgpu 0000:0e:00.0: GPU reset(1) succeeded!
+amdgpu 0000:0e:00.0: [drm] device wedged, but recovered through reset
+```
+
+Assessment:
+- Same chronic weight-load family as #65/#66 (boot Y12) and #57/#58 (Y8):
+  fence timeout on `comp_1.0.0` at a TP=2 init, self-recovered by reset,
+  VRAM cleared with no zombie processes (no BACO needed).
+- Init-fault probability again followed the boot's 2nd CUDA init (Y10 #62,
+  Y11 #63/#64, Y13 #67): the canary passes, then the first *server* init of
+  the boot wedges. Consistent with the standing host-wear hypothesis.
+- Retry discipline held: post-reset matmul probes (GPU0 10.0, GPU1 9.8
+  TFLOPS vs the 7.0 gate) then TWO subsequent inits (#3 spec-less load,
+  #4 the real MTP arm) loaded clean — hence a single event, not a burst.
+- Operational note for this session type: the CAT-1 K2 arm needs exactly one
+  TP=2 weight load. The canary costs an extra init, and the wedge record now
+  shows init #2 of a boot is a *high-risk* init — so a canary pass, while
+  required for health, does not protect the arm's own load; budget for one
+  authorized retry per session.
+
+## 2026-09-13 boot Y13 — wedge #69 (BACO reset; the same arm as #68) and the Y13 stop
+
+Sequence (all on boot Y13, uptime 16 h at the stop):
+
+- 20:09 canary PASS 38.9 t/s (init #1); 20:10 **#67** at `mtp1srv@cat132k` init
+  (#2), both-GPU reset, self-recovered; 20:14 (#3), 20:20 (#4) clean loads;
+  20:26-20:52 the CAT-1 A/B arms served 3×64k each cleanly.
+- 21:29 **#68** at `mtp1srv@cat1ctrl` init (#7): `hipErrorLaunchFailure`,
+  self-recovered, VRAM cleared.
+- 06:13 (next visit) the **authorized retry** of that same arm (init #8):
+
+```
+amdgpu 0000:0e:00.0: GPU reset begin!. Source: 4
+amdgpu 0000:0e:00.0: BACO reset
+amdgpu 0000:0e:00.0: GPU reset succeeded, trying to resume
+amdgpu 0000:0e:00.0: VRAM is lost due to GPU reset!
+amdgpu 0000:0e:00.0: Fence fallback timer expired on ring comp_1.0.0
+amdgpu 0000:0e:00.0: GPU reset(3) succeeded!
+amdgpu 0000:0e:00.0: [drm] device wedged, but recovered through reset
+```
+
+- Both failures were the *same work dir* (`/local/tmp/mtp1/cat1_32768ctrl`);
+  the three clean loads either side used `cat1_32768`, `cat1_pilot` and the
+  pristine snapshot. With 2 consecutive failures the house rule applies:
+  **GPU work stopped, reboot before the next session.**
+- Discriminator to run first on the fresh boot: load `cat1_32768ctrl` once
+  (1 load). Wedge again ⇒ suspect that work dir (rebuild it with a fresh
+  `slice` and re-verify the index/extra-tensors pair); clean ⇒ boot wear
+  (inits #7/#8 of a 16 h boot), no code implication.
+- Two useful lessons recorded here rather than in the dev log: (a) an idle
+  boot does not reset the init-fault probability — #68 and #69 were 9 h
+  apart on the same boot; (b) the `hipErrorLaunchFailure` init wedge can
+  escalate to a BACO reset on the retry, so retries are not free.
+
+## 2026-09-13 boot Y14 — wedge #70 (first load-wedge of the boot, BACO reset)
+
+Boot Y14 (07:10) was clean: canary PASS 38.9 t/s, one work-dir arm loaded and
+served 1×64k decode, teardown clean (VRAM 10.9 MB both). Then the **pristine
+snapshot** arm (init #3 of the boot) wedged at engine init:
+
+```
+terminate called after throwing an instance of 'c10::AcceleratorError'
+  what():  CUDA error: unspecified launch failure   (hipErrorLaunchFailure)
+...
+amdgpu 0000:0e:00.0: GPU reset begin!. Source:  4
+amdgpu 0000:0e:00.0: BACO reset
+amdgpu 0000:0e:00.0: VRAM is lost due to GPU reset!
+amdgpu 0000:0e:00.0: GPU reset(1) succeeded!
+amdgpu 0000:0e:00.0: [drm] device wedged, but recovered through reset
+```
+
+Observations: (a) the init-wedge does **not** discriminate by model dir — the
+previous boot's #68/#69 were the *work-dir* arm and I had begun to suspect that
+directory; **this one is the pristine snapshot**, which exonerates the work dir
+and re-confirms the boot-wear/load-family reading; (b) the BACO path now appears
+in 2 of the last 3 wedges (#69, #70) — the escalation is no longer unusual;
+(c) still clustering on the 1st-3rd CUDA init of a boot, minutes after a wedge-
+free canary and a clean arm. One authorized retry per house rules.
+
+## 2026-09-13 boot Y16 — wedge #72 (README-perf session's first big load; GPU0, in-place reset)
+
+Boot Y16 (up 07:10) had already carried the V2-runner init wedge at 10:33.
+This session: canary PASS **38.8 t/s** at 12:05 (GPU0), then the
+headline-restamp script. Its first arm (MoE 35B) aborted for a **software**
+reason (stale model path: `/local/models/QuantTrio/...` no longer exists — the
+model now lives on `/data`; vLLM treated the path as a repo id and raised
+`HFValidationError`). The script fell through to the dense arm, which died ~40 s
+later at shard 0/8 of the 20.35 GiB checkpoint:
+
+```
+terminate called after throwing an instance of 'c10::AcceleratorError'
+  what():  CUDA error: unspecified launch failure   (hipErrorLaunchFailure)
+Exception raised from SetDevice at c10/hip/HIPFunctions.cpp:334
+amdgpu 0000:0b:00.0: Fence fallback timer expired on ring comp_1.0.0
+amdgpu 0000:0b:00.0: GPU reset(2) succeeded!
+amdgpu 0000:0b:00.0: [drm] device wedged, but recovered through reset
+```
+
+Notes: (a) GPU0 (`0b:00.0`), unlike the GPU1-heavy pattern of the earlier
+load-family events; (b) **no `VRAM is lost due to GPU reset!` and no BACO
+line** — the fence-timeout path reset and recovered in place; (c) the trigger
+sequence is *failed software launch → next load wedge*, i.e. the engine-init
+path was cold rather than preceded by a long serve; (d) VRAM returned to the
+10.9 MB/GPU idle baseline, `rocm-smi --showpids` shows only `gpuagent` — no
+zombie KFD handles, so the house recipe applies: probe both GPUs, canary, then
+ONE retry (two consecutive genuine failures = burst → stop + reboot).
+
+## 2026-09-13 boot Y16 — wedge #73 + BURST (the retry of #72; GPU0 BACO, session stopped)
+
+Retry sequence after #72 was textbook-clean until the second load: both GPUs
+probed at **10.0 / 9.8 TFLOPS fp16** (healthy 10.0/9.7 band) and the canary
+passed at **38.9 t/s**. Then, 5 min later, the MoE arm
+(`/data/models/QuantTrio/Qwen3.5-35B-A3B-AWQ`, 23.71 GiB over AUTOFS) died at
+shard 0/9 with the identical `hipErrorLaunchFailure`, and this time the kernel
+took the BACO path:
+
+```
+amdgpu 0000:0b:00.0: GPU reset begin!. Source:  4
+amdgpu 0000:0b:00.0: BACO reset
+amdgpu 0000:0b:00.0: GPU reset succeeded, trying to resume
+amdgpu 0000:0b:00.0: VRAM is lost due to GPU reset!
+amdgpu 0000:0b:00.0: Fence fallback timer expired on ring comp_1.0.0
+amdgpu 0000:0b:00.0: GPU reset(3) succeeded!
+amdgpu 0000:0b:00.0: [drm] device wedged, but recovered through reset
+```
+
+This is the **2nd consecutive genuine single-instance load failure on GPU0
+within ~6 min** (#72 at 12:08:55, reset(2); #73 at 12:14:33, reset(3)) ⇒ BURST
+per the house recipe: all GPU work stopped. The script's third arm (dense,
+which had reached 62 % of its 8-shard load without error) was killed rather
+than allowed to continue; VRAM returned to the 10.9 MB/GPU idle baseline and
+`rocm-smi --showpids` shows only `gpuagent`.
+
+Reading: the pattern is the **chronic weight-load family on this boot** (both
+failures at shard 0, both on GPU0, the *second* right after a clean probe and
+canary), i.e. boot-wear rather than a model/code/path cause — the model path
+change (NFS `/data`) and the software abort of the first arm are incidental.
+Two GPU resets in six minutes is the pre-full-wedge wear signal, so the boot
+is spent: **reboot before further GPU work** (a fresh boot's first load is the
+cleanest slot we have; see the load-lottery tallies in this file).
+
+## 2026-09-13 boot f27e8058 — wedge #74 (TP=2 first launch of the CAT-1 headline session; GPU1, in-place reset)
+
+Clean-boot context: canary **39.0 t/s**, probes **10.0/9.8 TFLOPS**, four
+harness runs completed with mclk verified at 1000 MHz (MoE/dense x cold/warm),
+~90 min of GPU work with no event. Then the CAT-1 agentic session's first arm
+(TP=2, `run_server.sh greedy`) launched and GPU1 reset in place:
+
+```
+amdgpu 0000:0e:00.0: PSP is resuming...
+amdgpu 0000:0e:00.0: reserve 0x400000 from 0x87fe000000 for PSP TMR
+amdgpu 0000:0e:00.0: Fence fallback timer expired on ring comp_1.0.0
+amdgpu 0000:0e:00.0: GPU reset(1) succeeded!
+amdgpu 0000:0e:00.0: [drm] device wedged, but recovered through reset
+```
+
+The GPU1 worker process died, so the driver's `ready` check reported "failed to
+start" (the launcher deleted that attempt's server log — the campaign scripts
+keep `.attempt1`; worth porting back). The **authorized retry loaded clean in
+1.7 min** and the session continued; no BACO, no `VRAM is lost`. Same
+load-family signature as #72/#73 but on the *other* GPU and after a long clean
+stretch, i.e. boot-wear rather than a specific arm or config.
+
+## 2026-09-13 boot f27e8058 — wedge #75 (CAT-1 arm first launch; GPU1 BACO, retry passed)
+
+Second wedge of the boot, same GPU as #74 (GPU1 `0e:00.0`) and the same
+weight-load family, this time escalating through BACO:
+
+```
+amdgpu 0000:0e:00.0: BACO reset
+amdgpu 0000:0e:00.0: GPU reset succeeded, trying to resume
+amdgpu 0000:0e:00.0: VRAM is lost due to GPU reset!
+amdgpu 0000:0e:00.0: Fence fallback timer expired on ring comp_1.0.0
+amdgpu 0000:0e:00.0: GPU reset(2) succeeded!
+amdgpu 0000:0e:00.0: [drm] device wedged, but recovered through reset
+```
+
+Trigger: the third and last arm of the CAT-1 headline session (TP=2,
+`cat1v3k3` = Qwen3.8-27B + the CAT-1 v3 draft head + MTP k=3) launching after
+the k=3 arm's clean teardown. The worker died, so the arm reported "failed to
+start"; the **authorized retry loaded clean in 5.7 min** and the sweep ran.
+Between #74 (15:51) and #75 (16:51) the session completed six full sweeps
+(greedy + MTP k=3 on the agent corpus, 4 reps each) with no event, i.e. two
+resets an hour apart on the same card with long clean stretches between —
+boot-wear/load-lottery behaviour, not an arm, model-dir or config dependency.
