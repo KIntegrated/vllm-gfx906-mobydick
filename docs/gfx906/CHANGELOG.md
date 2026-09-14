@@ -6,6 +6,20 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-14
+
+- **The 0.29.0 line was promoted to `main`** (fast-forward, `main` ==
+  `gfx906/v0.29.0` @ `7311119d67`; `gfx906/v0.28.0` stays as the previous release
+  branch). Parity gate all green before the promotion: build + extensions, FA
+  suite (88 pass / 3 tracked skips), PPL probe **bit-identical** to the 0.28 line
+  (10.5516), V1 serving smoke, V1 restamp (MoE 65.40/58.17, dense 24.90/16.33),
+  and the agentic corpus re-measured (greedy 19.91/13.25 — parity; MTP k=3
+  33.30/24.54 — parity arm-level; MTP k=3 + CAT-1 34.62/25.55). V2 was shown
+  viable on gfx906 in the same window (graph serve + PPL 10.5516); its
+  performance/spec-decode parity work continues off `main` (`V2-bringup.md`).
+- VIT-1 step 1 landed (custom-FA arm for the Qwen3.5 ViT, opt-in, unit-validated);
+  the aiter/spec-decode blocker found on the 0.29 line was fixed.
+
 ## 2026-09-13
 
 - **Upstream v0.29.0 merged** into `gfx906/v0.29.0` (merge `3c445dba56`; parents
