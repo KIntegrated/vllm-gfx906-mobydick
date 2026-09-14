@@ -1577,19 +1577,24 @@ three pass unchanged, and the suite is **91 passed, 0 skipped**
 extended to assert that a full-length (V2-style) host `cu_seqlens` slice with a
 garbage tail is bit-identical, which is the guard the V2-bringup plan asked for.
 
-### V2-CAT1-1 — explain the V2 CAT-1 acceptance boost (do not quote 42.6 t/s before this)
-
-**Status: CLOSED (2026-09-14, `gfx906/v2-bringup`).** Three-arm V2 run (same
-boot/prompts/runner/k, only the list differs): no list 33.62/23.75 (acc
-2.05/1.93), corpus-matched 35,251 **42.60/26.94 (acc 2.44/2.49)**, mismatched
-32,768 control 35.22/22.80 (acc 1.72/1.71). So the ms saving is common (~+5 %,
-matching the V1 controlled A/B) while the acceptance effect is **content-dependent**:
-a matched list is a good prior over the target's own continuations (+20 %), a
-mismatched one is a bad prior (−15 %). Exactness is established by audit
-(`gumbel_sample` caches the masked draft logits; `rejection_sampler_utils.py`
-computes the ratio from that same cache; the target keeps its own head) and the
-draft path at temp 0 is a plain argmax, so this is not stochastic drafting.
-Quote the V2 number as V2-specific.
+### V2-CAT1-1 — the V2 CAT-1 acceptance boost was a harness bug (RETRACTED; the real effect is ms/step)
+**Status: CLOSED (2026-09-14, `gfx906/v2-bringup`) — the acceptance effect was a
+measurement artifact.** The A/B client put the arm *name* in the prompt header
+(`RESEARCH-BRIEFING-{arm}-…`); because the header's token count differs per arm
+(26 vs 29) the body slice `pp - len(header)` shifted too, so each arm ran a
+*different prompt* — the exact trap `AGENTS.md` forbids. The three-arm reading
+(matched 2.44/2.49 vs control 1.72/1.71 vs none 2.05/1.93) is therefore void, as
+is 42.60 t/s. Re-measured with the fixed client (arm out of the prompt; a
+`prompt_sha1` digest is now logged so prompt identity can be asserted), same boot,
+V2, 3 reps: plain 34.41/24.00 vs CAT-1 35.44/24.61 t/s, ms/step 86.3→83.7 @64k
+and 128.5→124.4 @120k ⇒ **+3.0 % / +2.5 %**, **acceptance unchanged** (1.98 vs
+1.98 @64k, 2.07 vs 2.10 @120k). The mechanism is the cheaper per-step head read
+(35,251 rows vs 248,320), exactly as the V1 controlled A/B found (−2.52 ms/step,
+no acceptance penalty). Exactness still holds by audit (`gumbel_sample` caches the
+masked draft logits; `rejection_sampler_utils.py` computes the ratio from that same
+cache; the target keeps its own head) and the draft path at temp 0 is a plain
+argmax. Quote CAT-1's gain as **+3.0 % / +2.5 % on V2** (and ~+5 % on V1), never
+as an acceptance effect.
 
 (Original entry, kept for the record.) On V2 the CAT-1 shortlist arm's acceptance is ~20 %
 higher than V2's plain MTP k=3 arm (2.44/2.49 vs 2.05/1.93 @64k, 2.37 vs 2.13/2.00

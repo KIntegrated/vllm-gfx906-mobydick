@@ -20,14 +20,17 @@ the date an investigation began.
 - **V2 bring-up (`gfx906/v2-bringup`) — V2 now serves spec decode at parity, and
   CAT-1 works under it.** Dense 27B on the agentic corpus (same boot, 2 reps):
   greedy 20.37/13.27 vs V1 19.91/13.25; MTP k=3 33.62/23.75 vs 33.30/24.54;
-  **MTP k=3 + CAT-1 42.60/26.94 vs V1 34.62/25.55** — the fastest configuration
-  measured on this box. The `MTP draft-vocab shortlist ACTIVE` marker fires under
-  V2 with graph capture on and no eager fallback, so item 3's silent-loss risk is
-  refuted both by code audit (V2 drafts go through the draft model's
-  `compute_logits`; the one bypass path fails closed at init) and live.
-  V2-CAT1-1 was resolved with a third arm: the acceptance gain is the *list's
-  content* (matched 35,251: acc 2.44/2.49; mismatched 32,768 control: 1.72/1.71;
-  no list: 2.05/1.93), the ms saving (~+5 %) is common to both, and exactness
+  MTP k=3 + CAT-1 42.60/26.94 vs V1 34.62/25.55 — **RETRACTED 2026-09-14**: the
+  A/B client put the arm name in the prompt header, so every arm ran a different
+  prompt (the AGENTS.md trap). Re-measured same-boot with the fixed client, 3 reps:
+  plain 34.41/24.00 vs CAT-1 35.44/24.61 t/s (ms/step 86.3→83.7 @64k, 128.5→124.4
+  @120k ⇒ **+3.0 % / +2.5 %**) with **acceptance unchanged** — the shortlist's
+  effect is the cheaper per-step head read, not agreement. The `MTP draft-vocab
+  shortlist ACTIVE` marker fires under V2 with graph capture on and no eager
+  fallback, so item 3's silent-loss risk is refuted both by code audit (V2 drafts
+  go through the draft model's `compute_logits`; the one bypass path fails closed
+  at init) and live. V2-CAT1-1's earlier three-arm reading (matched 2.44/2.49 vs
+  control 1.72/1.71 vs none 2.05/1.93) is retracted with it; exactness still
   holds because the rejection sampler reads the same masked draft logits it
   sampled from. V2 reserves more VRAM for the same flags (KV pool 454,536 vs
   496,693 tokens greedy; 386,513 vs 442,368 spec; capture 2.49–3.02 GiB vs

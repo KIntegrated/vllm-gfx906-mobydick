@@ -294,8 +294,11 @@ vllm serve <model> \
   `docs/gfx906/V2-bringup.md` for the exact pairs) and Ornith (16.7824 vs 16.7724).
   Caveats measured on V2: in the TP=2 serving config it reserves more VRAM for
   graph capture (KV pool 454,536 vs V1's 496,693 tokens at `--gpu-memory-utilization
-  0.82`), and **V2 + the CAT-1 shortlist is the fastest configuration measured on
-  this box** (agentic 64k/120k: 42.60 / 26.94 t/s vs V1's 34.62 / 25.55).
+  0.82`), and the **CAT-1 shortlist buys a ms/step saving, not acceptance** —
+  same-boot 3-rep A/B on V2: 34.41 → 35.44 t/s @64k and 24.00 → 24.61 @120k
+  (−2.6 / −4.1 ms/step ⇒ **+3.0 % / +2.5 %**), acceptance unchanged. (An earlier
+  +23 % figure came from an A/B client that put the arm name in the prompt header
+  — retracted, see `docs/gfx906/V2-bringup.md`.)
 - `--dtype float16` is required: gfx906 has no bf16 hardware; bfloat16
   checkpoints would fall back to fp32 math.
 - **cudagraph capture sizes = multiples of `num_speculative_tokens + 1`, up to

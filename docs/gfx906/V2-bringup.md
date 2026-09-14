@@ -164,7 +164,7 @@ from the same boot; 2 reps/cell, mclk 1000; runner confirmed V2 by the bare
 |---|---|---|---|---|---|
 | greedy | 20.37 (20.78/19.95) | 13.27 (13.28/13.25) | – | 19.91 / 13.25 | +2.3 % / +0.2 % |
 | MTP k=3 | 33.62 (34.38/32.86) | 23.75 (24.15/23.36) | 2.05/1.93, 2.13/2.00 | 33.30 / 24.54 | +1.0 % / −3.2 % |
-| MTP k=3 + CAT-1 | **42.60** (42.31/42.89) | **26.94** (26.97/26.91) | 2.44/2.49, 2.37/2.37 | 34.62 / 25.55 | **+23.1 % / +5.4 %** |
+| MTP k=3 + CAT-1 | ~~42.60~~ (superseded) | ~~26.94~~ | ~~2.44/2.49~~ | 34.62 / 25.55 | **+3.0 % / +2.5 %** (ms/step; see the correction below) |
 
 - **CAT-1 is active under V2** — `MTP draft-vocab shortlist ACTIVE (35251 ids)`
   logged (count 1 in that arm, 0 in the others), with graph capture on and **no
@@ -179,62 +179,67 @@ from the same boot; 2 reps/cell, mclk 1000; runner confirmed V2 by the bare
   GiB avail) — V2 reserves 8.5–12.6 % more, and its graph capture costs
   1.69+0.80 GiB (greedy) / 2.15+0.87 GiB (spec) against V1's 0.71 GiB. On V2 the
   capture-ladder trimming therefore matters more, not less.
-- **V2-CAT1-1 RESOLVED — the list's content is the mechanism (three-arm run,
-  2026-09-14).** Same boot, same runner, same prompts, same k, only the draft
-  list differs:
+- **V2-CAT1-1 — RETRACTED, then re-measured (2026-09-14).** The earlier result
+  (plain 33.62 / matched **42.60** / mismatched 35.22 at 64k; acceptance 2.05 /
+  2.44 / 1.72) is **invalid**: the A/B client put the arm *name* in the prompt
+  header (`RESEARCH-BRIEFING-{arm}-…`), and since the header token count differs
+  per arm (26 vs 29) the body slice `pp - len(header)` shifted too, so each arm
+  saw a **different prompt ending** — the exact trap AGENTS.md forbids. The
+  acceptance column was arm-dependent-prompt junk, and with it the 42.60 figure,
+  which was acceptance-driven.
+  Re-measured with the fixed client (arm name out of the prompt; a `prompt_sha1`
+  digest is now logged so prompt identity can be *asserted*), same boot, V2,
+  agentic corpus, **3 reps**, ms/step as the lead metric:
 
-  | V2 arm | @64k | @120k | acc @64k | acc @120k |
-  |---|---|---|---|---|
-  | no list (plain k=3) | 33.62 | 23.75 | 2.05/1.93 | 2.13/2.00 |
-  | **corpus-matched 35,251** | **42.60** | **26.94** | 2.44/2.49 | 2.37/2.37 |
-  | mismatched 32,768 (control) | 35.22 | 22.80 | 1.72/1.71 | 1.66/1.62 |
+  | V2 arm | @64k t/s | ms/step @64k | @120k t/s | ms/step @120k | acc @64k | acc @120k |
+  |---|---|---|---|---|---|---|
+  | plain MTP k=3 | 34.41 (34.56/34.74/33.94) | 86.3 (82.0/88.4/88.4) | 24.00 (24.01/23.85/24.15) | 128.5 (128.0/128.8/128.8) | 1.83/2.07/2.02 | 2.08/2.07/2.13 |
+  | **MTP k=3 + CAT-1** | 35.44 (34.64/36.65/35.02) | **83.7** (83.6/83.9/83.7) | 24.61 (24.71/24.68/24.43) | **124.4** (124.3/124.5/124.3) | 1.91/2.07/1.97 | 2.08/2.07/2.06 |
 
-  Reading: the ms saving is common to both lists (+4.8 %/−4.0 % for the
-  mismatched one — the same ~2.5 ms/step the V1 controlled A/B measured), and on
-  top of it the *matched* list acts as a good prior over what the target
-  actually generates (+20 % acceptance), while the mismatched list is a bad prior
-  (−15 %). So the V2 CAT-1 win is partly acceptance, it is content-dependent, and
-  it is not a structural V2 artifact.
-  **Exactness is established by audit**, not assumed: `gumbel_sample` caches the
-  *masked* draft logits (`logits_cache=draft_logits`) and
-  `rejection_sampler_utils.py` computes the acceptance ratio from that same cache
-  (`draft_logit … / temp`), while the target keeps its own full `lm_head` — the
-  ratio therefore uses exactly the distribution the draft was sampled from. At
-  `temperature = 0` the draft path is a plain argmax
-  (`gumbel_noised_argmax`, "or plain argmax at temp 0"), so the effect is the
-  mask shaping *which* token the argmax lands on, not stochastic drafting (an
-  earlier hypothesis, now discarded).
-  Consequence for quoting: **V2 + matched CAT-1 at 42.60/26.94 is the fastest
-  configuration measured on this box**, but it should be quoted as V2-specific
-  (under V1 the same list showed no acceptance effect, so its V1 gain stays
-  ~+4–5 %).
-  **Caveat added 2026-09-14 (post-reboot A3 session):** acceptance is
-  *deterministic per (config, prompt)* on V2 at temperature 0 — the plain k=3
-  baseline reproduced its per-rep acceptance exactly (2.4133 twice, identical
-  `acc_per_pos` 0.8933/0.8/0.72 and draft count, no shortlist marker) — but the
-  **absolute level shifts across boots**: the same plain k=3 arm read 2.05
-  pre-reboot and 2.41 on the fresh boot, with 33.62 vs 40.27 t/s @64k. So the
-  CAT-1 numbers must be compared **within a boot** (the three-arm run above is
-  same-boot, and the mismatched control arm is what establishes the *content*
-  effect), and any headline re-measure has to be same-boot A/B, not a
-  cross-boot comparison against these tables.
-- (Superseded, kept for the record) **V2-CAT1-1 (acceptance anomaly).** In the CAT-1 arm V2's
-  acceptance is ~20 % *higher* than V2's plain arm (2.44/2.49 vs 2.05/1.93 @64k;
-  server-side `Mean acceptance length` 3.3–3.5 vs 3.0 independently agrees), while
-  under V1 the same list showed no acceptance effect (controlled A/B: z = −0.83).
-  Hypothesis: V2's draft sampling is seeded/stochastic, so restricting the draft
-  head to a corpus-matched prior *shapes the draft distribution* (raising
-  agreement), whereas V1's greedy drafts are unchanged by the restriction.
-  Exactness should be unaffected — rejection sampling corrects any draft
-  distribution as long as the target's logits are untouched, which they are (the
-  target is a separate model with its own full `lm_head`). Disambiguating runs
-  (queued in ROADMAP V2-CAT1-1): a *mismatched* control list of the same size
-  (if it shows the same boost, the content is irrelevant and something structural
-  is happening), plus a token-identity/PPL check with the shortlist active under
-  V2. Corpus/list-shaping caveat for the *headline*: on V2, `34.62 → 42.60` mixes
-  the list's ms saving with this acceptance effect, so quote the V2 CAT-1 number
-  only with the caveat until V2-CAT1-1 lands.
-- Wedge #83 (GPU1) hit the mtp3 arm's first launch; the retry passed and is
+  Reading: **the effect is the ms/step saving, and it reproduces** — −2.6 ms/step
+  @64k, −4.1 ms/step @120k ⇒ **+3.0 % / +2.5 %**, with the CAT-1 per-rep ms/step
+  spread an order of magnitude tighter than the plain arm's (83.6–83.9 vs
+  82.0–88.4). **Acceptance is unchanged** (1.98 vs 1.98 @64k, 2.07 vs 2.10 @120k):
+  the shortlist makes each step cheaper (35,251-row head read instead of the full
+  248,320-row one), it does not make the drafter agree more often. That matches
+  the V1 controlled A/B (−2.52 ms/step ⇒ +4.8 %/+5.9 %, MWU z = −0.83 on
+  acceptance = no acceptance penalty), so CAT-1's honest V2 headline is
+  **+3.0 % / +2.5 %**, not +23 %.
+  **Exactness holds by audit**: `gumbel_sample` caches the *masked* draft logits
+  (`logits_cache=draft_logits`) and `rejection_sampler_utils.py` computes the
+  acceptance ratio from that same cache (`draft_logit … / temp`) while the target
+  keeps its own full `lm_head`, so the ratio uses exactly the distribution the
+  draft was sampled from. At `temperature = 0` the draft path is a plain argmax
+  (`gumbel_noised_argmax`, "or plain argmax at temp 0").
+  **Method note (why this took three readings):** acceptance is deterministic per
+  (config, prompt) at temperature 0 but its absolute level moves across boots (the
+  same plain k=3 arm read 2.05 pre-reboot, 2.41 on the next boot), so acceptance
+  deltas are only meaningful **within a boot** and the only trustworthy cross-arm
+  signal is ms/step.
+- **A3 revived and gated (item 7, 2026-09-14): NEUTRAL at both the serving k and
+  k=7.** The three archive items are restored (env-gated `VLLM_GFX906_FUSED_DRAFT`,
+  default 0, + the no-op `update_draft_decode_metadata`, + 3 tests, 3 passed; the
+  reuse test migrated to the 0.29 fused KV layout) and the no-op contract
+  re-audited against 0.29 + V2. The flag demonstrably flips the path: the *off*
+  arm logs "Fused multi-step draft decode is not supported by attention
+  backend(s) CUSTOM; falling back to rebuilding attention metadata between draft
+  steps" (count 1) and the *on* arm logs it 0 times. Serving A/B, V2, agentic,
+  ms/step lead:
+
+  | arm | k | ms/step (reps) | acceptance (reps) |
+  |---|---|---|---|
+  | a3 off | 3 | 81.2 / 88.7 @64k, 128.9 / 129.4 @120k | 2.4133/2.4133, 2.0595/2.0595 |
+  | a3 on | 3 | 81.9 / 89.1 @64k, 128.5 / 129.6 @120k | 2.4133/2.3816, 2.1605/2.0595 |
+  | a3 off | 7 | 140.4 / 139.3 @64k | 5.2683 / 2.5833 |
+  | a3 on | 7 | 141.5 / 140.7 @64k | 2.4933 / 5.1190 |
+
+  Neutral at both depths — the 1–3 ms/round host saving stays hidden behind the
+  22–31 ms (k=3) and ~140 ms (k=7) GPU steps. Note the k=7 acceptance spread
+  (2.58 vs 5.27 across the two prompts) is *prompt* variation, and ms/step is flat
+  across it, which is exactly why ms/step is the gate. The opt-in stays **default
+  OFF** (behaviourally inert), which is also its shipped state.
+- **Wedge #83 (GPU1) hit the mtp3 arm's first launch; the retry passed and is
+  recorded in `degradation.md`.**
   recorded in `degradation.md`.
 
 **Session E-2 — remaining models, in-process PPL, same boot (2026-09-14).**
