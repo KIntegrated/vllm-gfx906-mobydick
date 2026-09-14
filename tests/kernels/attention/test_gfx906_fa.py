@@ -3263,3 +3263,253 @@ def test_kv_split_transient_cap_rules():
     # Empty batch.
     assert Gfx906FAImpl._kv_split_transient_cap(
         0, 1024, 12, 256, budget) == 0
+
+
+# ---------------------------------------------------------------------------
+# A3 (revived 2026-09-14 on the V2 bring-up branch): the fused multi-step draft
+# metadata protocol. Its only consumer is V2's `_generate_fused_drafts` loop,
+# which builds the draft metadata once per propose round and calls
+# `update_draft_decode_metadata` between draft steps. Our implementation opts in
+# under VLLM_GFX906_FUSED_DRAFT=1 and the update is a no-op — correct only while
+# every step-dependent field the builder hands over stays a live view of a
+# persistent buffer. These three tests pin the flag, the view contract and the
+# end-to-end reuse behaviour (the last one is the corruption guard).
+# ---------------------------------------------------------------------------
+
+
+def _a3_builder(monkeypatch, value: str | None):
+    from vllm.gfx906_fa.gfx906_fa_backend import Gfx906FAMetadataBuilder
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
+    if value is None:
+        monkeypatch.delenv("VLLM_GFX906_FUSED_DRAFT", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_GFX906_FUSED_DRAFT", value)
+    spec = AttentionSpec(
+        block_size=BLOCK, num_kv_heads=HKV, head_size=D, dtype=torch.float16
+    )
+    return Gfx906FAMetadataBuilder(spec, ["l0"], None, torch.device("cuda"))
+
+
+def test_a3_fused_draft_flag_env_gate_and_noop_update(monkeypatch):
+    """The capability flag follows VLLM_GFX906_FUSED_DRAFT and the in-place
+    update is a no-op that never raises (it runs between draft steps, possibly
+    inside CUDA graph capture, so it must stay host-logic-free)."""
+    from vllm.gfx906_fa.gfx906_fa_backend import Gfx906FAMetadata
+
+    dev = torch.device("cuda")
+    b0 = _a3_builder(monkeypatch, None)
+    assert not b0.supports_draft_decode_metadata_update
+    b1 = _a3_builder(monkeypatch, "0")
+    assert not b1.supports_draft_decode_metadata_update
+    b2 = _a3_builder(monkeypatch, "1")
+    assert b2.supports_draft_decode_metadata_update
+
+    md = Gfx906FAMetadata(
+        num_actual_tokens=1,
+        max_query_len=1,
+        max_seq_len=8,
+        query_start_loc=torch.zeros(2, dtype=torch.int32, device=dev),
+        seq_lens=torch.zeros(1, dtype=torch.int32, device=dev),
+        block_table=torch.zeros(1, 1, dtype=torch.int32, device=dev),
+        slot_mapping=torch.zeros(1, dtype=torch.int64, device=dev),
+    )
+    b2.update_draft_decode_metadata(md)  # no-op: must not raise
+
+
+def test_a3_metadata_build_is_persistent_views():
+    """build() must hand back the caller's own tensors (views, not copies): the
+    speculator's draft loop relies on mutating the persistent buffers between
+    steps and seeing the change through a metadata object built ONCE at step 1."""
+    from vllm.gfx906_fa.gfx906_fa_backend import Gfx906FAMetadataBuilder
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
+    dev = torch.device("cuda")
+    spec = AttentionSpec(
+        block_size=BLOCK, num_kv_heads=HKV, head_size=D, dtype=torch.float16
+    )
+    builder = Gfx906FAMetadataBuilder(spec, ["l0"], None, dev)
+    B, max_seq = 2, 128
+    qsl = torch.arange(B + 1, dtype=torch.int32, device=dev)
+    sl = torch.tensor([100, 64], dtype=torch.int32, device=dev)
+    bt = torch.zeros(B, 8, dtype=torch.int32, device=dev)
+    smap = torch.zeros(B, dtype=torch.int64, device=dev)
+    cam = CommonAttentionMetadata(
+        query_start_loc=qsl,
+        query_start_loc_cpu=qsl.cpu(),
+        seq_lens=sl,
+        num_reqs=B,
+        num_actual_tokens=B,
+        max_query_len=1,
+        max_seq_len=max_seq,
+        block_table_tensor=bt,
+        slot_mapping=smap,
+    )
+    md = builder.build(0, cam)
+    assert md.query_start_loc.data_ptr() == qsl.data_ptr()
+    assert md.seq_lens.data_ptr() == sl.data_ptr()
+    assert md.block_table.data_ptr() == bt.data_ptr()
+    assert md.slot_mapping.data_ptr() == smap.data_ptr()
+
+
+def test_a3_draft_step_reuse_reads_live_seq_lens():
+    """The fused-loop contract end-to-end: build metadata once (step 1), advance
+    seq_lens + slot + KV write in place (what the captured update_draft_inputs /
+    compute_slot_mappings / do_kv_cache_update kernels do between steps), call the
+    (no-op) metadata update, and the second forward through the SAME metadata
+    object must match a fresh reference at the advanced lengths. If any field
+    were step-baked (a copy, a host scalar read by the kernel) this second
+    forward would still attend over the old lengths and mismatch."""
+    dev = "cuda"
+    torch.manual_seed(23)
+    from vllm.gfx906_fa.gfx906_fa_backend import (
+        Gfx906FAImpl,
+        Gfx906FAMetadataBuilder,
+    )
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
+    impl = Gfx906FAImpl(
+        num_heads=HQ,
+        head_size=D,
+        scale=1.0 / math.sqrt(D),
+        num_kv_heads=HKV,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="float16",
+    )
+    cls = type(impl)
+    assert impl._legacy, "test must exercise the LEGACY=1 fp16 gather path"
+    saved = (
+        cls._k_gather_buf,
+        cls._v_gather_buf,
+        cls._gather_retired,
+        cls._gather_captured,
+        cls._gather_buf_captured,
+    )
+    try:
+        cls._k_gather_buf, cls._v_gather_buf, cls._gather_retired = None, None, {}
+        cls._gather_captured = False
+        cls._gather_buf_captured = False
+
+        B, L0, max_seq = 2, [100, 64], 128
+        nblk = (max_seq + BLOCK - 1) // BLOCK
+        num_blocks = B * nblk + 4
+        # 0.29 fused cache: one tensor per layer, K/V = strided halves of the
+        # last axis; the backend splits it internally (the impl takes the fused
+        # tensor, as the backend-level tests do).
+        _, v_view, kv = _make_fused_cache(num_blocks, dev)
+        k_view = _kv_split(kv)[0]
+        # Flat row r of request s lives at slot s * nblk * BLOCK + r
+        # (contiguous private blocks, like the existing paged tests).
+        # Kf/Vf (contiguous) are the source of truth for the reference;
+        # the cache halves are copies kept in sync by the 'KV write' steps.
+        Kf = (
+            torch.randn(num_blocks * BLOCK, HKV, D, device=dev, dtype=torch.float16)
+            * 0.5
+        )
+        Vf = (
+            torch.randn(num_blocks * BLOCK, HKV, D, device=dev, dtype=torch.float16)
+            * 0.5
+        )
+        k_view.copy_(Kf.view(num_blocks, BLOCK, HKV, D))
+        _write_v_fused(v_view, Vf)
+
+        def slot_of(s: int, r: int) -> int:
+            return s * nblk * BLOCK + r
+
+        # Persistent draft buffers (the speculator's input_buffers /
+        # block-table views) — metadata must be built from these ONCE.
+        seq_lens = torch.tensor(L0, dtype=torch.int32, device=dev)
+        qsl = torch.arange(B + 1, dtype=torch.int32, device=dev)
+        bt = torch.zeros(B, nblk, dtype=torch.int32, device=dev)
+        for s in range(B):
+            bt[s] = torch.arange(
+                s * nblk, (s + 1) * nblk, dtype=torch.int32, device=dev
+            )
+        smap = torch.tensor(
+            [slot_of(s, L) for s, L in enumerate(L0)],
+            dtype=torch.int64,
+            device=dev,
+        )
+        cam = CommonAttentionMetadata(
+            query_start_loc=qsl,
+            query_start_loc_cpu=qsl.cpu(),
+            seq_lens=seq_lens,
+            num_reqs=B,
+            num_actual_tokens=B,
+            max_query_len=1,
+            max_seq_len=max_seq,
+            block_table_tensor=bt,
+            slot_mapping=smap,
+        )
+        spec = AttentionSpec(
+            block_size=BLOCK, num_kv_heads=HKV, head_size=D, dtype=torch.float16
+        )
+        builder = Gfx906FAMetadataBuilder(spec, ["l0"], None, torch.device(dev))
+        md = builder.build(0, cam)  # the step-1 build — never rebuilt
+
+        def ref_at(q: torch.Tensor, lengths):
+            g = HQ // HKV
+            scale = 1.0 / math.sqrt(D)
+            out = torch.empty(B, HQ, D, dtype=torch.float32, device=dev)
+            for s, L in enumerate(lengths):
+                kf = Kf[slot_of(s, 0) : slot_of(s, L)].float()
+                vf = Vf[slot_of(s, 0) : slot_of(s, L)].float()
+                for h in range(HQ):
+                    hk = h // g
+                    sc = q[s, h].float() @ kf[:, hk].T * scale
+                    out[s, h] = torch.softmax(sc, -1) @ vf[:, hk]
+            return out
+
+        def run_step(q: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros(B, HQ, D, dtype=torch.float16, device=dev)
+            impl.forward(None, q, q, q, kv, md, output=out)
+            return out
+
+        # Step 1 (Sq=1 per request: each draft step is one query/req).
+        q1 = torch.randn(B, HQ, D, device=dev, dtype=torch.float16) * 0.5
+        out1 = run_step(q1)
+        rel1 = ((out1.float() - ref_at(q1, L0)).norm() / ref_at(q1, L0).norm()).item()
+        assert rel1 < 5e-2, f"step 1 rel={rel1:.2e}"
+
+        # Advance to step 2 IN PLACE, mirroring the captured kernels:
+        # update_draft_inputs (+1 seq_lens), compute_slot_mappings (new slot),
+        # do_kv_cache_update (new K/V row at the new slot).
+        new_k = torch.randn(1, HKV, D, device=dev, dtype=torch.float16) * 0.5
+        new_v = torch.randn(1, HKV, D, device=dev, dtype=torch.float16) * 0.5
+        for s, L in enumerate(L0):
+            sl = slot_of(s, L)
+            blk, off = sl // BLOCK, sl % BLOCK
+            k_view[blk, off] = new_k[0]
+            v_view[blk, off] = new_v[0]
+            Kf[sl] = new_k[0]
+            Vf[sl] = new_v[0]
+        seq_lens.add_(1)
+        smap.copy_(
+            torch.tensor(
+                [slot_of(s, L + 1) for s, L in enumerate(L0)],
+                dtype=torch.int64,
+                device=dev,
+            )
+        )
+        builder.update_draft_decode_metadata(md)  # no-op between steps
+
+        q2 = torch.randn(B, HQ, D, device=dev, dtype=torch.float16) * 0.5
+        out2 = run_step(q2)  # SAME md object, advanced persistent state
+        L2 = [L + 1 for L in L0]
+        rel2 = ((out2.float() - ref_at(q2, L2)).norm() / ref_at(q2, L2).norm()).item()
+        assert rel2 < 5e-2, f"step 2 (reused metadata) rel={rel2:.2e}"
+        # The stale-lengths reference must NOT match: guards against a vacuous
+        # pass (e.g. kv_max ignored entirely).
+        stale = ((out2.float() - ref_at(q2, L0)).norm() / ref_at(q2, L0).norm()).item()
+        assert stale > 5e-2, "step-2 output ignored the advanced seq_lens"
+    finally:
+        (
+            cls._k_gather_buf,
+            cls._v_gather_buf,
+            cls._gather_retired,
+            cls._gather_captured,
+            cls._gather_buf_captured,
+        ) = saved

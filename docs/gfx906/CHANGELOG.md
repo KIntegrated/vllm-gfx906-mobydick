@@ -34,6 +34,19 @@ the date an investigation began.
   0.71 GiB), so capture ladders matter more on V2. M3's host-`cu_seqlens` path is
   length-agnostic and now has a full-length-slice guard test; KVLAYOUT-2's three
   skipped capture tests were stale skips and pass (suite: 91 passed, 0 skipped).
+- **A3 revived (V2-only, opt-in, still default OFF) and gated: NEUTRAL at the
+  serving k.** The fused-draft opt-in + no-op `update_draft_decode_metadata` are
+  back in `gfx906_fa_backend.py` behind `VLLM_GFX906_FUSED_DRAFT` (default 0),
+  with the three archive tests (3 passed; the reuse test migrated to the 0.29
+  fused KV layout) and the no-op contract re-audited against 0.29 + V2. Serving
+  A/B under V2 (agentic, 2 reps, ms/step lead): off 81.2/88.7 ms @64k and
+  128.9/129.4 @120k vs on 81.9/89.1 and 128.5/129.6 — neutral, like the archive's
+  k=4. k=7 stays open: both `mtp7` launches wedged at load (burst) and GPU work
+  stopped.
+- **V2 parity extended to Nemotron 3.5 Lightning (PPL 27.0066 vs V1 26.9986) and
+  Ornith 1.5-35B-A3B (16.7824 vs 16.7724)** — both flipped to V2. Gemma-4 cannot
+  be gated by the in-process probe (both runners degenerate, PPL ~10^5 over a
+  multimodal load) → ROADMAP GEMMA4-1, stays pinned to V1.
 - VIT-1 step 1 landed (custom-FA arm for the Qwen3.5 ViT, opt-in, unit-validated);
   the aiter/spec-decode blocker found on the 0.29 line was fixed.
 

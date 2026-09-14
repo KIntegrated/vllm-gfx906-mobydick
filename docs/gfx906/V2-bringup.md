@@ -107,6 +107,34 @@ Most gfx906 work sits in paths both runners drive, so the question is
    (`archive/a3-fused-draft` + `A3-REVIVAL.md`). Only after 1–6: re-add the
    opt-in, re-audit the no-op contract at the serving k, and gate at k=7 (k=4 was
    NEUTRAL).
+   **Revived 2026-09-14, gate NEUTRAL at k=3 (the serving k); k=7 unmeasured
+   (burst).** The three archive items were restored: the env-gated opt-in
+   (`VLLM_GFX906_FUSED_DRAFT`, default 0) plus the no-op
+   `update_draft_decode_metadata` in `gfx906_fa_backend.py`, and the three tests
+   (`test_a3_fused_draft_flag_env_gate_and_noop_update`,
+   `test_a3_metadata_build_is_persistent_views`,
+   `test_a3_draft_step_reuse_reads_live_seq_lens` — the last one migrated to the
+   0.29 fused KV layout; **3 passed**). The no-op contract was re-audited against
+   0.29 + V2 (see the comment at the opt-in): seq_lens is advanced in place by
+   `update_draft_inputs`, slot_mapping is rewritten by `compute_slot_mappings`
+   inside the captured loop, and every layer's forward re-derives kv_max /
+   q_abs_offset from those buffers, so a once-built metadata object stays correct
+   across draft steps; the scalar fields are step-constant.
+   Serving A/B under V2 on the agentic corpus (2 reps, ms/step is the lead
+   metric):
+
+   | arm | @64k t/s | ms/step @64k | @120k t/s | ms/step @120k |
+   |---|---|---|---|---|
+   | a3 off | 40.27 (42.05/38.49) | 81.2 / 88.7 | 23.69 (23.74/23.64) | 128.9 / 129.4 |
+   | a3 on | 39.81 (41.69/37.94) | 81.9 / 89.1 | 24.10 (24.60/23.60) | 128.5 / 129.6 |
+
+   i.e. **neutral, exactly as at k=4** — the 1–3 ms/round host saving stays hidden
+   behind the 22–31 ms GPU steps at our shapes. The opt-in is therefore kept
+   **default OFF** (behaviourally inert; it exists so the k=7 question can be
+   closed later), which is also its shipped state. k=7 could not be measured: the
+   two `mtp7` launches wedged at load (wedges #87/#88, the second one both decks)
+   → burst → GPU work stopped; that arm is the one measurement to redo on a fresh
+   boot.
 8. **Flip the recipes** (`VLLM_USE_V2_MODEL_RUNNER` removal) model by model, only
    as each one passes. **Done 2026-09-14 for dense 27B and MoE 35B** (both at
    parity: agentic greedy/spec + MoE in-process 58.36 vs 57.86 t/s; see the

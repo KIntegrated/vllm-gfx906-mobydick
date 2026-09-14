@@ -162,6 +162,42 @@ class Gfx906FAMetadataBuilder(
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_size = kv_cache_spec.block_size
+        # A3 (revived 2026-09-14 on the V2 bring-up branch): opt in to the
+        # upstream fused-draft protocol, whose only consumer is V2's
+        # `_generate_fused_drafts` loop. It builds the draft metadata ONCE per
+        # propose round instead of rebuilding it on the host per draft step.
+        #
+        # The in-place update is a NO-OP by construction, so opting in only
+        # skips host work. Audit (re-run against 0.29 + V2, 2026-09-14): every
+        # step-dependent input this builder hands over is a live view of a
+        # persistent buffer — seq_lens is incremented in place by
+        # update_draft_inputs (its draft-step kernel) and slot_mapping is
+        # rewritten by compute_slot_mappings between steps, both inside the
+        # captured loop — and each layer's forward re-derives its live inputs
+        # from those buffers (kv_max = seq_lens, q_abs_offset = seq_lens - n_q),
+        # never from a step-baked scalar. The scalar fields are step-constant:
+        # num_actual_tokens (1 query per request), max_query_len (1), max_seq_len
+        # (a per-propose host bound used for buffer CAPACITY only — kernel reads
+        # are cut by the live kv_max), use_cascade (False for draft builds). The
+        # one field a per-step rebuild would recompute
+        # (seq_lens_cpu_upper_bound, CPU) is not read by this builder. Same
+        # contract as TritonAttentionMetadataBuilder.
+        #
+        # Env-gated (default OFF): flipping this changes which spec-decode code
+        # path serves, so per the standing same-boot A/B rule it must pass a
+        # serving A/B at the serving k before becoming the default.
+        self.supports_draft_decode_metadata_update = (
+            _os.environ.get("VLLM_GFX906_FUSED_DRAFT", "0") == "1"
+        )
+
+    def update_draft_decode_metadata(self, metadata: Gfx906FAMetadata) -> None:
+        # No-op by construction — see supports_draft_decode_metadata_update.
+        # May be called during CUDA graph capture (the fused loop bakes the
+        # call into the graph), so it must stay host-logic-free and launch
+        # nothing: there is nothing to update (every kernel input is a live
+        # read of the persistent buffers inside each forward).
+        return
+
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> Gfx906FAMetadata:
