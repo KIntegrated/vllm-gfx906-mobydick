@@ -1615,6 +1615,20 @@ this stack, so lead with the numbers, not the diff); (3) only then decide whethe
 the V2 CAT-1 config becomes the recommended one (it is currently the fastest
 configuration measured on this box).
 
+### GEMMA4-1 — a valid gate for Gemma-4 (and then its V2 flip)
+
+**Status: open.** The in-process PPL probe cannot gate
+`cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit`: it loads through the multimodal path and
+**both** runners return a degenerate distribution (V1 84261.54, V2 108909.96 PPL
+over 350 tokens, 0 top-20 misses), so the 2026-09-14 V2 parity session produced no
+signal for it and the model stays pinned to V1. Work: find the real failure mode
+first (is it the probe's text-only path on a multimodal loader, the A4B MoE
+config, or the AWQ-4bit quant path on gfx906?), then gate Gemma-4 by serving A/B
+(same boot, identical prompts) instead of the probe, and flip it to V2 only after
+that passes. Cross-check: does Gemma-4 serve at all today via the normal server
+path (with mm preprocessing + chat template)? If it does, the probe is simply the
+wrong instrument and the roadmap item is documentation, not a bug hunt.
+
 ### TRITON-1 — move to stock Triton with native gfx906 support (perf secondary)
 
 **Status: open, investigate.** Kevin 2026-09-13. The fork runs a custom/patched

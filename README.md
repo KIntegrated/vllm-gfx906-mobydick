@@ -286,9 +286,12 @@ vllm serve <model> \
 - **Model Runner: V2 is the validated default on 0.29.0+, per model.** Upstream
   defaults to V2; on gfx906 it is now brought up and at parity for the models
   listed below, so no pin is needed for them. `VLLM_USE_V2_MODEL_RUNNER=0` still
-  selects V1 (used for A/B reference arms), and **models not yet validated must
-  keep it set** until their parity run lands — currently Muse-Glimmer, Nemotron
-  3.5 Lightning, Ornith and Gemma-4 are pending (see `docs/gfx906/V2-bringup.md`).
+  selects V1 (used for A/B reference arms), and **the two models whose parity run
+  has not passed must keep it set**: Gemma-4 (its in-process PPL gate is
+  inapplicable — both runners return a degenerate distribution, so it needs a
+  serving-level gate) and Muse-Glimmer (no local AWQ checkpoint). Validated on V2:
+  Qwen3.8-27B, MoE 35B, Nemotron 3.5 Lightning (PPL 27.0066 vs 27.9986… — see
+  `docs/gfx906/V2-bringup.md` for the exact pairs) and Ornith (16.7824 vs 16.7724).
   Caveats measured on V2: in the TP=2 serving config it reserves more VRAM for
   graph capture (KV pool 454,536 vs V1's 496,693 tokens at `--gpu-memory-utilization
   0.82`), and **V2 + the CAT-1 shortlist is the fastest configuration measured on

@@ -112,11 +112,10 @@ Most gfx906 work sits in paths both runners drive, so the question is
    parity: agentic greedy/spec + MoE in-process 58.36 vs 57.86 t/s; see the
    session results above). `run_server.sh` now defaults to V2 with V1 one env
    override away, and the root README carries the per-model status. Still pinned
-   to V1: Muse-Glimmer (checkpoint not local — only the GGUF), Nemotron 3.5
-   Lightning (`primitive-ai/Nemotron-3.5-Lightning-30B-A3B-mixed-INT4-INT8`),
-   Ornith (`cyankiwi/Ornith-1.5-35B-A3B-AWQ-INT4`), Gemma-4
-   (`cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit`) — all three checkpoints verified
-   present, parity runs queued.
+   to V1: **Gemma-4** (its PPL probe is inapplicable — both runners degenerate,
+   see below; needs a serving gate) and **Muse-Glimmer** (checkpoint not local —
+   only the GGUF). Nemotron 3.5 Lightning and Ornith passed the probe at parity
+   and are flipped too (session E-2 below).
    **Flip verification (2026-09-14, after the burst reboot): PASSED.** With no
    runner env set, `run_server.sh greedy` came up on V2 (7 bare
    `[model_runner.py:*]` tags, 0 `gpu_model_runner.py`), served a completion whose
@@ -199,6 +198,23 @@ from the same boot; 2 reps/cell, mclk 1000; runner confirmed V2 by the bare
   only with the caveat until V2-CAT1-1 lands.
 - Wedge #83 (GPU1) hit the mtp3 arm's first launch; the retry passed and is
   recorded in `degradation.md`.
+
+**Session E-2 — remaining models, in-process PPL, same boot (2026-09-14).**
+PPL is our only valid numerical gate:
+
+| model | V1 | V2 | verdict |
+|---|---|---|---|
+| Nemotron 3.5 Lightning 30B-A3B (mixed INT4/INT8) | 26.9986 | 27.0066 | **parity** (0.03 %; both inside the recorded 26.96–27.02 fp16 band) |
+| Ornith 1.5-35B-A3B-AWQ-INT4 | 16.7724 | 16.7824 | **parity** (0.06 %) |
+| Gemma-4-26B-A4B-it-AWQ-4bit | 84261.54 | 108909.96 | **probe not applicable** — both arms degenerate |
+
+Nemotron and Ornith are therefore flipped to V2 as well (item 8). Nemotron
+serving note: at TP>1 it needs `--enable-expert-parallel` (group-64 CT experts),
+unchanged by the runner. **Gemma-4 is a separate problem, not a V2 one**: the
+in-process probe loads it through the multimodal path ("Model does not support
+mm_device_do_normalize") and both runners return a degenerate distribution
+(PPL ~10^5, 350 tokens), so the probe cannot gate it at all — it stays pinned to
+V1 and needs a serving-level gate (new ROADMAP item GEMMA4-1).
 
 **MoE 35B parity (session E-1, in-process harness, same boot).** `docs/gfx906/_bench_gfx906.py`,
 `BENCH_SAMPLES=4 BENCH_PP=2048 BENCH_TG=256 BENCH_MAX_SEQS=32`, single GPU, mclk 1000
