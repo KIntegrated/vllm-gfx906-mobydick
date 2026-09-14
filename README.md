@@ -290,7 +290,7 @@ vllm serve <model> \
   has not passed must keep it set**: Gemma-4 (its in-process PPL gate is
   inapplicable — both runners return a degenerate distribution, so it needs a
   serving-level gate) and Muse-Glimmer (no local AWQ checkpoint). Validated on V2:
-  Qwen3.8-27B, MoE 35B, Nemotron 3.5 Lightning (PPL 27.0066 vs 27.9986… — see
+  Qwen3.8-27B, MoE 35B, Nemotron 3.5 Lightning (PPL 27.0066 vs 26.9986 — see
   `docs/gfx906/V2-bringup.md` for the exact pairs) and Ornith (16.7824 vs 16.7724).
   Caveats measured on V2: in the TP=2 serving config it reserves more VRAM for
   graph capture (KV pool 454,536 vs V1's 496,693 tokens at `--gpu-memory-utilization
