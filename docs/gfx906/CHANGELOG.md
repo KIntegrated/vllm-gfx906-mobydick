@@ -51,6 +51,15 @@ the date an investigation began.
   metadata type with a one-shot warning); MTP k=3 then serves normally
   (`MTP3 READY ~395 s`). The deeper, upstream-worthy fix is to guard the
   module-level aiter import in `rocm_aiter_fa.py` itself.
+  **Agentic-corpus re-measure on 0.29 (boot eefacc1e, V1 pinned, 2 reps/cell,
+  mclk 1000):** greedy 20.39 @64k / 13.26 @120k, MTP k=3 32.54 / 24.53, MTP k=3
+  + CAT-1 **34.62 / 25.55** — the CAT-1 shortlist reproduces here (+6.4 % /
+  +4.2 % over plain k=3 in-session) and its `MTP draft-vocab shortlist ACTIVE`
+  marker is logged in serving, which also de-risks the V2 variant of that check.
+  Bare MTP k=3 reads ~1-2 % below the 0.28 line at both contexts (acceptance on
+  par), flagged for an arm-level (>=3 rep) re-check before acting on it. Two load
+  wedges hit the session (#81 mtp3 attempt 1, #82 CAT-1 attempt 1); both retried
+  clean and are recorded in `degradation.md`.
 
   **Parity + V2 status (boot eefacc1e, same day).** V1 restamp of the 0.29 line
   against the 0.28 numbers: MoE **65.40 warm / 58.17 cold**, dense **24.90 /
