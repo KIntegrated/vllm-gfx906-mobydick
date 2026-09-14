@@ -196,6 +196,15 @@ flash-attn editable install can then be dropped from serving deps.
 **Effort: low-medium** (adapter + wiring + tests; the kernel needs nothing);
 **risk: low** (fallback stays).
 
+**Dep-shedding caveat (Kevin, 2026-09-13): do NOT drop the Triton-AMD
+flash-attn dependency for the ViT win alone.** It must be verified that no other
+model we serve needs it — the fork serves more than the Qwen3.5 family (Gemma-4,
+Muse-Glimmer, Ornith, Nemotron, and anything whose encoder path falls back to
+`FLASH_ATTN`/`TRITON_ATTN` on ROCm). Audit `get_vit_attn_backend`'s ROCm
+fallbacks and the mm-encoder backend list per model *before* removing the
+editable install; the boot-time stall win can be banked for the Qwen3.5 family
+without touching the dependency.
+
 ### TP-1 — TP-scaling probe: prefill + decode vs TP, the TP=4 question (queued after the 120k×B4 campaign)
 
 **User request 2026-09-10.** How well do prefill and decode scale with TP;
@@ -1545,6 +1554,35 @@ its K view is the `split(D, -1)` half, whose last dim is stride-1 and whose
 holds, so the uint8 byte-alias writes stay inside K's own segment and never
 touch V. That reasoning is static; the path has not been run on 0.29. Verify with
 one serving A/B before enabling LEGACY=0 for anything.
+
+### KVLAYOUT-2 — migrate the three skipped fork capture/lifecycle tests to the fused layout
+
+**Status: open, small.** 0.29's fused KV-cache content axis (#51718) made the
+fork's capture/lifecycle tests hand-build the pre-0.29 `[N, 2, B, Hkv, D]`
+fill/reference conventions. Eight of them were migrated (fused cache helper +
+`_kv_split`/`_write_v_fused`); three remain **skipped** with that reason:
+`test_q_pad_buffer_survives_capture_then_prefill_grow`,
+`test_gather_buffers_lifecycle_postfix`,
+`test_forward_mixed_batch_pad_tile_clamp_and_host_cu`. Work: re-derive each
+test's fill + reference construction against the fused layout (the K/V views are
+now strided halves of one tensor, so the staging/`view()` idioms also need
+`reshape`). The engine paths they cover are already validated end-to-end on 0.29
+(PPL 10.5516 == 0.28, serving smoke, parity restamp), so this is coverage debt,
+not an unknown.
+
+### TRITON-1 — move to stock Triton with native gfx906 support (perf secondary)
+
+**Status: open, investigate.** Kevin 2026-09-13. The fork runs a custom/patched
+Triton build for gfx906 (the venv's editable `triton` predates upstream's ROCm
+pin, `triton 3.7.1+git…` in 0.29's `requirements/build/rocm.txt`). Question: does
+the **latest stock Triton** support gfx906 (gfx9/Vega20) without our patches? If
+yes, we drop a fork build artifact and the maintenance that goes with it, and the
+ROCm wheel pin from upstream becomes usable. **Primary goal is maintenance, not
+speed**; the secondary question — whether newer Triton kernels (attention,
+rms-norm, GDN) reduce our Triton share of the step — is measured after the swap
+with the standard benches. Screens: the FA suite, the PPL probe, and a serving
+A/B; plus a check that nothing we rely on is Triton-version-pinned (the
+`triton_prefill_attention` / `vllm.triton_utils` surfaces and the ViT fallback).
 
 ### SMLA-1 — re-port the fork's fp16 sparse-MLA to 0.29.0's ROCm path (only if needed)
 
