@@ -180,6 +180,16 @@ from the same boot; 2 reps/cell, mclk 1000; runner confirmed V2 by the bare
   configuration measured on this box**, but it should be quoted as V2-specific
   (under V1 the same list showed no acceptance effect, so its V1 gain stays
   ~+4–5 %).
+  **Caveat added 2026-09-14 (post-reboot A3 session):** acceptance is
+  *deterministic per (config, prompt)* on V2 at temperature 0 — the plain k=3
+  baseline reproduced its per-rep acceptance exactly (2.4133 twice, identical
+  `acc_per_pos` 0.8933/0.8/0.72 and draft count, no shortlist marker) — but the
+  **absolute level shifts across boots**: the same plain k=3 arm read 2.05
+  pre-reboot and 2.41 on the fresh boot, with 33.62 vs 40.27 t/s @64k. So the
+  CAT-1 numbers must be compared **within a boot** (the three-arm run above is
+  same-boot, and the mismatched control arm is what establishes the *content*
+  effect), and any headline re-measure has to be same-boot A/B, not a
+  cross-boot comparison against these tables.
 - (Superseded, kept for the record) **V2-CAT1-1 (acceptance anomaly).** In the CAT-1 arm V2's
   acceptance is ~20 % *higher* than V2's plain arm (2.44/2.49 vs 2.05/1.93 @64k;
   server-side `Mean acceptance length` 3.3–3.5 vs 3.0 independently agrees), while
