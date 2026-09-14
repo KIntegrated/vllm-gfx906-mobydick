@@ -1584,6 +1584,20 @@ with the standard benches. Screens: the FA suite, the PPL probe, and a serving
 A/B; plus a check that nothing we rely on is Triton-version-pinned (the
 `triton_prefill_attention` / `vllm.triton_utils` surfaces and the ViT fallback).
 
+### MUSE-1 — Muse-Glimmer spec decode: MTP instead of ngram
+
+**Status: open, medium.** Kevin 2026-09-13: Muse-Glimmer should use **MTP**, not
+ngram (ngram is deprecated for now across our models). The Muse rows in the
+model table were measured with ngram n=5 on a **repetitive filler** corpus where
+acceptance saturates (100 %, acceptance-length 6.0), so they are a ceiling and
+say nothing about real prompts. Work: (1) confirm the checkpoint exposes an MTP
+draft head (the local cache currently has only the GGUF build — the AWQ-INT4
+checkpoint referenced by the table is not in `/local/cache`), (2) same-boot A/B
+on a real prompt set: greedy vs MTP k=3 (capture ladder multiples of 4), with
+acceptance and ms/step reported, (3) fold the result into the model table and
+drop the ngram recipe for this model. Reuses the VIT-1/v2 machinery: nothing new
+in the kernels.
+
 ### SMLA-1 — re-port the fork's fp16 sparse-MLA to 0.29.0's ROCm path (only if needed)
 
 **Status: parked, inert.** The fork carries an fp16 variant of the ROCm AITER

@@ -149,6 +149,14 @@ load-time repack (~65 s). Handles both MoeWNA16 (N-first uint8) and AutoAWQ
   (+1.15%), attributed the rest (MoE gemm zeroings are required by grid.z
   atomic K-splits; runner H2D micro-copies are upstream).
 
+
+**Spec-decode recommendation (2026-09-13, Kevin).** All local models use **MTP**
+(MTP k=3 where available, e.g. the Qwen3.5/3.8 family; Muse-Glimmer included).
+The `ngram` configs still shown in some rows above — and the "+15 % at tg256"
+and Muse-Glimmer "100 % filler acceptance" figures — are the historical
+filler-corpus measurements (acceptance ceilings, not real-payload results);
+ngram is **deprecated for now**, with a Muse-Glimmer MTP re-measure tracked as
+MUSE-1 in `ROADMAP.md`.
 ## Performance history (serving, pp=2048/tg=256)
 
 ### MoE — Qwen3.5-35B-A3B-AWQ

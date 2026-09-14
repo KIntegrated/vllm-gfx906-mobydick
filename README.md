@@ -292,9 +292,12 @@ vllm serve <model> \
   the Qwen3.5/3.8 family** (same-corpus A/B: +9.3 % over k=2 @120k, tie at 64k;
   agentic-corpus headline 33.3 @64k / 25.0 @120k t/s). k=2 stays useful for
   short-context/copy-light work, k=4 is a loss on real payloads, and both beat
-  greedy by ~2× at 64k+ after the kv_split fix. **ngram n=5 remains the choice
-  for Muse-Glimmer** (100 % filler-acceptance ceiling) and for filler/copy-heavy
-  short outputs (+15 % decode at tg256, neutral at tg1024 — 2026-08-25 A/B).
+  greedy by ~2× at 64k+ after the kv_split fix. **MTP is the spec config for
+  every local model, Muse-Glimmer included** (Kevin, 2026-09-13). ngram is
+  deprecated for now: the ngram numbers in this tree (e.g. +15 % decode at
+  tg256, the Muse-Glimmer "100 % filler acceptance" rows) were measured on
+  filler corpora and are ceilings, not real-payload results — a Muse-Glimmer MTP
+  A/B is queued as MUSE-1 in `docs/gfx906/ROADMAP.md`.
 - Tool/reasoning parsers: Qwen 3.5/3.6/3.8 → `qwen3_coder` + `qwen3`;
   Muse-Glimmer → `muse_glimmer` for both.
 - `--gpu-memory-utilization`: 0.82 with the spec config above; 0.93 for

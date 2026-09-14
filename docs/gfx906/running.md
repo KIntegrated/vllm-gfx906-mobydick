@@ -219,10 +219,11 @@ The W1 work (`DEVLOG-gdn-mixed-decode.md`) added:
 
 - `BENCH_NREQS=<n>` — send `n` prompts as one batch (default 1).
 - `BENCH_SPEC_CONFIG='<json>'` — speculative-decoding config for the
-  harness engine (e.g. the production ngram config
-  `{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_max":2}`).
+  harness engine (e.g. the production MTP config
+  `{"method":"mtp","num_speculative_tokens":3}`; ngram is deprecated for now).
 - `BENCH_CG_MAX=<n>` — cap the cudagraph capture sizes (use a multiple
-  of `num_speculative_tokens + 1` for ngram; e.g. 12 for n=5, 2 requests).
+  of `num_speculative_tokens + 1` for spec decode; e.g. 16 for MTP k=3 with 4
+  requests, 12 for ngram n=5 with 2).
 - `BENCH_MIXED=1` — with `BENCH_NREQS>=2`: request 0 gets a 2048-token
   repetitive filler (always drafts), the rest get the 190-token diverse
   sentence pool ending mid-sentence (rarely drafts) → spec-mixed
