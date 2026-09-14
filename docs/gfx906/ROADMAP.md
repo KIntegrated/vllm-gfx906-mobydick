@@ -1579,7 +1579,19 @@ garbage tail is bit-identical, which is the guard the V2-bringup plan asked for.
 
 ### V2-CAT1-1 — explain the V2 CAT-1 acceptance boost (do not quote 42.6 t/s before this)
 
-**Status: open, high value.** On V2 the CAT-1 shortlist arm's acceptance is ~20 %
+**Status: CLOSED (2026-09-14, `gfx906/v2-bringup`).** Three-arm V2 run (same
+boot/prompts/runner/k, only the list differs): no list 33.62/23.75 (acc
+2.05/1.93), corpus-matched 35,251 **42.60/26.94 (acc 2.44/2.49)**, mismatched
+32,768 control 35.22/22.80 (acc 1.72/1.71). So the ms saving is common (~+5 %,
+matching the V1 controlled A/B) while the acceptance effect is **content-dependent**:
+a matched list is a good prior over the target's own continuations (+20 %), a
+mismatched one is a bad prior (−15 %). Exactness is established by audit
+(`gumbel_sample` caches the masked draft logits; `rejection_sampler_utils.py`
+computes the ratio from that same cache; the target keeps its own head) and the
+draft path at temp 0 is a plain argmax, so this is not stochastic drafting.
+Quote the V2 number as V2-specific.
+
+(Original entry, kept for the record.) On V2 the CAT-1 shortlist arm's acceptance is ~20 %
 higher than V2's plain MTP k=3 arm (2.44/2.49 vs 2.05/1.93 @64k, 2.37 vs 2.13/2.00
 @120k; the server's own `Mean acceptance length` agrees: 3.3–3.5 vs 3.0), while
 under V1 the same list showed **no** acceptance effect (controlled A/B, z = −0.83).

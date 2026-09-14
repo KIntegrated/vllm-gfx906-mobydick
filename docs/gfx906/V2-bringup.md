@@ -135,7 +135,36 @@ from the same boot; 2 reps/cell, mclk 1000; runner confirmed V2 by the bare
   GiB avail) — V2 reserves 8.5–12.6 % more, and its graph capture costs
   1.69+0.80 GiB (greedy) / 2.15+0.87 GiB (spec) against V1's 0.71 GiB. On V2 the
   capture-ladder trimming therefore matters more, not less.
-- **NEW OPEN ITEM — V2-CAT1-1 (acceptance anomaly).** In the CAT-1 arm V2's
+- **V2-CAT1-1 RESOLVED — the list's content is the mechanism (three-arm run,
+  2026-09-14).** Same boot, same runner, same prompts, same k, only the draft
+  list differs:
+
+  | V2 arm | @64k | @120k | acc @64k | acc @120k |
+  |---|---|---|---|---|
+  | no list (plain k=3) | 33.62 | 23.75 | 2.05/1.93 | 2.13/2.00 |
+  | **corpus-matched 35,251** | **42.60** | **26.94** | 2.44/2.49 | 2.37/2.37 |
+  | mismatched 32,768 (control) | 35.22 | 22.80 | 1.72/1.71 | 1.66/1.62 |
+
+  Reading: the ms saving is common to both lists (+4.8 %/−4.0 % for the
+  mismatched one — the same ~2.5 ms/step the V1 controlled A/B measured), and on
+  top of it the *matched* list acts as a good prior over what the target
+  actually generates (+20 % acceptance), while the mismatched list is a bad prior
+  (−15 %). So the V2 CAT-1 win is partly acceptance, it is content-dependent, and
+  it is not a structural V2 artifact.
+  **Exactness is established by audit**, not assumed: `gumbel_sample` caches the
+  *masked* draft logits (`logits_cache=draft_logits`) and
+  `rejection_sampler_utils.py` computes the acceptance ratio from that same cache
+  (`draft_logit … / temp`), while the target keeps its own full `lm_head` — the
+  ratio therefore uses exactly the distribution the draft was sampled from. At
+  `temperature = 0` the draft path is a plain argmax
+  (`gumbel_noised_argmax`, "or plain argmax at temp 0"), so the effect is the
+  mask shaping *which* token the argmax lands on, not stochastic drafting (an
+  earlier hypothesis, now discarded).
+  Consequence for quoting: **V2 + matched CAT-1 at 42.60/26.94 is the fastest
+  configuration measured on this box**, but it should be quoted as V2-specific
+  (under V1 the same list showed no acceptance effect, so its V1 gain stays
+  ~+4–5 %).
+- (Superseded, kept for the record) **V2-CAT1-1 (acceptance anomaly).** In the CAT-1 arm V2's
   acceptance is ~20 % *higher* than V2's plain arm (2.44/2.49 vs 2.05/1.93 @64k;
   server-side `Mean acceptance length` 3.3–3.5 vs 3.0 independently agrees), while
   under V1 the same list showed no acceptance effect (controlled A/B: z = −0.83).
