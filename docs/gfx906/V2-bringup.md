@@ -234,7 +234,11 @@ from the same boot; 2 reps/cell, mclk 1000; runner confirmed V2 by the bare
   | a3 on | 7 | 141.5 / 140.7 @64k | 2.4933 / 5.1190 |
 
   Neutral at both depths — the 1–3 ms/round host saving stays hidden behind the
-  22–31 ms (k=3) and ~140 ms (k=7) GPU steps. Note the k=7 acceptance spread
+  22–31 ms (k=3) and ~140 ms (k=7) GPU steps. **This A/B is unaffected by the
+  arm-label bug above:** the pairs happened to tokenize to equal header lengths
+  (`a3off_k3`/`a3on_k3` both 28, `a3off_k7b`/`a3on_k7b` both 29), so each pair ran
+  byte-identical prompts (verified by the header token counts), and the verdict
+  rests on ms/step, which is acceptance-independent by construction. Note the k=7 acceptance spread
   (2.58 vs 5.27 across the two prompts) is *prompt* variation, and ms/step is flat
   across it, which is exactly why ms/step is the gate. The opt-in stays **default
   OFF** (behaviourally inert), which is also its shipped state.
