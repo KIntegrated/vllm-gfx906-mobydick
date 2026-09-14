@@ -56,8 +56,11 @@ the date an investigation began.
   + CAT-1 **34.62 / 25.55** — the CAT-1 shortlist reproduces here (+6.4 % /
   +4.2 % over plain k=3 in-session) and its `MTP draft-vocab shortlist ACTIVE`
   marker is logged in serving, which also de-risks the V2 variant of that check.
-  Bare MTP k=3 reads ~1-2 % below the 0.28 line at both contexts (acceptance on
-  par), flagged for an arm-level (>=3 rep) re-check before acting on it. Two load
+  An arm-level re-check of bare MTP k=3 (3 reps) then **retired that reading**:
+  64k {35.20, 35.14, 29.56} → mean 33.30 (0.28: 33.28), 120k {24.26, 25.14,
+  24.21} → mean 24.54 (0.28: 24.74, -0.8 % inside the spread), acceptance
+  2.05/2.05/1.55 and 2.06/2.15/2.06 — the 2-rep "-1-2 %" was the arm's own
+  acceptance variance, and spec decode is **at parity on 0.29**. Two load
   wedges hit the session (#81 mtp3 attempt 1, #82 CAT-1 attempt 1); both retried
   clean and are recorded in `degradation.md`.
 
