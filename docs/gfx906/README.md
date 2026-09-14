@@ -281,7 +281,7 @@ records — 2.05/2.15 for plain k=3, 1.99/2.07 with CAT-1 — because a long age
 tail is copy-heavy, which is exactly CAT-1's operating point. CAT-1 and plain
 k=3 are a tie here (within the arm's own rep spread); its benefit is the
 **per-step** one, measured under control on 11 identical 8k prompts × 2 reps:
-**−2.52 ms/step [−2.91, −1.94] ⇒ +4.8 % mean / +5.9 % median t/s**, acceptance
+**−2.52 ms/step [−2.91, −1.94] ⇒ +4.8 % mean / +5.9 % median t/s** (Note 2026-09-14: the same arm-labelled client was in use here, so the *acceptance* column of that A/B is void — the arms ran different prompts. The ms/step result is unaffected (at fixed k the per-step cost does not depend on acceptance), and "no acceptance penalty" is now independently supported by the clean V2 re-measure: acceptance 1.98 vs 1.98 @64k, 2.07 vs 2.10 @120k.), acceptance
 no detectable penalty. So quote **~33 t/s @64k / ~25 t/s @120k** for agentic
 coding on TP=2, and read the CAT-1 gain from the controlled A/B, not from this
 session's 2-rep cells.

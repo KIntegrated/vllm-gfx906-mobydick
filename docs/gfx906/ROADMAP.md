@@ -975,7 +975,7 @@ deode data is mined first; future cells at pp=4096.**
     forced — parsed logs can never contain it (`CAT1-corpus-build.md`).
     Controlled A/B on identical prompts (11 agentic 8k prompts × 2 reps/arm,
     TP=2 k=2): **−2.52 ms/step [−2.91, −1.94] ⇒ +4.8 % mean / +5.9 % median
-    t/s**, acceptance no detectable penalty (MWU z = −0.83). Agentic-coding
+    t/s** (Note 2026-09-14: the same arm-labelled client was in use here, so the *acceptance* column of that A/B is void — the arms ran different prompts. The ms/step result is unaffected (at fixed k the per-step cost does not depend on acceptance), and "no acceptance penalty" is now independently supported by the clean V2 re-measure: acceptance 1.98 vs 1.98 @64k, 2.07 vs 2.10 @120k.) The original "acceptance no detectable penalty (MWU z = −0.83)" claim came from the flawed client and is superseded by that re-measure. Agentic-coding
     headline with MTP k=3: **33.25 @64k / 24.95 @120k t/s** (greedy
     19.80/13.17 = 1.68×/1.89×).
     *Follow-ups:* (a) **T2-5 hygiene** — move the lazy `draft_vocab_ids` device
