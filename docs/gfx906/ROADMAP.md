@@ -1570,6 +1570,39 @@ now strided halves of one tensor, so the staging/`view()` idioms also need
 (PPL 10.5516 == 0.28, serving smoke, parity restamp), so this is coverage debt,
 not an unknown.
 
+**Status: CLOSED (2026-09-14, `gfx906/v2-bringup`).** The three tests were already
+written against the fused-layout helpers; the skip decorators were stale. All
+three pass unchanged, and the suite is **91 passed, 0 skipped**
+(`tests/kernels/attention/test_gfx906_fa.py`). The M3 test was additionally
+extended to assert that a full-length (V2-style) host `cu_seqlens` slice with a
+garbage tail is bit-identical, which is the guard the V2-bringup plan asked for.
+
+### V2-CAT1-1 — explain the V2 CAT-1 acceptance boost (do not quote 42.6 t/s before this)
+
+**Status: open, high value.** On V2 the CAT-1 shortlist arm's acceptance is ~20 %
+higher than V2's plain MTP k=3 arm (2.44/2.49 vs 2.05/1.93 @64k, 2.37 vs 2.13/2.00
+@120k; the server's own `Mean acceptance length` agrees: 3.3–3.5 vs 3.0), while
+under V1 the same list showed **no** acceptance effect (controlled A/B, z = −0.83).
+The t/s gain on V2 (+26.7 % @64k over V2's own plain arm) therefore mixes two
+effects, and the *headline* number should carry that caveat until this is settled.
+
+Hypothesis to test: V2's draft sampling is seeded/stochastic, so restricting the
+draft head to a corpus-matched prior shapes the draft *distribution* (raising
+agreement with the target), whereas V1's greedy drafts are unchanged. Exactness
+should be unaffected (rejection sampling corrects any draft distribution; the
+target keeps its own full `lm_head`).
+
+Work: (1) run the **mismatched control list** of the same size
+(`/local/tmp/mtp1/cat1_32768ctrl`) under the identical V2 config — if it shows the
+same boost, the list's content is irrelevant and something structural is
+happening (investigate the V2 speculator's draft path, `logits_cache`/
+`gumbel_sample`); (2) a correctness cross-check with the shortlist active under
+V2 — in-process PPL with the MTP spec config, or a greedy token-identity A/B
+against the no-shortlist arm (remember: token identity alone is *not* a gate on
+this stack, so lead with the numbers, not the diff); (3) only then decide whether
+the V2 CAT-1 config becomes the recommended one (it is currently the fastest
+configuration measured on this box).
+
 ### TRITON-1 — move to stock Triton with native gfx906 support (perf secondary)
 
 **Status: open, investigate.** Kevin 2026-09-13. The fork runs a custom/patched
