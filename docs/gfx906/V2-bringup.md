@@ -65,10 +65,36 @@ Most gfx906 work sits in paths both runners drive, so the question is
    logs `MTP draft-vocab shortlist ACTIVE (…)` on first use
    (`logger.info_once`, added 2026-09-13): **a V2 run that never prints it is not
    using the shortlist.** Verify the marker plus a per-step ms delta.
+   **Code audit (2026-09-14, `gfx906/v2-bringup`): no silent-loss path exists.**
+   V2's draft sampling goes through `BaseSpeculator.sample_draft` →
+   `self.model.compute_logits(...)` (`speculator.py:364-388`), i.e. the draft
+   model's own `compute_logits`, where the shortlist scatter lives — and the
+   greedy branch `_greedy_sample_draft` (`:358-362`) uses `compute_logits` too,
+   *except* under `use_local_argmax_reduction`, where it calls `get_top_tokens`
+   (full `lm_head`): that combination already raises at drafter init via our
+   CAT-1 guard (`qwen3_5_mtp.py`, `use_local_argmax_reduction` check), so it
+   fails closed rather than silently degrading. The
+   `share_mtp_topk_indices` route (target's top-k instead of the drafter's head,
+   `mtp/speculator.py:30-34`) is gated on
+   `index_share_for_mtp_iteration` + `set_skip_topk`/`compact_topk_indices` —
+   DeepSeek-style MTP only; the Qwen3.5 drafter has neither, so it stays off.
+   Live confirmation (marker + ms/step under V2) is the session below.
 4. **M3 host-`cu_seqlens` path.** V2 passes *full-length* host/device
    `query_start_loc` slices in `mamba_hybrid`, unlike V1's
    `[:num_reqs_padded+1]`; our host-path argument was written for V1's slicing.
    Re-audit + test with a full-length slice; then a V2 prefill A/B.
+   **Code audit + guard test (2026-09-14): the path is length-agnostic.**
+   `forward_paged` consumes the host list with `for s in range(num_seqs)` where
+   `num_seqs` comes from the padded query tensor, never from the list's length
+   (`gfx906_fa_paged.py:482-490` and `:575-582`), so trailing entries are never
+   read; V2's zero-length padded rows are already skipped by `if n > 0`. V2's
+   builder passes `query_start_loc_cpu` unsliced
+   (`v1/worker/gpu/attn_utils.py:296`) — fine under that bound. The doc's
+   failure mode is now guarded by
+   `test_forward_mixed_batch_pad_tile_clamp_and_host_cu`, which additionally
+   runs the same case with a **full-length slice whose tail is garbage
+   (`-12345`)** and asserts bit-identical output (V2 layout). V2 prefill A/B
+   still outstanding.
 5. **Graph capture.** 0.29 changed the defaults ("widest uniform decode batch by
    default", memory-safe graph sizes) and V2 reserves graph memory differently
    (#53306, #53682). Re-tune the trimmed capture ladder per model, assert no
@@ -83,6 +109,58 @@ Most gfx906 work sits in paths both runners drive, so the question is
    NEUTRAL).
 8. **Flip the recipes** (`VLLM_USE_V2_MODEL_RUNNER` removal) model by model, only
    as each one passes.
+
+## 2b. Session C/D result (2026-09-14, branch `gfx906/v2-bringup`, boot eefacc1e)
+
+V2 serving on the agentic corpus (dense 27B, TP=2, V1-pinned reference numbers
+from the same boot; 2 reps/cell, mclk 1000; runner confirmed V2 by the bare
+`[model_runner.py:*]` tag, which V1 never emits):
+
+| arm | V2 @64k | V2 @120k | V2 acc | V1 @64k / @120k | V2 vs V1 |
+|---|---|---|---|---|---|
+| greedy | 20.37 (20.78/19.95) | 13.27 (13.28/13.25) | – | 19.91 / 13.25 | +2.3 % / +0.2 % |
+| MTP k=3 | 33.62 (34.38/32.86) | 23.75 (24.15/23.36) | 2.05/1.93, 2.13/2.00 | 33.30 / 24.54 | +1.0 % / −3.2 % |
+| MTP k=3 + CAT-1 | **42.60** (42.31/42.89) | **26.94** (26.97/26.91) | 2.44/2.49, 2.37/2.37 | 34.62 / 25.55 | **+23.1 % / +5.4 %** |
+
+- **CAT-1 is active under V2** — `MTP draft-vocab shortlist ACTIVE (35251 ids)`
+  logged (count 1 in that arm, 0 in the others), with graph capture on and **no
+  eager fallback** in any arm, i.e. the scatter survives capture. Item 3's
+  silent-loss risk is refuted live, matching the code audit above.
+- **Spec decode works under V2** at k=3 with acceptance on par with V1 in the
+  plain arm (2.05/1.93 vs V1's 2.05/2.05 at 64k; 2.13/2.00 vs 2.06/2.15 at
+  120k) — the −3.2 % @120k is inside the arm spread and is the only
+  below-parity cell.
+- **Item 6 (KV/VRAM), same util + flags:** V2 `GPU KV cache size` 454,536 tokens
+  (greedy, 14.2 GiB avail) vs V1 496,693; 386,513 (spec) vs V1 442,368 (13.48
+  GiB avail) — V2 reserves 8.5–12.6 % more, and its graph capture costs
+  1.69+0.80 GiB (greedy) / 2.15+0.87 GiB (spec) against V1's 0.71 GiB. On V2 the
+  capture-ladder trimming therefore matters more, not less.
+- **NEW OPEN ITEM — V2-CAT1-1 (acceptance anomaly).** In the CAT-1 arm V2's
+  acceptance is ~20 % *higher* than V2's plain arm (2.44/2.49 vs 2.05/1.93 @64k;
+  server-side `Mean acceptance length` 3.3–3.5 vs 3.0 independently agrees), while
+  under V1 the same list showed no acceptance effect (controlled A/B: z = −0.83).
+  Hypothesis: V2's draft sampling is seeded/stochastic, so restricting the draft
+  head to a corpus-matched prior *shapes the draft distribution* (raising
+  agreement), whereas V1's greedy drafts are unchanged by the restriction.
+  Exactness should be unaffected — rejection sampling corrects any draft
+  distribution as long as the target's logits are untouched, which they are (the
+  target is a separate model with its own full `lm_head`). Disambiguating runs
+  (queued in ROADMAP V2-CAT1-1): a *mismatched* control list of the same size
+  (if it shows the same boost, the content is irrelevant and something structural
+  is happening), plus a token-identity/PPL check with the shortlist active under
+  V2. Corpus/list-shaping caveat for the *headline*: on V2, `34.62 → 42.60` mixes
+  the list's ms saving with this acceptance effect, so quote the V2 CAT-1 number
+  only with the caveat until V2-CAT1-1 lands.
+- Wedge #83 (GPU1) hit the mtp3 arm's first launch; the retry passed and is
+  recorded in `degradation.md`.
+
+**KVLAYOUT-2 closed in this session too:** the three capture/lifecycle tests that
+were skipped as "0.29 fused KV layout migration pending" were already written
+against the fused-layout helpers (`_make_fused_cache`/`_kv_split`/
+`_write_v_fused`) and pass unchanged — the skips were stale. The suite is now
+**91 passed, 0 skipped** (`tests/kernels/attention/test_gfx906_fa.py`), including
+the extended M3 test which now also asserts that a **full-length (V2-style) host
+`cu_seqlens` slice with a garbage tail** gives bit-identical output.
 
 ## 3. Test and verification matrix
 

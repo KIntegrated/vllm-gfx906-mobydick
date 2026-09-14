@@ -487,14 +487,6 @@ def test_fused_fp16_gather_matches_torch_gather():
     assert bool((v_f2[1, :, L2:] == 0).all())
 
 
-@pytest.mark.skip(
-    reason=(
-        "0.29 fused KV layout migration pending (KVLAYOUT-2): this test "
-        "hand-builds pre-0.29 fill/reference conventions. The engine paths "
-        "it covers are validated on 0.29 by the PPL probe (10.5516 == 0.28), "
-        "the serving smoke and the parity restamp. See ROADMAP KVLAYOUT-2."
-    )
-)
 def test_q_pad_buffer_survives_capture_then_prefill_grow():
     """Review F1: a captured graph bakes in the VA of the q_pad buffer
     that was current at capture time. An eager prefill with a larger
@@ -609,14 +601,6 @@ def test_q_pad_buffer_survives_capture_then_prefill_grow():
          cls._q_pad_captured) = saved
 
 
-@pytest.mark.skip(
-    reason=(
-        "0.29 fused KV layout migration pending (KVLAYOUT-2): this test "
-        "hand-builds pre-0.29 fill/reference conventions. The engine paths "
-        "it covers are validated on 0.29 by the PPL probe (10.5516 == 0.28), "
-        "the serving smoke and the parity restamp. See ROADMAP KVLAYOUT-2."
-    )
-)
 def test_gather_buffers_lifecycle_postfix():
     """plan-gfx906-fa-fix.md §5 — pins the POST-FIX gather-buffer
     contract (GFX906_FA_GATHER_EXACT=0) by driving the real
@@ -3145,14 +3129,6 @@ def test_r3_kv_split_defaults_aligned(monkeypatch):
 # Sq_pad=128 for both; ncols1=64 -> seq2 has tile0 (row 0, straddling) and
 # tile1 (rows 64..127, FULLY PAD -> must be clamped).
 # ---------------------------------------------------------------------------
-@pytest.mark.skip(
-    reason=(
-        "0.29 fused KV layout migration pending (KVLAYOUT-2): this test "
-        "hand-builds pre-0.29 fill/reference conventions. The engine paths "
-        "it covers are validated on 0.29 by the PPL probe (10.5516 == 0.28), "
-        "the serving smoke and the parity restamp. See ROADMAP KVLAYOUT-2."
-    )
-)
 def test_forward_mixed_batch_pad_tile_clamp_and_host_cu():
     import math
 
@@ -3198,7 +3174,17 @@ def test_forward_mixed_batch_pad_tile_clamp_and_host_cu():
     q = torch.randn(num_tokens, HQ, D, device=dev, dtype=torch.float16) * 0.5
     out = torch.zeros(num_tokens, HQ, D, device=dev, dtype=torch.float16)
 
-    def run(with_host):
+    def run(host_mode):
+        host_cu = None
+        if host_mode == "exact":
+            host_cu = cu.cpu()
+        elif host_mode == "full":
+            # V2 hands over the full max_num_reqs+1 slice, not V1's
+            # [:num_reqs_padded+1]. The M3 host walk iterates
+            # range(num_seqs) only, so the tail must never be read: garbage
+            # there is the tripwire.
+            host_cu = torch.full((8,), -12345, dtype=torch.int32)
+            host_cu[: cu.numel()] = cu.cpu()
         m = Gfx906FAMetadata(
             num_actual_tokens=num_tokens,
             max_query_len=n1,
@@ -3207,15 +3193,18 @@ def test_forward_mixed_batch_pad_tile_clamp_and_host_cu():
             seq_lens=seq_lens,
             block_table=bt,
             slot_mapping=torch.empty(0, dtype=torch.int64, device=dev),
-            query_start_loc_cpu=(cu.cpu() if with_host else None),
+            query_start_loc_cpu=host_cu,
         )
         impl.forward(None, q, q, q, kv, m, output=out)
         return out[:num_tokens].clone()
 
-    out_none = run(with_host=False)
-    out_host = run(with_host=True)
+    out_none = run(None)
+    out_host = run("exact")
+    out_full = run("full")
     assert torch.equal(out_none, out_host), \
         "M3: host cu_seqlens must not change outputs"
+    assert torch.equal(out_none, out_full), \
+        "M3: a full-length (V2-style) host slice must ignore its tail"
 
     # fp32 per-head reference: row r of seq s sits at abs q_abs[s]+r and
     # attends causally over its own sequence's K/V.
