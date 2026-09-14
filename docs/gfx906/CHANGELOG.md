@@ -41,6 +41,16 @@ the date an investigation began.
   engine logs `Using LBHNC KV cache layout` (caught by the first PPL run).
   `ops/rocm_aiter_mla_sparse.py` was taken wholesale from upstream (the fork's
   fp16 sparse-MLA is half-ported, tracked as SMLA-1).
+  **Spec-decode blocker found on the 0.29 line (2026-09-14):** the MTP/EAGLE
+  drafter's base proposer imports `vllm.v1.attention.backends.rocm_aiter_fa`
+  after a `find_spec` existence check, but that module imports AITER's gluon PA
+  kernel at module scope — on a box without the `aiter` package (the gfx906
+  venv; AITER is unusable here) **every spec-decode serve died at drafter init
+  with `ModuleNotFoundError: No module named 'aiter'`**, i.e. our production MTP
+  k=3 config could not start. Fixed by making that import optional (skip the
+  metadata type with a one-shot warning); MTP k=3 then serves normally
+  (`MTP3 READY ~395 s`). The deeper, upstream-worthy fix is to guard the
+  module-level aiter import in `rocm_aiter_fa.py` itself.
 
   **Parity + V2 status (boot eefacc1e, same day).** V1 restamp of the 0.29 line
   against the 0.28 numbers: MoE **65.40 warm / 58.17 cold**, dense **24.90 /

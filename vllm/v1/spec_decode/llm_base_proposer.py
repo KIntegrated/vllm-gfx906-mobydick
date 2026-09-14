@@ -310,11 +310,26 @@ class SpecDecodeBaseProposer:
             if find_spec(
                 AttentionBackendEnum.ROCM_AITER_FA.get_path(include_classname=False)
             ):
-                from vllm.v1.attention.backends.rocm_aiter_fa import (
-                    AiterFlashAttentionMetadata,
-                )
-
-                rocm_types.append(AiterFlashAttentionMetadata)
+                # The module can exist while its optional `aiter` package is
+                # absent (e.g. gfx906 builds ship no AITER: its kernels are not
+                # usable there). Spec decode must not depend on an optional
+                # attention backend's third-party package, so a missing
+                # dependency skips the metadata type instead of failing drafter
+                # init (0.29 regression: the module-level aiter import in
+                # rocm_aiter_fa.py turned every MTP/EAGLE serve into an
+                # `ModuleNotFoundError` on such boxes).
+                try:
+                    from vllm.v1.attention.backends.rocm_aiter_fa import (
+                        AiterFlashAttentionMetadata,
+                    )
+                except ImportError as exc:
+                    logger.warning_once(
+                        "Skipping the ROCM_AITER_FA metadata type for the "
+                        "drafter: %s",
+                        exc,
+                    )
+                else:
+                    rocm_types.append(AiterFlashAttentionMetadata)
 
             # TRITON_MLA backend support for MLA models (e.g., DeepSeek)
             from vllm.model_executor.layers.attention.mla_attention import (
