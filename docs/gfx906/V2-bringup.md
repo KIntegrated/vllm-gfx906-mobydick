@@ -183,6 +183,16 @@ from the same boot; 2 reps/cell, mclk 1000; runner confirmed V2 by the bare
 - Wedge #83 (GPU1) hit the mtp3 arm's first launch; the retry passed and is
   recorded in `degradation.md`.
 
+**MoE 35B parity (session E-1, in-process harness, same boot).** `docs/gfx906/_bench_gfx906.py`,
+`BENCH_SAMPLES=4 BENCH_PP=2048 BENCH_TG=256 BENCH_MAX_SEQS=32`, single GPU, mclk 1000
+in every sample: **V1 57.86 t/s** {58.13, 58.18, 57.04, 58.08} vs **V2 58.36 t/s**
+{58.42, 58.36, 58.32, 58.33} → **+0.9 %**, and within 0.1 % of the recorded 58.43
+reference. Runner identity confirmed the same way (bare `[model_runner.py:*]`
+tags only in the V2 arm). No cudagraph fallback in either arm. Note the KV
+direction is config-dependent here: in-process single-GPU V2 kept *more* KV
+(130,944 vs 123,904 tokens) while reserving more for capture (0.35+0.05 vs
+0.05 GiB) — unlike the TP=2 dense-27B serving case where V2 was smaller.
+
 **KVLAYOUT-2 closed in this session too:** the three capture/lifecycle tests that
 were skipped as "0.29 fused KV layout migration pending" were already written
 against the fused-layout helpers (`_make_fused_cache`/`_kv_split`/
