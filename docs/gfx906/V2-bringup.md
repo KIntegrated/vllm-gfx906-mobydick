@@ -113,7 +113,17 @@ Most gfx906 work sits in paths both runners drive, so the question is
    session results above). `run_server.sh` now defaults to V2 with V1 one env
    override away, and the root README carries the per-model status. Still pinned
    to V1: Muse-Glimmer (checkpoint not local — only the GGUF), Nemotron 3.5
-   Lightning, Ornith, Gemma-4 (parity runs queued).
+   Lightning (`primitive-ai/Nemotron-3.5-Lightning-30B-A3B-mixed-INT4-INT8`),
+   Ornith (`cyankiwi/Ornith-1.5-35B-A3B-AWQ-INT4`), Gemma-4
+   (`cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit`) — all three checkpoints verified
+   present, parity runs queued.
+   **Flip verification status:** the flipped `run_server.sh` was confirmed to
+   *select* V2 with no runner env (1 bare `[model_runner.py:*]` line, 0
+   `gpu_model_runner.py`), but the end-to-end smoke could not complete: the boot
+   took two consecutive load wedges (#84 at 14:23 on both GPUs, #85 at 14:34 on
+   GPU1) → **BURST, GPU work stopped, host reboot required** before the
+   remaining V2 work (Nemotron/Ornith/Gemma-4 parity → A3 revival → the V2 CAT-1
+   headline re-measure).
 
 ## 2b. Session C/D result (2026-09-14, branch `gfx906/v2-bringup`, boot eefacc1e)
 
