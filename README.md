@@ -193,6 +193,14 @@ no detectable penalty. So quote **~33 t/s @64k / ~25 t/s @120k** for agentic
 coding on TP=2, and read the CAT-1 gain from the controlled A/B, not from this
 session's 2-rep cells.
 
+**Re-measured on the 0.29 line (2026-09-14, boot eefacc1e, V1 pinned, same
+protocol).** Greedy **20.39 @64k / 13.26 @120k** (the 0.28 line: 19.80 / 13.17);
+MTP k=3 **32.54 / 24.53** (33.28 / 24.74); **MTP k=3 + CAT-1 34.62 / 25.55**
+(33.25 / 24.95) — i.e. the CAT-1 gain reproduces on 0.29 (+6.4 % @64k / +4.2 %
+@120k over plain k=3 in-session), while the bare MTP k=3 arm reads ~1–2 % below
+the 0.28 line at both contexts with acceptance on par (an open item to verify
+arm-level, ≥3 reps, before acting on it).
+
 ### Benchmarks
 
 **gfx906 fork — dense AWQ `QuantTrio/Qwen3.5-9B-AWQ` (few full attention
