@@ -108,7 +108,12 @@ Most gfx906 work sits in paths both runners drive, so the question is
    opt-in, re-audit the no-op contract at the serving k, and gate at k=7 (k=4 was
    NEUTRAL).
 8. **Flip the recipes** (`VLLM_USE_V2_MODEL_RUNNER` removal) model by model, only
-   as each one passes.
+   as each one passes. **Done 2026-09-14 for dense 27B and MoE 35B** (both at
+   parity: agentic greedy/spec + MoE in-process 58.36 vs 57.86 t/s; see the
+   session results above). `run_server.sh` now defaults to V2 with V1 one env
+   override away, and the root README carries the per-model status. Still pinned
+   to V1: Muse-Glimmer (checkpoint not local — only the GGUF), Nemotron 3.5
+   Lightning, Ornith, Gemma-4 (parity runs queued).
 
 ## 2b. Session C/D result (2026-09-14, branch `gfx906/v2-bringup`, boot eefacc1e)
 

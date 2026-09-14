@@ -283,11 +283,16 @@ vllm serve <model> \
   --generation-config auto
 ```
 
-- **`VLLM_USE_V2_MODEL_RUNNER=0` is required on upstream 0.29.0+**: upstream
-  defaults to Model Runner V2 for all models, and V2 is not yet validated on
-  gfx906 (it wedged at engine init on the first smoke). V1 remains fully
-  supported; the fork's V2 bring-up is tracked as DFL2-2 in
-  `docs/gfx906/ROADMAP.md`.
+- **Model Runner: V2 is the validated default on 0.29.0+, per model.** Upstream
+  defaults to V2; on gfx906 it is now brought up and at parity for the models
+  listed below, so no pin is needed for them. `VLLM_USE_V2_MODEL_RUNNER=0` still
+  selects V1 (used for A/B reference arms), and **models not yet validated must
+  keep it set** until their parity run lands — currently Muse-Glimmer, Nemotron
+  3.5 Lightning, Ornith and Gemma-4 are pending (see `docs/gfx906/V2-bringup.md`).
+  Caveats measured on V2: in the TP=2 serving config it reserves more VRAM for
+  graph capture (KV pool 454,536 vs V1's 496,693 tokens at `--gpu-memory-utilization
+  0.82`), and **V2 + the CAT-1 shortlist is the fastest configuration measured on
+  this box** (agentic 64k/120k: 42.60 / 26.94 t/s vs V1's 34.62 / 25.55).
 - `--dtype float16` is required: gfx906 has no bf16 hardware; bfloat16
   checkpoints would fall back to fp32 math.
 - **cudagraph capture sizes = multiples of `num_speculative_tokens + 1`, up to
