@@ -593,6 +593,34 @@ class MMEncoderAttention(CustomOp):
             output = output.reshape(bsz, q_len, -1)
         return output
 
+    def _forward_gfx906_fa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """gfx906 custom Q8 FA (VIT-1).
+
+        Bidirectional, cache-free, ragged ViT attention through the dense
+        non-paged `gfx906_fa.forward` entry; the kernel head dim is padded
+        (72 -> 128) to fit the instantiated sizes. See
+        `vllm/gfx906_fa/gfx906_fa_mm_encoder.py`.
+        """
+        from vllm.gfx906_fa.gfx906_fa_mm_encoder import forward_vit
+
+        bsz, q_len = query.size()[:2]
+        kv_len = key.size(1)
+        is_reshaped = query.dim() != 4
+        query, key, value = self.view_qkv_to_4d(query, key, value, bsz, q_len, kv_len)
+        output = forward_vit(
+            query, key, value, cu_seqlens, max_seqlen, self.scale, self.head_size
+        )
+        if is_reshaped:
+            output = output.reshape(bsz, q_len, -1)
+        return output
+
     def _forward_triton(
         self,
         query: torch.Tensor,
@@ -794,6 +822,8 @@ class MMEncoderAttention(CustomOp):
             return self._forward_aiter_fp8(query, key, value, cu_seqlens, max_seqlen)
         elif self.is_flash_attn_backend:
             return self._forward_fa(query, key, value, cu_seqlens, max_seqlen)
+        elif self.attn_backend == AttentionBackendEnum.CUSTOM:
+            return self._forward_gfx906_fa(query, key, value, cu_seqlens, max_seqlen)
         elif self.attn_backend == AttentionBackendEnum.TRITON_ATTN:
             return self._forward_triton(query, key, value, cu_seqlens, max_seqlen)
         elif self.attn_backend == AttentionBackendEnum.FLASHINFER:

@@ -2995,6 +2995,56 @@ def test_q8_0_row_layout_planar_pin_fused_q8_gather():
 # in-process, unlike the launch-site get_fa_kv_split static).
 # ---------------------------------------------------------------------------
 
+def test_vit_bidirectional_matches_sdpa():
+    """VIT-1: the dense FA entry serves bidirectional ragged ViT attention.
+
+    Qwen3.5 ViT geometry: head_dim 72 (padded to 128 in-kernel), bidirectional,
+    cache-free, ragged batches. The second item is deliberately shorter than the
+    padded length, so a wrong KV bound (kv_max) would attend padded KV rows and
+    show up as a large error here.
+    """
+    import math
+    from itertools import accumulate
+
+    import torch
+    import torch.nn.functional as F
+
+    from vllm.gfx906_fa.gfx906_fa_mm_encoder import forward_vit, vit_supported
+
+    if not vit_supported(72, torch.float16):
+        pytest.skip("gfx906 ViT FA path disabled (GFX906_FA_VIT=0)")
+
+    torch.manual_seed(0)
+    b, s, hq, hkv, d = 2, 96, 4, 4, 72
+    lens = [s, 53]
+    q = torch.randn(b, s, hq, d, dtype=torch.float16, device="cuda")
+    k = torch.randn(b, s, hkv, d, dtype=torch.float16, device="cuda")
+    v = torch.randn(b, s, hkv, d, dtype=torch.float16, device="cuda")
+    cu = torch.tensor([0, *accumulate(lens)], dtype=torch.int32)
+
+    scale = 1.0 / math.sqrt(d)
+    out = forward_vit(q, k, v, cu, None, scale, d)
+    assert out.shape == q.shape and out.dtype == q.dtype
+
+    for i, ln in enumerate(lens):
+        qi = q[i, :ln].transpose(0, 1).float()
+        ki = k[i, :ln].transpose(0, 1).float()
+        vi = v[i, :ln].transpose(0, 1).float()
+        ref = F.scaled_dot_product_attention(qi, ki, vi, scale=scale, is_causal=False)
+        ref = ref.transpose(0, 1)
+        rel = (out[i, :ln].float() - ref).abs().max() / ref.abs().max()
+        assert rel < 5e-2, f"item {i} (len {ln}): rel err {rel:.4f}"
+
+    # The padded KV rows must not be attended: a longer KV that is *fully
+    # padded past the real length* has to leave the real rows unchanged.
+    k2, v2 = k.clone(), v.clone()
+    k2[1, lens[1]:] = 1e3
+    v2[1, lens[1]:] = 1e3
+    out2 = forward_vit(q, k2, v2, cu, None, scale, d)
+    rel2 = (out2[1, : lens[1]].float() - out[1, : lens[1]].float()).abs().max()
+    assert rel2 < 1e-3, f"padded KV leaked into the scan: {rel2:.4f}"
+
+
 def test_legacy_zero_refused_until_verified(monkeypatch):
     """GFX906_FA_LEGACY=0 (Q8 side-buffer) is fail-closed on 0.29.
 

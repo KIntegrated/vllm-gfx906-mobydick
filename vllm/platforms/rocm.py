@@ -786,12 +786,17 @@ class RocmPlatform(Platform):
 
     @classmethod
     def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:
-        return [
+        backends = [
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.ROCM_AITER_FA,
             AttentionBackendEnum.TRITON_ATTN,
             AttentionBackendEnum.TORCH_SDPA,
         ]
+        if on_gfx906():
+            # VIT-1: the custom Q8 FA serves the ViT through its dense non-paged
+            # entry (explicit opt-in via --mm-encoder-attn-backend custom).
+            backends.insert(0, AttentionBackendEnum.CUSTOM)
+        return backends
 
     @classmethod
     def get_vit_attn_backend(
@@ -809,6 +814,19 @@ class RocmPlatform(Platform):
             return backend
 
         from importlib.util import find_spec
+
+        # gfx906 (VIT-1): prefer the custom Q8 FA for the ViT when explicitly
+        # enabled with GFX906_FA_VIT_AUTO=1 (default stays the upstream path
+        # until the screens pass; `--mm-encoder-attn-backend custom` always works).
+        if on_gfx906():
+            from vllm.gfx906_fa.gfx906_fa_mm_encoder import (
+                vit_auto_enabled,
+                vit_supported,
+            )
+
+            if vit_auto_enabled() and vit_supported(head_size, dtype):
+                logger.info_once("Using CUSTOM (gfx906 FA) backend for ViT attention.")
+                return AttentionBackendEnum.CUSTOM
 
         from vllm._aiter_ops import rocm_aiter_ops
 
