@@ -117,13 +117,15 @@ Most gfx906 work sits in paths both runners drive, so the question is
    Ornith (`cyankiwi/Ornith-1.5-35B-A3B-AWQ-INT4`), Gemma-4
    (`cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit`) — all three checkpoints verified
    present, parity runs queued.
-   **Flip verification status:** the flipped `run_server.sh` was confirmed to
-   *select* V2 with no runner env (1 bare `[model_runner.py:*]` line, 0
-   `gpu_model_runner.py`), but the end-to-end smoke could not complete: the boot
-   took two consecutive load wedges (#84 at 14:23 on both GPUs, #85 at 14:34 on
-   GPU1) → **BURST, GPU work stopped, host reboot required** before the
+   **Flip verification (2026-09-14, after the burst reboot): PASSED.** With no
+   runner env set, `run_server.sh greedy` came up on V2 (7 bare
+   `[model_runner.py:*]` tags, 0 `gpu_model_runner.py`), served a completion whose
+   text is **identical** to the V1-pinned arm of the same recipe, and tore down
+   cleanly (KV 472,932 tokens, no eager fallback, 0 resets). The diagnostic arms
+   also showed the preceding load wedge was the lottery rather than V2-specific:
+   the V1-pinned arm loaded on the first attempt immediately after the wedge. The
    remaining V2 work (Nemotron/Ornith/Gemma-4 parity → A3 revival → the V2 CAT-1
-   headline re-measure).
+   headline re-measure) continues on the fresh boot.
 
 ## 2b. Session C/D result (2026-09-14, branch `gfx906/v2-bringup`, boot eefacc1e)
 
