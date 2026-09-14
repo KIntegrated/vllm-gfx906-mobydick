@@ -17,6 +17,23 @@ the date an investigation began.
   33.30/24.54 — parity arm-level; MTP k=3 + CAT-1 34.62/25.55). V2 was shown
   viable on gfx906 in the same window (graph serve + PPL 10.5516); its
   performance/spec-decode parity work continues off `main` (`V2-bringup.md`).
+- **V2 bring-up (`gfx906/v2-bringup`) — V2 now serves spec decode at parity, and
+  CAT-1 works under it.** Dense 27B on the agentic corpus (same boot, 2 reps):
+  greedy 20.37/13.27 vs V1 19.91/13.25; MTP k=3 33.62/23.75 vs 33.30/24.54;
+  **MTP k=3 + CAT-1 42.60/26.94 vs V1 34.62/25.55** — the fastest configuration
+  measured on this box. The `MTP draft-vocab shortlist ACTIVE` marker fires under
+  V2 with graph capture on and no eager fallback, so item 3's silent-loss risk is
+  refuted both by code audit (V2 drafts go through the draft model's
+  `compute_logits`; the one bypass path fails closed at init) and live.
+  V2-CAT1-1 was resolved with a third arm: the acceptance gain is the *list's
+  content* (matched 35,251: acc 2.44/2.49; mismatched 32,768 control: 1.72/1.71;
+  no list: 2.05/1.93), the ms saving (~+5 %) is common to both, and exactness
+  holds because the rejection sampler reads the same masked draft logits it
+  sampled from. V2 reserves more VRAM for the same flags (KV pool 454,536 vs
+  496,693 tokens greedy; 386,513 vs 442,368 spec; capture 2.49–3.02 GiB vs
+  0.71 GiB), so capture ladders matter more on V2. M3's host-`cu_seqlens` path is
+  length-agnostic and now has a full-length-slice guard test; KVLAYOUT-2's three
+  skipped capture tests were stale skips and pass (suite: 91 passed, 0 skipped).
 - VIT-1 step 1 landed (custom-FA arm for the Qwen3.5 ViT, opt-in, unit-validated);
   the aiter/spec-decode blocker found on the 0.29 line was fixed.
 
