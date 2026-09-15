@@ -135,6 +135,95 @@ vs our MTP k=3), so "lead with ms/step" is not the whole story — report **t/s 
 method's recommended config** (the decision metric), with ms/step *and* acceptance as the
 supporting detail that separates a cost effect from a depth effect.
 
+### DFL2-2 — V2 runner up to speed on gfx906 (**V1 removal lands in 0.32.0**) (**HIGH PRIORITY**, Kevin 2026-09-12)
+
+**STATUS 2026-09-15 — the bring-up is DONE for every model whose gate exists; one
+pin left.** V2 is validated and default for the dense 27B, MoE 35B, Nemotron 3.5
+Lightning, Ornith, **and Gemma-4** (gated today through its chat template — see
+GEMMA4-1); evidence and numbers in [`V2-bringup.md`](V2-bringup.md) (PPL bit-identity,
+in-process bench parity, agentic ms/step parity, MoE +0.9 %). **Muse-Glimmer is the only
+remaining V1 pin** (MUSE-1; its templated gate is in flight, and its PPL probe is
+inapplicable by construction — see the prompt-format note in `README.md`). Upstream
+removes the V1 runner in **0.32.0** (Kevin 2026-09-15), so that pin is the deadline item.
+
+**Why now.** vLLM 0.29.0 makes the V2 model runner the default; DFlash2 and DSpark drafts
+**force V2 today** (`config/vllm.py:642`). Every gfx906 optimization and serving gate on
+record — custom FA backend metadata, GDN/mamba ops (incl. the SYV-10 bounds
+port), mamba state-pool sizing, the trimmed capture ladder, default-ON FIX-H2
+and M3 — has only ever been validated on **V1**. V2 carries a `mamba_hybrid`
+model state, so it *claims* our Qwen3.5/3.8 GDN hybrids, but it has never been
+measured here.
+
+**First datapoint (in flight, 2026-09-12):** `VLLM_USE_V2_MODEL_RUNNER=1` +
+MTP k=2 + the real agentic payload, one weight load
+(`/local/tmp/mtp1/v2_probe_driver.sh`), compared against the V1 baseline
+measured minutes earlier on the same boot.
+
+**Work items if it loads:** (a) confirm the gfx906 FA backend is actually
+selected under V2 (log the attention backend name); (b) re-run the standard
+gates — single-card dense-27B and MoE-35B `docs/gfx906/_bench_gfx906.py`,
+then a TP=2 serving A/B at parity vs V1; (c) re-check the trimmed-capture
+assumption (`cudagraph_capture_sizes`) against V2's cudagraph utils;
+(d) re-validate the default-ON fixes under V2's metadata construction (V2
+passes *full-length* host/device `query_start_loc` slices in `mamba_hybrid`,
+unlike V1's `[:num_reqs_padded+1]` — see the review-trains T1/M3 notes);
+(e) decide the fate of the branch's V2 SYV-12 wiring
+(`vllm/v1/worker/gpu/model_runner.py`, archive-bound per T6) — V2 revival of
+SYV-12 needs those hunks.
+
+**Bring-up plan:** the concrete audit (what already rides shared code, the eight
+gaps, the test matrix and the session order) lives in
+[`V2-bringup.md`](V2-bringup.md). V2 stays pinned off until that plan's parity
+steps are signed off; the first question is the fresh-boot init retry (the Y16
+wedge is unresolved, not arch evidence).
+
+**0.29.0 merge (2026-09-13, `gfx906/v0.29.0` → merge `3c445dba56`).** Upstream
+now defaults V2 for **all** models (#53183) and its own ROCm V1 list covers only
+DeepSeek archs, so the fork must pin V1 explicitly: every recipe carries
+`VLLM_USE_V2_MODEL_RUNNER=0` (the env override wins inside
+`VllmConfig.use_v2_model_runner`). Bring-up target is now 0.29.0's V2, whose
+`_get_v2_model_runner_unsupported_features()` + `HAS_TRITON` gate replaces the
+fork's removed `_is_default_v2_model_runner_model()` helper. Also relevant from
+the release: ROCr/CLR update (#53712, graph-replay segfault fix, ~20 % TPOT
+class) and the TheRock 7.14 preview (#49925).
+
+**⚠ Re-investigate before closing (2026-09-13).** The branch currently records
+"V2 forced on Qwen3.8-GDN ⇒ init wedge ⇒ unsupported-by-design". A single
+`hipErrorLaunchFailure` at init is **not** architecture evidence on this box:
+wedges #67–#71 hit the pristine snapshot and non-GDN work with the identical
+signature (load lottery; one authorized retry normally loads clean), so the V2
+conclusion needs a **fresh-boot retry** before GDN is written off — with 0.29.0
+making V2 the default this is a cadence risk, not a detail. Related: the fork's
+**A3 fused-draft opt-in was stripped** (2026-09-13, `VLLM_GFX906_FUSED_DRAFT`;
+brief `/local/tmp/b4/a3-strip-decision.md`, archive `archive/a3-fused-draft`).
+A3 is a V2-only accelerator (the fused loop lives in
+`v1/worker/gpu/spec_decode/autoregressive/speculator.py`, upstream), so if V2
+becomes our path the strip has to be revisited: re-add the ~7-line opt-in and
+re-run the no-op contract audit at the serving k (A3's own k=4 gate was NEUTRAL,
+k=7 was never measured).
+
+**V2 revival detail — variable draft width (2026-09-13).** The branch's V2
+footprint is now **zero**: the SYV-12 ext-column wiring and the two hunks it
+required in V2 files — the truncating draft assign in
+`vllm/v1/worker/gpu/model_runner.py`
+(`draft_tokens[idx_mapping, :draft_tokens.shape[1]] = draft_tokens`, which
+leaves the tail columns holding *stale drafts from the previous step*) and the
+relaxed per-position assert in `vllm/v1/spec_decode/metrics.py` — are reverted
+and preserved on `archive/syv12`. If a future V2 feature reintroduces a
+variable draft width (renewed ext column, or upstream's per-request
+adaptive-verification budgets), **do not** re-apply the truncating assign:
+size the buffer to the max, zero/pad the tail (or pass an explicit per-request
+count downstream), assert the width, and add a test. Upstream's whole-row
+assign fails loudly on a width mismatch — a feature to keep, not to paper over.
+
+**Gate:** same-boot V2-vs-V1 serving A/B at parity or better on both served
+models; otherwise V2 readiness becomes a merge-cadence blocker at 0.29.0.
+
+**Effort:** medium (mostly measurement + fixing whatever V2-specific gaps
+appear); **risk:** low-medium (probe first, one load, no new code).
+
+## High priority — user-requested (2026-09-10)
+
 ### DFL2-3 — port `dflash2-lookup-drafting` (draft from the request's own context)
 
 **Status: open, queued as a follow-up (Kevin 2026-09-15).** This is the mechanism Kevin
