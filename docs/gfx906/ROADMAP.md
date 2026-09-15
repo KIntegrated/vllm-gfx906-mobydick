@@ -275,6 +275,142 @@ rejection sampling uses the distribution the draft was sampled from, and the tar
 full head.
 
 
+### DFL2-7 — cover the DFlash2 draft GEMM shapes in the gfx906 GEMV family
+
+**Status: open — found while fixing the DFlash2 bring-up crash (2026-09-15).** The drafter's
+projections are `m ∈ {256, 6144, 17408}`, `k = 5120`, `n = 2 × block_size(8) = 14` block tokens.
+Our gfx906 GEMM dispatch has fast paths only for `n == 1` (LLMM1 / long-k GEMV) and `n == 2..4`
+(spec-GEMV-M4), so this regime falls through to the **generic fp16 `triton_matmul`**
+(`waves_per_eu=1`, no max-ilp tuning) — and, with a weight in upstream's `[K, N]` orientation, it
+pays a per-call `t().contiguous()` transpose on top. Several projections × 5 layers **per draft
+step**, on the critical path of every DFlash2 step. Work: extend the GEMV/skinny coverage to
+`n ≤ ~16` for these `(m, k)` pairs and/or add a stride-aware variant that takes `[K, N]`
+directly; then measure in serving (interleaved arms, agentic corpus). **Profile first**
+(`DFL2-1` subtask 1, rocprofv3) so the target comes from measured kernel time, not shapes — see
+[`DEVLOG-dflash2.md`](DEVLOG-dflash2.md).
+
+### VIT-1 — serve the Qwen3.5-family ViT shapes from the custom FA (user request 2026-09-12: kill the Triton ViT path)
+
+**Status 2026-09-15: DONE — default ON.** Items 1-3 landed and gated; see
+[`DEVLOG-vit1.md`](DEVLOG-vit1.md). Image-prompt TTFT (fresh image per rep, same
+boot, identical prompts, prefix cache OFF): **5.81 → 5.14 s @1024×1024 (−11.5 %,
+3/3 reps)**, 1.71 → 1.67 s @512; 256-token probe 6.06 → 5.42 s. Fresh-boot cost
+with an empty `TRITON_CACHE_DIR`: upstream **330 s** vs ours **275 s** → the ViT's
+Triton JIT is **−55 s**, but ~140 s of that 195 s penalty is *other* Triton (the
+LLM's GDN decode kernel is Triton), so **item 4 (dropping the triton-AMD
+flash-attn package) does not follow from this win** and stays open behind the
+per-model dependency audit. Two defects fixed on the way: the adapter asserted a
+`[B,S,H,D]`/`B+1` layout production never passes (the VL towers pass one **packed**
+`[seq_len, 1, hidden]` stream with `cu_seqlens[-1] == seq_len`, so multi-image
+requests would have failed), and the decode-era `kv_split` default (32 for any
+`Sq >= 4`) cost 4-9× on prefill-shaped calls until the adapter pinned `kv_split=1`
+(needed an optional per-call argument on the dense binding). Follow-up queued as
+**VIT-2** (head_dim-96 instantiation, ~−5 % TTFT @1024×1024, measured); an fp16-K
+kernel variant (would remove the ~2e-2 Q8 error) stays on the same residue shelf.
+
+**Kevin 2026-09-12.** Extend `gfx906_fa` (the CUSTOM attention backend) to
+also serve the vision-tower shapes of the Qwen3.5 VL family so the ViT
+stops going through the Triton-AMD flash-attention path. Wins: (a) **no
+per-boot Triton JIT compile / graph-capture stall for the ViT** (the
+`__triton_launcher.c` first-boot compile + capture adds ~tens of seconds
+to every fresh boot and every fresh container), (b) **ViT prefill
+performance** — the ViT runs on the critical path of every image-bearing
+prompt (text+image prefill pays it), and the Triton FA is not MI50-tuned,
+(c) one attention code path — the triton-AMD flash-attn package (editable
+install, `flash_attn_2_cuda` build) becomes removable from the serving
+deps.
+
+Shapes (Qwen3.5/3.8 ViT, SigLIP-style, from the shipped config:
+`hidden_size=1152`, `num_position_embeddings=2304` (48×48 patches),
+`patch_size=16`, `spatial_merge_size=2`, `out_hidden_size=5120`,
+`deepstack_visual_indexes=[]`): **full attention (no window mask in this
+cfg), ~16 heads × head_dim 72, sequences ≈ 2304/merge-tile positions,
+prefill-only (no decode), fp16 KV** — i.e. small head_dim, short seqs,
+batch-over-image-tiles: a very different kernel regime from the LLM path
+(head_dim 256, Hkv 4, 122k contexts, Q8 K).
+
+**Recon (2026-09-13, 0.29 tree) — the kernel work is essentially zero; the effort
+is an adapter + wiring:**
+
+- **Shapes confirmed from the shipped config** (`vision_config`: hidden 1152,
+  `num_heads 16`, depth 27, patch 16, merge 2, 2304 position embeddings) →
+  **head_dim = 1152/16 = 72**, bidirectional (no window mask), prefill-only,
+  fp16 KV, ragged batches (`cu_seqlens` / `max_seqlen`).
+- **No mask or tiling work needed.** The vendored kernel masks *either* via a
+  materialised mask *or* the inline-causal `q_abs_offset`; with **neither** it
+  computes **full bidirectional attention** (`mask=None`, `q_abs_offset=None`,
+  `window=0`, `k_VKQ_max` = per-seq length). The ViT is exactly that case.
+- **A dense, non-paged entry already exists**: `gfx906_fa_forward(q_fp32
+  [B,Hq,Sq,D], k_q8 [B,Hkv,Skv,D*34/32], v_fp16 [B,Hkv,Skv,D], scale, kv_max?,
+  mask?, q_abs_offset?, window, kv_start?)` — no block table, plain contiguous
+  K/V. `MMEncoderAttention` dispatches per backend (`forward_cuda` →
+  `_forward_fa` → `vit_flash_attn_wrapper` on ROCm), so this is a new
+  `_forward_gfx906_fa` arm plus a config default.
+- **D=72 must be padded** (launcher requires `head_size % 32 == 0`) → pad Q/K/V
+  72 → **96** (or 128 if the tile table lacks 96). Zero-padding is **exact**: the
+  padded dims contribute 0 to the QK dot, they quantise to zero Q8 blocks and
+  contribute 0 to P·V, and because the padding is in the *head* dim the softmax
+  denominator is untouched; padded query rows are sliced off.
+- **Contract detail**: the kernel wants Q in fp32 and K pre-quantised Q8, so the
+  adapter reshapes ragged → `[B, H, Sq_pad, D_pad]`, zero-pads, casts Q,
+  quantises K (`quantize_q8_0`), and passes V fp16.
+
+**Work items (revised):** (1) the `_forward_gfx906_fa` adapter + `CUSTOM`
+accepted by `MMEncoderAttention` and defaulted on gfx906 (env kill switch,
+FLASH_ATTN fallback for unsupported shapes); (2) ncols1/kv_split tuning at D=96
+using the existing ladders; (3) screens: a ViT-shaped call vs a torch-SDPA
+reference (bidirectional, ≤5e-2 rel like the FA suite), the FA suite staying
+green, then an image-prompt TTFT A/B **and** a boot-time measurement (killing the
+Triton-AMD ViT JIT/capture stall is half the win); (4) confirm the Triton-AMD
+flash-attn editable install can then be dropped from serving deps.
+**Effort: low-medium** (adapter + wiring + tests; the kernel needs nothing);
+**risk: low** (fallback stays).
+
+**Dep-shedding caveat (Kevin, 2026-09-13): do NOT drop the Triton-AMD
+flash-attn dependency for the ViT win alone.** It must be verified that no other
+model we serve needs it — the fork serves more than the Qwen3.5 family (Gemma-4,
+Muse-Glimmer, Ornith, Nemotron, and anything whose encoder path falls back to
+`FLASH_ATTN`/`TRITON_ATTN` on ROCm). Audit `get_vit_attn_backend`'s ROCm
+fallbacks and the mm-encoder backend list per model *before* removing the
+editable install; the boot-time stall win can be banked for the Qwen3.5 family
+without touching the dependency.
+
+### TP-1 — TP-scaling probe: prefill + decode vs TP, the TP=4 question (queued after the 120k×B4 campaign)
+
+**User request 2026-09-10.** How well do prefill and decode scale with TP;
+would TP=4 pay off? Expectation to test: memory-bw-bound decode should still
+improve with TP (memory access spread over the aggregate HBM of the GPUs).
+**2× MI50 only → TP=4 is not available; TP=2 is the ceiling** (TP=4 answered
+counterfactually). Full analysis + probe design:
+[`ttft-prefill-stall.md` §13.11](ttft-prefill-stall.md).
+
+- **Prefill** = compute-bound → scales ~linearly (measured ~2× at TP=2,
+  Muse 240→500 t/s @32k). TP=4 → ~4×.
+- **Decode** = memory-bw-bound; the bandwidth term (weights ~20 GB loaded LM
+  [21 GB on-disk VL ckpt] + KV 64 KB/token, weight-dominated to ~234k ctx)
+  **does** halve at TP=2 (expectation holds), but a large TP-invariant term
+  (CPU fixed cost + 64-layer per-layer all-reduce, latency-bound at M=1)
+  blunts the net to ~parity at short ctx (measured 39.74 → 39.7 t/s). KV term
+  grows with ctx → scaling should improve at long ctx, but stays
+  weight+fixed-bound for this model to ~234k.
+- **Probe** (two wedge-light loads, GPU0 only), **1 sample/point** (Kevin's
+  2026-09-10 cut, applied — the handoff is low-risk): **(a)** TP=1 greedy, no
+  spec, util 0.93, B=1, at **pp ∈ {32768, 65536} × tg=256** → prefill
+  TTFT/t·s (clean TP ratio vs 442/364) + decode t/s (long-ctx decode scaling,
+  never measured at TP=1). **(b)** TP=1 MTP k=3, B=1, same grid → the
+  **compute-regime test**: MTP verify runs M=1+k (k=3→4/req, more
+  compute-bound than greedy M=1), so TP=2 MTP decode should beat TP=1 MTP by
+  *more* than the greedy parity — compare vs the existing TP=2 MTP k=3 B=1
+  anchors (09-09: 64k×3, 120k×2).
+- **120k point DROPPED — does not fit TP=1.** 21 GB on-disk weights (LM-only
+  loads ~20 GB) leave only ~6 GB KV at util 0.93 ≈ **~90k tokens** (correcting
+  the earlier "~160k / fits 120k" — that assumed ~15 GB weights). 64k fits
+  with headroom and still answers the scaling question. B=4 MTP is also not
+  runnable at TP=1 (4×120k=480k ≫ 90k).
+- **Driver ready** (`/local/tmp/b4/run_postcampaign.sh`, safe startup tears
+  down the orphaned campaign server itself). **Queued after the 120k×B4
+  campaign** (TP=1 = the canary load pattern, least wedge-prone).
+
 ### FD-1 — CLOSED: the MTP fused-draft path was measured (NEUTRAL, stack-confounded) and its only reader is gone
 
 **STATUS 2026-09-13 — EXECUTED: VERDICT NEUTRAL, stack-confounded.** FIX arm
