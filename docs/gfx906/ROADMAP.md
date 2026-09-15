@@ -24,6 +24,25 @@ default (`VLLM_DFLASH2_CHAIN_GREEDY_ONLY=1`), requires `LOOKUP=1`.** Its precond
 now met: the patch forces the V2 runner, and V2 is validated as the default on this line
 (DFL2-2).
 
+**ENQUEUED 2026-09-15 (tonight, Kevin).** Ready pieces, checked:
+- patch: `../qwen38-27b-rtx3090/patches/dflash2-ngram-chains.patch` (15,963 B);
+- in-tree DFlash2 support already exists (`vllm/v1/worker/gpu/spec_decode/dflash2/`, and
+  `_is_dflash2_draft()` in `config/vllm.py` forces V2), so only the chain feature is
+  missing;
+- drafter checkpoint `incoai/Qwen3.8-27B-DFlash2` — **3.85 GB**, one safetensors
+  (downloading to the local HF cache). Not to be confused with the `z-lab/…` repo that also
+  exists; the model card's usage for the drafter is:
+
+  ```bash
+  vllm serve <Qwen3.8-27B ckpt> --speculative-config '{"method":"dflash",
+    "model":"incoai/Qwen3.8-27B-DFlash2","num_speculative_tokens":7}'
+  ```
+
+Gate: serving A/B on the agentic corpus with arms **interleaved** (same-boot is not
+enough), **with and without the CAT-1 shortlist** (both cut drafter work, so they interact),
+leading with ms/step and reporting per-rep acceptance; k=7 matches the upstream copy-cell
+measurement.
+
 **Why this one, not SYV-12.** It *removes* work (a whole drafter pass per copy
 step) where SYV-12 *adds* a verify row to every step. Our MI50 stack is
 launch/bandwidth-bound and the always-paid row is what sank SYV-12
@@ -1612,6 +1631,10 @@ its K view is the `split(D, -1)` half, whose last dim is stride-1 and whose
 holds, so the uint8 byte-alias writes stay inside K's own segment and never
 touch V. That reasoning is static; the path has not been run on 0.29. Verify with
 one serving A/B before enabling LEGACY=0 for anything.
+**ENQUEUED 2026-09-15 (tonight, Kevin):** run that A/B — LEGACY=1 vs LEGACY=0, same boot,
+interleaved, agentic corpus, ms/step lead. The outcome either enables the Q8 side-buffer or
+retires the opt-in with evidence; note it currently *fails closed* (refuses without
+`GFX906_FA_LEGACY_ALLOW_UNVERIFIED=1`), so only the LEGACY=0 arm needs that override.
 
 ### KVLAYOUT-2 — migrate the three skipped fork capture/lifecycle tests to the fused layout
 
