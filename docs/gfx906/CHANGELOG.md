@@ -6,6 +6,25 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-15 (TRITON-1 adopted)
+
+- **Stock upstream Triton 3.8.0 is now the default** (the ai-infos v3.6.0+gfx906 fork
+  is retained as rollback only). Upstream has carried gfx906 since `aa53dba7455`
+  `ISAFamily::GCN5_1`; all gates pass (FA 97, dense/MoE/Nemotron/Ornith numerics,
+  ViT fallback, serving ms/step parity) and the install docs
+  (`README.md`, `requirements/build/rocm.txt`, `running.md`) now describe building
+  from the upstream v3.8.0 tag instead of cloning the fork. Two build gotchas and
+  the PyPI-wheel-import segfault are recorded; adoption therefore carries a small
+  build step.
+- **The 0.29.0 docker image was built and published**: `unverbraucht/vllm-gfx906:
+  0.29.0-rocm-7.14` and `:0.29.0-e730ef4066` (digest `sha256:bf3caead…`, both the
+  same image), from `preset.0.29.0-rocm-7.14-kintegrated.sh` pinned to
+  `gfx906/v0.29.0` @ `e730ef4066`. Verified in-container: vllm 0.29.0,
+  **transformers 5.15.0** (the pinset's stale `5.7.0` violated upstream's
+  `>= 5.10.4` and was updated), triton 3.6.0+gfx906, torch 2.13.0+gfx906, FA
+  extension loads. This image still ships the fork Triton; a triton-adopting image
+  would be a separate build.
+
 ## 2026-09-15 (TRITON-1, model gates)
 
 - **All per-model gates pass on stock Triton 3.8.0.** MoE 35B (layer-0 Triton

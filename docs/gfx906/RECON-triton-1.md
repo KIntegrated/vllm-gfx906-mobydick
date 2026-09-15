@@ -301,7 +301,7 @@ coalescing, which gfx906 never enters. There is no behavioural gap and nothing t
 measure; the only residue is a latent inconsistency that would fail **loudly**
 (the `LoadStoreOpToLLVM` asserts) if upstream ever opens that path for gfx906.
 
-## 4e. Adoption status (2026-09-15)
+## 4e. Adoption status (2026-09-15) — **ADOPTED**
 
 **Green light, with one caveat about the artifact.** All gates pass on stock
 v3.8.0: FA suite 97, dense PPL −0.04 %, MoE −0.7 %, Nemotron −0.05 %, Ornith
@@ -314,10 +314,13 @@ vLLM's `requirements/build/rock.txt` pins) downloads fine and is a candidate but
 has not been functionally tested here. So adoption today = **build the unpatched
 upstream v3.8.0 tag with the documented recipe** (§4c) and install that wheel; it
 carries no patches and is reproducible from the tag, but it is a build artefact we
-produce rather than a stock download. Remaining if we adopt: update
-`requirements/build/rocm.txt`, `running.md` §0, the root README install section
-(which still clones the fork) and `/local/git/AGENTS.md`, then close ROADMAP
-`TRITON-1`. The 0.29.0 **docker image** published 2026-09-15 still ships the fork
+produce rather than a stock download. Done on adoption (`cb1cb016fa`):
+`requirements/build/rocm.txt`, `running.md` §0 and the root README install section
+now describe building stock v3.8.0 from the upstream tag, and ROADMAP `TRITON-1` is
+closed. Open follow-ups: one clean in-tree extension rebuild with 3.8.0 installed,
+a triton-adopting docker image (separate tag), and re-testing the two fork-specific
+workarounds (Muse-Glimmer's `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0`; Nemotron's
+mamba2 restructure). The 0.29.0 **docker image** published 2026-09-15 still ships the fork
 (`preset.0.29.0-rocm-7.14-kintegrated.sh`, triton branch `v3.6.0+gfx906`) — a
 triton-adopting image would be a separate build.
 

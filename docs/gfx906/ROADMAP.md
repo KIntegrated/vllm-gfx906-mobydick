@@ -1685,35 +1685,41 @@ wrong instrument and the roadmap item is documentation, not a bug hunt.
 
 ### TRITON-1 — move to stock Triton with native gfx906 support (perf secondary)
 
-**Status: recon + screens DONE (2026-09-15) — stock Triton 3.8.0 supports gfx906
-and is at parity; only the adoption decision is left.** All four gates passed on
-stock v3.8.0 (FA suite 97; in-process PPL 10.5472 vs the fork's 10.5516 = −0.04 %
-with a **byte-identical** 32-token greedy completion, i.e. fp rounding not a
-semantic change; the `GFX906_FA_VIT=0` flash-attn/Triton-AMD ViT fallback compiles
-and runs; serving MTP k=3 agentic ms/step 85.4/127.9 vs the fork's 85.8/128.2 =
-parity). Interleaved follow-up (A→B→A, fresh boot, two corpus bodies): 3.8.0 over four
-processes gave acceptance 2.1875 / 1.8132 / 1.7634 / 1.7128 at one body (spread
-0.475) and the fork 1.7634 twice there — but at the second body the fork's own two
-samples differ by 0.19 (1.4951 / 1.6842) and straddle 3.8.0's range, so the
-variance-asymmetry hint dies and per-process variance is common to both builds. The
-A/B's delta sat *inside the same build's own spread* — no mean-level build
-difference is detectable; the only hint left is a **variance asymmetry** (3.8.0
-spreads more over processes than the fork at n=4 vs n=2, not established). Also:
-128-token greedy probes are byte-identical across all runs of both builds on a
-*code* prompt but differ between two runs of the *same* build on a *prose* prompt —
-close-call flips are prompt-dependent and per-process, not build-dependent.
-Note for any future triton swap: **acceptance/t/s cannot carry a build
-comparison here** — a follow-up run of the *same* build on the *same* corpus body
-gave acceptance 2.1875 → 1.8132 across processes (as large as the cross-build
-delta), so the sequential-arms A/B confounded order with build; interleave arms and
-lead with **ms/step** (which itself has ~2-4 % per-process spread, so parity means
-"no difference beyond that"). Remaining: (a) decide
-to adopt (one command; the box currently has the fork installed), (b) ~~the small
-`supportsDirectToLdsLoadBitWidth` gap~~ **CLOSED as inert** — direct-to-LDS is only
-created via the async-copy path, gated on `{CDNA3,CDNA4,GFX1250}` in 3.8.0 and
-`{CDNA3,CDNA4}` in the fork, so gfx906 never reaches the function in either build
-(the fork's `VEGA20` case was dead code); nothing to measure or patch, (c) if adopted, update `requirements/build/rocm.txt`/docs and
-re-run the release validation on the new install.
+**Status: DONE — ADOPTED (2026-09-15).** Stock upstream **Triton 3.8.0** is the
+default; the ai-infos fork (v3.6.0 + a 7-line gfx906 patch) is retained only as a
+rollback (`pip install -e /local/git/triton-gfx906`). Upstream carries gfx906
+natively since `aa53dba7455` "[AMD] Add GCN5.1 / gfx906 target (#9628)" —
+`ISAFamily::GCN5_1`, wave64, v_dot, DPP, no MFMA, deliberately not CDNA/RDNA — so
+the fork had nothing left to carry.
+
+Gates passed on stock 3.8.0 (full detail + the retractions in
+[`RECON-triton-1.md`](RECON-triton-1.md)): FA suite **97/97**; dense 27B PPL
+**10.5472** vs 10.5516 (−0.04 %); MoE 35B (whose layer-0 experts run Triton
+`fused_moe`) **57.97** vs 58.36 t/s; Nemotron **26.9937** vs 27.0066 (band
+26.96–27.02); Ornith **16.6664** vs 16.7824; all with 0 top-20 misses; the
+`GFX906_FA_VIT=0` flash-attn/Triton-AMD ViT fallback compiles and runs; serving
+ms/step parity (85.4/127.9 vs 85.8/128.2 @64k/120k).
+
+Artifact: build from the **upstream v3.8.0 tag** (no patches) with the recipe in
+`README.md`; the **PyPI 3.8.0 wheel segfaults on import here**, and AMD's
+ROCm-index wheel (`3.7.1+git0263a6a6.rocm7.14.0`, upstream's own `rock.txt` pin)
+downloads but is untested — so adoption carries a small build step rather than a
+stock download.
+
+Follow-ups this created:
+- **one clean in-tree extension rebuild** with 3.8.0 installed (all gates so far
+  ran against the existing vLLM build) — the release build recipe must still work;
+- **a triton-adopting image build** if the docker images should move off the fork
+  (the published `0.29.0-e730ef4066` image still ships `v3.6.0+gfx906`), which
+  needs a new tag shape rather than a retag of the published one;
+- **re-test the two fork-specific workarounds** the new Triton may obsolete:
+  Muse-Glimmer's `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` (the rblock *variant*
+  compile crashed in the fork — part of the MUSE-1 investigation) and Nemotron's
+  mamba2 `ssd_chunk_scan` restructure (a triton 3.6.x `CanonicalizePointers`
+  assertion; the shipped kernel fix is harmless either way and now upstream-report
+  is moot).
+- Measurement hygiene this item produced: acceptance/t/s cannot carry a
+  build comparison (see §"interleaved" in the recon and the AGENTS.md rule).
 
 **Original recon (2026-09-15) — the answer was better than expected:
 stock Triton supports gfx906 since v3.8.0, so this is an *upgrade*, not a port.**
