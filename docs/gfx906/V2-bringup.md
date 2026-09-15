@@ -253,7 +253,7 @@ PPL is our only valid numerical gate:
 |---|---|---|---|
 | Nemotron 3.5 Lightning 30B-A3B (mixed INT4/INT8) | 26.9986 | 27.0066 | **parity** (0.03 %; both inside the recorded 26.96–27.02 fp16 band) |
 | Ornith 1.5-35B-A3B-AWQ-INT4 | 16.7724 | 16.7824 | **parity** (0.06 %) |
-| Gemma-4-26B-A4B-it-AWQ-4bit | 84261.54 | 108909.96 | **probe not applicable** — both arms degenerate |
+| Gemma-4-26B-A4B-it-AWQ-4bit | 84261.54 (raw-text artifact) | 108909.96 (raw-text artifact) | **V2-validated 2026-09-15** via a *templated* V1/V2 comparison (identical text and logprobs ≤0.05) — the PPL figures were a prompt-format artifact of an IFT checkpoint, not a defect |
 
 Nemotron and Ornith are therefore flipped to V2 as well (item 8). Nemotron
 serving note: at TP>1 it needs `--enable-expert-parallel` (group-64 CT experts),
