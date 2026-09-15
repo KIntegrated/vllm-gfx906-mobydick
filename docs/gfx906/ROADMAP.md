@@ -416,6 +416,40 @@ counterfactually). Full analysis + probe design:
   down the orphaned campaign server itself). **Queued after the 120k×B4
   campaign** (TP=1 = the canary load pattern, least wedge-prone).
 
+### DFL2-8 — the DFlash2 drafter's attention backend (blocking unknown; correctness + speed)
+
+**Status: open — highest priority in the DFlash2 family (2026-09-15).** With the bring-up crash
+fixed, arm C measured **2.48 t/s / acceptance 0.045 / 421.9 ms/step** at 64k against the MTP k=3
+band (33.62 plain, 35.44 with CAT-1) — a 13x gap that no downstream patch can close. The log says
+why: the **target** gets `CUSTOM` (our FA), but the **drafter** is rejected by our backend and runs
+upstream `ROCM_ATTN`, whose paged kernel then falls back to Triton (`Cannot use ROCm custom paged
+attention kernel, falling back to Triton implementation`, drafter only). ~422 ms/step over 5
+sliding layers plus 0.045 acceptance suggests the fallback is attending over far more than the
+2048-token window — i.e. a *wrong* draft context, not just a slow one.
+
+Steps: (1) **log the rejection reasons** — `ROcmPlatform` prints only the names of invalid
+backends (`Found incompatible backend(s) [CUSTOM, TURBOQUANT]`), while the reasons are already
+computed (`v1/attention/backend.py`: head_size / dtype / kv_cache_dtype / block_size / mm_prefix /
+MLA / sinks / **sparse** / per-head-quant / compute-capability / attn_type); one line of logging
+turns this into a five-minute diagnosis; (2) with the reason known, decide whether our FA can
+serve the drafter's config (bidirectional + sliding-2048 + D=128 — the kernel supports each of
+those individually, VIT-1 proved the bidirectional path and `supports_sliding_window()` is
+already True) or whether the drafter genuinely needs the sparse path; (3) gate any wiring with the
+same interleaved serving A/B, and check acceptance (a correct window should move 0.045 by a lot).
+This is the gate for the whole DFlash2 family — `DFL2-1`/`DFL2-3` stay behind it.
+
+### FA-COVER-1 — enumerate every config where CUSTOM is rejected or not selected
+
+**Status: open (2026-09-15).** The same mechanism silently puts models on Triton-based attention
+instead of the MI50-tuned FA. Two instances found so far: **Gemma-4 → TRITON_ATTN** (noticed during
+GEMMA4-1) and the **DFlash2 drafter → ROCM_ATTN + Triton fallback** (DFL2-8). Work: log the
+per-backend rejection reasons (same one-liner as DFL2-8 step 1), then sweep the models we serve and
+record, per model, which backend was chosen *and why*; for every rejection, decide whether it is a
+genuine kernel limitation or a declaration/dispatch gap that our FA already covers (its capability
+surface: head sizes {64,128,256}, sliding window, bidirectional, DECODER, MM-encoder/ViT) and close
+the reachable ones. Any model that silently runs Triton attention is a candidate for a VIT-1-style
+wiring win, and this is the cheapest way to find them.
+
 ### FD-1 — CLOSED: the MTP fused-draft path was measured (NEUTRAL, stack-confounded) and its only reader is gone
 
 **STATUS 2026-09-13 — EXECUTED: VERDICT NEUTRAL, stack-confounded.** FIX arm

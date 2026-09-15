@@ -81,6 +81,44 @@ add a stride-aware variant so no transpose copy is needed. **Profile before opti
 (`DFL2-1` subtask 1, rocprofv3) — standalone numbers on this box have repeatedly failed to
 transfer.
 
+## 2026-09-15 (late) — arm C runs: DFlash2 is *far* behind MTP k=3, and the drafter's attention is the suspect
+
+**Arm C (DFlash2, no patch, k=7, agentic 64k, rep 0, V2, same boot as the fix):**
+`2.48 t/s`, acceptance **0.0451**, **421.9 ms/step** (244 drafts for 256 tokens) — against the
+recorded MTP k=3 band on this line (plain 33.62 t/s / MTP+CAT-1 35.44 t/s at 64k). That is ~13x
+slower with essentially no accepted drafts, i.e. **plain DFlash2 is not competitive on gfx906 as
+it stands** — Q1 answered negatively for the unpatched baseline (pending the remaining reps).
+
+**Why it is that slow — the drafter's attention is not on our FA.** The engine log for this arm:
+
+- target (dense 27B, 20:40:58): `Found incompatible backend(s) [TURBOQUANT] with
+  AttentionType.DECODER. Overriding with **CUSTOM**` — the target *does* get our FA, so the arm
+  stays comparable with the MTP arms;
+- drafter (3.58 GiB checkpoint, 20:41:25): `Found incompatible backend(s) [**CUSTOM**,
+  TURBOQUANT] … Overriding with **ROCM_ATTN**` — the drafter's attention runs upstream ROCM_ATTN,
+  whose paged kernel then reports `Cannot use ROCm custom paged attention kernel, falling back to
+  Triton implementation` (1 occurrence, i.e. the drafter only). ~422 ms/step over 5 sliding
+  layers is consistent with a Triton fallback attending over far more than the 2048-token window,
+  and a wrong context would also explain the 0.045 acceptance.
+
+**Why CUSTOM is rejected for the drafter — reasons are not logged.** The base validity checks
+(`v1/attention/backend.py`) are head_size, dtype, kv_cache_dtype, block_size, mm_prefix, `use_mla`
+vs `is_mla()`, sinks, `use_sparse` vs `is_sparse()`, per-head quant scales, compute capability and
+attn_type. The drafter's config passes the ones we can verify by hand (head_dim 128 supported,
+fp16, DECODER, and — checked — `supports_sliding_window()` is **True** in our backend), so the
+culprit is one of the remaining ones, with **sparse** the leading hypothesis given this stack's
+`sparse_attn_indexer` machinery. But the platform logs only the *names* of rejected backends, so
+the first step is to make it log the *reasons* — see ROADMAP **DFL2-8**.
+
+**Consequence for the family's priority:** the chain patch (DFL2-1) is not the path to viability —
+a +7 % copy-cell feature cannot close a 13x gap. **DFL2-8 (the drafter's attention backend) is now
+the item that decides whether DFlash2 is viable here at all**, and it is a correctness question as
+much as a speed one (0.045 acceptance says the draft context itself is wrong). `DFL2-3`
+(lookup-drafting) and the rest stay queued behind it.
+
+**VERDICT:** `OPEN` — baseline gate measured and negative for the unpatched drafter; the drafter's
+attention backend is the blocking unknown.
+
 ## Refrigerated residue
 
 `rocm_unquantized_gemm`'s 3-D branches still pass `x` (not the flattened view) to
