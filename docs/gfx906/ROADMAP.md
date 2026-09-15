@@ -12,7 +12,12 @@ tiers are do-order, sections within a tier are ordered the same way.
 
 ## High priority — user-requested (2026-09-12)
 
-### DFL2-1 — DFlash2 n-gram chains: drafter-free verify blocks while a request copies its context (**HIGH PRIORITY**, Kevin 2026-09-12)
+### DFL2-1 — DFlash2 n-gram chains: drafter-free verify blocks while a request copies its context (**HIGH PRIORITY
+> **Work branch: `gfx906/dflash2`** (cut from `main` 2026-09-15). The DFlash2 bring-up records
+> already on `main` — the `triton_matmul` 3-D / `[K, N]` fix, `DEVLOG-dflash2.md` and the DFL2-*
+> items — are shared; the DFlash2 feature work (DFL2-3 lookup-drafting → DFL2-1 chains, DFL2-7
+> GEMV coverage) proceeds on this branch until it passes its gates.
+**, Kevin 2026-09-12)
 
 **Kevin 2026-09-12.** Port `patches/dflash2-ngram-chains.patch` from
 `../qwen38-27b-rtx3090` (`VLLM_DFLASH2_CHAIN=1`): while a request keeps
