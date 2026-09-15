@@ -1691,7 +1691,15 @@ stock v3.8.0 (FA suite 97; in-process PPL 10.5472 vs the fork's 10.5516 = −0.0
 with a **byte-identical** 32-token greedy completion, i.e. fp rounding not a
 semantic change; the `GFX906_FA_VIT=0` flash-attn/Triton-AMD ViT fallback compiles
 and runs; serving MTP k=3 agentic ms/step 85.4/127.9 vs the fork's 85.8/128.2 =
-parity). Note for any future triton swap: **acceptance/t/s cannot carry a build
+parity). Interleaved follow-up (A→B→A, fresh boot): 3.8.0 over four processes gave acceptance
+2.1875 / 1.8132 / 1.7634 / 1.7128 (spread 0.475) and the fork 1.7634 twice, so the
+A/B's delta sat *inside the same build's own spread* — no mean-level build
+difference is detectable; the only hint left is a **variance asymmetry** (3.8.0
+spreads more over processes than the fork at n=4 vs n=2, not established). Also:
+128-token greedy probes are byte-identical across all runs of both builds on a
+*code* prompt but differ between two runs of the *same* build on a *prose* prompt —
+close-call flips are prompt-dependent and per-process, not build-dependent.
+Note for any future triton swap: **acceptance/t/s cannot carry a build
 comparison here** — a follow-up run of the *same* build on the *same* corpus body
 gave acceptance 2.1875 → 1.8132 across processes (as large as the cross-build
 delta), so the sequential-arms A/B confounded order with build; interleave arms and

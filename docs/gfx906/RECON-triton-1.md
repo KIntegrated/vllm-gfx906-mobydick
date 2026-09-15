@@ -190,8 +190,8 @@ Wheel installed over the editable fork (rollback `pip install -e
 | **ViT fallback smoke** (`GFX906_FA_VIT=0`) | the upstream flash-attn/Triton-AMD ViT path compiles and runs under 3.8.0; both image requests returned sane output (1024×1024 TTFT 6.43 s, `sum_logprob` −2.229 vs the fork's −2.205 on the same `prompt_sha1`) |
 | **serving parity** (MTP k=3, agentic corpus, 64k+120k, 2 reps, same boot) | ms/step **85.4 vs 85.8 @64k** (−0.5 %) and **127.9 vs 128.2 @120k** (−0.2 %) → parity |
 
-**Caveat — corrected 2026-09-15 after a follow-up experiment (this is the
-important one):** the A/B's acceptance difference **cannot be attributed to the
+**Caveat — corrected 2026-09-15 (full interleaved dataset in the follow-up
+block below):** the A/B's acceptance difference **cannot be attributed to the
 triton build**. Re-running *the same build* (3.8.0) on *the same corpus body*
 (`prompt_sha1 795844ca5794`) in a second process gave acceptance **2.1875 → 1.8132
 (−0.374)**, i.e. a within-build process-to-process swing as large as the
@@ -225,6 +225,40 @@ Switching to stock 3.8.0 is one command (install the wheel in
 `/local/tmp/triton-v380/wheel/`); a fresh triton *version* recompiles every triton
 kernel it uses on first boot (both arms booted ~450 s here with `NOCACHE=1`), which
 is a one-time cost per version change, not a recurring one.
+
+**Follow-up, interleaved A → B → A (2026-09-15, fresh boot, canary 38.7 t/s).** Same
+corpus body (`prompt_sha1 795844ca5794`, 64k), acceptance and ms/step per *process*:
+
+| build | process samples (acceptance, ms/step) |
+|---|---|
+| stock 3.8.0 | (2.1875, 82.8) · (1.8132, 86.0) · (1.7634, 82.4) · (1.7128, 87.7) |
+| fork 3.6.0 | (1.7634, 83.7) · (**1.7634**, 81.6) |
+
+Reading:
+
+- **No mean-level build difference is detectable.** The A/B's apparent delta
+  (2.1875 vs 1.7634 = 0.424) is *smaller than the same build's own
+  process-to-process spread* (0.475 over four processes), and the fork's value
+  (1.7634) is exactly reproduced by one of 3.8.0's own samples. ms/step spreads the
+  same way (3.8.0: 82.4–87.7 = 6.4 %; fork: 81.6–83.7 = 2.6 %).
+- **The only surviving build-flavoured hint is a variance asymmetry**: over four
+  processes 3.8.0 spread 1.71–2.19 (ms/step 82.4–87.7) while the fork gave 1.7634
+  twice (ms/step 81.6–83.7). At n=4 vs n=2 that is **not established** — it would
+  take 2–3 more fork runs to test, and if real it is a config-selection instability
+  in the newer Triton rather than a numerical difference.
+- **Numeric differences exist, but they are prompt-dependent, not build-dependent.**
+  128-token greedy probes (temp 0): the *code* prompt's continuation was
+  byte-identical across **every** run of both builds (`16172ed9edfc`), while the
+  *prose* prompt's differed **between two runs of the same build**
+  (`43531fd7aa41` vs `f93789285849`; the fork produced a third variant). So
+  close-call argmax flips happen per process on sensitive prompts, on either build.
+- Consistent with that: the in-process PPL probe (359-token prompt, no chunked
+  prefill) was bit-reproducible per build (10.5516 on the fork across many earlier
+  runs; 10.5472 on 3.8.0) — long-context measurements are where the per-process
+  variance enters, which points at the **autotuned chunked-prefill GDN kernels**
+  (`ssd_bmm.py`) as the leading mechanism candidate (timing-based config choice per
+  process → different accumulation order → different long-context trajectory).
+  Unpinned; a test would be to force a single autotune config and re-measure.
 
 **Closed: the `supportsDirectToLdsLoadBitWidth` "gap" is inert, in both builds.**
 Checked the mechanism rather than the symptom (the parity A/B showed no perf
