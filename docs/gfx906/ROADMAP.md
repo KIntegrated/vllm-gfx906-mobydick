@@ -115,8 +115,18 @@ at 33.62 / 23.75. Boot-to-boot spread for these arms is ~1–3 % (parity restamp
    **C → B → C** (B = MTP k=3 + CAT-1, C repeated last as the order control) so the
    comparison is same-boot and same-order-position. Plain MTP (arm A) is *not* run live: it is
    not the config we would serve, and its numbers are on record (V2 33.62 / 23.75).
-3. Arm D (DFlash2 + chain patch) joins once the manual port lands — the patch does not apply,
-   so it is separate work, not a session slot.
+3. ~~Arm D (DFlash2 + chain patch) joins once the manual port lands~~ — **D is blocked on
+   DFL2-3, discovered while preparing the port (2026-09-15):** the chain patch does
+   `from vllm.v1.worker.gpu.spec_decode.dflash2.lookup import …` and itself warns
+   `VLLM_DFLASH2_CHAIN=1 needs VLLM_DFLASH2_LOOKUP=1; disabling`. Our tree has **no
+   `dflash2/lookup.py`** (the dir holds only `__init__.py` + `speculator.py`), and core vLLM's
+   ngram proposer (`v1/spec_decode/ngram_proposer*.py`) is a different mechanism. So the port
+   order is **DFL2-3 (lookup-drafting) → DFL2-1 (chains)**, and D cannot run tonight.
+   Second finding: both patches are written against a **~480-line** `dflash2/speculator.py`
+   while ours is **217 lines** (upstream refactored the speculators for 0.28/0.29), and the
+   lookup patch also touches the model (`qwen3_dflash2.py`: `_dense_kv_rows`,
+   `VocabParallelEmbedding`, masked-query slots). Both are **adaptations, not `git apply`** —
+   realistically multi-session work, so DFL2-1's ETA now sits behind DFL2-3.
 
 **DFlash2 patch family as later follow-ups** (all from `../qwen38-27b-rtx3090/patches/`):
 `dflash2-lookup-drafting.patch` (context-drafting, 178 KB — potentially the biggest win, and
@@ -226,8 +236,11 @@ appear); **risk:** low-medium (probe first, one load, no new code).
 
 ### DFL2-3 — port `dflash2-lookup-drafting` (draft from the request's own context)
 
-**Status: open, queued as a follow-up (Kevin 2026-09-15).** This is the mechanism Kevin
-remembered as "CAT-1 for DFlash": instead of a drafter forward, blocks are proposed from the
+**Status: open — and it is the *prerequisite* for DFL2-1** (verified 2026-09-15: the chain
+patch imports `dflash2.lookup` and refuses to enable itself without `VLLM_DFLASH2_LOOKUP=1`,
+while our tree has no `lookup.py`). Touches the model too (`qwen3_dflash2.py`), and is written
+against a speculator that upstream has since refactored (~480 lines there vs 217 here), so it is
+an adaptation port. This is the mechanism Kevin remembered as "CAT-1 for DFlash": instead of a drafter forward, blocks are proposed from the
 **request's own context** (`dflash2/lookup.py` picks the block length from emitted/rejected
 counts) — the same goal as CAT-1 (cheap drafting on predictable text) by a different mechanism.
 Largish patch (178 KB, `../qwen38-27b-rtx3090/patches/`); verified that its
