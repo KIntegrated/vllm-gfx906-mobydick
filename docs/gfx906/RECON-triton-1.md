@@ -83,6 +83,41 @@ serving A/B (MTP k=3, agentic corpus) → ViT-fallback smoke with
 (`triton_prefill_attention`, `vllm.triton_utils`, and the `triton_kernels`
 build variable `TRITON_KERNELS_SRC_DIR` in the fork's build recipe).
 
+## 4b. The port, as implemented (2026-09-15)
+
+`/local/tmp/triton-v371` = a **worktree of upstream `v3.7.1`** (tag `f797708c06`,
+LLVM pin `1f126a6dea50…`, triton `3.7.1`), branch `gfx906/triton-1` in that
+repository, commit **`549ce65245`**: **28 insertions / 2 deletions across 5
+files** — smaller and more precise than the fork's blanket alias:
+
+| site | change |
+|---|---|
+| `TargetUtils.h` | re-add `ISAFamily::VEGA20` (upstream dropped it after 3.6.0) |
+| `TargetUtils.cpp` `deduceISAFamily` | `GK_GFX906 → VEGA20` |
+| `TargetUtils.cpp` `supportsVDot` | VEGA20 → true |
+| `TargetInfo.cpp` `getWarpSize` | VEGA20 → 64 |
+| `TargetInfo.cpp` `supportsDirectToLdsLoadBitWidth` | VEGA20 with CDNA3 → 32-bit |
+| `MemoryOpToLLVM.cpp` (BarrierOp) | name VEGA20 explicitly (parity with the fork) |
+| `UpdateAsyncWaitCount.cpp` | name VEGA20 explicitly — its own comment says the pass exists for GFX9 parts with direct-to-LDS and no async loads |
+
+**Deliberately *not* done:** adding VEGA20 to `isCDNA()`. The fork aliased it, but
+on v3.7.1 that function also gates CDNA-only features (async copies, buffer
+atomics, TDM, direct-to-LDS scattering) that gfx906 does not have; the two sites
+above get the behaviour by name instead. Left at upstream defaults, all correct
+for gfx906: `getMfmaVersion` 0 (FMA dots — gfx906's MFMA shapes are not CDNA's),
+`getSharedMemorySize` 64 KB, `requiresAliasInfoForAsyncOps` false,
+`supportsDirectToLDSScattering` false, `supportDppBroadcast` false (a *perf*
+candidate, not parity — gfx906 has DPP, so this is a follow-up A/B).
+
+**Build:** `pip wheel . --no-build-isolation --no-deps` in the worktree, using the
+vLLM venv (cmake 3.31 / ninja / pybind11 present). Triton downloads a prebuilt
+LLVM for its pin (`~/.triton/llvm/llvm-<hash>-ubuntu-x64`; the 3.6.0 one is already
+cached at 8.2 GB), so this is a download plus a compile — CPU-only, no GPU
+impact, runnable while the GPUs do release work. **Nothing is installed into the
+venv until the wheel exists and every screen is ready to run**, so the live
+`3.6.0+gfx906` editable install stays untouched; rollback is
+`pip install -e /local/git/triton-gfx906`.
+
 ## 5. Options
 
 - **A — stay on 3.6.0+gfx906.** Zero work, known-good. The fork remains a
