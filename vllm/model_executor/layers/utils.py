@@ -199,7 +199,31 @@ def triton_matmul_kernel(
 
 def triton_matmul(a, b):
     # Check constraints.
-    assert a.shape[1] == b.shape[1], "Incompatible dimensions" # NOTE(gfx906): b.shape inv
+    # 2026-09-15 (DFL2-1): two assumptions asserted here at model warmup for the DFlash2
+    # drafter's projections (x=(2, 7, 5120), weight=(256, 5120)):
+    #   1. activations may be >2-D — flatten the leading dims and restore them on the way
+    #      out (the "n <= 16 and bias is None" branch passes the raw x);
+    #   2. the weight may arrive as [K, N] (upstream's convention) where this kernel wants
+    #      [N, K] (see the `b.shape inv` note below) — transpose that case, and keep the
+    #      assert for genuinely incompatible shapes.
+    # PERF NOTE: this generic fp16 kernel (waves_per_eu=1) is the *fallback* for shapes the
+    # gfx906 skinny/GEMV family does not cover; the DFlash2 draft shapes land here — see
+    # ROADMAP DFL2-7.
+    a_shape = a.shape
+    if a.dim() > 2:
+        a = a.reshape(-1, a.size(-1))
+    if a.shape[1] != b.shape[1] and a.shape[1] == b.shape[0]:
+        logger.warning_once(
+            "triton_matmul: weight passed as [K, N] (a=%s, b=%s); transposing for the "
+            "gfx906 kernel. The kernel's native layout is [N, K].",
+            tuple(a.shape),
+            tuple(b.shape),
+        )
+        b = b.t().contiguous()
+    assert a.shape[1] == b.shape[1], (
+        f"Incompatible dimensions: a={tuple(a.shape)} b={tuple(b.shape)}"
+        " (gfx906 kernel expects b as [N, K])"
+    )
     assert a.dtype == b.dtype, "Matrices A and B must have the same dtype (assuming fp16)"
     assert a.is_contiguous(), "Matrix A must be contiguous"
     M, K = a.shape
@@ -219,7 +243,7 @@ def triton_matmul(a, b):
         c.stride(0), c.stride(1),  #
         **launch_kwargs,
     )
-    return c
+    return c if len(a_shape) == 2 else c.reshape(*a_shape[:-1], N)
 
 
 def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor | None:
