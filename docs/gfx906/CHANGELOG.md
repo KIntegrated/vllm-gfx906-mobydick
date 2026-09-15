@@ -22,6 +22,27 @@ the date an investigation began.
   workaround unnecessary is still open; the arms need interleaving to survive the
   load lottery.
 
+## 2026-09-15 (0.29.0 release readiness)
+
+- **Validation matrix on the 0.29.0 line (release candidate state):** FA suite **97/97**;
+  in-process PPL on the dense 27B **10.5516** (bit-identical to V1 and the 0.28 line, so the
+  V2 bring-up, VIT-1 and the `kv_split` override left the text path numerically untouched);
+  MoE 35B 57.97 t/s (v2 restamp 58.36, 0.28 record 58.43); Nemotron PPL 26.9937 (band
+  26.96–27.02); Ornith 16.6664 (fork 16.7824); Gemma-4 gated via its chat template
+  (templated V1/V2 identical, logprobs ≤0.05); Muse-Glimmer gate in flight.
+- **Default flips on this line:** V2 model runner (dense 27B, MoE 35B, Nemotron, Ornith,
+  Gemma-4); **VIT-1** (ViT attention on the custom FA: −11.5 % image-prompt TTFT @1024²,
+  −55 s fresh-boot Triton JIT); **stock Triton 3.8.0** (upstream gfx906 support, fork kept
+  as rollback); MTP k=3 spec config. Muse-Glimmer remains the only V1 pin.
+- **Published:** `unverbraucht/vllm-gfx906:0.29.0-rocm-7.14` + `:0.29.0-e730ef4066`
+  (digest `sha256:bf3caead…`; built from `preset.0.29.0-rocm-7.14-kintegrated.sh` pinned to
+  `gfx906/v0.29.0` @ `e730ef4066`; verified in-container: vllm 0.29.0, transformers 5.15.0,
+  triton 3.6.0+gfx906, torch 2.13.0+gfx906, FA extension loads). Note the image still ships
+  the triton fork; a triton-adopting image needs its own tag.
+- **Open before publishing the next artifact:** push the branch (needs the `gh` `workflow`
+  scope or the user's credentials — 18 commits ahead of the pushed `e730ef4066`), the
+  in-tree extension rebuild against stock Triton 3.8.0, and a triton-adopting image build.
+
 ## 2026-09-15 (IFT gate tool + the PPL probe's real limit)
 
 - **`BENCH_CHAT_TEMPLATE=1` does not make the PPL probe valid for IFT checkpoints** —

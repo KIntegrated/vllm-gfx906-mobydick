@@ -20,7 +20,9 @@ reproducing its context, whole verify blocks are proposed from the request's
 own token history and **the drafter's forward plus its graph replay are
 skipped** until the first rejected token. Upstream evidence: **+7 % on the copy
 cell** (256.9 → 276 tok/s at `DFLASH_TOKENS=7`), flat on prose, greedy-only by
-default (`VLLM_DFLASH2_CHAIN_GREEDY_ONLY=1`), requires `LOOKUP=1`.
+default (`VLLM_DFLASH2_CHAIN_GREEDY_ONLY=1`), requires `LOOKUP=1`.** Its precondition is
+now met: the patch forces the V2 runner, and V2 is validated as the default on this line
+(DFL2-2).
 
 **Why this one, not SYV-12.** It *removes* work (a whole drafter pass per copy
 step) where SYV-12 *adds* a verify row to every step. Our MI50 stack is
@@ -57,10 +59,17 @@ medium (V2 never measured on gfx906 for our models — DFL2-2 de-risks it first)
 
 ### DFL2-2 — V2 runner up to speed on gfx906 (**V1 removal lands in 0.32.0**) (**HIGH PRIORITY**, Kevin 2026-09-12)
 
-**Why now.** vLLM 0.29.0 makes the V2 model runner the default and **V1 is removed
-in 0.32.0** (Kevin 2026-09-15), i.e. this is the deadline for the two models still
-pinned to V1 (Gemma-4, Muse-Glimmer — see GEMMA4-1/MUSE-1); DFlash2 and DSpark drafts **force V2
-today** (`config/vllm.py:642`). Every gfx906 optimization and serving gate on
+**STATUS 2026-09-15 — the bring-up is DONE for every model whose gate exists; one
+pin left.** V2 is validated and default for the dense 27B, MoE 35B, Nemotron 3.5
+Lightning, Ornith, **and Gemma-4** (gated today through its chat template — see
+GEMMA4-1); evidence and numbers in [`V2-bringup.md`](V2-bringup.md) (PPL bit-identity,
+in-process bench parity, agentic ms/step parity, MoE +0.9 %). **Muse-Glimmer is the only
+remaining V1 pin** (MUSE-1; its templated gate is in flight, and its PPL probe is
+inapplicable by construction — see the prompt-format note in `README.md`). Upstream
+removes the V1 runner in **0.32.0** (Kevin 2026-09-15), so that pin is the deadline item.
+
+**Why now.** vLLM 0.29.0 makes the V2 model runner the default; DFlash2 and DSpark drafts
+**force V2 today** (`config/vllm.py:642`). Every gfx906 optimization and serving gate on
 record — custom FA backend metadata, GDN/mamba ops (incl. the SYV-10 bounds
 port), mamba state-pool sizing, the trimmed capture ladder, default-ON FIX-H2
 and M3 — has only ever been validated on **V1**. V2 carries a `mamba_hybrid`
@@ -259,7 +268,7 @@ counterfactually). Full analysis + probe design:
   down the orphaned campaign server itself). **Queued after the 120k×B4
   campaign** (TP=1 = the canary load pattern, least wedge-prone).
 
-### FD-1 — measure the MTP fused-draft path at B=4/TP=2 (queued after campaign, 2026-09-10)
+### FD-1 — CLOSED: the MTP fused-draft path was measured (NEUTRAL, stack-confounded) and its only reader is gone
 
 **STATUS 2026-09-13 — EXECUTED: VERDICT NEUTRAL, stack-confounded.** FIX arm
 2377.6 s vs non-FD *serving* 2447.8/2464.9 s at 4×122880 (offline arm vs
