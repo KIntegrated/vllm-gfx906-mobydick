@@ -241,11 +241,22 @@ Reading:
   process-to-process spread* (0.475 over four processes), and the fork's value
   (1.7634) is exactly reproduced by one of 3.8.0's own samples. ms/step spreads the
   same way (3.8.0: 82.4–87.7 = 6.4 %; fork: 81.6–83.7 = 2.6 %).
-- **The only surviving build-flavoured hint is a variance asymmetry**: over four
-  processes 3.8.0 spread 1.71–2.19 (ms/step 82.4–87.7) while the fork gave 1.7634
-  twice (ms/step 81.6–83.7). At n=4 vs n=2 that is **not established** — it would
-  take 2–3 more fork runs to test, and if real it is a config-selection instability
-  in the newer Triton rather than a numerical difference.
+- **A variance asymmetry was visible at one body and then refuted at the second.**
+  Complete interleaved set (two bodies, A→B→A):
+
+  | arm | body `795844ca5794` | body `62331f5bb6c8` |
+  |---|---|---|
+  | A1 stock 3.8.0 | 1.7634 (82.4 ms) | 1.6495 (87.8 ms) |
+  | B fork 3.6.0 | 1.7634 (81.6 ms) | 1.6842 (88.2 ms) |
+  | A2 stock 3.8.0 | 1.7128 (87.7 ms) | 1.7634 (87.8 ms) |
+  | all samples of that build | 3.8.0: 2.1875, 1.8132, 1.7634, 1.7128 | 3.8.0: 1.7419, 1.6392, 1.6495, 1.7634 |
+  | | fork: 1.7634, 1.7634 | fork: 1.4951, 1.6842 |
+
+  The fork's identical pair at body 0 looked like stability; at body 1 its own two
+  samples differ by 0.19 and **straddle 3.8.0's range**, so the asymmetry does not
+  survive and per-process variance is common to both builds. What remains is: same
+  build, same prompt, different process → acceptance anywhere in ~1.5–2.2 (and
+  ms/step in ~81–88 ms), on either build, with overlapping distributions.
 - **Numeric differences exist, but they are prompt-dependent, not build-dependent.**
   128-token greedy probes (temp 0): the *code* prompt's continuation was
   byte-identical across **every** run of both builds (`16172ed9edfc`), while the

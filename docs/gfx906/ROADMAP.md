@@ -1691,8 +1691,11 @@ stock v3.8.0 (FA suite 97; in-process PPL 10.5472 vs the fork's 10.5516 = −0.0
 with a **byte-identical** 32-token greedy completion, i.e. fp rounding not a
 semantic change; the `GFX906_FA_VIT=0` flash-attn/Triton-AMD ViT fallback compiles
 and runs; serving MTP k=3 agentic ms/step 85.4/127.9 vs the fork's 85.8/128.2 =
-parity). Interleaved follow-up (A→B→A, fresh boot): 3.8.0 over four processes gave acceptance
-2.1875 / 1.8132 / 1.7634 / 1.7128 (spread 0.475) and the fork 1.7634 twice, so the
+parity). Interleaved follow-up (A→B→A, fresh boot, two corpus bodies): 3.8.0 over four
+processes gave acceptance 2.1875 / 1.8132 / 1.7634 / 1.7128 at one body (spread
+0.475) and the fork 1.7634 twice there — but at the second body the fork's own two
+samples differ by 0.19 (1.4951 / 1.6842) and straddle 3.8.0's range, so the
+variance-asymmetry hint dies and per-process variance is common to both builds. The
 A/B's delta sat *inside the same build's own spread* — no mean-level build
 difference is detectable; the only hint left is a **variance asymmetry** (3.8.0
 spreads more over processes than the fork at n=4 vs n=2, not established). Also:
