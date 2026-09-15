@@ -1685,17 +1685,30 @@ wrong instrument and the roadmap item is documentation, not a bug hunt.
 
 ### TRITON-1 — move to stock Triton with native gfx906 support (perf secondary)
 
-**Status: open, investigate.** Kevin 2026-09-13. The fork runs a custom/patched
-Triton build for gfx906 (the venv's editable `triton` predates upstream's ROCm
-pin, `triton 3.7.1+git…` in 0.29's `requirements/build/rocm.txt`). Question: does
-the **latest stock Triton** support gfx906 (gfx9/Vega20) without our patches? If
-yes, we drop a fork build artifact and the maintenance that goes with it, and the
-ROCm wheel pin from upstream becomes usable. **Primary goal is maintenance, not
-speed**; the secondary question — whether newer Triton kernels (attention,
-rms-norm, GDN) reduce our Triton share of the step — is measured after the swap
-with the standard benches. Screens: the FA suite, the PPL probe, and a serving
-A/B; plus a check that nothing we rely on is Triton-version-pinned (the
-`triton_prefill_attention` / `vllm.triton_utils` surfaces and the ViT fallback).
+**Status: recon DONE (2026-09-15, branch `gfx906/triton-1` →
+[`RECON-triton-1.md`](RECON-triton-1.md)); build pending a base choice.**
+Answered: (**i**) the fork carries **nothing but a 7-line ISA classification**
+(3 files: `gfx906 → ISAFamily::VEGA20`, `getWarpSize → 64`, `supportsVDot`,
+direct-to-LDS 32-bit, `isCDNA(VEGA20) = true`) — its whole history is upstream
+source drops plus one gfx906 commit each, so there are no other optimizations to
+carry; (**ii**) **upstream still does not support gfx906** (`upstream/main`,
+v3.7.1, v3.8.0 all lack the mapping) and **`ISAFamily::VEGA20` no longer exists**
+in v3.7.1 (enum is `Unknown, CDNA1..4, RDNA1..4, GFX1250`), so a move is a
+*reintroduction*, not a re-apply — 11 switch sites over 4 files at v3.7.1 vs 6
+today, and 15 sites over 6 files at v3.8.0 where the feature model moved into
+`TargetFeatures.cpp`; (**iii**) the semantic work is per-site, not mechanical:
+`getMfmaVersion` must stay 0 (FMA dots — aliasing to CDNA would emit gfx908 MFMA
+shapes), and `isCDNA()` must **not** be aliased wholesale on a newer base because
+upstream has since gated CDNA-only features (async copies, buffer atomics, TDM)
+that gfx906 lacks — v3.7.1 gates exactly three sites with it. **Recommendation:
+port to v3.7.1** (the version vLLM 0.29 nominates) as a rebase-able patch series on
+the upstream tag, keeping the 3.6.0 fork as fallback. Screens: build → FA suite
+(97) → in-process PPL (dense 27B, expect **10.5516 / 359 tokens**) → serving A/B
+(MTP k=3, agentic) → ViT-fallback smoke (`GFX906_FA_VIT=0`); the triton-touching
+code we depend on is the **GDN decode kernel**, the mamba ops, `triton_mla` and the
+flash-attn Triton-AMD fallback. **Primary goal is maintenance, not speed**; the
+secondary question (whether newer Triton kernels shrink our Triton share of a step)
+is measured after the swap.
 
 ### MUSE-1 — Muse-Glimmer spec decode: MTP instead of ngram
 
