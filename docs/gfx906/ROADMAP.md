@@ -1702,17 +1702,42 @@ bypassed → then the original plan (a serving-level gate, and the V2 flip only 
 the model answers sanely). Until then Gemma-4 stays pinned to V1, but note that
 **V1 is also broken for it on 0.29**, so the pin is not a working fallback.
 
-### MUSE-1 — Muse-Glimmer: checkpoint pull in progress
+### MUSE-1 — Muse-Glimmer: V2 parity looks good, but the PPL probe is not its gate
+
+**Status: open (2026-09-15) — checkpoint obtained, first signals in.** The 24 GB AWQ
+checkpoint came down to `/data/cache` (see the pull note below). Findings from the
+first session (0.29 line, stock triton 3.8.0, in-process, single GPU):
+
+- **V1/V2 parity on generation is exact**: greedy completions are **byte-identical**
+  across the two runners on both probe prompts (the raw-text quicksort continuation
+  and the capital-of-France one), i.e. the same class of evidence as the triton
+  greedy-identity control. The quicksort continuation is sensible; the capital
+  prompt loops ("… is Paris. The capital of France is Paris. …"), which is a
+  raw-text-on-instruct-model artifact, identical on both runners.
+- **The in-process PPL probe cannot gate this model**: it renders the prompts
+  through the chat template and loads it as a **VLM** (`MuseGlimmerForConditionalGeneration`
+  with a `vision_config`; the log shows the encoder cache being profiled with image
+  items), and it reports **362 of 363 top-20 misses** on *every* arm (PPL 36.12 V1 /
+  36.19 V2 / 36.19 V2-with-rblock-default) while the same model generates sanely
+  outside the probe. So those numbers are a prompt/template artifact, not a model
+  defect — unlike Gemma-4, where raw-text *generation* is garbage.
+- **The `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` question is unresolved**: that arm
+  (V2) was killed by a GPU wedge (`hipErrorLaunchFailure`, wedge #93) 2 s before its
+  failure was logged, and the arm that ran after it (rblock default) succeeded — no
+  controlled comparison yet. The workaround existed because the rblock *variant*
+  compile crashed in the triton v3.6.0 fork.
+- Being a VLM, its vision tower also exercises **VIT-1** on this line — worth
+  checking which ViT backend it selects (the new loud fallback warning makes a
+  fall-through visible).
+
+**Next**: gate it the way its siblings were gated where the probe applies — a
+**serving A/B** (V1 vs V2, same boot, identical prompts, MTP k=3 since MUSE-1's own
+point is that Muse-Glimmer should use MTP rather than ngram) with the rblock arms
+interleaved (A,B,A) to survive the wedge lottery, and check the ViT backend line.
+
 
 **Status: open; the AWQ checkpoint is downloading (2026-09-15).** Only the GGUF was
-local. The AWQ-INT4 repo is 24 GB of 16 files; pulls here are throttled
-unauthenticated (~2.5 MB/s ⇒ ~2.7 h; a HF token would raise the limits). It could
-not go to the usual cache: `~/.cache/huggingface` → `/local/cache` has only ~27 GB
-free box-wide, so the pull targets **`/data/cache/huggingface/hub`** (586 GB free).
-Once it lands: the V2 parity run (in-process PPL, V1 vs V2) *and* a specific test
-this item inherits from TRITON-1 — Muse-Glimmer needed
-`TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` because the rblock *variant* compile crashed
-in the old triton fork; with stock Triton 3.8.0 that workaround may be obsolete.
+local. The AWQ-INT4 checkpoint (24 GB) is now in `/data/cache/huggingface/hub` — see the findings above.
 
 ### TRITON-1### TRITON-1 — move to stock Triton with native gfx906 support (perf secondary)
 

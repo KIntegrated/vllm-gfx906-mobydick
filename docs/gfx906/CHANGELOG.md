@@ -6,6 +6,22 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-15 (MUSE-1 first signals)
+
+- **Muse-Glimmer loads and runs on both runners, and V1/V2 generation is
+  byte-identical** (greedy, two raw-text prompts) — the first parity evidence for
+  the model, and the same class of control as the triton greedy-identity test.
+- **The in-process PPL probe cannot gate it**: Muse-Glimmer is a VLM
+  (`MuseGlimmerForConditionalGeneration` + `vision_config`) and the probe renders
+  its prompts through the chat template and profiles the encoder cache, reporting
+  **362/363 top-20 misses on every arm** (PPL 36.12 V1 / 36.19 V2) while raw-text
+  generation is sane — a prompt/template artifact, unlike Gemma-4's genuinely broken
+  output. Its gate has to be a serving A/B.
+- The `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` arm (V2) was killed by a GPU wedge
+  (#93, `hipErrorLaunchFailure`), so whether stock Triton 3.8.0 makes that fork-era
+  workaround unnecessary is still open; the arms need interleaving to survive the
+  load lottery.
+
 ## 2026-09-15 (0.29 line: missing-model investigation)
 
 - **Gemma-4 is broken on the 0.29 line — a regression, not a probe limitation.**
