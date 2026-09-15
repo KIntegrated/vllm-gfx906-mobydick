@@ -383,7 +383,16 @@ torch::Tensor gfx906_fa_forward(
     // binding of the same name). The K buffer must contain rows
     // [kv_start[b], seq_len[b]); the backend pairs it with the
     // kv_start-aware persistent gather.
-    c10::optional<torch::Tensor> kv_start = c10::nullopt
+    c10::optional<torch::Tensor> kv_start = c10::nullopt,
+    // Explicit KV-split override (VIT-1). The shape-aware default is tuned for
+    // DECODE (Sq in {1,2,4,8}), where splitting the KV scan across grid.y buys
+    // parallelism cheaply; for a PREFILL-shaped bidirectional call (the Qwen
+    // ViT: Sq = 576..2304, Hq=16, D_pad=128) the per-split partial buffer
+    // [B, Sq, Hq, y, D] fp32 grows with Sq and the split-combine dominates:
+    // measured 34-42 ms at Sq=1536/1728 (y=32, inside the 512 MiB budget)
+    // against 7 ms at Sq=2304 (y forced to 1 by that same budget). Callers with
+    // prefill-shaped inputs pass 1; <= 0 keeps default resolution.
+    c10::optional<int64_t>   kv_split_override = c10::nullopt
 ) {
     TORCH_CHECK(window == 0 || q_abs_offset.has_value(),
         "window > 0 requires q_abs_offset (the window mask needs absolute "
@@ -439,6 +448,13 @@ torch::Tensor gfx906_fa_forward(
     // into o_bshd by gfx906_fa_split_combine.
     const int nc2 = get_fa_nc2();
     int kv_split = get_fa_kv_split();
+    // VIT-1: a per-call override wins over the env/shape-aware default. y=1 is
+    // always safe (no partials, no combine), so it bypasses the byte budget.
+    const bool kv_split_pinned_one =
+        kv_split_override.has_value() && kv_split_override.value() == 1;
+    if (kv_split_override.has_value() && kv_split_override.value() > 0) {
+        kv_split = static_cast<int>(kv_split_override.value());
+    }
     const int tile_clip = get_fa_tile_clip();
     if (kv_split < 0) kv_split = fa_kv_split_default(seq_q);  // shape-aware (see fn)
     // MTP-1b-0: the old hard clamp `if (seq_q > 2) kv_split = 1` (a prefill
@@ -447,8 +463,10 @@ torch::Tensor gfx906_fa_forward(
     // byte budget below protects against the real OOM case (prefill Sq~thousands)
     // while letting small-Sq verify keep kv_split>1. An explicit
     // GFX906_FA_KVSPLIT is still bounded by the budget, so it cannot OOM.
-    kv_split = fa_apply_kv_split_budget(
-        kv_split, batch, seq_q, heads_q, head_dim);
+    if (!kv_split_pinned_one) {
+        kv_split = fa_apply_kv_split_budget(
+            kv_split, batch, seq_q, heads_q, head_dim);
+    }
     // M3 #4b: the kernel's only dst_meta write is guarded by
     // `gridDim.y != 1` (gridDim.y == kv_split), so at kv_split==1 the
     // [B, Sq, Hq, 2] meta is never written — nor read back: it is a
@@ -1440,7 +1458,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("mask")          = c10::nullopt,
           py::arg("q_abs_offset")  = c10::nullopt,
           py::arg("window")        = 0,
-          py::arg("kv_start")      = c10::nullopt);
+          py::arg("kv_start")      = c10::nullopt,
+          py::arg("kv_split")      = c10::nullopt);
     m.def("quantize_q8_0", &quantize_q8_0,
           "Quantize fp16 tensor (last dim D) → block_q8_0 uint8 (device-side)",
           py::arg("k_fp16"));

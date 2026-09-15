@@ -185,7 +185,14 @@ def forward_vit(
         ln = grp[0][2]
         if not ln:
             continue
-        if len(grp) == 1 and grp[0][1] == 0:
+        # Whole-row fast path only when the sequence really is the whole row
+        # (a single image / one sequence per batch item covering all of S). A
+        # packed sequence that merely *starts* at 0 is shorter than the stream,
+        # and passing the whole row would compute attention for every other
+        # image's queries too (right answer for the rows we keep, since later
+        # groups overwrite them, but ~2x the work).
+        whole_row = len(grp) == 1 and grp[0][1] == 0 and ln == sq
+        if whole_row:
             qs = query[grp[0][0] : grp[0][0] + 1]
             ks = key[grp[0][0] : grp[0][0] + 1]
             vs = value[grp[0][0] : grp[0][0] + 1]
@@ -210,15 +217,23 @@ def forward_vit(
         # mask=None + q_abs_offset=None => full bidirectional attention; kv_max
         # bounds the scan to the sequence. NOTE: `forward` takes Q as
         # [B, H, S, D] but returns the BSHD-native output [B, S, H, D].
+        # kv_split=1: the shape-aware default (32 for any Sq >= 4) is a DECODE
+        # rule. With Sq in the hundreds-to-thousands the per-split partial
+        # buffer [B, Sq, Hq, y, D] fp32 grows with Sq and the split-combine
+        # dominates: measured 34-42 ms at Sq=1536/1728 with y=32, against 7 ms
+        # at Sq=2304 where the 512 MiB budget happens to force y=1. Bidirectional
+        # prefill-shaped attention has no KV-split parallelism to win: the query
+        # axis already supplies the grid.
         got = gfx906_fa.forward(
             to_kernel(qs).float().contiguous(),
             gfx906_fa.quantize_q8_0(to_kernel(ks).contiguous()),
             to_kernel(vs).contiguous(),
             float(scale),
             kv_max,
+            kv_split=1,
         )[..., :head_size].to(query.dtype)
 
-        if len(grp) == 1 and grp[0][1] == 0:
+        if whole_row:
             out[grp[0][0] : grp[0][0] + 1] = got
         else:
             out[grp[0][0], grp[0][1] : grp[0][1] + ln * len(grp)] = got.reshape(
