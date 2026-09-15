@@ -815,18 +815,49 @@ class RocmPlatform(Platform):
 
         from importlib.util import find_spec
 
-        # gfx906 (VIT-1): prefer the custom Q8 FA for the ViT when explicitly
-        # enabled with GFX906_FA_VIT_AUTO=1 (default stays the upstream path
-        # until the screens pass; `--mm-encoder-attn-backend custom` always works).
+        # gfx906 (VIT-1): prefer the custom Q8 FA for the ViT. Default ON since the
+        # 2026-09-15 serving gate (image-prompt TTFT -11.5 % @1024x1024, -55 s of
+        # fresh-boot Triton JIT); `GFX906_FA_VIT=0` restores the upstream path and
+        # `GFX906_FA_VIT_AUTO=0` opts out of auto-selection only. An explicit
+        # `--mm-encoder-attn-backend custom` always works.
         if on_gfx906():
             from vllm.gfx906_fa.gfx906_fa_mm_encoder import (
                 vit_auto_enabled,
-                vit_supported,
+                vit_enabled,
+                vit_unsupported_reason,
             )
 
-            if vit_auto_enabled() and vit_supported(head_size, dtype):
-                logger.info_once("Using CUSTOM (gfx906 FA) backend for ViT attention.")
-                return AttentionBackendEnum.CUSTOM
+            if vit_auto_enabled():
+                reason = vit_unsupported_reason(head_size, dtype)
+                if reason is None:
+                    logger.info_once("Using CUSTOM (gfx906 FA) backend for ViT attention.")
+                    return AttentionBackendEnum.CUSTOM
+                # LOUD on purpose: this is a silent-loss path otherwise. The ViT
+                # keeps working, but it loses the MI50-tuned kernel and pays the
+                # per-boot Triton JIT; worse, depending on what is installed the
+                # fall-through chain can end at TORCH_SDPA (unfused) rather than
+                # flash-attn. Note `on_cdna()` is a substring test that is TRUE on
+                # gfx906, so the "CDNA" branch below is the usual upstream pick.
+                logger.warning_once(
+                    "gfx906 CUSTOM ViT attention UNAVAILABLE (%s); falling back to "
+                    "the upstream ViT backend. VIT-1's image-prompt win (-11.5 %% "
+                    "TTFT at 1024x1024) and its fresh-boot saving do NOT apply to "
+                    "this model. See docs/gfx906/DEVLOG-vit1.md.",
+                    reason,
+                )
+            elif not vit_enabled():
+                logger.info_once(
+                    "gfx906 CUSTOM ViT attention disabled by GFX906_FA_VIT=0 "
+                    "(upstream ViT path in use)."
+                )
+            else:
+                logger.info_once(
+                    "gfx906 CUSTOM ViT attention is available for head_size=%d %s "
+                    "but auto-selection is off (GFX906_FA_VIT_AUTO=0); upstream "
+                    "ViT path in use.",
+                    head_size,
+                    dtype,
+                )
 
         from vllm._aiter_ops import rocm_aiter_ops
 

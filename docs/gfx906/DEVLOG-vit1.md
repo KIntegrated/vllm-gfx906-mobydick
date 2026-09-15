@@ -129,6 +129,14 @@ ViT share is small enough that the win is 2.5 %.
   prompt drift but not a skipped computation.
 - The `kv_split` finding is the **third** decode-tuned default that misbehaves on
   prefill-shaped input; see also the MTP-1b-0 budget note in `gfx906_fa.cpp`.
+- **The fall-through is now loud.** `ROCmPlatform.get_vit_attn_backend` used to
+  drop to the upstream path silently, which is how a model quietly loses the
+  MI50-tuned ViT kernel; it now logs `gfx906 CUSTOM ViT attention UNAVAILABLE
+  (<reason>)…` at WARNING, with the reason (dtype, head size, or the kill switch)
+  from `vit_unsupported_reason()`. Worth knowing for that path: `on_cdna()` is a
+  substring test (`"gfx9" in arch`) that is **TRUE on gfx906**, so the usual
+  upstream pick is the "CDNA" flash-attn branch — and if `flash_attn` is not
+  installed the chain ends at unfused `TORCH_SDPA`.
 
 ## Refrigerated residue
 
@@ -137,9 +145,30 @@ ViT share is small enough that the win is 2.5 %.
   in-kernel). A fp16-K instantiation would remove both the ~2e-2 error (→ the
   upstream path's 4e-4 class) and the quantise pass. Kernel work, not adapter
   work; not attempted.
-- **head_dim 96 instantiation**: 72 → 128 wastes 78 % of the QK/PV head-dim work
-  (the launcher only dispatches {64,128,256}). 96 would cut ~25 % of the
-  arithmetic at the ViT shapes; touches the tile config table.
+- **head_dim 96 instantiation — quantified, not yet attempted.** Cost tracks the
+  **padded** head dim, not the useful one: with the D=128 instantiation,
+  head_size 72 / 80 / 96 / 112 / 128 all cost **7.68–8.00 ms** (96–100 % of each
+  other, `bench_vit_dscale.py`, H=16 S=2304, mclk 800 MHz) while the D=64
+  instantiation is **3.205 ms**, i.e. 0.050 ms/dim at 64 vs 0.063 ms/dim at 128.
+  So the 56 zero dims of the 72 → 128 pad are pure cost, and a 96-wide instance
+  would remove exactly 25 % of the head-dim arithmetic: at the measured per-dim
+  costs that is **~5.5–6.0 ms vs 7.78 ms → −22 … −29 % on the ViT attention**,
+  worth **≈ −0.25 s of TTFT at 1024×1024 (−5 %)** and −0.7 % at 512×512 (the ViT
+  is ~19 % of the custom path's TTFT there).
+  *Accuracy is unaffected*: q8_0 blocks are 32-wide, so D=96's three blocks are
+  the first three of today's D=128 (dims 64–95 = 8 real + 24 zeros either way) —
+  only the redundant all-zero fourth block disappears. Measured rel err is
+  padding-independent: 0.0156 / 0.0172 / 0.0199 / 0.0182 at head dim 64 / 72 / 96 /
+  128.
+  *Risks*: (a) the `(DKQ=96, DV=96)` tile-config entry (nthreads, occupancy,
+  nbatch_fa, nbatch_K) is new and untuned — the ±25 % per-dim spread between the
+  64 and 128 entries shows config quality dominates, and a bad entry can end up
+  **slower** than the padded 128 path; (b) build size/time grows per
+  (DKQ, DV, ncols) instance, so instantiate only the ncols1 the ViT picks (64 for
+  Sq > 32); (c) the launcher's `switch (head_dim)` is shared — a mis-keyed table
+  entry could shadow an existing case, and any other caller asking for 96 (the
+  paged paths derive 256) moves onto the new kernel; (d) `_pad_head_dim` must learn
+  96, which likewise moves any caller with head_size 80–96 onto it.
 - Standalone `Sq=1536/1728` single-row calls stay 4–9× slower than the
   budget-forced large-`Sq` case *without* the override — any future caller of the
   dense entry with prefill-shaped input needs the same `kv_split=1`.

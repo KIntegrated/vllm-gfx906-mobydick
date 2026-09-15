@@ -50,9 +50,12 @@ import torch
 from vllm import _gfx906_fa_C as gfx906_fa
 
 
+_INSTANTIATED_HEAD_DIMS = (64, 128, 256)
+
+
 def _pad_head_dim(head_size: int) -> int | None:
     """Smallest instantiated kernel head dim that fits (None if none does)."""
-    for hd in (64, 128, 256):
+    for hd in _INSTANTIATED_HEAD_DIMS:
         if head_size <= hd:
             return hd
     return None
@@ -79,12 +82,31 @@ def vit_auto_enabled() -> bool:
     return vit_enabled() and os.environ.get("GFX906_FA_VIT_AUTO", "1") == "1"
 
 
-def vit_supported(head_size: int, dtype: torch.dtype) -> bool:
+def vit_unsupported_reason(head_size: int, dtype: torch.dtype) -> str | None:
+    """Why the custom ViT path cannot serve this shape/dtype (None = it can).
+
+    Separate from `vit_supported` so the caller can *say* why it fell back: a
+    silent fall-through loses the MI50-tuned kernel, the -11.5 % image-prompt
+    TTFT win and the fresh-boot saving, and depending on what is installed can
+    land on unfused SDPA instead of flash-attn (VIT-1, DEVLOG-vit1.md).
+    """
     if not vit_enabled():
-        return False
+        return "custom ViT path disabled by GFX906_FA_VIT=0"
     if dtype not in (torch.float16, torch.float32):
-        return False
-    return _pad_head_dim(head_size) is not None
+        return (
+            f"dtype {dtype} is neither fp16 nor fp32 — the Q8 FA kernel takes fp16 "
+            "Q/K/V, and casting to reach it would be lossy for bf16"
+        )
+    if _pad_head_dim(head_size) is None:
+        return (
+            f"head_size {head_size} exceeds every instantiated kernel head dim "
+            f"{_INSTANTIATED_HEAD_DIMS} (the launcher dispatches those only)"
+        )
+    return None
+
+
+def vit_supported(head_size: int, dtype: torch.dtype) -> bool:
+    return vit_unsupported_reason(head_size, dtype) is None
 
 
 def _seq_plan(

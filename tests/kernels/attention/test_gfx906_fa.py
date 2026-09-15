@@ -3068,6 +3068,55 @@ def test_vit_auto_is_default_on_and_falls_back(monkeypatch):
     assert not vit_supported(320, torch.float16)
 
 
+def test_vit_fallback_is_loud_and_explains_itself(monkeypatch, caplog):
+    """VIT-1: an unsupported ViT shape/dtype must not fall back *silently*.
+
+    A silent fall-through keeps the model correct but loses the MI50-tuned ViT
+    kernel (-11.5 % image-prompt TTFT @1024x1024, -55 s fresh-boot Triton JIT),
+    and on gfx906 the fall-through chain can end at unfused TORCH_SDPA rather
+    than flash-attn — note `on_cdna()` is a substring test that is TRUE here
+    ("gfx9" in "gfx906"), so the CDNA branch is the usual upstream pick. This test
+    drives the real `ROCmPlatform.get_vit_attn_backend` with the default env and
+    asserts a WARNING that names the reason.
+    """
+    import logging
+
+    import torch
+
+    from vllm.gfx906_fa.gfx906_fa_mm_encoder import vit_unsupported_reason
+    from vllm.platforms import current_platform
+    from vllm.platforms.interface import AttentionBackendEnum
+    from vllm.platforms.rocm import on_gfx906
+
+    if not on_gfx906():
+        pytest.skip("gfx906-only fallback path")
+
+    monkeypatch.delenv("GFX906_FA_VIT_AUTO", raising=False)
+    monkeypatch.delenv("GFX906_FA_VIT", raising=False)
+    monkeypatch.setenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "TRUE")
+
+    # supported shapes/dtypes report no reason (padded head dims are fine)
+    assert vit_unsupported_reason(72, torch.float16) is None
+    assert vit_unsupported_reason(160, torch.float16) is None  # pads to 256
+
+    # each fallback reason is named
+    bf16_reason = vit_unsupported_reason(72, torch.bfloat16)
+    assert bf16_reason and "bfloat16" in bf16_reason, bf16_reason
+    dim_reason = vit_unsupported_reason(320, torch.float16)
+    assert dim_reason and "320" in dim_reason, dim_reason
+    monkeypatch.setenv("GFX906_FA_VIT", "0")
+    assert "GFX906_FA_VIT=0" in (vit_unsupported_reason(72, torch.float16) or "")
+    monkeypatch.delenv("GFX906_FA_VIT")
+
+    # ...and the selection path warns about it, loudly, with the reason inline
+    with caplog.at_level(logging.WARNING):
+        backend = current_platform.get_vit_attn_backend(320, torch.float16, backend=None)
+    assert backend != AttentionBackendEnum.CUSTOM, backend
+    msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("CUSTOM ViT attention UNAVAILABLE" in m for m in msgs), msgs
+    assert any("320" in m for m in msgs), msgs
+
+
 def test_vit_bidirectional_matches_sdpa():
     """VIT-1: the dense FA entry serves bidirectional ragged ViT attention.
 
