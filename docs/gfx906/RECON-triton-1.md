@@ -177,6 +177,36 @@ env MAX_JOBS=14 TRITON_APPEND_CMAKE_ARGS="-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON" \
   live `3.6.0+gfx906` editable install is untouched (rollback:
   `pip install -e /local/git/triton-gfx906`).
 
+## 4d. Screens on stock v3.8.0 — all four gates passed (2026-09-15)
+
+Wheel installed over the editable fork (rollback `pip install -e
+/local/git/triton-gfx906`), same boot for the A/B, same vLLM build throughout.
+
+| gate | result |
+|---|---|
+| **FA suite** | **97 passed** (`tests/kernels/attention/test_gfx906_fa.py`) |
+| **in-process PPL** (dense 27B, V2) | **10.5472** (359 tokens, **0** top-20 misses) vs the fork's 10.5516 → **−0.04 %** |
+| **greedy identity control** | a fixed 32-token temp-0 completion is **byte-identical** between the two triton builds — the PPL shift is fp-accumulation rounding below the argmax threshold, not a semantic change |
+| **ViT fallback smoke** (`GFX906_FA_VIT=0`) | the upstream flash-attn/Triton-AMD ViT path compiles and runs under 3.8.0; both image requests returned sane output (1024×1024 TTFT 6.43 s, `sum_logprob` −2.229 vs the fork's −2.205 on the same `prompt_sha1`) |
+| **serving parity** (MTP k=3, agentic corpus, 64k+120k, 2 reps, same boot) | ms/step **85.4 vs 85.8 @64k** (−0.5 %) and **127.9 vs 128.2 @120k** (−0.2 %) → parity |
+
+**Caveat worth keeping:** *throughput* is not comparable across a triton change.
+The two arms ran identical prompts (`prompt_sha1` matched) yet acceptance diverged
+(2.19/1.74 vs 1.76/1.50 @64k) → t/s means of 34.9 vs 30.5 for identical per-step
+cost. A different codegen perturbs the draft path's numerics just enough to send
+spec-decode trajectories down different branches; **ms/step is the metric**, exactly
+as the CAT-1 investigation concluded.
+
+**Adoption state:** the A/B left the **fork** installed (the known-good default).
+Switching to stock 3.8.0 is one command (install the wheel in
+`/local/tmp/triton-v380/wheel/`); a fresh triton *version* recompiles every triton
+kernel it uses on first boot (both arms booted ~450 s here with `NOCACHE=1`), which
+is a one-time cost per version change, not a recurring one.
+
+**Open, small:** the `supportsDirectToLdsLoadBitWidth` gap (§2) — worth a
+measurement before carrying a patch, and a good upstream PR against #9628 either
+way.
+
 ## 5. Options (superseded by §2 — kept for the record)
 
 - **A — stay on 3.6.0+gfx906.** Zero work, known-good. The fork remains a

@@ -1685,7 +1685,22 @@ wrong instrument and the roadmap item is documentation, not a bug hunt.
 
 ### TRITON-1 — move to stock Triton with native gfx906 support (perf secondary)
 
-**Status: recon DONE (2026-09-15) — and the answer is better than expected:
+**Status: recon + screens DONE (2026-09-15) — stock Triton 3.8.0 supports gfx906
+and is at parity; only the adoption decision is left.** All four gates passed on
+stock v3.8.0 (FA suite 97; in-process PPL 10.5472 vs the fork's 10.5516 = −0.04 %
+with a **byte-identical** 32-token greedy completion, i.e. fp rounding not a
+semantic change; the `GFX906_FA_VIT=0` flash-attn/Triton-AMD ViT fallback compiles
+and runs; serving MTP k=3 agentic ms/step 85.4/127.9 vs the fork's 85.8/128.2 =
+parity). Note for any future triton swap: **t/s is not comparable across a triton
+change** — identical prompts gave acceptance 2.19/1.74 vs 1.76/1.50 and hence t/s
+34.9 vs 30.5 at parity per-step cost; ms/step is the metric. Remaining: (a) decide
+to adopt (one command; the box currently has the fork installed), (b) the small
+`supportsDirectToLdsLoadBitWidth` gap (v3.8.0 has no `GCN5_1` case, the fork
+allowed 32-bit) — measure before patching, and offer the one-liner upstream against
+#9628 either way, (c) if adopted, update `requirements/build/rocm.txt`/docs and
+re-run the release validation on the new install.
+
+**Original recon (2026-09-15) — the answer was better than expected:
 stock Triton supports gfx906 since v3.8.0, so this is an *upgrade*, not a port.**
 See [`RECON-triton-1.md`](RECON-triton-1.md). Findings: (**i**) the fork carries
 **nothing but a 7-line ISA classification** (its history is upstream source drops
