@@ -22,9 +22,27 @@ the date an investigation began.
   workaround unnecessary is still open; the arms need interleaving to survive the
   load lottery.
 
+## 2026-09-15 (GEMMA4-1: the model is fine, the gate was wrong)
+
+- **Gemma-4 was never broken and there is no 0.28→0.29 regression.** Two probes misled
+  this item: (a) the in-process PPL probe (degenerate 84261/108909, 0 top-20 misses —
+  a prompt/format artifact), and (b) my raw-text generation probe on 0.29, which showed
+  garbage and was then *reproduced byte-identically by the 0.28 image*, proving the
+  lines agree rather than that the model is broken. Root cause of both: Gemma-4 is an
+  **instruction-tuned** checkpoint that does not continue raw text. With its chat
+  template it answers correctly and confidently — `'Paris//'` at first-token logprob
+  0.00, and a correct Python function snippet at ≈0.00 (`/local/tmp/b4/gemma_diag.log`).
+- So the model's "supported, 67.79 t/s" row is a *speed* claim that was never backed by
+  an output gate — the same class of proxy error as the acceptance and CAT-1 lessons.
+  The gate for it (and for its V2 flip) is a **templated** in-process comparison or a
+  serving A/B; the templated V1-vs-V2 parity run is in flight.
+
 ## 2026-09-15 (0.29 line: missing-model investigation)
 
-- **Gemma-4 is broken on the 0.29 line — a regression, not a probe limitation.**
+- **(CORRECTED 18:55 — see the next entry: Gemma-4 is *not* broken and it is not a 0.29
+  regression; the raw-text probe below was invalid for an instruction-tuned
+  checkpoint, and the 0.28 image reproduces the identical output.)**
+  ~~Gemma-4 is broken on the 0.29 line — a regression, not a probe limitation.~~
   In-process greedy completions at temperature 0 (V1) are garbage
   (`' it it it it most is it it ...'`, `'<|||||||로. ...'`), which is what the
   degenerate PPL (84261.54 V1 / 108909.96 V2) was telling us. The same checkpoint

@@ -1669,39 +1669,46 @@ this stack, so lead with the numbers, not the diff); (3) only then decide whethe
 the V2 CAT-1 config becomes the recommended one (it is currently the fastest
 configuration measured on this box).
 
-### GEMMA4-1 — Gemma-4 does not serve sanely on the 0.29 line (was: "find a valid gate")
+### GEMMA4-1 — Gemma-4 is fine; the *gate* was wrong (it needs its chat template)
 
-**Status: open, and the problem is bigger than the gate — it is a 0.29 regression
-(2026-09-15).** The item was originally about the in-process PPL probe being unable
-to gate `cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit` (both runners returned a degenerate
-distribution). A direct generation probe shows the *model* is broken on 0.29, not
-the probe: in-process greedy completions **at temperature 0, V1** produce garbage —
+**Status: corrected 2026-09-15 — no regression, no model defect; the probe was
+invalid.** The item's three successive readings, with the evidence that settled it:
 
-```
-PROMPT 'The capital of France is'
-  text: ' it it it it most is it it it it it it it it it it it it it it it ...'
-PROMPT 'def quicksort(arr):\n    '
-  text: '<|||||||로.\n    <|||||||ロ.\n    <|||||||ロ.'
-```
+1. *"The in-process PPL probe can't gate it"* (the original entry) — true, and the
+   right instinct.
+2. *"It's a 0.29 regression"* (my first raw-text generation probe on 0.29) — **wrong**:
+   running the *same* probe against the **0.28 image** on the same checkpoint
+   reproduces byte-identical garbage (`' it it it it most is it it …'`,
+   `'<|||||||||||||'`), so nothing changed between the lines.
+3. *"It's broken on both lines"* (that second reading) — **also wrong**: the model is
+   an **instruction-tuned** checkpoint (`…-it-…`) that does not continue raw text.
+   With its own **chat template** applied it answers correctly and confidently:
 
-(`/local/tmp/b4/gemma_probe_v0.log`; V1 PPL 84261.54, V2 PPL 108909.96, both 0
-top-20 misses — i.e. the degenerate PPL was the *symptom*, and the earlier
-"inapplicable probe" reading was wrong.) On the **0.28 line the same checkpoint was
-the fastest model on record here (67.79 t/s)**, so this is a regression introduced
-somewhere in the 0.29 merge, not a checkpoint or V2 issue.
+   | prompt form | output | first-token logprob |
+   |---|---|---|
+   | raw `'The capital of France is'` | `" a kind.\n\nWait, I'm a kind.…"` | flat top-5 −1.7…−2.6 |
+   | templated "…capital of France? One word." | **`'Paris//'`** | **0.00** |
+   | templated "…function that adds two numbers." | **`'Here is a simple Python function that adds two numbers:\n\n```python\ndef'`** | **≈0.00** |
 
-Where to look: the 0.29 merge touched a lot of Gemma-4 code —
-`gemma4.py` (+64 lines), **`gemma4_mm.py` (+181)**, `gemma4_mtp.py`,
-`gemma4_unified.py`, `gemma4_dspark.py` (new), plus the quantization utils
-(43 files, +1702 total between the 0.28 pin `4b7e0b7eb2` and 0.29 `e730ef4066`) —
-e.g. a new "unified"/dspark path intercepting the config, an AWQ-4bit weight-loading
-change, or the A4B MoE expert config.
+   (`/local/tmp/b4/gemma_diag.log`; the raw-text run also produced the garbage used in
+   reading 2, so both readings came from the same invalid probe.)
 
-Next steps: audit those diffs (CPU-only) → targeted V1 loads with the suspect path
-bypassed → then the original plan (a serving-level gate, and the V2 flip only once
-the model answers sanely). Until then Gemma-4 stays pinned to V1, but note that
-**V1 is also broken for it on 0.29**, so the pin is not a working fallback.
+Consequence: the PPL probe's degenerate values for this model (84261 V1 / 108909 V2,
+0 top-20 misses) are a *prompt/format artifact*, exactly as the original entry
+suspected — its rendered prompts evidently don't give this model a form it continues
+well. The throughput number in `README.md` (67.79 t/s) is a *speed* claim and stands,
+but it never implied correctness — which is why the model looked "supported" while
+being ungated.
 
+**Gate for this model: a templated comparison** (in-process, first-token top-5
+logprobs + text identity, V1 vs V2) or a serving A/B with the chat template. A raw-text
+continuation is not a validity check for an IFT checkpoint.
+
+**Lesson (goes with the AGENTS.md hygiene rules):** an output-sanity gate must use the
+model's own prompt format. "Both builds produce the same garbage" proves the *builds*
+agree, not that the model works; and a throughput number is not a correctness gate.
+
+**Next:** the templated V1/V2 parity run (in flight) → then Gemma-4's V2 flip decision.
 ### MUSE-1 — Muse-Glimmer: V2 parity looks good, but the PPL probe is not its gate
 
 **Status: open (2026-09-15) — checkpoint obtained, first signals in.** The 24 GB AWQ
