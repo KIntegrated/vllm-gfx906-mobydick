@@ -6,6 +6,24 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-15 (0.29 line: missing-model investigation)
+
+- **Gemma-4 is broken on the 0.29 line — a regression, not a probe limitation.**
+  In-process greedy completions at temperature 0 (V1) are garbage
+  (`' it it it it most is it it ...'`, `'<|||||||로. ...'`), which is what the
+  degenerate PPL (84261.54 V1 / 108909.96 V2) was telling us. The same checkpoint
+  was the fastest model on record on the 0.28 line (67.79 t/s). The 0.29 merge
+  rewrote a lot of Gemma-4 code (`gemma4_mm.py` +181 lines, `gemma4.py` +64,
+  new `gemma4_dspark.py`, the Gemma-4 MTP/unified paths, 43 files / +1702 lines
+  including the quantization utils) — that is the suspect area. GEMMA4-1 is
+  reframed accordingly; it stays V1-pinned but V1 is *also* broken for it.
+- **Muse-Glimmer: the AWQ-INT4 checkpoint pull is in progress.** 24 GB / 16 files,
+  throttled unauthenticated at ~2.5 MB/s (~2.7 h); it goes to
+  `/data/cache/huggingface/hub` because the `/local` cache has only ~27 GB free.
+  On arrival: the V2 parity run plus a test of whether stock Triton 3.8.0 makes
+  Muse-Glimmer's `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` workaround unnecessary
+  (that env exists because the rblock variant compile crashed in the triton fork).
+
 ## 2026-09-15 (TRITON-1 adopted)
 
 - **Stock upstream Triton 3.8.0 is now the default** (the ai-infos v3.6.0+gfx906 fork

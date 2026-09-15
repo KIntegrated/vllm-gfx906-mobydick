@@ -1669,21 +1669,52 @@ this stack, so lead with the numbers, not the diff); (3) only then decide whethe
 the V2 CAT-1 config becomes the recommended one (it is currently the fastest
 configuration measured on this box).
 
-### GEMMA4-1 — a valid gate for Gemma-4 (and then its V2 flip)
+### GEMMA4-1 — Gemma-4 does not serve sanely on the 0.29 line (was: "find a valid gate")
 
-**Status: open.** The in-process PPL probe cannot gate
-`cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit`: it loads through the multimodal path and
-**both** runners return a degenerate distribution (V1 84261.54, V2 108909.96 PPL
-over 350 tokens, 0 top-20 misses), so the 2026-09-14 V2 parity session produced no
-signal for it and the model stays pinned to V1. Work: find the real failure mode
-first (is it the probe's text-only path on a multimodal loader, the A4B MoE
-config, or the AWQ-4bit quant path on gfx906?), then gate Gemma-4 by serving A/B
-(same boot, identical prompts) instead of the probe, and flip it to V2 only after
-that passes. Cross-check: does Gemma-4 serve at all today via the normal server
-path (with mm preprocessing + chat template)? If it does, the probe is simply the
-wrong instrument and the roadmap item is documentation, not a bug hunt.
+**Status: open, and the problem is bigger than the gate — it is a 0.29 regression
+(2026-09-15).** The item was originally about the in-process PPL probe being unable
+to gate `cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit` (both runners returned a degenerate
+distribution). A direct generation probe shows the *model* is broken on 0.29, not
+the probe: in-process greedy completions **at temperature 0, V1** produce garbage —
 
-### TRITON-1 — move to stock Triton with native gfx906 support (perf secondary)
+```
+PROMPT 'The capital of France is'
+  text: ' it it it it most is it it it it it it it it it it it it it it it ...'
+PROMPT 'def quicksort(arr):\n    '
+  text: '<|||||||로.\n    <|||||||ロ.\n    <|||||||ロ.'
+```
+
+(`/local/tmp/b4/gemma_probe_v0.log`; V1 PPL 84261.54, V2 PPL 108909.96, both 0
+top-20 misses — i.e. the degenerate PPL was the *symptom*, and the earlier
+"inapplicable probe" reading was wrong.) On the **0.28 line the same checkpoint was
+the fastest model on record here (67.79 t/s)**, so this is a regression introduced
+somewhere in the 0.29 merge, not a checkpoint or V2 issue.
+
+Where to look: the 0.29 merge touched a lot of Gemma-4 code —
+`gemma4.py` (+64 lines), **`gemma4_mm.py` (+181)**, `gemma4_mtp.py`,
+`gemma4_unified.py`, `gemma4_dspark.py` (new), plus the quantization utils
+(43 files, +1702 total between the 0.28 pin `4b7e0b7eb2` and 0.29 `e730ef4066`) —
+e.g. a new "unified"/dspark path intercepting the config, an AWQ-4bit weight-loading
+change, or the A4B MoE expert config.
+
+Next steps: audit those diffs (CPU-only) → targeted V1 loads with the suspect path
+bypassed → then the original plan (a serving-level gate, and the V2 flip only once
+the model answers sanely). Until then Gemma-4 stays pinned to V1, but note that
+**V1 is also broken for it on 0.29**, so the pin is not a working fallback.
+
+### MUSE-1 — Muse-Glimmer: checkpoint pull in progress
+
+**Status: open; the AWQ checkpoint is downloading (2026-09-15).** Only the GGUF was
+local. The AWQ-INT4 repo is 24 GB of 16 files; pulls here are throttled
+unauthenticated (~2.5 MB/s ⇒ ~2.7 h; a HF token would raise the limits). It could
+not go to the usual cache: `~/.cache/huggingface` → `/local/cache` has only ~27 GB
+free box-wide, so the pull targets **`/data/cache/huggingface/hub`** (586 GB free).
+Once it lands: the V2 parity run (in-process PPL, V1 vs V2) *and* a specific test
+this item inherits from TRITON-1 — Muse-Glimmer needed
+`TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` because the rblock *variant* compile crashed
+in the old triton fork; with stock Triton 3.8.0 that workaround may be obsolete.
+
+### TRITON-1### TRITON-1 — move to stock Triton with native gfx906 support (perf secondary)
 
 **Status: DONE — ADOPTED (2026-09-15).** Stock upstream **Triton 3.8.0** is the
 default; the ai-infos fork (v3.6.0 + a 7-line gfx906 patch) is retained only as a
