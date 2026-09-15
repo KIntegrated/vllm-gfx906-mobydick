@@ -99,6 +99,12 @@ def main():
             "BENCH_CHAT_TEMPLATE=1 to gate those.",
             flush=True,
         )
+    # NOTE (2026-09-15, verified): templating does NOT make the probe valid for IFT
+    # checkpoints — prompt-logprob PPL asks the model to predict the *user's* tokens, which
+    # an instruct model was never trained to model. Measured on Gemma-4: raw text PPL 84261,
+    # templated PPL 1278491 (0 top-20 misses in both). Use
+    # benchmarks/kernels/gfx906/ift_chat_gate.py (templated generation + first-token
+    # logprobs) or a serving A/B for those models.
     if render_chat:
         prompts = [
             tokenizer.apply_chat_template(
@@ -109,7 +115,10 @@ def main():
             for p in PROMPTS
         ]
         print("NOTE: prompts rendered through the chat template "
-              "(BENCH_CHAT_TEMPLATE=1) — not comparable to the raw-text bands",
+              "(BENCH_CHAT_TEMPLATE=1) — not comparable to the raw-text bands. For an "
+              "IFT-only checkpoint this number is still NOT a gate: the protocol asks "
+              "the model to predict user tokens (Gemma-4: raw 84261, templated "
+              "1278491). Use ift_chat_gate.py instead.",
               flush=True)
     else:
         prompts = list(PROMPTS)

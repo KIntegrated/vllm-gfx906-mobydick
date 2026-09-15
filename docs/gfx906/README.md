@@ -77,9 +77,16 @@ carried this caveat; it is now *enforced* by the harnesses.
 | Qwen3.5/3.8 dense + MoE, Nemotron 3.5 Lightning, Ornith | **valid** — the recorded reference bands were measured this way | fine (and correct for real traffic) |
 | **Gemma-4-*-it, Muse-Glimmer** | **invalid: garbage that is not a defect** | **required** |
 
+**The PPL probe cannot gate these models at all** — not even templated: its protocol scores
+the *user's* tokens, which an instruct model is not trained to model (Gemma-4: raw text
+84261, templated **1278491** — both artifacts). Use the **templated generation gate**,
+`benchmarks/kernels/gfx906/ift_chat_gate.py` (greedy continuation + first-token top-k
+logprobs per prompt; run it twice and compare text/logprobs), or a serving A/B.
+
 Enforcement: `benchmarks/kernels/gfx906/ppl_probe.py` warns loudly when the tokenizer has
 a chat template while `BENCH_CHAT_TEMPLATE` is unset, and renders prompts through the
-template when it is set (those numbers are **not** comparable to the raw-text bands);
+template when it is set — while telling you those numbers are still not a gate for IFT
+checkpoints;
 `_bench_gfx906.py` records `prompt_form`/`has_chat_template` in every row and warns that
 **tokens/s is a speed measurement, not a correctness gate** — Gemma-4 sat in this table as
 "supported, 67.79 t/s" for weeks without ever having been gated, which is how the trap

@@ -219,8 +219,11 @@ canonical runner is the local venv recipe in §0.
 **Prompt format first:** these harnesses fill *raw text*. Valid for the
 Qwen3.x/Nemotron/Ornith models the reference bands were measured on; **invalid for
 instruction-tuned checkpoints (Gemma-4-*-it, Muse-Glimmer)**, where raw text returns
-garbage that is not a defect. `ppl_probe.py` takes `BENCH_CHAT_TEMPLATE=1` for those and
-`_bench_gfx906.py` records the prompt form; see the prompt-format note in `README.md`.
+garbage that is not a defect, and the PPL probe cannot gate them even templated (its
+protocol scores the user's own tokens). Use `benchmarks/kernels/gfx906/ift_chat_gate.py`
+for those — templated generation + first-token top-k logprobs, comparable across
+configurations — or a serving A/B. `_bench_gfx906.py` records the prompt form; see the
+prompt-format note in `README.md`.
 
 ### `_bench_gfx906.py` env-var surface (W1 additions, 2026-08-26)
 

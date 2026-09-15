@@ -22,6 +22,21 @@ the date an investigation began.
   workaround unnecessary is still open; the arms need interleaving to survive the
   load lottery.
 
+## 2026-09-15 (IFT gate tool + the PPL probe's real limit)
+
+- **`BENCH_CHAT_TEMPLATE=1` does not make the PPL probe valid for IFT checkpoints** —
+  verified, not assumed: templating Gemma-4's prompts makes the number *worse*
+  (PPL **1278491** vs 84261 raw, 0 top-20 misses in both) because prompt-logprob PPL asks
+  the model to predict the **user's** tokens, which an instruct model was never trained to
+  model. Both are prompt-format artifacts.
+- So the shipped gate for those models is a new repo tool,
+  **`benchmarks/kernels/gfx906/ift_chat_gate.py`**: renders each prompt through the model's
+  chat template and prints the greedy continuation plus the first-token top-k logprobs —
+  a confident first token (≈0.00) with a sensible completion is the signal, and running it
+  under two configurations gives a parity gate by comparing text and logprobs (that is how
+  Gemma-4's V2 validation was done). The prompt-format note, `running.md` and the probe's
+  own warning now point there instead of promising the flag fixes it.
+
 ## 2026-09-15 (GEMMA4-1 CLOSED + prompt-format guards)
 
 - **Gemma-4's V2 gate passed**: a *templated* in-process V1-vs-V2 comparison gives
