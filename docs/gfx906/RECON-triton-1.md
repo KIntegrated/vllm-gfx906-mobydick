@@ -226,6 +226,24 @@ Switching to stock 3.8.0 is one command (install the wheel in
 kernel it uses on first boot (both arms booted ~450 s here with `NOCACHE=1`), which
 is a one-time cost per version change, not a recurring one.
 
+**Per-model gates on stock 3.8.0 (2026-09-15, in-process, V2, single GPU)** — the
+dense 27B was already covered (FA suite 97, PPL 10.5472 vs 10.5516, serving ms/step
+parity). The other models were run because they exercise *different* Triton paths:
+
+| model | gate | 3.8.0 | recorded reference (fork) |
+|---|---|---|---|
+| MoE 35B (layer-0 Triton `fused_moe`) | `_bench_gfx906.py`, pp=2048/tg=256, 4 samples, mclk 1000 | **57.97 t/s** (58.03/57.97/57.96/57.90) | 58.36 (V2) / 58.43 (0.28) |
+| Nemotron 3.5 Lightning | in-process PPL | **26.9937** (365 tok, 0 misses) | 27.0066, band 26.96–27.02 |
+| Ornith 1.5-35B-A3B | in-process PPL | **16.6664** (359 tok, 0 misses) | 16.7824 |
+
+Reading: MoE is within 0.7 % (and inside the ±2–6 % per-process spread), Nemotron
+within 0.05 %, and **Ornith shifts −0.7 %** — larger than the other models but still
+a small numeric perturbation with **no change in top-20 misses**. PPL is
+deterministic per (build, model) here (the dense value reproduces bit-exactly across
+processes), so Ornith's −0.7 % is a real codegen effect on that model's kernel mix,
+not noise. Net: all three functional/numeric gates pass; the triton swap perturbs
+numerics at the 0.0x–0.7 % level depending on the model, with no quality cliff.
+
 **Follow-up, interleaved A → B → A (2026-09-15, fresh boot, canary 38.7 t/s).** Same
 corpus body (`prompt_sha1 795844ca5794`, 64k), acceptance and ms/step per *process*:
 
@@ -282,6 +300,26 @@ unreachable; the function is only consulted from inside async-copy lowering/
 coalescing, which gfx906 never enters. There is no behavioural gap and nothing to
 measure; the only residue is a latent inconsistency that would fail **loudly**
 (the `LoadStoreOpToLLVM` asserts) if upstream ever opens that path for gfx906.
+
+## 4e. Adoption status (2026-09-15)
+
+**Green light, with one caveat about the artifact.** All gates pass on stock
+v3.8.0: FA suite 97, dense PPL −0.04 %, MoE −0.7 %, Nemotron −0.05 %, Ornith
+−0.7 % (all 0 top-20 misses), ViT fallback smoke, serving ms/step parity.
+The **published PyPI wheel is not usable on this box** (segfaults on `import
+triton`, with and without the ROCm env; no missing shared libs; no declared
+runtime deps) even though it ships the AMD backend and its `libtriton.so` carries
+`gfx906`; AMD's ROCm-index wheel (`triton==3.7.1+git0263a6a6.rocm7.14.0`, what
+vLLM's `requirements/build/rock.txt` pins) downloads fine and is a candidate but
+has not been functionally tested here. So adoption today = **build the unpatched
+upstream v3.8.0 tag with the documented recipe** (§4c) and install that wheel; it
+carries no patches and is reproducible from the tag, but it is a build artefact we
+produce rather than a stock download. Remaining if we adopt: update
+`requirements/build/rocm.txt`, `running.md` §0, the root README install section
+(which still clones the fork) and `/local/git/AGENTS.md`, then close ROADMAP
+`TRITON-1`. The 0.29.0 **docker image** published 2026-09-15 still ships the fork
+(`preset.0.29.0-rocm-7.14-kintegrated.sh`, triton branch `v3.6.0+gfx906`) — a
+triton-adopting image would be a separate build.
 
 ## 5. Options (superseded by §2 — kept for the record)
 

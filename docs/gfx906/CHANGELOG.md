@@ -6,6 +6,22 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-15 (TRITON-1, model gates)
+
+- **All per-model gates pass on stock Triton 3.8.0.** MoE 35B (layer-0 Triton
+  `fused_moe`) **57.97 t/s** (58.03/57.97/57.96/57.90, mclk 1000) vs the recorded
+  58.36; Nemotron **PPL 26.9937** vs 27.0066 (band 26.96–27.02); Ornith **PPL
+  16.6664** vs 16.7824 — all 0 top-20 misses. Dense 27B and the FA suite were
+  already green. Ornith's −0.7 % is the largest numeric shift (PPL is
+  deterministic per build+model here, so it is a real codegen effect on that
+  model's kernel mix) and is the one number worth remembering when adopting.
+- **Artifact caveat:** the published PyPI `triton-3.8.0` wheel segfaults on import
+  on this box (AMD backend and `gfx906` present; no missing libs, no runtime deps),
+  so adoption means building the unpatched upstream tag with our documented recipe
+  — no patches, reproducible, but a build we produce. AMD's ROCm-index wheel
+  (`3.7.1+git0263a6a6.rocm7.14.0`, vLLM's own `rock.txt` pin) downloads and is an
+  untested alternative.
+
 ## 2026-09-15 (TRITON-1)
 
 - **Stock Triton supports gfx906 since v3.8.0 — validated at parity, so the
