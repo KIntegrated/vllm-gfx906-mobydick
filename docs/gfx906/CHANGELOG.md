@@ -6,6 +6,29 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-15
+
+- **0.29.0 line updated for release: `gfx906/v2-bringup` fast-forwarded into
+  `main` and `gfx906/v0.29.0` (all three at `8c147037f3`, 23 commits, 0 behind).**
+  The release branch now carries the V2 bring-up, VIT-1, the CAT-1 correction, the
+  A3 revival, KVLAYOUT-2's closure and the k=3 spec-decode default.
+- **Decisions recorded for the release.** V2 is the default runner for the
+  validated models (dense 27B, MoE 35B, Nemotron 3.5 Lightning, Ornith);
+  **Gemma-4 and Muse-Glimmer stay pinned to V1** (`VLLM_USE_V2_MODEL_RUNNER=0`)
+  because their parity gate has not passed. **VIT-1 stays default ON** (kill
+  switches `GFX906_FA_VIT=0` / `GFX906_FA_VIT_AUTO=0`, documented in the root
+  README). **V1's removal is upstream 0.32.0**, which sets the deadline for the
+  two pins — tracked in ROADMAP `DFL2-2` / `GEMMA4-1` / `MUSE-1`.
+- **Release docs re-anchored on the 0.29.0/V2 basis:** the root README's install
+  section was empty and now states the stack (ROCm 7.14 + the official AMD DKMS
+  driver for TP=2 P2P), the mandatory `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`,
+  the build recipe, the MTP k=3 + capture-ladder defaults and the wedge/canary
+  protocol; `docs/gfx906/README.md` carries the release basis, the V1-pin list,
+  the VIT-1 knobs and the 0.29/V2 performance rows.
+- **`VLLM_GFX906_FUSED_DRAFT` (A3) is revived but inert** (default OFF, neutral at
+  k=3 and k=7) and **SMLA-1 is parked/inert** (fork fp16 sparse-MLA, default off,
+  DeepSeek-MLA only) — neither blocks the release.
+
 ## 2026-09-14
 
 - **The 0.29.0 line was promoted to `main`** (fast-forward, `main` ==

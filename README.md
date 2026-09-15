@@ -1,5 +1,35 @@
 ## Mini Install Guide for GFX906
 
+**0.29.0 line.** MI50/MI60 (gfx906) cards; single-GPU is the normal mode, TP=2 is
+supported for the dense models (see the TP=2 notes below).
+
+- **Stack:** ROCm **7.14** with the **official AMD DKMS `amdgpu` driver (6.19.14)**
+  — *not* the stock Ubuntu driver. The DKMS driver is required for working TP=2
+  P2P: the stock driver stalls or hangs RCCL P2P/IPC on this dual-root-port
+  topology. On the 7.14 images do **not** set `HSA_OVERRIDE_GFX_VERSION` (7.14
+  targets gfx906 natively; the override belongs to the older 7.2.1 images).
+  Container images and the full environment notes:
+  [`docs/gfx906/running.md`](docs/gfx906/running.md).
+- **`FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` is mandatory at import time.** The ROCm
+  platform aborts without upstream `flash_attn` installed, and the ViT attention
+  wrapper uses this env to select the Triton-AMD path. Still true on 0.29.0 even
+  though the LLM path runs the custom FA (see *Vision-tower attention* below).
+- **Build (editable venv, in-tree extensions):**
+  ```bash
+  uv venv --python 3.12 && source .venv/bin/activate
+  VLLM_VERSION_OVERRIDE=0.29.0 FETCHCONTENT_BASE_DIR=/tmp/vllm-deps \
+    TRITON_KERNELS_SRC_DIR=$PWD/.deps/triton_kernels-src/python/triton_kernels/triton_kernels \
+    MAX_JOBS=10 HIP_VISIBLE_DEVICES=0 .venv/bin/python setup.py build_ext --inplace
+  ```
+  (`running.md` §0/§0.1 has the venv and `.pth` details, the rebuild recipe, and
+  the `VLLM_GFX906_HIP_BLOCKING_SYNC` CPU-idle knob.)
+- **Serving defaults:** MTP **k=3** spec decode plus a cudagraph capture ladder of
+  multiples of `k+1` up to `max_num_seqs × (k+1)`; an undersized ladder silently
+  collapses to B=1. Recipe + rule: `running.md` §1 and [`AGENTS.md`](AGENTS.md).
+- **Operational caveats:** gfx906 hosts accumulate GPU wedges and a degraded state
+  that only a reboot clears. Run the canary probe before trusting spec-decode
+  numbers and follow the two-strike burst rule — [`docs/gfx906/degradation.md`](docs/gfx906/degradation.md).
+
 ## Fork heritage
 
 This repository is the gfx906 vLLM port
@@ -65,6 +95,36 @@ reuse the prompt prefix); the harness default has been prefix caching OFF since
 mclk-verified). See the note under the model table.
 See [`docs/gfx906/`](docs/gfx906/) for the full change inventory, numbers,
 and bench recipes.
+
+### Vision-tower (ViT) attention — custom FA by default on 0.29.0
+
+The Qwen3.5/3.8 VL **vision tower** (bidirectional, cache-free, ragged fp16
+attention at head_dim 72, prefill-only, 27 layers, on the critical path of every
+image-bearing prompt) now also runs on the custom FA. Upstream served it through
+flash-attn's Triton-AMD path, which JIT-compiles its kernels per Triton cache.
+Measured on 0.29.0 (serving, a fresh image every rep so the mm encoder cache
+cannot skip the ViT, `--no-enable-prefix-caching`, identical prompts with
+`prompt_sha1` asserted, 3 reps/arm): image-prompt **TTFT 5.81 → 5.14 s @1024×1024
+(−11.5 %)**, 1.71 → 1.67 s @512×512, and **−55 s of fresh-boot time** (330 → 275 s
+with an empty `TRITON_CACHE_DIR`). That −55 s is the ViT's own Triton JIT; the rest
+of a cold boot's Triton cost is the LLM's GDN kernel, so this does **not** make the
+triton dependency droppable.
+
+The swap is **not bit-equivalent**: the custom path quantises K to q8_0 (rel err
+~2e-2 vs SDPA; flash-attn is 4e-4), so the image-conditioned distribution moves in
+the tail (top-1 preserved, max |Δlogprob| 0.66 at rank 4+, mean logprob
++0.0126/token) and a 256-token greedy description keeps its content but not its
+wording. If you want the upstream path back:
+
+```bash
+GFX906_FA_VIT=0        # kill switch — upstream flash-attn ViT path outright
+GFX906_FA_VIT_AUTO=0   # opt out of auto-selection only (an explicit
+                       # --mm-encoder-attn-backend custom still selects CUSTOM)
+```
+
+Unsupported head dims/dtypes (bf16, head_size > 256, …) fall back to the upstream
+backend automatically and now log a WARNING that names the reason. Full record:
+[`docs/gfx906/DEVLOG-vit1.md`](docs/gfx906/DEVLOG-vit1.md).
 
 ### Model support and performance on gfx906 (single MI50/MI60)
 
@@ -299,6 +359,10 @@ vllm serve <model> \
   (−2.6 / −4.1 ms/step ⇒ **+3.0 % / +2.5 %**), acceptance unchanged. (An earlier
   +23 % figure came from an A/B client that put the arm name in the prompt header
   — retracted, see `docs/gfx906/V2-bringup.md`.)
+  **V1 sunset:** upstream removes the V1 model runner in **0.32.0**, and we track
+  that schedule — the two pinned models above need their V2 parity (or a
+  serving-level gate) before then. Tracked as ROADMAP `DFL2-2` (V2 up to speed),
+  `GEMMA4-1` and `MUSE-1`.
 - `--dtype float16` is required: gfx906 has no bf16 hardware; bfloat16
   checkpoints would fall back to fp32 math.
 - **cudagraph capture sizes = multiples of `num_speculative_tokens + 1`, up to

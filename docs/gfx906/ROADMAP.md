@@ -55,10 +55,11 @@ by upstream's own table the copy cell is the only place it pays.
 **Effort:** medium-high (V2 + 3 patches + a 1.2 GB checkpoint); **risk:**
 medium (V2 never measured on gfx906 for our models — DFL2-2 de-risks it first).
 
-### DFL2-2 — V2 runner up to speed on gfx906 (0.29.0 makes V2 the default; V1 removal scheduled) (**HIGH PRIORITY**, Kevin 2026-09-12)
+### DFL2-2 — V2 runner up to speed on gfx906 (**V1 removal lands in 0.32.0**) (**HIGH PRIORITY**, Kevin 2026-09-12)
 
-**Why now.** vLLM 0.29.0 makes the V2 model runner the default and V1 is
-scheduled for removal in a few releases; DFlash2 and DSpark drafts **force V2
+**Why now.** vLLM 0.29.0 makes the V2 model runner the default and **V1 is removed
+in 0.32.0** (Kevin 2026-09-15), i.e. this is the deadline for the two models still
+pinned to V1 (Gemma-4, Muse-Glimmer — see GEMMA4-1/MUSE-1); DFlash2 and DSpark drafts **force V2
 today** (`config/vllm.py:642`). Every gfx906 optimization and serving gate on
 record — custom FA backend metadata, GDN/mamba ops (incl. the SYV-10 bounds
 port), mamba state-pool sizing, the trimmed capture ladder, default-ON FIX-H2
@@ -1416,8 +1417,8 @@ FAIL if the production change is reverted). See
 
 ### C1 — fuse the routing pipeline (~1 ms/step)
 
-**Status: stage 1 SHIPPED (unmerged, `feat/moe-c1-routing-fusion`);
-stage 2 DEAD-END. Item closed as an active fusion item — the remaining
+**Status: stage 1 SHIPPED and merged to `main` (verified 2026-09-15:
+`feat/moe-c1-routing-fusion` is an ancestor of `main`); stage 2 DEAD-END. Item closed as an active fusion item — the remaining
 topk component is conditional (see below), gated on G1 + a design that
 does not replace the production topk kernel in place.**
 
@@ -1763,7 +1764,8 @@ serving, correctness, and memory gates.
 
 ### C4 — quantize layer-0 routed experts (414 µs/step)
 
-**Status: GO 2026-09-01 (measured; `gfx906/c4-layer0-quant`, pending merge).**
+**Status: GO 2026-09-01 (measured) and merged to `main` (verified 2026-09-15:
+`gfx906/c4-layer0-quant` is an ancestor of `main`).**
 The checkpoint leaves layer 0's routed experts in fp16, so the unquantized
 Triton path costs ~740 µs per call at M=1 (C4 scoping probe) vs 182 µs for
 the gfx906 W4A16 kernel — ~558 µs/step ≈ 4.8% of the ~11.7 ms step.

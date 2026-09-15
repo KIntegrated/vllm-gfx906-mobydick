@@ -36,15 +36,29 @@ Reference point: llama.cpp (Q4_K_XL GGUF, full offload) — **70.3 t/s decode,
 | MoE concurrent decode (N=8) | 166.9 t/s (W4 off) | **191.0 t/s** | +14.5% | W4 skinny fp16 M≤16 (`VLLM_GFX906_SKINNY_M16`, flag on, soak-verified; `DEVLOG-fp16-skinny.md`) |
 
 Correctness gates: PPL on a fixed 442-token probe — MoE band 6.6817–6.6942,
-dense band 6.6993–6.7197. Kernel suites: **89 FA tests collected** (2026-09-13,
-post-A3-strip; the last full run was 92/92 on 2026-09-12) and 43/43 MoE GEMM
-(2026-08-24, not re-run since).
+dense band 6.6993–6.7197; on the 0.29.0 line the in-process probe is
+**bit-identical across V2 / V1 / the 0.28 line (10.5516)**. Kernel suites: **97 FA
+tests** (2026-09-15, default config) and 43/43 MoE GEMM (2026-08-24, not re-run
+since).
+
+**Release basis — 0.29.0 line (2026-09-15).** The V2 model runner is the default
+for the validated models (Qwen3.8-27B dense, MoE 35B, Nemotron 3.5 Lightning,
+Ornith; parity in [`V2-bringup.md`](V2-bringup.md)); **Gemma-4 and Muse-Glimmer stay
+pinned to V1** (`VLLM_USE_V2_MODEL_RUNNER=0`, the two models whose parity run has
+not passed). VIT-1 (ViT attention on the custom FA) is on by default. Upstream
+removes the V1 runner in **0.32.0**, which is the deadline for those two pins —
+see ROADMAP `DFL2-2` / `GEMMA4-1` / `MUSE-1`.
 
 ## Model support status (single MI50, MI60 numbers similar)
 
 All numbers: serving decode t/s, graph mode, pp=2048/tg=256, single
 request (4 samples) unless noted. Recipes: §Bench recipes +
 `DEVLOG-spec-decode.md` (spec-decode arms).
+
+**Runner (0.29.0):** every model below runs the V2 model runner by default except
+**Gemma-4** and **Muse-Glimmer**, which stay pinned to V1
+(`VLLM_USE_V2_MODEL_RUNNER=0`) until their parity gate passes; upstream removes
+the V1 runner in **0.32.0** (ROADMAP `DFL2-2`, `GEMMA4-1`, `MUSE-1`).
 
 | model | status | decode t/s | prefill t/s | notes |
 |---|---|---|---|---|
@@ -160,6 +174,13 @@ MUSE-1 in `ROADMAP.md`.
 ## Performance history (serving, pp=2048/tg=256)
 
 ### MoE — Qwen3.5-35B-A3B-AWQ
+
+0.29.0/V2 restamp (in-process harness, same boot, single GPU, mclk 1000): **V2
+58.36 t/s vs V1 57.86** (+0.9 %, recorded reference 58.43) — the V2 runner is at
+parity, no code change. Dense 27B: **V2 24.90 / 16.33 vs V1 24.82 / 16.27** (warm /
+cold). Agentic TP=2 dense (3 reps, V2): greedy **20.37/13.27**, MTP k=3
+**33.62/23.75**, MTP k=3 + CAT-1 **35.44/24.61** @64k/120k. Vision-tower path
+(VIT-1): image-prompt TTFT −11.5 % @1024×1024, fresh-boot −55 s.
 
 | milestone | t/s | commit |
 |---|---|---|
@@ -362,6 +383,9 @@ targets matrix cores; gfx906 has none).
 
 | env | default | effect |
 |---|---|---|
+| `GFX906_FA_VIT` | 1 | **VIT-1** (0.29.0): custom Q8 FA for the Qwen3.5/3.8 VL **vision tower**; `0` = kill switch back to the upstream flash-attn ViT path |
+| `GFX906_FA_VIT_AUTO` | 1 | whether the ViT path is chosen *automatically*; `0` opts out of auto-selection only (an explicit `--mm-encoder-attn-backend custom` still selects CUSTOM) |
+| `VLLM_USE_V2_MODEL_RUNNER` | (upstream) | `0` forces the V1 runner — still required for **Gemma-4** and **Muse-Glimmer** (V1 removed upstream in 0.32.0) |
 | `GFX906_FA_LEGACY` | 1 | fp16 KV cache + in-kernel Q8 quantize (validated serving default); `0` = Q8 pre-quantized at KV write into a side **view aliased into the fp16 K half** — zero extra KV memory, COW-safe (page copies move the Q8 bytes); attention reads the Q8 directly instead of re-quantizing per read. 2026-08-27: 46/46 suite + default-config and prefix-cache smokes clean. **Orthogonal to the read pattern** (`GFX906_FA_DIRECT_PAGED*`): direct-paged is LEGACY=0-only (round-7 erratum); LEGACY=0's distinct contribution is the Q8 read (no repeated inline quantize). **TP=2 bake executed 2026-08-28 (roadmap M5, boot M): LEGACY=0 was SLOWER than the LEGACY=1 control at every point** (B=1 decode −2.5…−3.7 % @2k/8k; B=4 @2k aggregate −27…−31 %; prefill wash). ****Default stays `1`**; `0` remains an experimental opt-in (zero-extra-KV-memory alias, COW-safe). Round 10 (M6 Part B, same day): rerouting LEGACY=0 B≥2 to the fused-Q8 gather (`GFX906_FA_DIRECT_PAGED_Q8=0`, now the default) recovered B=4 @2k to 35.7 → 46.3 t/s — parity with the 46.7 LEGACY=1 control (same-boot adjudication since run and closed: −6.3 %, see the row end) — with B=1/prefill unchanged; direct-paged is opt-in (=1) with no measured advantage. Mechanism (review-softened 2026-08-28): NOT an int8-compute gap (`v_dot4_i32_i8` is full-rate on gfx906, 4 int8 MAC/cyc, 2× packed fp16; both arms share the same dot — `DEVLOG-fa-kernel-batches.md` M5 entry). The loss is **Sq>1-specific** — the in-process Sq=1 A/B on the identical strided-read path was a wash, which the read-layout theory alone cannot explain; direct-paged's strided Q8-slice reads (136 B slices inside 256-B row strides, 34-B block strides → sector waste) remain the **leading but unconfirmed** hypothesis, with the Sq>1 machinery (round-8 Q-pad/unpad fast paths, graph-capture interaction) at least a co-contributor — devlog round-10 erratum. The flip gate's B=4 half is green; the B=1 same-boot adjudication ran 2026-08-29 (boot O): LEGACY=0 −6.3 % (−6.4 % with direct-paged) — flip CLOSED, default stays 1 (`DEVLOG-fa-legacy0-b1-decode.md`) |
 | `GFX906_FA_FUSED_QUANT` | 1 | fuse quantize into the decode KV gather (bit-equal); `0` kill switch |
 | `GFX906_FA_NC2` | 8 (auto-downgrade) | GQA heads packed per KV block; instantiated {1,2,8}; invalid explicit value = error |
