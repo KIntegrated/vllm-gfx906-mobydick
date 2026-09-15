@@ -68,8 +68,33 @@ a HIP port: they look like small index/dedup kernels — cheap to port, but like
 time-dominant, so subtask 1 decides whether it is worth it. *Rule: no HIP-port decision
 without a profile — the fork's history is full of standalone numbers that did not transfer.*
 
-**Then** the patch port itself (subtask 4), gated as originally specified (interleaved
-arms, agentic corpus, with/without CAT-1, ms/step lead).
+**Session design: subtask 0 and the patch A/B are ONE session — and CAT-1 is why it is
+*not* a factorial.** Verified in code (2026-09-15): our CAT-1 shortlist is loaded inside
+`qwen3_5_mtp.py` from `mtp_draft_vocab_ids.pt`, i.e. it applies to the **MTP** drafter only;
+DFlash/DFlash2 use their own *trained* draft vocabulary (`draft_vocab_size`, default
+`vocab_size`) and separate block machinery (`dflash_config`: `block_size 8`,
+`selector_rank 256`, `mask_token_id` 248070). So a "DFlash2 + CAT-1" cell does not exist,
+and one shared boot answers both questions against a common reference:
+
+| arm | config | answers |
+|---|---|---|
+| A | MTP k=3, plain | reference (no extra machinery) |
+| B | MTP k=3 + CAT-1 | **production baseline** for Q1 |
+| C | DFlash2, no patch | **Q1** (DFlash2 vs MTP) |
+| D | DFlash2 + chain patch | **Q2** (patch on/off) |
+| E | A repeated last | order control (arms run sequentially; acceptance is chaotic) |
+
+The patch is **7 Python hunks in one file** (320+/1−), so C and D can be swapped with **no
+rebuild** — but note it **does not apply cleanly** to our tree (`git apply` fails at
+`dflash2/speculator.py:2`: the RTX3090 fork's file has diverged), so arm D needs a manual
+port. **Sequence: run A, B, C, E first** (that is subtask 0 = Q1, tonight's question) and
+add D once the port is done.
+
+*Metric nuance for a method-vs-method comparison:* unlike a same-config build A/B, the two
+methods use **different draft depths** (DFlash2's recommended `num_speculative_tokens=7`
+vs our MTP k=3), so "lead with ms/step" is not the whole story — report **t/s at each
+method's recommended config** (the decision metric), with ms/step *and* acceptance as the
+supporting detail that separates a cost effect from a depth effect.
 
 ### FD-1 — CLOSED: the MTP fused-draft path was measured (NEUTRAL, stack-confounded) and its only reader is gone
 
