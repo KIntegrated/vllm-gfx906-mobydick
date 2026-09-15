@@ -90,6 +90,42 @@ rebuild** — but note it **does not apply cleanly** to our tree (`git apply` fa
 port. **Sequence: run A, B, C, E first** (that is subtask 0 = Q1, tonight's question) and
 add D once the port is done.
 
+**CAT-1 does NOT come from the DFlash line (checked 2026-09-15).** Our CAT-1 is upstream's
+`qwen3_5-mtp-draft-vocab.patch` — an **MTP** patch — so there is no upstream CAT-1-for-DFlash
+to port. The related upstream DFlash2 work is a *different mechanism* with the same goal
+(draft without paying a full drafter forward): **`dflash2-lookup-drafting.patch`** (178 KB —
+drafts from the request's own context via `dflash2/lookup.py`, deciding the next block length
+from emitted/rejected counts). Verified that its `vocab_size`/`VocabParallelEmbedding`
+references are the model's own embedding table, *not* a corpus shortlist.
+
+**Wedge-efficient measurement plan (Kevin, 2026-09-15).** Every arm is one server load and
+therefore one draw in the boot's wedge lottery, so do not pay for a live baseline unless the
+answer needs it. DFlash2 **forces V2**, so the production bar is already on record:
+**MTP k=3 + CAT-1 on V2 = 35.44 / 24.61 t/s** (64k/120k, 3-rep, 0.29 line) with plain MTP k=3
+at 33.62 / 23.75. Boot-to-boot spread for these arms is ~1–3 % (parity restamps: MoE 58.36 vs
+58.43, dense 24.90 vs 24.82).
+
+1. **Run arm C alone first** (DFlash2, no patch; 1 load). If it lands outside the MTP+CAT-1
+   band by more than ~3 %, that is the answer for Q1 — citation-grade with the boot caveat
+   stated, and no extra wedge draws.
+2. **Only if it lands inside the band**, escalate to the interleaved 3-arm design
+   **C → B → C** (B = MTP k=3 + CAT-1, C repeated last as the order control) so the
+   comparison is same-boot and same-order-position. Plain MTP (arm A) is *not* run live: it is
+   not the config we would serve, and its numbers are on record (V2 33.62 / 23.75).
+3. Arm D (DFlash2 + chain patch) joins once the manual port lands — the patch does not apply,
+   so it is separate work, not a session slot.
+
+**DFlash2 patch family as later follow-ups** (all from `../qwen38-27b-rtx3090/patches/`):
+`dflash2-lookup-drafting.patch` (context-drafting, 178 KB — potentially the biggest win, and
+it is the mechanism Kevin remembered as "CAT-1 for DFlash"), `dflash2-prewarm.patch` (37 KB —
+compile/capture prewarm, a boot-time win we care about given the Triton/inductor stalls),
+`dflash2-z-adaptive-emitted.patch` (1.7 KB — adaptive block length from emitted tokens), and
+the *idea* of applying our own CAT-1 shortlist to the **DFlash2 drafter's** head (its
+`draft_vocab_size` is `None` → the full 248 k vocab, so the same ~2.5 ms/step head-restriction
+saving that MTP got should apply; the shortlist loader would have to move out of
+`qwen3_5_mtp.py`, and the exactness argument carries over unchanged because rejection sampling
+uses the distribution the draft was sampled from).
+
 *Metric nuance for a method-vs-method comparison:* unlike a same-config build A/B, the two
 methods use **different draft depths** (DFlash2's recommended `num_speculative_tokens=7`
 vs our MTP k=3), so "lead with ms/step" is not the whole story — report **t/s at each
