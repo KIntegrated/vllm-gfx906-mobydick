@@ -9,6 +9,12 @@
 editable build of the fork at **3.6.0+gfx906** (`triton 3.6.0+git82957a51`). Do we
 still need the fork, and if we move to upstream, what must we carry with us?
 
+> **Answer, corrected 2026-09-15: upstream supports gfx906 natively since
+> v3.8.0, so we need neither the fork nor a port — see §2.** (The first draft of
+> this recon concluded "upstream still has no gfx906 support"; that was wrong: it
+> was based on grepping for `ISAFamily::VEGA20`, the *fork's* name. Upstream
+> landed the support under a different name, `GCN5_1`, and v3.7.1 predates it.)
+
 ## 1. The fork carries exactly one thing: 7 lines of ISA classification
 
 Its history is upstream source drops with one gfx906 commit after each
@@ -30,25 +36,55 @@ Two further answers come out correct *by default* and need no case:
 `getSharedMemorySize` → 64 KB (gfx906's LDS size) and `getMfmaVersion` → 0, i.e.
 FMA-lowered dots. The 3.6 fork therefore does **not** use MFMA on gfx906.
 
-## 2. Upstream still has no gfx906 support — and VEGA20 was *removed*
+## 2. Upstream *does* support gfx906 — since v3.8.0 (`GCN5_1`)
 
-Checked `upstream/main`, `v3.7.1` and `v3.8.0`: no `GK_GFX906` mapping anywhere,
-and `ISAFamily::VEGA20` no longer exists — v3.7.1's enum is
-`{Unknown, CDNA1..4, RDNA1..4, GFX1250}`.
+**`aa53dba7455` "[AMD] Add GCN5.1 / gfx906 target (#9628)"** (Luna Nova,
+2026-03-06) introduced native gfx906 support in stock Triton, under a **new
+family name**: `ISAFamily::GCN5_1`, mapped from `GK_GFX906`. It is contained in
+**`v3.8.0`** and *not* in `v3.7.1` (which predates it). The commit's own
+rationale matches both the fork's classification and this recon's conclusions,
+independently:
 
-So the port is **not** "re-apply 7 lines": VEGA20 has to be *reintroduced* (enum
-member plus a case at every site). Port surface, counted as `switch` sites over
-`ISAFamily` in `third_party/amd`:
+> gfx906 has v_dot2_f32_f16 and v_dot4_i32_i8 via VOP3P but **no MFMA** … New
+> `ISAFamily::GCN5_1` mapped from `GK_GFX906` with wave64, DPP broadcast, and
+> `supportsVDot`; this is GCN so **not marked as RDNA/CDNA** and most gates don't
+> need updated. `warpReduce` refactored from isCDNA/isRDNA negative enumeration to
+> a `getIsaVersion()` check (gfx90a+ || gfx11+).
 
-| base | sites | files | notes |
-|---|---|---|---|
-| 3.6.0 (today) | 6 (1 enum + 5 cases) | 3 | the current patch |
-| **v3.7.1** | **11** | 4 | `TargetInfo.cpp` ×6, `TargetUtils.cpp` ×3, `LoadStoreOpToLLVM.cpp` ×1, `AccelerateAMDMatmul.cpp` ×1 |
-| v3.8.0 | 15 | 6 | family/feature logic **restructured** into `Dialect/TritonAMDGPU/IR/TargetFeatures.cpp` (6 sites) — a feature-model port, not a case list |
+The five `GCN5_1` sites in v3.8.0: the enum (`TargetFeatures.h`),
+`deduceISAFamily` (`TargetFeatures.cpp:85`), `getWarpSize` (grouped with CDNA →
+**64** ✓), `supportDppBroadcast` (→ **true** — upstream enables DPP for gfx906,
+which the 3.6 fork left off), and a read-lane/shuffle path in `Utility.cpp:170`.
+`getMfmaVersion` stays 0 (FMA dots) and `getSharedMemorySize` stays 64 KB, both
+correct for gfx906.
 
-**Recommendation: v3.7.1.** It is the version vLLM 0.29 nominates, so the API
-surface is what upstream expects; 3.8.0 adds four sites and a restructured
-feature model for no functional need.
+**Feature parity vs the fork (3.6.0+gfx906):**
+
+| feature | fork | stock v3.8.0 `GCN5_1` |
+|---|---|---|
+| arch recognised | VEGA20 (patch) | **GCN5_1 (upstream)** |
+| wave64 | patch | ✓ |
+| `v_dot` | patch | ✓ |
+| DPP broadcast | default (off) | ✓ **better** |
+| MFMA | 0 (FMA) | 0 (FMA) |
+| shared memory 64 KB | ✓ | ✓ |
+| pre-CDNA2 warp-reduce exclusion | separate logic | ✓ via `getIsaVersion()` |
+| **direct-to-LDS 32-bit** | patch (with CDNA3) | ✗ `supportsDirectToLdsLoadBitWidth` has **no GCN5_1 case** → `false` |
+
+So exactly **one** item is missing versus the fork: the 32-bit direct-to-LDS
+allowance. That is a one-line change in `TargetFeatures.cpp` (add `GCN5_1`
+alongside `CDNA3`) and is a good candidate to offer upstream as a follow-up to
+#9628 — but it only matters if a measurement shows the LDS-direct path is
+actually taken and pays on gfx906; the screens below decide that.
+
+**Consequence:** TRITON-1 reduces to *validating and adopting a stock release* —
+no patch, no fork, no source drops. The 3.7.1 port in §4b is therefore
+**superseded** (kept on the triton-repo branch as a reference; it is also an
+independent implementation of the same design upstream chose).
+
+**Version caution:** vLLM 0.29 nominates `triton==3.7.1+git0263a6a6`, so v3.8.0 is
+*newer* than the nominated pin — the screens must watch for API drift
+(`triton_kernels`, `vllm.triton_utils`, `triton_prefill_attention`).
 
 ## 3. The semantic decisions (the real work, not the lines)
 
@@ -83,7 +119,7 @@ serving A/B (MTP k=3, agentic corpus) → ViT-fallback smoke with
 (`triton_prefill_attention`, `vllm.triton_utils`, and the `triton_kernels`
 build variable `TRITON_KERNELS_SRC_DIR` in the fork's build recipe).
 
-## 4b. The port, as implemented (2026-09-15)
+## 4b. The 3.7.1 port, as implemented — **SUPERSEDED by §2** (kept for the record)
 
 `/local/tmp/triton-v371` = a **worktree of upstream `v3.7.1`** (tag `f797708c06`,
 LLVM pin `1f126a6dea50…`, triton `3.7.1`), branch `gfx906/triton-1` in that
@@ -118,7 +154,30 @@ venv until the wheel exists and every screen is ready to run**, so the live
 `3.6.0+gfx906` editable install stays untouched; rollback is
 `pip install -e /local/git/triton-gfx906`.
 
-## 5. Options
+## 4c. Build recipe for stock v3.8.0 (what actually works here)
+
+`/local/tmp/triton-v380` = worktree of upstream **`v3.8.0`** (tag `c01b6774b1`,
+LLVM pin `5f07f818b51b…` → prebuilt `~/.triton/llvm/llvm-5f07f818-ubuntu-x64-1`),
+built with the **same recipe as the known-good fork build** (`/usr/bin/cc` +
+`/usr/bin/c++`, no `TRITON_BUILD_WITH_CLANG_LLD`), plus one variable:
+
+```bash
+env MAX_JOBS=14 TRITON_APPEND_CMAKE_ARGS="-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON" \
+  .venv/bin/python -m pip wheel . --no-build-isolation --no-deps -w wheel
+```
+
+- `TRITON_BUILD_WITH_CLANG_LLD=1` **must not** be set: it makes triton's CMake ask
+  for bare `clang`/`clang++` on PATH, which this box does not have (ROCm's clang is
+  at `/opt/rocm/llvm/bin`), and the failure is a confusing "not a full path".
+- The 3.8.0 prebuilt LLVM's exported targets request an install-RPATH relink that
+  the Ninja generator refuses (7 × `CMake Error at CMakeLists.txt:415`); CMake's
+  own suggested `CMAKE_BUILD_WITH_INSTALL_RPATH=ON`, forwarded through
+  `TRITON_APPEND_CMAKE_ARGS`, clears it.
+- Wheel only: **nothing is installed into the venv** until the screens run, so the
+  live `3.6.0+gfx906` editable install is untouched (rollback:
+  `pip install -e /local/git/triton-gfx906`).
+
+## 5. Options (superseded by §2 — kept for the record)
 
 - **A — stay on 3.6.0+gfx906.** Zero work, known-good. The fork remains a
   source-drop fork (not rebase-able), and drifts further from what upstream vLLM
