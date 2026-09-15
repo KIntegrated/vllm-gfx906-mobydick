@@ -24,8 +24,9 @@ the date an investigation began.
   build effect — at one corpus body 3.8.0 gave 2.1875 / 1.8132 / 1.7634 / 1.7128
   over four processes (spread 0.475) against the fork's 1.7634 twice, i.e. the
   cross-build delta is *inside the same build's own spread* (lead with ms/step,
-  interleave arms; a variance asymmetry in favour of the fork is visible but not
-  established at n=4 vs n=2); 128-token greedy probes are byte-identical across all
+  interleave arms; the variance-asymmetry hint did not survive the second
+  corpus body — the fork's own two samples there differ by 0.19 and straddle 3.8.0's
+  range, so per-process variance is common to both builds); 128-token greedy probes are byte-identical across all
   runs of both builds on a code prompt yet differ between two runs of the *same*
   build on a prose prompt, so close-call flips are per-process and prompt-dependent;
   the one surviving hint is that the newer Triton may be more process-variable
