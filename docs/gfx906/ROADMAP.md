@@ -24,268 +24,52 @@ default (`VLLM_DFLASH2_CHAIN_GREEDY_ONLY=1`), requires `LOOKUP=1`.** Its precond
 now met: the patch forces the V2 runner, and V2 is validated as the default on this line
 (DFL2-2).
 
-**ENQUEUED 2026-09-15 (tonight, Kevin).** Ready pieces, checked:
-- patch: `../qwen38-27b-rtx3090/patches/dflash2-ngram-chains.patch` (15,963 B);
-- in-tree DFlash2 support already exists (`vllm/v1/worker/gpu/spec_decode/dflash2/`, and
-  `_is_dflash2_draft()` in `config/vllm.py` forces V2), so only the chain feature is
-  missing;
-- drafter checkpoint `incoai/Qwen3.8-27B-DFlash2` — **3.85 GB**, one safetensors
-  (downloading to the local HF cache). Not to be confused with the `z-lab/…` repo that also
-  exists; the model card's usage for the drafter is:
+**ENQUEUED 2026-09-15 (tonight, Kevin) — with subtasks.** Ready pieces, verified:
 
-  ```bash
-  vllm serve <Qwen3.8-27B ckpt> --speculative-config '{"method":"dflash",
-    "model":"incoai/Qwen3.8-27B-DFlash2","num_speculative_tokens":7}'
-  ```
+- patch: `../qwen38-27b-rtx3090/patches/dflash2-ngram-chains.patch` (15,963 B) — touches
+  **one file** (`v1/worker/gpu/spec_decode/dflash2/speculator.py`);
+- in-tree DFlash2 support: `DFlash2DraftModel` is registered (`registry.py:615` →
+  `qwen3_dflash2::DFlash2Qwen3ForCausalLM`), `DFlash2Speculator` exists,
+  `_is_dflash2_draft()` forces V2 (validated, DFL2-2);
+- drafter `incoai/Qwen3.8-27B-DFlash2` downloaded (3.6 GB, RC=0): **5 layers, hidden 5120,
+  32 heads / 8 KV, head_dim 128, `is_causal: false`, sliding_window 2048** — i.e. a small
+  **bidirectional** drafter, and its speculator's chain/lookup machinery is **Triton**
+  (`@triton.jit` in `dflash/speculator.py` and `dflash2/speculator.py`);
+- serving usage (from the model card):
+  `--speculative-config '{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","num_speculative_tokens":7}'`.
 
-Gate: serving A/B on the agentic corpus with arms **interleaved** (same-boot is not
-enough), **with and without the CAT-1 shortlist** (both cut drafter work, so they interact),
-leading with ms/step and reporting per-rep acceptance; k=7 matches the upstream copy-cell
-measurement.
+**Subtask 0 — DFlash2 *without* the patch vs MTP k=3 (do this first; it is interesting on
+its own).** Record whether plain DFlash2 already beats MTP k=3 on gfx906: drafter is 5
+layers against the MTP head, and it drafts a block in parallel, so the case for it is
+independent of the n-gram chains. Serve the dense 27B with the config above vs MTP k=3,
+same boot, **interleaved arms**, agentic corpus (64k/120k), ms/step lead + per-rep
+acceptance + t/s; also with and without CAT-1 (both cut drafter work, so they interact).
+Reference: MTP k=3 agentic on this line is 33.30/24.54 (V1) and 33.62/23.75 (V2).
 
-**Why this one, not SYV-12.** It *removes* work (a whole drafter pass per copy
-step) where SYV-12 *adds* a verify row to every step. Our MI50 stack is
-launch/bandwidth-bound and the always-paid row is what sank SYV-12
-(`/local/tmp/b4/syv12-structural-analysis.md`: 16 % fill fire rate on our own
-pi traffic, ≤ +4 % tokens/step gross against a +1-row-every-step cost). Our
-traffic also has **more copy-tail headroom than upstream's chat prompts**
-(≈3.7–4 % of accepted tokens vs their measured 0.65 %), because agentic turns
-write files back out — so a mechanism that is free when idle and big when
-copying is the right shape here.
+**Subtask 1 — kernel attribution (what actually costs time).** Profile one DFlash2 decode
+step with **rocprofv3** (the only per-kernel GPU method on this box — torch-profiler GPU
+domains are absent on this build; skill `gfx906-rocprofv3-kernel-trace`) split by phase:
+draft forward (5 layers, 32/8 GQA, D=128, bidirectional + sliding-2048), verify (target
+shapes, our FA), and the chain/lookup/sampling Triton kernels. Output: top kernels by
+total time, with the exact serving config.
 
-**Prerequisites (a stack port, not one patch).** (1) V2 runner up to speed on
-gfx906 — see **DFL2-2** (DFlash2 drafts force V2); (2) a DFlash2 draft
-checkpoint — the W4A16-GPTQ `syvai/Qwen3.8-27B-DFlash2-W4A16` (1.2 GB) is
-*plausibly* runnable here now that the gfx906 GPTQ path is confirmed
-(`gptq_gemm`, `gptq_gemm_rdna3`, `moe_gptq_gemm_gfx906`; `auto_gptq.py:192`
-restricts act dtypes to fp16 on gfx906 and `:256` routes MoE to WNA16 — so the
-bf16 3.85 GB drafter is no longer the only option); (3) the lookup patch
-(`dflash2-lookup-drafting.patch`) — it targets
-`v1/worker/gpu/spec_decode/dflash2/speculator.py`, `v1/worker/gpu/model_runner.py`
-and `cudagraph_utils.py`, **the same layout we already carry** (the dflash2
-backport is in our main: `vllm/model_executor/models/qwen3_dflash2.py`,
-`vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py`, registry
-`DFlash2DraftModel`, `config/vllm.py:642` force-V2).
+**Subtask 2 — microbenches of the top kernels.** Standalone, at the real shapes, with the
+mclk gate (`docs/gfx906/dvfs-mi50.md`, skill `kernel-microbenchmark`) — and remembering the
+standalone-≠-production rule: bench the *dispatched* kernel, not a lookalike.
 
-**Gate:** serving A/B on a copy-dense payload (document reproduction /
-apply-edit) showing the upstream-class gain, plus a chat/agentic payload
-confirming flat, plus a token-identity check (upstream: 7/9 long greedy prompts
-identical). Do **not** gate this on our current chat/agentic corpora alone —
-by upstream's own table the copy cell is the only place it pays.
+**Subtask 3 — HIP feasibility for those kernels (Kevin's question).** For each top kernel:
+(a) does the fork already have it? Our custom FA serves **bidirectional** attention at
+D=128 (VIT-1 proved that path) and the dense GEMV / spec-GEMM-M4 family covers small-M
+GEMMs — so the first question is *which attention backend the drafter selects* (`Using …
+backend` log line; if it lands on TRITON_ATTN while our CUSTOM FA would serve it, that is a
+VIT-1-style wiring win, and the sliding-window layers need the `window`/`q_abs_offset`
+path); (b) for kernels with no in-tree equivalent (the Triton chain/lookup helpers), assess
+a HIP port: they look like small index/dedup kernels — cheap to port, but likely not
+time-dominant, so subtask 1 decides whether it is worth it. *Rule: no HIP-port decision
+without a profile — the fork's history is full of standalone numbers that did not transfer.*
 
-**Effort:** medium-high (V2 + 3 patches + a 1.2 GB checkpoint); **risk:**
-medium (V2 never measured on gfx906 for our models — DFL2-2 de-risks it first).
-
-### DFL2-2 — V2 runner up to speed on gfx906 (**V1 removal lands in 0.32.0**) (**HIGH PRIORITY**, Kevin 2026-09-12)
-
-**STATUS 2026-09-15 — the bring-up is DONE for every model whose gate exists; one
-pin left.** V2 is validated and default for the dense 27B, MoE 35B, Nemotron 3.5
-Lightning, Ornith, **and Gemma-4** (gated today through its chat template — see
-GEMMA4-1); evidence and numbers in [`V2-bringup.md`](V2-bringup.md) (PPL bit-identity,
-in-process bench parity, agentic ms/step parity, MoE +0.9 %). **Muse-Glimmer is the only
-remaining V1 pin** (MUSE-1; its templated gate is in flight, and its PPL probe is
-inapplicable by construction — see the prompt-format note in `README.md`). Upstream
-removes the V1 runner in **0.32.0** (Kevin 2026-09-15), so that pin is the deadline item.
-
-**Why now.** vLLM 0.29.0 makes the V2 model runner the default; DFlash2 and DSpark drafts
-**force V2 today** (`config/vllm.py:642`). Every gfx906 optimization and serving gate on
-record — custom FA backend metadata, GDN/mamba ops (incl. the SYV-10 bounds
-port), mamba state-pool sizing, the trimmed capture ladder, default-ON FIX-H2
-and M3 — has only ever been validated on **V1**. V2 carries a `mamba_hybrid`
-model state, so it *claims* our Qwen3.5/3.8 GDN hybrids, but it has never been
-measured here.
-
-**First datapoint (in flight, 2026-09-12):** `VLLM_USE_V2_MODEL_RUNNER=1` +
-MTP k=2 + the real agentic payload, one weight load
-(`/local/tmp/mtp1/v2_probe_driver.sh`), compared against the V1 baseline
-measured minutes earlier on the same boot.
-
-**Work items if it loads:** (a) confirm the gfx906 FA backend is actually
-selected under V2 (log the attention backend name); (b) re-run the standard
-gates — single-card dense-27B and MoE-35B `docs/gfx906/_bench_gfx906.py`,
-then a TP=2 serving A/B at parity vs V1; (c) re-check the trimmed-capture
-assumption (`cudagraph_capture_sizes`) against V2's cudagraph utils;
-(d) re-validate the default-ON fixes under V2's metadata construction (V2
-passes *full-length* host/device `query_start_loc` slices in `mamba_hybrid`,
-unlike V1's `[:num_reqs_padded+1]` — see the review-trains T1/M3 notes);
-(e) decide the fate of the branch's V2 SYV-12 wiring
-(`vllm/v1/worker/gpu/model_runner.py`, archive-bound per T6) — V2 revival of
-SYV-12 needs those hunks.
-
-**Bring-up plan:** the concrete audit (what already rides shared code, the eight
-gaps, the test matrix and the session order) lives in
-[`V2-bringup.md`](V2-bringup.md). V2 stays pinned off until that plan's parity
-steps are signed off; the first question is the fresh-boot init retry (the Y16
-wedge is unresolved, not arch evidence).
-
-**0.29.0 merge (2026-09-13, `gfx906/v0.29.0` → merge `3c445dba56`).** Upstream
-now defaults V2 for **all** models (#53183) and its own ROCm V1 list covers only
-DeepSeek archs, so the fork must pin V1 explicitly: every recipe carries
-`VLLM_USE_V2_MODEL_RUNNER=0` (the env override wins inside
-`VllmConfig.use_v2_model_runner`). Bring-up target is now 0.29.0's V2, whose
-`_get_v2_model_runner_unsupported_features()` + `HAS_TRITON` gate replaces the
-fork's removed `_is_default_v2_model_runner_model()` helper. Also relevant from
-the release: ROCr/CLR update (#53712, graph-replay segfault fix, ~20 % TPOT
-class) and the TheRock 7.14 preview (#49925).
-
-**⚠ Re-investigate before closing (2026-09-13).** The branch currently records
-"V2 forced on Qwen3.8-GDN ⇒ init wedge ⇒ unsupported-by-design". A single
-`hipErrorLaunchFailure` at init is **not** architecture evidence on this box:
-wedges #67–#71 hit the pristine snapshot and non-GDN work with the identical
-signature (load lottery; one authorized retry normally loads clean), so the V2
-conclusion needs a **fresh-boot retry** before GDN is written off — with 0.29.0
-making V2 the default this is a cadence risk, not a detail. Related: the fork's
-**A3 fused-draft opt-in was stripped** (2026-09-13, `VLLM_GFX906_FUSED_DRAFT`;
-brief `/local/tmp/b4/a3-strip-decision.md`, archive `archive/a3-fused-draft`).
-A3 is a V2-only accelerator (the fused loop lives in
-`v1/worker/gpu/spec_decode/autoregressive/speculator.py`, upstream), so if V2
-becomes our path the strip has to be revisited: re-add the ~7-line opt-in and
-re-run the no-op contract audit at the serving k (A3's own k=4 gate was NEUTRAL,
-k=7 was never measured).
-
-**V2 revival detail — variable draft width (2026-09-13).** The branch's V2
-footprint is now **zero**: the SYV-12 ext-column wiring and the two hunks it
-required in V2 files — the truncating draft assign in
-`vllm/v1/worker/gpu/model_runner.py`
-(`draft_tokens[idx_mapping, :draft_tokens.shape[1]] = draft_tokens`, which
-leaves the tail columns holding *stale drafts from the previous step*) and the
-relaxed per-position assert in `vllm/v1/spec_decode/metrics.py` — are reverted
-and preserved on `archive/syv12`. If a future V2 feature reintroduces a
-variable draft width (renewed ext column, or upstream's per-request
-adaptive-verification budgets), **do not** re-apply the truncating assign:
-size the buffer to the max, zero/pad the tail (or pass an explicit per-request
-count downstream), assert the width, and add a test. Upstream's whole-row
-assign fails loudly on a width mismatch — a feature to keep, not to paper over.
-
-**Gate:** same-boot V2-vs-V1 serving A/B at parity or better on both served
-models; otherwise V2 readiness becomes a merge-cadence blocker at 0.29.0.
-
-**Effort:** medium (mostly measurement + fixing whatever V2-specific gaps
-appear); **risk:** low-medium (probe first, one load, no new code).
-
-## High priority — user-requested (2026-09-10)
-
-### VIT-1 — serve the Qwen3.5-family ViT shapes from the custom FA (user request 2026-09-12: kill the Triton ViT path)
-
-**Status 2026-09-15: DONE — default ON.** Items 1-3 landed and gated; see
-[`DEVLOG-vit1.md`](DEVLOG-vit1.md). Image-prompt TTFT (fresh image per rep, same
-boot, identical prompts, prefix cache OFF): **5.81 → 5.14 s @1024×1024 (−11.5 %,
-3/3 reps)**, 1.71 → 1.67 s @512; 256-token probe 6.06 → 5.42 s. Fresh-boot cost
-with an empty `TRITON_CACHE_DIR`: upstream **330 s** vs ours **275 s** → the ViT's
-Triton JIT is **−55 s**, but ~140 s of that 195 s penalty is *other* Triton (the
-LLM's GDN decode kernel is Triton), so **item 4 (dropping the triton-AMD
-flash-attn package) does not follow from this win** and stays open behind the
-per-model dependency audit. Two defects fixed on the way: the adapter asserted a
-`[B,S,H,D]`/`B+1` layout production never passes (the VL towers pass one **packed**
-`[seq_len, 1, hidden]` stream with `cu_seqlens[-1] == seq_len`, so multi-image
-requests would have failed), and the decode-era `kv_split` default (32 for any
-`Sq >= 4`) cost 4-9× on prefill-shaped calls until the adapter pinned `kv_split=1`
-(needed an optional per-call argument on the dense binding). Follow-up queued as
-**VIT-2** (head_dim-96 instantiation, ~−5 % TTFT @1024×1024, measured); an fp16-K
-kernel variant (would remove the ~2e-2 Q8 error) stays on the same residue shelf.
-
-**Kevin 2026-09-12.** Extend `gfx906_fa` (the CUSTOM attention backend) to
-also serve the vision-tower shapes of the Qwen3.5 VL family so the ViT
-stops going through the Triton-AMD flash-attention path. Wins: (a) **no
-per-boot Triton JIT compile / graph-capture stall for the ViT** (the
-`__triton_launcher.c` first-boot compile + capture adds ~tens of seconds
-to every fresh boot and every fresh container), (b) **ViT prefill
-performance** — the ViT runs on the critical path of every image-bearing
-prompt (text+image prefill pays it), and the Triton FA is not MI50-tuned,
-(c) one attention code path — the triton-AMD flash-attn package (editable
-install, `flash_attn_2_cuda` build) becomes removable from the serving
-deps.
-
-Shapes (Qwen3.5/3.8 ViT, SigLIP-style, from the shipped config:
-`hidden_size=1152`, `num_position_embeddings=2304` (48×48 patches),
-`patch_size=16`, `spatial_merge_size=2`, `out_hidden_size=5120`,
-`deepstack_visual_indexes=[]`): **full attention (no window mask in this
-cfg), ~16 heads × head_dim 72, sequences ≈ 2304/merge-tile positions,
-prefill-only (no decode), fp16 KV** — i.e. small head_dim, short seqs,
-batch-over-image-tiles: a very different kernel regime from the LLM path
-(head_dim 256, Hkv 4, 122k contexts, Q8 K).
-
-**Recon (2026-09-13, 0.29 tree) — the kernel work is essentially zero; the effort
-is an adapter + wiring:**
-
-- **Shapes confirmed from the shipped config** (`vision_config`: hidden 1152,
-  `num_heads 16`, depth 27, patch 16, merge 2, 2304 position embeddings) →
-  **head_dim = 1152/16 = 72**, bidirectional (no window mask), prefill-only,
-  fp16 KV, ragged batches (`cu_seqlens` / `max_seqlen`).
-- **No mask or tiling work needed.** The vendored kernel masks *either* via a
-  materialised mask *or* the inline-causal `q_abs_offset`; with **neither** it
-  computes **full bidirectional attention** (`mask=None`, `q_abs_offset=None`,
-  `window=0`, `k_VKQ_max` = per-seq length). The ViT is exactly that case.
-- **A dense, non-paged entry already exists**: `gfx906_fa_forward(q_fp32
-  [B,Hq,Sq,D], k_q8 [B,Hkv,Skv,D*34/32], v_fp16 [B,Hkv,Skv,D], scale, kv_max?,
-  mask?, q_abs_offset?, window, kv_start?)` — no block table, plain contiguous
-  K/V. `MMEncoderAttention` dispatches per backend (`forward_cuda` →
-  `_forward_fa` → `vit_flash_attn_wrapper` on ROCm), so this is a new
-  `_forward_gfx906_fa` arm plus a config default.
-- **D=72 must be padded** (launcher requires `head_size % 32 == 0`) → pad Q/K/V
-  72 → **96** (or 128 if the tile table lacks 96). Zero-padding is **exact**: the
-  padded dims contribute 0 to the QK dot, they quantise to zero Q8 blocks and
-  contribute 0 to P·V, and because the padding is in the *head* dim the softmax
-  denominator is untouched; padded query rows are sliced off.
-- **Contract detail**: the kernel wants Q in fp32 and K pre-quantised Q8, so the
-  adapter reshapes ragged → `[B, H, Sq_pad, D_pad]`, zero-pads, casts Q,
-  quantises K (`quantize_q8_0`), and passes V fp16.
-
-**Work items (revised):** (1) the `_forward_gfx906_fa` adapter + `CUSTOM`
-accepted by `MMEncoderAttention` and defaulted on gfx906 (env kill switch,
-FLASH_ATTN fallback for unsupported shapes); (2) ncols1/kv_split tuning at D=96
-using the existing ladders; (3) screens: a ViT-shaped call vs a torch-SDPA
-reference (bidirectional, ≤5e-2 rel like the FA suite), the FA suite staying
-green, then an image-prompt TTFT A/B **and** a boot-time measurement (killing the
-Triton-AMD ViT JIT/capture stall is half the win); (4) confirm the Triton-AMD
-flash-attn editable install can then be dropped from serving deps.
-**Effort: low-medium** (adapter + wiring + tests; the kernel needs nothing);
-**risk: low** (fallback stays).
-
-**Dep-shedding caveat (Kevin, 2026-09-13): do NOT drop the Triton-AMD
-flash-attn dependency for the ViT win alone.** It must be verified that no other
-model we serve needs it — the fork serves more than the Qwen3.5 family (Gemma-4,
-Muse-Glimmer, Ornith, Nemotron, and anything whose encoder path falls back to
-`FLASH_ATTN`/`TRITON_ATTN` on ROCm). Audit `get_vit_attn_backend`'s ROCm
-fallbacks and the mm-encoder backend list per model *before* removing the
-editable install; the boot-time stall win can be banked for the Qwen3.5 family
-without touching the dependency.
-
-### TP-1 — TP-scaling probe: prefill + decode vs TP, the TP=4 question (queued after the 120k×B4 campaign)
-
-**User request 2026-09-10.** How well do prefill and decode scale with TP;
-would TP=4 pay off? Expectation to test: memory-bw-bound decode should still
-improve with TP (memory access spread over the aggregate HBM of the GPUs).
-**2× MI50 only → TP=4 is not available; TP=2 is the ceiling** (TP=4 answered
-counterfactually). Full analysis + probe design:
-[`ttft-prefill-stall.md` §13.11](ttft-prefill-stall.md).
-
-- **Prefill** = compute-bound → scales ~linearly (measured ~2× at TP=2,
-  Muse 240→500 t/s @32k). TP=4 → ~4×.
-- **Decode** = memory-bw-bound; the bandwidth term (weights ~20 GB loaded LM
-  [21 GB on-disk VL ckpt] + KV 64 KB/token, weight-dominated to ~234k ctx)
-  **does** halve at TP=2 (expectation holds), but a large TP-invariant term
-  (CPU fixed cost + 64-layer per-layer all-reduce, latency-bound at M=1)
-  blunts the net to ~parity at short ctx (measured 39.74 → 39.7 t/s). KV term
-  grows with ctx → scaling should improve at long ctx, but stays
-  weight+fixed-bound for this model to ~234k.
-- **Probe** (two wedge-light loads, GPU0 only), **1 sample/point** (Kevin's
-  2026-09-10 cut, applied — the handoff is low-risk): **(a)** TP=1 greedy, no
-  spec, util 0.93, B=1, at **pp ∈ {32768, 65536} × tg=256** → prefill
-  TTFT/t·s (clean TP ratio vs 442/364) + decode t/s (long-ctx decode scaling,
-  never measured at TP=1). **(b)** TP=1 MTP k=3, B=1, same grid → the
-  **compute-regime test**: MTP verify runs M=1+k (k=3→4/req, more
-  compute-bound than greedy M=1), so TP=2 MTP decode should beat TP=1 MTP by
-  *more* than the greedy parity — compare vs the existing TP=2 MTP k=3 B=1
-  anchors (09-09: 64k×3, 120k×2).
-- **120k point DROPPED — does not fit TP=1.** 21 GB on-disk weights (LM-only
-  loads ~20 GB) leave only ~6 GB KV at util 0.93 ≈ **~90k tokens** (correcting
-  the earlier "~160k / fits 120k" — that assumed ~15 GB weights). 64k fits
-  with headroom and still answers the scaling question. B=4 MTP is also not
-  runnable at TP=1 (4×120k=480k ≫ 90k).
-- **Driver ready** (`/local/tmp/b4/run_postcampaign.sh`, safe startup tears
-  down the orphaned campaign server itself). **Queued after the 120k×B4
-  campaign** (TP=1 = the canary load pattern, least wedge-prone).
+**Then** the patch port itself (subtask 4), gated as originally specified (interleaved
+arms, agentic corpus, with/without CAT-1, ms/step lead).
 
 ### FD-1 — CLOSED: the MTP fused-draft path was measured (NEUTRAL, stack-confounded) and its only reader is gone
 
@@ -1734,7 +1518,8 @@ for Muse-Glimmer (MUSE-1).
 
 ### MUSE-1 —### MUSE-1 — Muse-Glimmer: V2 parity looks good, but the PPL probe is not its gate
 
-**Status: open (2026-09-15) — checkpoint obtained, first signals in.** The 24 GB AWQ
+**Status: open (2026-09-15) — checkpoint obtained, gate run, verdict: V1/V2 parity holds
+at the token that matters; the RBLOCK workaround is obsolete.** The 24 GB AWQ
 checkpoint came down to `/data/cache` (see the pull note below). Findings from the
 first session (0.29 line, stock triton 3.8.0, in-process, single GPU):
 
@@ -1759,6 +1544,32 @@ first session (0.29 line, stock triton 3.8.0, in-process, single GPU):
 - Being a VLM, its vision tower also exercises **VIT-1** on this line — worth
   checking which ViT backend it selects (the new loud fallback warning makes a
   fall-through visible).
+
+**Gate result (clean, post-reset arms; the earlier NaNs were post-wedge contamination —
+see below).** Three arms with `RBLOCK` **unset**: V1, V2, V1 (repeat). The first token is
+identical and confident in every arm (`328` at logprob **0.00** — Glimmer's own
+`to=self` recipient/reasoning marker, which its system prompt defines via "Valid
+recipients: self, user"), and V1 reproduces itself exactly at ranks 2–5. V2's ranks 2+
+differ by ≤0.7 logprob at −18…−25 (numerically irrelevant near-zero probabilities).
+**So: V1/V2 parity holds at the top token, with tail differences inside the
+per-process variation the dense model also shows.** Two consequences:
+
+- **`TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` is no longer needed** — the variant-compile crash
+  (`AttributeError: 'NoneType' object has no attribute '__code__'`) was a **triton v3.6.0
+  fork** defect; every clean arm above ran with it unset on stock Triton 3.8.0. Drop it from
+  Muse-Glimmer recipes.
+- The in-process gate **cannot judge Glimmer's answer quality**: its output is its own
+  recipient/reasoning format (`' to=self…'` then the task restated), so the "should have
+  said Paris" heuristic does not apply and the *text* is not stable across processes (V1
+  said "We", a second V1 run said "Answer" after identical logprobs). Its **flip gate is a
+  serving A/B** (chat endpoint, tokens + ms/step, interleaved arms) — which is also the
+  deadline item, since upstream removes V1 in 0.32.0.
+
+**A caveat recorded for the record:** the *first* gate session's arms (V2 with
+`RBLOCK=0` and V1) both returned **`nan` logprobs**; they ran immediately after wedge #94
+and the clean re-run on the reset GPU produced rc=0 with 0 NaNs — i.e. NaN output is a
+**post-wedge symptom**, not a model or kernel defect. Do not read a post-reset session's
+numbers as evidence.
 
 **Next**: gate it the way its siblings were gated where the probe applies — a
 **serving A/B** (V1 vs V2, same boot, identical prompts, MTP k=3 since MUSE-1's own

@@ -22,6 +22,31 @@ the date an investigation began.
   workaround unnecessary is still open; the arms need interleaving to survive the
   load lottery.
 
+## 2026-09-15 (TRITON-1 rebuild + MUSE-1 gate + DFL2-1 prep)
+
+- **The in-tree extension rebuild with stock Triton 3.8.0 passes** (task 2 of the triton
+  adoption): `setup.py build_ext --inplace` rc=0, then `import vllm` (0.29.0 + triton 3.8.0)
+  and the **FA suite 97/97**. The release build recipe therefore works on the adopted
+  triton; no patches were needed.
+- **MUSE-1 gate: V1/V2 parity at the first token, and the RBLOCK workaround is obsolete.**
+  Clean arms (V1, V2, V1-repeat; `RBLOCK` unset) all start with the same confident token
+  (`328` @ 0.00 — Glimmer's `to=self` recipient marker) and V1 reproduces its ranks 2–5
+  exactly; V2 differs by ≤0.7 at −18…−25. Since the fork-era crash was a **triton 3.6.0**
+  defect, `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` can be dropped from Muse-Glimmer recipes.
+  Its answer-quality gate must be a **serving A/B** (its output is its own recipient/
+  reasoning format, and text is not stable across processes), which is also the 0.32 V1
+  deadline item.
+- **Post-wedge NaN caveat recorded**: the first gate session's arms returned `nan` logprobs
+  because they ran straight after wedge #94; the clean re-run gave rc=0 and 0 NaNs. NaN
+  output is a post-wedge symptom — do not treat a post-reset session's numbers as evidence.
+- **DFL2-1 prepared**: drafter `incoai/Qwen3.8-27B-DFlash2` downloaded (3.6 GB; 5 layers,
+  hidden 5120, 32/8 GQA, head_dim 128, `is_causal: false`, sliding-2048), the chain patch
+  touches one file, and `DFlash2DraftModel` is already registered. Subtasks added: a
+  **baseline DFlash2-vs-MTP-k=3 comparison without the patch**, then **rocprofv3 kernel
+  attribution**, **microbenches** at the real shapes, and a **HIP-feasibility assessment per
+  top kernel** (starting with which attention backend the drafter selects — its attention is
+  bidirectional, which our custom FA already serves).
+
 ## 2026-09-15 (0.29.0 release readiness)
 
 - **Validation matrix on the 0.29.0 line (release candidate state):** FA suite **97/97**;
