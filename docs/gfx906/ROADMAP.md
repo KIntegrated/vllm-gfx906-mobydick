@@ -138,6 +138,23 @@ appear); **risk:** low-medium (probe first, one load, no new code).
 
 ### VIT-1 — serve the Qwen3.5-family ViT shapes from the custom FA (user request 2026-09-12: kill the Triton ViT path)
 
+**Status 2026-09-15: DONE — default ON.** Items 1-3 landed and gated; see
+[`DEVLOG-vit1.md`](DEVLOG-vit1.md). Image-prompt TTFT (fresh image per rep, same
+boot, identical prompts, prefix cache OFF): **5.81 → 5.14 s @1024×1024 (−11.5 %,
+3/3 reps)**, 1.71 → 1.67 s @512; 256-token probe 6.06 → 5.42 s. Fresh-boot cost
+with an empty `TRITON_CACHE_DIR`: upstream **330 s** vs ours **275 s** → the ViT's
+Triton JIT is **−55 s**, but ~140 s of that 195 s penalty is *other* Triton (the
+LLM's GDN decode kernel is Triton), so **item 4 (dropping the triton-AMD
+flash-attn package) does not follow from this win** and stays open behind the
+per-model dependency audit. Two defects fixed on the way: the adapter asserted a
+`[B,S,H,D]`/`B+1` layout production never passes (the VL towers pass one **packed**
+`[seq_len, 1, hidden]` stream with `cu_seqlens[-1] == seq_len`, so multi-image
+requests would have failed), and the decode-era `kv_split` default (32 for any
+`Sq >= 4`) cost 4-9× on prefill-shaped calls until the adapter pinned `kv_split=1`
+(needed an optional per-call argument on the dense binding). Residue: an fp16-K
+kernel variant would remove the ~2e-2 Q8 error (upstream is 4e-4) and the
+quantise pass; a head_dim-96 instantiation would cut the 78 % padding waste.
+
 **Kevin 2026-09-12.** Extend `gfx906_fa` (the CUSTOM attention backend) to
 also serve the vision-tower shapes of the Qwen3.5 VL family so the ViT
 stops going through the Triton-AMD flash-attention path. Wins: (a) **no

@@ -50,6 +50,17 @@ the date an investigation began.
   Ornith 1.5-35B-A3B (16.7824 vs 16.7724)** — both flipped to V2. Gemma-4 cannot
   be gated by the in-process probe (both runners degenerate, PPL ~10^5 over a
   multimodal load) → ROADMAP GEMMA4-1, stays pinned to V1.
+- **VIT-1 DONE — the Qwen3.5-family ViT now runs on the custom FA by default**
+  (`DEVLOG-vit1.md`). Serving gate, fresh image per rep, prefix cache OFF, same
+  boot, identical prompts: **5.81 → 5.14 s TTFT @1024x1024 (−11.5 %)**, 1.71 →
+  1.67 s @512, and the fresh-boot Triton JIT for the ViT is **−55 s** (330 → 275 s
+  with an empty `TRITON_CACHE_DIR`; the remaining ~140 s is the GDN Triton kernel,
+  so this does *not* make the triton-AMD flash-attn package droppable). The
+  swap is not bit-equivalent: same greedy answer content, different wording, top-1
+  preserved, max tail |dlogprob| 0.66 (Q8-K features vs fp16). Fixed en route: the
+  adapter's non-production layout assumption (packed `[seq_len,1,hidden]` is what
+  the VL towers pass — multi-image requests would have failed) and the decode-era
+  `kv_split` default (32), now a per-call override.
 - VIT-1 step 1 landed (custom-FA arm for the Qwen3.5 ViT, opt-in, unit-validated);
   the aiter/spec-decode blocker found on the 0.29 line was fixed.
 

@@ -66,11 +66,17 @@ def vit_enabled() -> bool:
 def vit_auto_enabled() -> bool:
     """Whether the ViT path is selected *automatically* on gfx906.
 
-    Off by default until the ViT screens pass (VIT-1): an explicit
-    `--mm-encoder-attn-backend custom` already works, this only gates the
-    default flip. `GFX906_FA_VIT=0` overrides everything.
+    Default ON since the VIT-1 serving gate (2026-09-15): image-prompt TTFT
+    -11.5 % at 1024x1024 (5.81 -> 5.14 s, 3 fresh images/arm) and -55 s of
+    fresh-boot Triton JIT, with the image-conditioned distribution perturbed only
+    in the tail (top-1 preserved, max |dlogprob| 0.66 at rank 4+; mean logprob
+    +0.0126/token). `GFX906_FA_VIT=0` restores the upstream flash-attn ViT path
+    outright; `GFX906_FA_VIT_AUTO=0` only opts out of the automatic selection
+    (an explicit `--mm-encoder-attn-backend custom` still works). Unsupported
+    shapes/dtypes fall through to the upstream backends in
+    `ROCmPlatform.get_vit_attn_backend`.
     """
-    return vit_enabled() and os.environ.get("GFX906_FA_VIT_AUTO", "0") == "1"
+    return vit_enabled() and os.environ.get("GFX906_FA_VIT_AUTO", "1") == "1"
 
 
 def vit_supported(head_size: int, dtype: torch.dtype) -> bool:

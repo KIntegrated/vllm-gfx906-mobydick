@@ -3020,6 +3020,54 @@ def test_q8_0_row_layout_planar_pin_fused_q8_gather():
 # in-process, unlike the launch-site get_fa_kv_split static).
 # ---------------------------------------------------------------------------
 
+def test_vit_auto_is_default_on_and_falls_back(monkeypatch):
+    """VIT-1: the custom ViT path is the gfx906 default, with real fallbacks.
+
+    Pins the 2026-09-15 flip (image-prompt TTFT -11.5 % @1024x1024, -55 s of
+    fresh-boot Triton JIT) so a future change to the default is deliberate, and
+    pins the two escape hatches: `GFX906_FA_VIT=0` (upstream path outright) and
+    `GFX906_FA_VIT_AUTO=0` (opt out of auto-selection). Unsupported shapes/dtypes
+    must still resolve to the upstream backend rather than reaching the kernel.
+    """
+    import torch
+
+    from vllm.gfx906_fa.gfx906_fa_mm_encoder import (
+        vit_auto_enabled,
+        vit_enabled,
+        vit_supported,
+    )
+
+    monkeypatch.delenv("GFX906_FA_VIT_AUTO", raising=False)
+    monkeypatch.delenv("GFX906_FA_VIT", raising=False)
+    assert vit_enabled() and vit_auto_enabled(), "custom ViT path must be ON by default"
+
+    from vllm.platforms import current_platform
+    from vllm.platforms.interface import AttentionBackendEnum
+    from vllm.platforms.rocm import on_gfx906
+
+    monkeypatch.setenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "TRUE")
+    backend = current_platform.get_vit_attn_backend(72, torch.float16, backend=None)
+    if on_gfx906():
+        # the real selection function, with no runner env set
+        assert backend == AttentionBackendEnum.CUSTOM, backend
+
+    monkeypatch.setenv("GFX906_FA_VIT_AUTO", "0")
+    assert not vit_auto_enabled() and vit_enabled()
+
+    monkeypatch.setenv("GFX906_FA_VIT", "0")
+    assert not vit_enabled() and not vit_auto_enabled()
+    assert not vit_supported(72, torch.float16)
+
+    # unsupported head size / dtype never reach the kernel
+    monkeypatch.delenv("GFX906_FA_VIT")
+    assert vit_supported(72, torch.float16)
+    assert not vit_supported(72, torch.bfloat16)
+    # 160 pads up to 256 (still supported); only a head dim no instantiation
+    # covers (256 is the largest) must fall back to the upstream backends
+    assert vit_supported(160, torch.float16)
+    assert not vit_supported(320, torch.float16)
+
+
 def test_vit_bidirectional_matches_sdpa():
     """VIT-1: the dense FA entry serves bidirectional ragged ViT attention.
 
