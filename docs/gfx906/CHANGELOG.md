@@ -6,6 +6,23 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-15 (TRITON-1)
+
+- **Stock Triton supports gfx906 since v3.8.0 — validated at parity, so the
+  patched fork is no longer needed.** Upstream's `aa53dba7455` "[AMD] Add GCN5.1 /
+  gfx906 target (#9628)" introduces `ISAFamily::GCN5_1` (wave64, DPP broadcast,
+  `supportsVDot`, no MFMA, deliberately not CDNA/RDNA); v3.7.1 predates it. Built
+  stock v3.8.0 (recipe: gcc, *no* `TRITON_BUILD_WITH_CLANG_LLD`, plus
+  `TRITON_APPEND_CMAKE_ARGS=-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON`) and ran the
+  screens on the 0.29.0 line: **FA suite 97 passed**; **PPL 10.5472 vs the fork's
+  10.5516 (−0.04 %)** with 0 top-20 misses and a **byte-identical** 32-token greedy
+  completion (so the drift is fp accumulation rounding); the
+  **`GFX906_FA_VIT=0` ViT fallback** (flash-attn/Triton-AMD) compiles and runs; and
+  serving parity in the same boot (MTP k=3, agentic, 64k+120k, 2 reps) gives
+  ms/step **85.4/127.9 vs 85.8/128.2**. Remaining: the adoption decision, and one
+  small parity gap (`supportsDirectToLdsLoadBitWidth` has no `GCN5_1` case —
+  upstreamable against #9628). Full record: `RECON-triton-1.md`.
+
 ## 2026-09-15
 
 - **0.29.0 line updated for release: `gfx906/v2-bringup` fast-forwarded into
