@@ -151,9 +151,9 @@ per-model dependency audit. Two defects fixed on the way: the adapter asserted a
 `[seq_len, 1, hidden]` stream with `cu_seqlens[-1] == seq_len`, so multi-image
 requests would have failed), and the decode-era `kv_split` default (32 for any
 `Sq >= 4`) cost 4-9× on prefill-shaped calls until the adapter pinned `kv_split=1`
-(needed an optional per-call argument on the dense binding). Residue: an fp16-K
-kernel variant would remove the ~2e-2 Q8 error (upstream is 4e-4) and the
-quantise pass; a head_dim-96 instantiation would cut the 78 % padding waste.
+(needed an optional per-call argument on the dense binding). Follow-up queued as
+**VIT-2** (head_dim-96 instantiation, ~−5 % TTFT @1024×1024, measured); an fp16-K
+kernel variant (would remove the ~2e-2 Q8 error) stays on the same residue shelf.
 
 **Kevin 2026-09-12.** Extend `gfx906_fa` (the CUSTOM attention backend) to
 also serve the vision-tower shapes of the Qwen3.5 VL family so the ViT
@@ -1559,6 +1559,37 @@ copy-free; this is a separate decode-specialized kernel and launcher
 change.
 
 ## Tier 2 — bigger / conditional bets
+
+### VIT-2 — head_dim-96 instantiation for the ViT (cut the 72 → 128 padding waste)
+
+**Status: open, queued follow-up to VIT-1 (2026-09-15).** The ViT's real head dim
+is 72 and the launcher dispatches only {64,128,256}, so it is padded to 128 and the
+kernel does 128/72 = 1.78× the arithmetic the model needs. Measured basis
+(`bench_vit_dscale.py`, launch-regime, H=16 S=2304, mclk 800 MHz, DEVLOG-vit1.md):
+cost tracks the **padded** dim — head_size 72/80/96/112/128 (all padding to 128)
+cost **7.68–8.00 ms**, the D=64 instantiation **3.205 ms** — so the 56 zero dims are
+pure cost. A 96-wide instance removes exactly 25 % of the head-dim arithmetic:
+**~5.5–6.0 ms vs 7.78 ms (−22…−29 % on the ViT attention)**, worth ≈ **−0.25 s TTFT
+at 1024×1024 (−5 %)** and −0.7 % at 512×512 (the ViT is ~19 % of the custom path's
+TTFT there; VIT-1's own win is already banked). **Accuracy is unaffected**: q8_0
+blocks are 32-wide, so D=96's three blocks are the first three of today's D=128
+(dims 64–95 = 8 real + 24 zeros either way) — only the redundant all-zero fourth
+block disappears; measured rel err is padding-independent (0.0156 / 0.0172 / 0.0199
+/ 0.0182 at head dim 64 / 72 / 96 / 128). Note 72 itself is unusable (not a
+multiple of 32), which is why 96 is the target.
+*Work*: add a `(DKQ=96, DV=96)` tile-config entry (nthreads, occupancy, nbatch_fa,
+nbatch_K) and instantiate only the `ncols1` the ViT selects (64 for Sq > 32, per the
+ladder in `gfx906_fa_launcher.cu`); read the VKQ/LDS paths for DV assumptions first;
+then `_pad_head_dim` learns 96. *Risks*: config quality dominates — the ±25 %
+per-dim spread between the 64 and 128 entries means an untuned 96 entry can come out
+**slower** than the padded 128 path; build time/TU size grows; the launcher's
+`head_dim` switch is shared (a mis-keyed entry can shadow D=128 users) and any other
+caller with head_size 80–96 moves onto the new kernel. *Gate*: standalone at the ViT
+shapes **and** the FA suite (D=128 unchanged) **and** a one-image-prompt TTFT A/B
+(−5 % @1024) — keep it behind an opt-in (`GFX906_FA_VIT_PAD=96`) until that passes,
+so the reviewed default stays the validated 128. Residue on the same shelf: a
+**fp16-K** variant (removes the ~2e-2 Q8 error and the quantise pass; accuracy win,
+not a speed win at these S).
 
 ### KVLAYOUT-1 — verify the opt-in LEGACY=0 Q8 side-buffer under 0.29's fused layout
 
