@@ -22,6 +22,11 @@ editable install of this repo; the compiled extensions live in-tree.
 # FA micro-bench all run without it). rocminfo resolves via /usr/bin.
 ```
 
+- **Triton: stock upstream v3.8.0** (since 2026-09-15; upstream carries gfx906 as
+  `ISAFamily::GCN5_1`, so the old ai-infos fork is only a rollback). Build recipe +
+  the two build gotchas and the PyPI-wheel caveat: `README.md` ("TRITON 3.8.0").
+  A fresh Triton *version* recompiles every Triton kernel it uses on first boot
+  (~450 s with a cold cache) — one-time per version change.
 - **TP=2+ serving needs the HIP blocking-sync `.pth` shim, once per venv**
   (2026-08-25): without it, every TP worker permanently pegs 1-2 host
   cores at ~100%+ each for the life of the process (HIP's default

@@ -512,13 +512,31 @@ export USE_ROCM=1
 python setup.py install
 
 
-# TRITON-GFX906 V3.6.0
+# TRITON 3.8.0 (stock upstream — gfx906 support is upstream since v3.8.0)
 
-git clone --branch v3.6.0+gfx906 https://github.com/ai-infos/triton-gfx906.git
-cd triton-gfx906 
+# Since 0.29.0 the box runs *stock* Triton: upstream commit aa53dba7455
+# "[AMD] Add GCN5.1 / gfx906 target" (in v3.8.0) maps gfx906 to
+# ISAFamily::GCN5_1 with wave64, v_dot and DPP, so no patch is needed and the
+# old fork (ai-infos/triton-gfx906, v3.6.0 + 7 lines) is only a rollback option.
+# Validated on the dense 27B (FA suite 97/97, PPL 10.5472 vs 10.5516), MoE 35B
+# (57.97 vs 58.36 t/s), Nemotron (PPL 26.9937 vs 27.0066), Ornith (16.6664 vs
+# 16.7824) and serving ms/step parity; see docs/gfx906/RECON-triton-1.md.
+
+git clone --branch v3.8.0 https://github.com/triton-lang/triton.git
+cd triton
 pip install -r python/requirements.txt
-TRITON_CODEGEN_BACKENDS="amd" pip wheel --no-build-isolation -w dist . 2>&1 | tee build.log
-pip install ./dist/triton-*.whl  
+# Two build gotchas (both hit here, both recorded in the recon):
+#  - do NOT set TRITON_BUILD_WITH_CLANG_LLD=1: it asks for bare clang/clang++ on
+#    PATH and fails with a misleading "not a full path" error
+#  - the 3.8.0 prebuilt LLVM's exported targets request an install-RPATH relink
+#    the Ninja generator refuses; CMake's own suggestion clears it
+TRITON_APPEND_CMAKE_ARGS="-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON" \
+  TRITON_CODEGEN_BACKENDS="amd" pip wheel --no-build-isolation -w dist . 2>&1 | tee build.log
+pip install ./dist/triton-*.whl
+# NOTE: the published PyPI wheel (triton==3.8.0) segfaults on import on this box
+# (AMD backend and gfx906 are present in it; no missing libs) — build from source
+# as above, or test AMD's ROCm-index wheel
+# (triton==3.7.1+git0263a6a6.rocm7.14.0, what upstream's rock.txt pins).
 
 
 # FLASH-ATTENTION-GFX906 (triton backend)
