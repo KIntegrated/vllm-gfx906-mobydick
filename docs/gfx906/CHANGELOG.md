@@ -25,6 +25,10 @@ the date an investigation began.
   the build recipe, the MTP k=3 + capture-ladder defaults and the wedge/canary
   protocol; `docs/gfx906/README.md` carries the release basis, the V1-pin list,
   the VIT-1 knobs and the 0.29/V2 performance rows.
+- **Release validation on the merged tree passed.** FA suite **97 passed** and
+  the in-process PPL probe on the dense 27B is **10.5516 (359 tokens, 0 top-20
+  misses)** — bit-identical to V1 and to the 0.28 line, i.e. the V2 bring-up +
+  VIT-1 + the `kv_split` override left the text path numerically untouched.
 - **`VLLM_GFX906_FUSED_DRAFT` (A3) is revived but inert** (default OFF, neutral at
   k=3 and k=7) and **SMLA-1 is parked/inert** (fork fp16 sparse-MLA, default off,
   DeepSeek-MLA only) — neither blocks the release.
