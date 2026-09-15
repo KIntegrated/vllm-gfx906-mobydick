@@ -19,7 +19,14 @@ the date an investigation began.
   completion (so the drift is fp accumulation rounding); the
   **`GFX906_FA_VIT=0` ViT fallback** (flash-attn/Triton-AMD) compiles and runs; and
   serving parity in the same boot (MTP k=3, agentic, 64k+120k, 2 reps) gives
-  ms/step **85.4/127.9 vs 85.8/128.2**. Remaining: the adoption decision, and one
+  ms/step **85.4/127.9 vs 85.8/128.2**. Two claims were walked back by a follow-up
+  experiment: (a) the A/B's acceptance difference is **not** a build effect — the
+  same build on the same corpus body moved by −0.374 across processes, as large as
+  the cross-build delta, so arm order/per-process variance confounds it (lead with
+  ms/step, interleave arms); (b) the `supportsDirectToLdsLoadBitWidth` "gap" is
+  **inert** — direct-to-LDS is only created for async copies, gated on
+  `{CDNA3,CDNA4,GFX1250}` in 3.8.0 and `{CDNA3,CDNA4}` in the fork, so the fork's
+  `VEGA20` case was dead code and 3.8.0's missing `GCN5_1` case is unreachable. Remaining: the adoption decision, and one
   small parity gap (`supportsDirectToLdsLoadBitWidth` has no `GCN5_1` case —
   upstreamable against #9628). Full record: `RECON-triton-1.md`.
 

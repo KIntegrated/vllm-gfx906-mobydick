@@ -1691,13 +1691,17 @@ stock v3.8.0 (FA suite 97; in-process PPL 10.5472 vs the fork's 10.5516 = −0.0
 with a **byte-identical** 32-token greedy completion, i.e. fp rounding not a
 semantic change; the `GFX906_FA_VIT=0` flash-attn/Triton-AMD ViT fallback compiles
 and runs; serving MTP k=3 agentic ms/step 85.4/127.9 vs the fork's 85.8/128.2 =
-parity). Note for any future triton swap: **t/s is not comparable across a triton
-change** — identical prompts gave acceptance 2.19/1.74 vs 1.76/1.50 and hence t/s
-34.9 vs 30.5 at parity per-step cost; ms/step is the metric. Remaining: (a) decide
-to adopt (one command; the box currently has the fork installed), (b) the small
-`supportsDirectToLdsLoadBitWidth` gap (v3.8.0 has no `GCN5_1` case, the fork
-allowed 32-bit) — measure before patching, and offer the one-liner upstream against
-#9628 either way, (c) if adopted, update `requirements/build/rocm.txt`/docs and
+parity). Note for any future triton swap: **acceptance/t/s cannot carry a build
+comparison here** — a follow-up run of the *same* build on the *same* corpus body
+gave acceptance 2.1875 → 1.8132 across processes (as large as the cross-build
+delta), so the sequential-arms A/B confounded order with build; interleave arms and
+lead with **ms/step** (which itself has ~2-4 % per-process spread, so parity means
+"no difference beyond that"). Remaining: (a) decide
+to adopt (one command; the box currently has the fork installed), (b) ~~the small
+`supportsDirectToLdsLoadBitWidth` gap~~ **CLOSED as inert** — direct-to-LDS is only
+created via the async-copy path, gated on `{CDNA3,CDNA4,GFX1250}` in 3.8.0 and
+`{CDNA3,CDNA4}` in the fork, so gfx906 never reaches the function in either build
+(the fork's `VEGA20` case was dead code); nothing to measure or patch, (c) if adopted, update `requirements/build/rocm.txt`/docs and
 re-run the release validation on the new install.
 
 **Original recon (2026-09-15) — the answer was better than expected:

@@ -190,12 +190,35 @@ Wheel installed over the editable fork (rollback `pip install -e
 | **ViT fallback smoke** (`GFX906_FA_VIT=0`) | the upstream flash-attn/Triton-AMD ViT path compiles and runs under 3.8.0; both image requests returned sane output (1024×1024 TTFT 6.43 s, `sum_logprob` −2.229 vs the fork's −2.205 on the same `prompt_sha1`) |
 | **serving parity** (MTP k=3, agentic corpus, 64k+120k, 2 reps, same boot) | ms/step **85.4 vs 85.8 @64k** (−0.5 %) and **127.9 vs 128.2 @120k** (−0.2 %) → parity |
 
-**Caveat worth keeping:** *throughput* is not comparable across a triton change.
-The two arms ran identical prompts (`prompt_sha1` matched) yet acceptance diverged
-(2.19/1.74 vs 1.76/1.50 @64k) → t/s means of 34.9 vs 30.5 for identical per-step
-cost. A different codegen perturbs the draft path's numerics just enough to send
-spec-decode trajectories down different branches; **ms/step is the metric**, exactly
-as the CAT-1 investigation concluded.
+**Caveat — corrected 2026-09-15 after a follow-up experiment (this is the
+important one):** the A/B's acceptance difference **cannot be attributed to the
+triton build**. Re-running *the same build* (3.8.0) on *the same corpus body*
+(`prompt_sha1 795844ca5794`) in a second process gave acceptance **2.1875 → 1.8132
+(−0.374)**, i.e. a within-build process-to-process swing as large as the
+cross-build delta (−0.424 at that body, −0.247 at the next). The fork's single
+sample (1.7634) sits inside 3.8.0's two-sample range, and ms/step shows the same
+per-process spread (82.8 vs 86.0 = 3.9 % on that body).
+
+Consequences:
+
+- **Acceptance/t/s cannot carry a build comparison at all here.** The A/B ran the
+  arms *sequentially* (3.8.0 first, fork second), so arm order is confounded with
+  the build, and per-process variance is of the same magnitude as the effect being
+  measured. Any future triton/patch A/B must either interleave arms (A,B,A,B) or
+  repeat the first arm last, and must lead with **ms/step**.
+- ms/step itself has ~2–4 % per-process spread, so "parity" here means *no
+  difference beyond that spread* — a <2 % regression would not have been
+  detectable at n=2 arms × 2 reps. That is a limitation of the verdict, not a
+  claim of exactness.
+- The mechanism of the per-process variance is **not pinned**. Candidates: the
+  chunked-prefill GDN path is `@triton.autotune`d (`ssd_bmm.py`, timing-based
+  config choice per process → different fp accumulation orders → different GDN
+  state → different trajectory), host/kernel state, or allocation-dependent
+  kernel selection. What the evidence excludes is a *build* cause.
+- The gates that do survive as build comparisons are the deterministic ones: FA
+  suite (97), the in-process PPL (10.5472 vs 10.5516, −0.04 %) and the greedy
+  target-text identity (byte-identical at 32 tokens) — plus the ViT-fallback
+  smoke.
 
 **Adoption state:** the A/B left the **fork** installed (the known-good default).
 Switching to stock 3.8.0 is one command (install the wheel in
@@ -203,9 +226,17 @@ Switching to stock 3.8.0 is one command (install the wheel in
 kernel it uses on first boot (both arms booted ~450 s here with `NOCACHE=1`), which
 is a one-time cost per version change, not a recurring one.
 
-**Open, small:** the `supportsDirectToLdsLoadBitWidth` gap (§2) — worth a
-measurement before carrying a patch, and a good upstream PR against #9628 either
-way.
+**Closed: the `supportsDirectToLdsLoadBitWidth` "gap" is inert, in both builds.**
+Checked the mechanism rather than the symptom (the parity A/B showed no perf
+difference, which is *why*): direct-to-LDS loads are only ever *created* for the
+async-copy path, gated in `canBeConvertedToAsyncLoad` on
+`{CDNA3, CDNA4, GFX1250}` in v3.8.0 — and in the fork's own 3.6.0 that list is
+`{CDNA3, CDNA4}`, i.e. **VEGA20 was excluded there too**. So the fork's `VEGA20`
+case in that switch was dead code, and v3.8.0's missing `GCN5_1` case is equally
+unreachable; the function is only consulted from inside async-copy lowering/
+coalescing, which gfx906 never enters. There is no behavioural gap and nothing to
+measure; the only residue is a latent inconsistency that would fail **loudly**
+(the `LoadStoreOpToLLVM` asserts) if upstream ever opens that path for gfx906.
 
 ## 5. Options (superseded by §2 — kept for the record)
 
