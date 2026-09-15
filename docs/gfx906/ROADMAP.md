@@ -107,7 +107,10 @@ at 33.62 / 23.75. Boot-to-boot spread for these arms is ~1–3 % (parity restamp
 
 1. **Run arm C alone first** (DFlash2, no patch; 1 load). If it lands outside the MTP+CAT-1
    band by more than ~3 %, that is the answer for Q1 — citation-grade with the boot caveat
-   stated, and no extra wedge draws.
+   stated, and no extra wedge draws. *(Agreed with Kevin 2026-09-15: **C → D → B** if the
+   session survives. D before B because the patch A/B is what same-boot pairing protects, while
+   the method question has a historical band to lean on. The live A+B re-measure is queued for
+   the next boot if tonight's session runs clean.)*
 2. **Only if it lands inside the band**, escalate to the interleaved 3-arm design
    **C → B → C** (B = MTP k=3 + CAT-1, C repeated last as the order control) so the
    comparison is same-boot and same-order-position. Plain MTP (arm A) is *not* run live: it is
@@ -131,6 +134,44 @@ methods use **different draft depths** (DFlash2's recommended `num_speculative_t
 vs our MTP k=3), so "lead with ms/step" is not the whole story — report **t/s at each
 method's recommended config** (the decision metric), with ms/step *and* acceptance as the
 supporting detail that separates a cost effect from a depth effect.
+
+### DFL2-3 — port `dflash2-lookup-drafting` (draft from the request's own context)
+
+**Status: open, queued as a follow-up (Kevin 2026-09-15).** This is the mechanism Kevin
+remembered as "CAT-1 for DFlash": instead of a drafter forward, blocks are proposed from the
+**request's own context** (`dflash2/lookup.py` picks the block length from emitted/rejected
+counts) — the same goal as CAT-1 (cheap drafting on predictable text) by a different mechanism.
+Largish patch (178 KB, `../qwen38-27b-rtx3090/patches/`); verified that its
+`vocab_size`/`VocabParallelEmbedding` references are the model's own embedding table, *not* a
+corpus shortlist. Port + the standard gates (interleaved same-boot A/B, agentic corpus, ms/step
+plus acceptance, weighted to the copy-heavy end where lookup drafting should pay).
+
+### DFL2-4 — port `dflash2-prewarm` (boot-time compile/capture prewarm)
+
+**Status: open, queued as a follow-up (Kevin 2026-09-15).** 37 KB patch adding a prewarm set —
+relevant because boot-time Triton/inductor compile and graph-capture stalls are a standing cost
+here (VIT-1's own win included −55 s of cold-boot Triton JIT). Gate: boot time with fresh caches
+plus a serving smoke, not a decode A/B.
+
+### DFL2-5 — port `dflash2-z-adaptive-emitted` (adaptive block length)
+
+**Status: open, queued as a follow-up (Kevin 2026-09-15).** Small patch (1.7 KB): the next
+block's length follows the emitted/rejected counts the sampler already reports, i.e. dynamic
+draft depth. Cheap to port; gate on the agentic corpus at 64k/120k with per-rep acceptance
+(depth changes move tokens/step, so t/s is the metric).
+
+### DFL2-6 — apply the CAT-1 shortlist to the **DFlash2 drafter** head
+
+**Status: open, our own idea (2026-09-15) — not an upstream port.** The DFlash2 drafter's head is
+the full vocabulary (`draft_vocab_size: null` → `vocab_size`, 248 320) — exactly the shape the
+MTP CAT-1 shortlist cut by ~2.5 ms/step — so the same saving should apply. Work: lift the
+shortlist loader out of its MTP-specific home (`qwen3_5_mtp.py` reads `mtp_draft_vocab_ids.pt`)
+into something a DFlash2 draft model can consume too, then gate it the way CAT-1 was gated
+(controlled A/B, per-rep acceptance — while remembering that CAT-1's *acceptance* effect was
+retracted, so the honest expectation is the ms/step saving). Exactness carries over unchanged:
+rejection sampling uses the distribution the draft was sampled from, and the target keeps its own
+full head.
+
 
 ### FD-1 — CLOSED: the MTP fused-draft path was measured (NEUTRAL, stack-confounded) and its only reader is gone
 
