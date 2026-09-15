@@ -77,13 +77,48 @@ def main():
         **extra,
     )
     sp = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=20)
-    outs = llm.generate(PROMPTS, sp)
     tokenizer = llm.get_tokenizer()
+    # 2026-09-15 (GEMMA4-1): raw-text prompt-logprob PPL is only meaningful for
+    # checkpoints that accept raw text. Instruction-tuned checkpoints continue raw
+    # text as garbage, which reads like a broken model: Gemma-4-*-it scored
+    # PPL 84261 with 362 of 363 top-20 misses here while answering *correctly*
+    # ('Paris//' at logprob 0.00) through its chat template. Muse-Glimmer behaves the
+    # same way. `BENCH_CHAT_TEMPLATE=1` renders each prompt through the model's chat
+    # template (do NOT compare those numbers with the raw-text reference bands).
+    render_chat = os.environ.get("BENCH_CHAT_TEMPLATE", "0") == "1"
+    has_template = bool(getattr(tokenizer, "chat_template", None))
+    if render_chat and not has_template:
+        raise SystemExit("BENCH_CHAT_TEMPLATE=1 but this tokenizer has no chat template")
+    if not render_chat and has_template:
+        print(
+            "WARNING: this tokenizer HAS a chat template but BENCH_CHAT_TEMPLATE is "
+            "unset, so raw text is being fed. That is valid for raw-text-tolerant "
+            "models (Qwen3.x, Nemotron, Ornith) and MEANINGLESS for IFT-only "
+            "checkpoints (Gemma-4-*-it, Muse-Glimmer) — their PPL/miss counts are "
+            "prompt-format artifacts there, not model defects. Set "
+            "BENCH_CHAT_TEMPLATE=1 to gate those.",
+            flush=True,
+        )
+    if render_chat:
+        prompts = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for p in PROMPTS
+        ]
+        print("NOTE: prompts rendered through the chat template "
+              "(BENCH_CHAT_TEMPLATE=1) — not comparable to the raw-text bands",
+              flush=True)
+    else:
+        prompts = list(PROMPTS)
+    outs = llm.generate(prompts, sp)
 
     total_lp = 0.0
     n_tok = 0
     n_miss = 0
-    for prompt, o in zip(PROMPTS, outs):
+    for prompt, o in zip(prompts, outs):
         ids = tokenizer.encode(prompt)
         pl = o.prompt_logprobs
         for i in range(1, len(ids) - 1):  # position 0 has no conditioning

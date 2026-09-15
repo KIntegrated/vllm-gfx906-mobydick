@@ -216,6 +216,12 @@ docker run ... -v /tmp/bench:/bench <image> -c \
 Full zero-ambiguity runner scripts lived here historically; the current
 canonical runner is the local venv recipe in §0.
 
+**Prompt format first:** these harnesses fill *raw text*. Valid for the
+Qwen3.x/Nemotron/Ornith models the reference bands were measured on; **invalid for
+instruction-tuned checkpoints (Gemma-4-*-it, Muse-Glimmer)**, where raw text returns
+garbage that is not a defect. `ppl_probe.py` takes `BENCH_CHAT_TEMPLATE=1` for those and
+`_bench_gfx906.py` records the prompt form; see the prompt-format note in `README.md`.
+
 ### `_bench_gfx906.py` env-var surface (W1 additions, 2026-08-26)
 
 Core knobs (documented in the harness header): `BENCH_PP`, `BENCH_TG`,

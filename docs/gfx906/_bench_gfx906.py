@@ -151,6 +151,22 @@ def main():
         **extra,
     )
     tok = llm.get_tokenizer()
+    # 2026-09-15 (GEMMA4-1): this harness fills *raw text* to the target prompt
+    # length and measures tokens/s only. A speed number is not a correctness gate —
+    # Gemma-4-*-it sat in the docs as "supported, 67.79 t/s" while its raw-text
+    # output was garbage (it is an IFT checkpoint and needs its chat template).
+    # Recorded in every row so a number is never mistaken for validation.
+    prompt_form = "raw-filler"
+    has_chat_template = bool(getattr(tok, "chat_template", None))
+    if has_chat_template:
+        print(
+            "WARNING: this tokenizer has a chat template, so its output for this "
+            "raw-text filler prompt is NOT a quality signal (IFT-only checkpoints "
+            "return garbage here). Tokens/s is valid; use a templated gate "
+            "(BENCH_CHAT_TEMPLATE=1 in benchmarks/kernels/gfx906/ppl_probe.py) or a "
+            "serving A/B for correctness.",
+            flush=True,
+        )
 
     # Build a prompt encoding to exactly pp tokens.
     filler = "The quick brown fox jumps over the lazy dog. "
@@ -245,6 +261,8 @@ def main():
                 "model": model,
                 "pp": pp,
                 "tg": tg,
+                "prompt_form": prompt_form,
+                "has_chat_template": has_chat_template,
                 "maxlen": maxlen,
                 "samples": results,
             }

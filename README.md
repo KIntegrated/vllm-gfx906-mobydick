@@ -360,9 +360,13 @@ vllm serve <model> \
   +23 % figure came from an A/B client that put the arm name in the prompt header
   — retracted, see `docs/gfx906/V2-bringup.md`.)
   **V1 sunset:** upstream removes the V1 model runner in **0.32.0**, and we track
-  that schedule — the two pinned models above need their V2 parity (or a
-  serving-level gate) before then. Tracked as ROADMAP `DFL2-2` (V2 up to speed),
-  `GEMMA4-1` and `MUSE-1`.
+  that schedule. Gemma-4 cleared its V2 gate on 2026-09-15 (templated V1/V2 comparison:
+  identical answers and logprobs), so **Muse-Glimmer is the only remaining pin** —
+  tracked as ROADMAP `DFL2-2` (V2 up to speed) and `MUSE-1`. **Prompt format matters:**
+  instruction-tuned checkpoints (Gemma-4-*-it, Muse-Glimmer) must be prompted through
+  their chat template — raw `/v1/completions` text or a raw-text PPL probe returns
+  garbage that looks like a broken model yet is a prompt-format artifact; see the
+  prompt-format note in `docs/gfx906/README.md`.
 - `--dtype float16` is required: gfx906 has no bf16 hardware; bfloat16
   checkpoints would fall back to fp32 math.
 - **cudagraph capture sizes = multiples of `num_speculative_tokens + 1`, up to
