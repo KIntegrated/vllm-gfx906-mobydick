@@ -3070,6 +3070,69 @@ def test_vit_bidirectional_matches_sdpa():
     assert rel2 < 1e-3, f"padded KV leaked into the scan: {rel2:.4f}"
 
 
+def test_vit_packed_batch_matches_sdpa_and_does_not_cross_attend():
+    """VIT-1: the *production* ViT layout is a packed token stream.
+
+    `Qwen3VLModel.forward` does `hidden_states.unsqueeze(1)` before the vision
+    blocks, so attention sees `[seq_len, 1, hidden]` with
+    `cu_seqlens = [0, l_0, l_0+l_1, ...]` and `cu_seqlens[-1] == seq_len` — i.e.
+    **one** batch row holding every image back to back (the same reason
+    flash-attn's varlen wrapper asserts `cu_seqlens_q[-1] == total_seqlen_q`).
+
+    Two properties are pinned here, and the second is the one that matters: each
+    image must match its own SDPA reference, and no image may attend another
+    (the kernel's per-row `kv_max` is what enforces that, so a mapping mistake
+    would silently blend images rather than crash).
+    """
+    import math
+    from itertools import accumulate
+
+    import torch
+    import torch.nn.functional as F
+
+    from vllm.gfx906_fa.gfx906_fa_mm_encoder import forward_vit, vit_supported
+
+    if not vit_supported(72, torch.float16):
+        pytest.skip("gfx906 ViT FA path disabled (GFX906_FA_VIT=0)")
+
+    torch.manual_seed(0)
+    h, d = 16, 72
+    lens = [2304, 576, 1728]  # ragged, and not a multiple of any tile size
+    n = sum(lens)
+    q = torch.randn(1, n, h, d, dtype=torch.float16, device="cuda")
+    k = torch.randn(1, n, h, d, dtype=torch.float16, device="cuda")
+    v = torch.randn(1, n, h, d, dtype=torch.float16, device="cuda")
+    cu = torch.tensor([0, *accumulate(lens)], dtype=torch.int32, device="cuda")
+    scale = 1.0 / math.sqrt(d)
+
+    out = forward_vit(q, k, v, cu, None, scale, d)
+    assert out.shape == q.shape and out.dtype == q.dtype
+
+    start = 0
+    for ln in lens:
+        qi = q[0, start : start + ln].transpose(0, 1).float()
+        ki = k[0, start : start + ln].transpose(0, 1).float()
+        vi = v[0, start : start + ln].transpose(0, 1).float()
+        ref = F.scaled_dot_product_attention(qi, ki, vi, scale=scale, is_causal=False)
+        got = out[0, start : start + ln].float()
+        rel = (got - ref.transpose(0, 1)).abs().max() / ref.abs().max()
+        assert rel < 5e-2, f"len {ln} at {start}: rel err {rel:.4f}"
+        start += ln
+
+    # No image may attend another: perturb image 0's K/V and the rest must not move.
+    k2, v2 = k.clone(), v.clone()
+    k2[0, : lens[0]] += 3.0
+    v2[0, : lens[0]] += 3.0
+    out2 = forward_vit(q, k2, v2, cu, None, scale, d)
+    start = lens[0]
+    for ln in lens[1:]:
+        moved = (
+            out2[0, start : start + ln].float() - out[0, start : start + ln].float()
+        ).abs().max()
+        assert moved < 1e-3, f"image at {start} attended image 0: {moved:.4f}"
+        start += ln
+
+
 def test_legacy_zero_refused_until_verified(monkeypatch):
     """GFX906_FA_LEGACY=0 (Q8 side-buffer) is fail-closed on 0.29.
 

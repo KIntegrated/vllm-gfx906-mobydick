@@ -13,6 +13,21 @@ contiguous `K`/`V`, no block table) and the kernel masks *either* via a
 materialised mask *or* the inline-causal `q_abs_offset` — with **neither** it
 computes **full bidirectional attention**, which is exactly the ViT case.
 
+**Input layout (production).** The Qwen VL towers keep the whole batch of images
+in one packed token stream: `Qwen3VLModel.forward` does
+`hidden_states.unsqueeze(1)` before the blocks, so the attention sees
+`[seq_len, 1, hidden]` — i.e. `B = 1`, `S = sum(real lengths)`, with
+`cu_seqlens = [0, l_0, l_0+l_1, …]` and `cu_seqlens[-1] == S` (this is also why
+flash-attn's varlen wrapper asserts `cu_seqlens_q[-1] == total_seqlen_q`: the
+tensor is packed, never padded). The kernel wants one batch row per *sequence*
+(`kv_max` is per row), so this adapter groups the packed stream into runs of
+equal sequence length, hands each run to the kernel as a separate batch row via
+zero-copy views, and scatters the results back into the packed output.
+
+A `cu_seqlens` of `B+1` entries over a `[B, S, …]` tensor (one sequence per batch
+item, optionally padded) is also handled — per-item calls when lengths differ,
+one batched call when they do not.
+
 Why head_dim is padded: the launcher dispatches on
 `head_dim in {64, 128, 256}` and requires `head_size % 32 == 0`, so 72 is
 zero-padded to **128**. The padding is exact:
@@ -20,13 +35,10 @@ zero-padded to **128**. The padding is exact:
 * padded `Q` dims contribute 0 to the QK dot,
 * padded `K` dims quantise to zero q8_0 blocks (0 contribution),
 * padded `V` dims contribute 0 to P·V,
-* the padding is in the **head** dim, so the softmax denominator is unchanged
-  (the per-sequence KV bound is `kv_max`, not a shorter pad).
+* the padding is in the **head** dim, so the softmax denominator is unchanged.
 
-Ragged handling: `MMEncoderAttention` passes `[B, S, H, D]` tensors padded to a
-common `S` plus `cu_seqlens`; we bound the KV scan with `kv_max = [B]`, so the
-padded KV rows are never read, and padded *query* rows only produce output we
-discard (query rows are independent by construction).
+Padding cost is real (the QK/PV work grows with the padded head dim) and is
+tracked in the VIT-1 dev log; a 96-wide instantiation is the open follow-up.
 """
 
 from __future__ import annotations
@@ -69,6 +81,41 @@ def vit_supported(head_size: int, dtype: torch.dtype) -> bool:
     return _pad_head_dim(head_size) is not None
 
 
+def _seq_plan(
+    b: int, s: int, cu: torch.Tensor | None
+) -> list[tuple[int, int, int]]:
+    """Map the input to `(batch_row, start, length)` per attention sequence.
+
+    Packed input (`b == 1`, `cu[-1] == s`): sequences are contiguous slices of
+    row 0. Per-item input (`cu.numel() == b + 1`): each sequence starts at the
+    beginning of its own batch row, and `length <= s` (padded rows are simply not
+    read, which is what `kv_max` is for).
+    """
+    if cu is None:
+        return [(i, 0, s) for i in range(b)]
+
+    cu = cu.to(dtype=torch.int32)
+    lens = (cu[1:] - cu[:-1]).tolist()
+    total = b * s
+
+    if b == 1 and sum(lens) == total:
+        plan, off = [], 0
+        for ln in lens:
+            plan.append((0, off, ln))
+            off += ln
+        return plan
+
+    if len(lens) == b:
+        return [(i, 0, ln) for i, ln in enumerate(lens)]
+
+    raise ValueError(
+        f"ViT FA cannot map cu_seqlens ({cu.numel()} entries, "
+        f"lens={lens[:8]}{'…' if len(lens) > 8 else ''}) onto a [{b}, {s}] "
+        f"tensor: packed input needs a single batch row with cu[-1] == {total}, "
+        f"per-item input needs {b + 1} entries."
+    )
+
+
 def forward_vit(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -81,9 +128,10 @@ def forward_vit(
     """Bidirectional ragged attention through the gfx906 dense FA entry.
 
     Args:
-        query/key/value: `[B, S, H|Hkv, D]` fp16 (upstream ViT layout).
-        cu_seqlens: int32 `[B+1]` real token counts per batch item (S is the
-            padded common length), or None for one batch of `B * S` tokens.
+        query/key/value: `[B, S, H|Hkv, D]` fp16 (upstream ViT layout). For the
+            Qwen VL towers `B == 1` and the token stream is packed.
+        cu_seqlens: int32 `[num_seqs+1]` real lengths, or None for one sequence
+            per batch item covering the whole `S`.
         max_seqlen: int32 `[1]` upstream FA convention (informational here).
         scale: the model's own softmax scale, computed for the real head size.
         head_size: real (unpadded) head dim.
@@ -97,16 +145,12 @@ def forward_vit(
     hkv = key.shape[2]
     assert d_in == head_size, (d_in, head_size)
     assert value.shape == (b, sk, hkv, head_size)
+    assert sq == sk, f"ViT FA is bidirectional; Sq {sq} != Skv {sk}"
 
     pad = _pad_head_dim(head_size)
     assert pad is not None, f"head_size {head_size} is not pad-able"
 
-    if cu_seqlens is None:
-        kv_max = torch.full((b,), sk, dtype=torch.int32, device=query.device)
-    else:
-        cu = cu_seqlens.to(device=query.device, dtype=torch.int32)
-        assert cu.numel() == b + 1, (cu.numel(), b)
-        kv_max = (cu[1:] - cu[:-1]).contiguous()
+    plan = _seq_plan(b, sq, cu_seqlens)
 
     def to_kernel(x: torch.Tensor) -> torch.Tensor:
         # [B, S, H, D] -> [B, H, S, D], zero-padded to the kernel head dim.
@@ -117,13 +161,68 @@ def forward_vit(
         out[..., :head_size] = x
         return out
 
-    q = to_kernel(query).float().contiguous()
-    v = to_kernel(value).contiguous()
-    k_q8 = gfx906_fa.quantize_q8_0(to_kernel(key).contiguous())
+    out = torch.empty(
+        (b, sq, heads, head_size), dtype=query.dtype, device=query.device
+    )
 
-    # mask=None + q_abs_offset=None => full bidirectional attention; kv_max keeps
-    # the scan inside the real KV rows. NOTE: `forward` takes Q as [B, H, S, D]
-    # but returns the BSHD-native output [B, S, H, D] (the layout the LLM path
-    # consumes), i.e. no output transpose is needed.
-    out = gfx906_fa.forward(q, k_q8, v, float(scale), kv_max)
-    return out[..., :head_size].to(query.dtype).contiguous()
+    # Group consecutive sequences of equal length so an equal-length batch (the
+    # common case: one image, or N images of the same size) is a single kernel
+    # call, and the view stays contiguous.
+    groups: list[list[tuple[int, int, int]]] = []
+    for row, start, ln in plan:
+        prev = groups[-1] if groups else None
+        if (
+            prev
+            and prev[-1][2] == ln
+            and prev[-1][0] == row
+            and prev[-1][1] + ln == start
+        ):
+            prev.append((row, start, ln))
+        else:
+            groups.append([(row, start, ln)])
+
+    for grp in groups:
+        ln = grp[0][2]
+        if not ln:
+            continue
+        if len(grp) == 1 and grp[0][1] == 0:
+            qs = query[grp[0][0] : grp[0][0] + 1]
+            ks = key[grp[0][0] : grp[0][0] + 1]
+            vs = value[grp[0][0] : grp[0][0] + 1]
+            kv_max = torch.full(
+                (1,), ln, dtype=torch.int32, device=query.device
+            )
+        else:
+            # Contiguous run of equally long sequences: a zero-copy view.
+            qs = query[grp[0][0], grp[0][1] : grp[0][1] + ln * len(grp)].view(
+                len(grp), ln, heads, head_size
+            )
+            ks = key[grp[0][0], grp[0][1] : grp[0][1] + ln * len(grp)].view(
+                len(grp), ln, hkv, head_size
+            )
+            vs = value[grp[0][0], grp[0][1] : grp[0][1] + ln * len(grp)].view(
+                len(grp), ln, hkv, head_size
+            )
+            kv_max = torch.full(
+                (len(grp),), ln, dtype=torch.int32, device=query.device
+            )
+
+        # mask=None + q_abs_offset=None => full bidirectional attention; kv_max
+        # bounds the scan to the sequence. NOTE: `forward` takes Q as
+        # [B, H, S, D] but returns the BSHD-native output [B, S, H, D].
+        got = gfx906_fa.forward(
+            to_kernel(qs).float().contiguous(),
+            gfx906_fa.quantize_q8_0(to_kernel(ks).contiguous()),
+            to_kernel(vs).contiguous(),
+            float(scale),
+            kv_max,
+        )[..., :head_size].to(query.dtype)
+
+        if len(grp) == 1 and grp[0][1] == 0:
+            out[grp[0][0] : grp[0][0] + 1] = got
+        else:
+            out[grp[0][0], grp[0][1] : grp[0][1] + ln * len(grp)] = got.reshape(
+                -1, heads, head_size
+            )
+
+    return out
