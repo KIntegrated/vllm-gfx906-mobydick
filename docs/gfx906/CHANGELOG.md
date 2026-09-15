@@ -22,6 +22,22 @@ the date an investigation began.
   workaround unnecessary is still open; the arms need interleaving to survive the
   load lottery.
 
+## 2026-09-15 (GEMMA4-1 CLOSED + prompt-format guards)
+
+- **Gemma-4's V2 gate passed**: a *templated* in-process V1-vs-V2 comparison gives
+  identical text and logprobs agreeing to ≤0.05 (`'Paris//'` at 0.00), so its V1 pin is
+  lifted on evidence. The model was never broken (raw text on an IFT checkpoint returns
+  garbage; the same garbage reproduces on the 0.28 image).
+- **Prompt-format guards shipped** so the trap cannot repeat: the PPL probe warns loudly
+  when a tokenizer has a chat template while `BENCH_CHAT_TEMPLATE` is unset and renders
+  prompts through the template when set; the throughput harness records
+  `prompt_form`/`has_chat_template` and warns that tokens/s is not a correctness gate; and
+  `docs/gfx906/README.md` now carries a "Prompt format — read before gating any model"
+  block with the raw-text-valid vs template-required model split.
+- Lesson recorded (with AGENTS.md): the Gemma-4 row already said "chat template
+  required", but an aside in a notes column is not a guard — and a speed number is not a
+  correctness gate.
+
 ## 2026-09-15 (GEMMA4-1: the model is fine, the gate was wrong)
 
 - **Gemma-4 was never broken and there is no 0.28→0.29 regression.** Two probes misled
