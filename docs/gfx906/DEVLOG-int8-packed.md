@@ -83,3 +83,15 @@ error rather than a kernel or dtype error — the layer had no packed parameters
 - This boot (2026-09-15 13:20) wedged once during the first INT8 load (half-wedge, `reset(4)`
   recovered, `degradation.md` #96); the authorized retry loaded cleanly, i.e. that failure was the
   boot's load lottery rather than this change.
+
+## 2026-09-16 (promotion) — cherry-picked to `main` and re-gated there
+
+**VERDICT:** on `main` · **GATE:** the same load+sanity gate, re-run on main's tree.
+
+The INT8/W8A16 work (`309862a0b8` + the dev-log correction `20f356dbc3`) was cherry-picked from
+`gfx906/int8-packed` onto `main` (clean, no conflicts; plus a follow-up fixing the lint fallout in
+`tools/ct_scheme_probe.py`, which had been created by header injection into a scratch script).
+Re-gated on main: `Application startup complete` after 300 s, `GPU KV cache size: 240,493 tokens`,
+no skipped/unexpected-key lines, and the same two coherent templated answers as on the branch
+("...The capital of France is Paris."; a fenced python block). The DFlash2 records stay on
+`gfx906/dflash2`; only the quantisation work is promoted.

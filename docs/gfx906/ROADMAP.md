@@ -1773,7 +1773,7 @@ change.
 The support was already in-tree (schemes `CompressedTensorsWNA16(group,8)` plus the pack-quantized
 embedding dequant-gather in `compressed_tensors_embedding.py`); the failure was model wiring —
 `Qwen3_5Model.embed_tokens` was built without `quant_config`/`prefix`, so the quantized embedding
-never registered its packed parameters. Fixed in **2 lines** (`gfx906/int8-packed`); the checkpoint now
+never registered its packed parameters. Fixed in **2 lines** (on `main` since the 2026-09-16 cherry-pick); the checkpoint now
 loads with zero skipped tensors (252,196-token KV pool) and answers templated chat prompts correctly.
 Remaining: the **numerical gate vs bf16 `Qwen/Qwen3.8-27B`** via `ift_chat_gate.py`, a proper
 serving/perf measurement, and the same wiring gap in `qwen3_5_mtp.py` (latent here — all `mtp` weights
