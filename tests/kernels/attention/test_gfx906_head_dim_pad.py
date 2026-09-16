@@ -41,7 +41,7 @@ def test_pad_map(head_size, want):
 
 
 def test_padding_default_is_on_after_the_phi3_gate(monkeypatch):
-    """Default ON since Phi-3: head_dim 96 -> CUSTOM at 36.41 vs 28.62 t/s, same tokens."""
+    """Default ON since Phi-3: 96 -> CUSTOM at 36.41 vs 28.62 t/s."""
     monkeypatch.delenv("GFX906_FA_PAD", raising=False)
     assert _padded_head_size(128) == 128  # instantiated dims are unaffected
     assert _padded_head_size(96) == 128
@@ -59,7 +59,7 @@ def test_kill_switch_restores_exact_dims_only(monkeypatch):
 def test_supports_head_size_serves_pad_able_dims_by_default(monkeypatch):
     """Pad-able dims are servable now; dims past 256 still are not."""
     monkeypatch.delenv("GFX906_FA_PAD", raising=False)
-    # pad-able: instantiated dims, everything below 64 (32 -> 64), and 65..256 (96 -> 128)
+    # pad-able: instantiated, below 64 (32 -> 64), and 65..256 (96 -> 128)
     for supported in (32, 40, 64, 72, 80, 96, 112, 128, 160, 256):
         assert Gfx906FABackend.supports_head_size(supported), supported
     # only dims beyond the largest instantiated kernel dim are out of reach
@@ -71,7 +71,7 @@ def test_supports_head_size_serves_pad_able_dims_by_default(monkeypatch):
     assert not Gfx906FABackend.supports_head_size(96)
 
 def test_customize_spec_widens_both_halves(monkeypatch):
-    """The spec must carry the padded dim on BOTH halves (this was Phi-3's 224-row bug)."""
+    """The spec must widen BOTH halves (this was Phi-3's 224-row bug)."""
     from vllm.v1.kv_cache_interface import FullAttentionSpec
 
     spec = FullAttentionSpec(
@@ -102,7 +102,7 @@ def test_spec_and_shape_agree_on_the_padded_row(real_d, monkeypatch):
     """The spec's page size and the declared shape must describe the same row.
 
     The invariant the Phi-3 gate broke: vLLM sizes a page from the spec
-    (block * num_kv_heads * (head_size + head_size_v) * dtype) and builds the tensor from
+    (block * num_kv_heads * (head_size + head_size_v) * dtype) and builds the tensor
     get_kv_cache_shape, so a mismatch makes the allocator invent a third row width.
     """
     from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -114,7 +114,12 @@ def test_spec_and_shape_agree_on_the_padded_row(real_d, monkeypatch):
             dtype=torch.float16, kv_quant_mode=None,
         )
     )
-    shape = Gfx906FABackend.get_kv_cache_shape(2, spec.block_size, spec.num_kv_heads, real_d)
+    shape = Gfx906FABackend.get_kv_cache_shape(
+        2, spec.block_size, spec.num_kv_heads, real_d
+    )
     row_elements = shape[1] * shape[-1]  # dim 1 pairs K/V; the last is the padded row
     assert row_elements == spec.head_size + spec.head_size_v, (shape, spec)
-    assert spec.page_size_bytes == spec.block_size * spec.num_kv_heads * row_elements * 2
+    assert (
+        spec.page_size_bytes
+        == spec.block_size * spec.num_kv_heads * row_elements * 2
+    )
