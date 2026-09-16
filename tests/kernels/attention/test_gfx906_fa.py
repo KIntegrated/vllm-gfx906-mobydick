@@ -3131,7 +3131,7 @@ def test_vit_fallback_is_loud_and_explains_itself(monkeypatch, caplog):
 def test_vit_bidirectional_matches_sdpa():
     """VIT-1: the dense FA entry serves bidirectional ragged ViT attention.
 
-    Qwen3.5 ViT geometry: head_dim 72 (padded to 128 in-kernel), bidirectional,
+    Qwen3.5 ViT geometry: head_dim 72 (padded to 96 in-kernel since FA-D96), bidirectional,
     cache-free, ragged batches. The second item is deliberately shorter than the
     padded length, so a wrong KV bound (kv_max) would attend padded KV rows and
     show up as a large error here.
@@ -3699,13 +3699,22 @@ def test_a3_draft_step_reuse_reads_live_seq_lens(monkeypatch):
 # the pad, and the cache is pre-filled with garbage so an unzeroed pad shows up
 # as a mismatch - and the query is padded on the way in and sliced on the way
 # out. Opted in per test via GFX906_FA_PAD (the default is off).
+# D=96 is instantiated since FA-D96, but a dim that would *pad onto* 96 is gated
+# behind GFX906_FA_PAD96 (the ViT/TTFT arm), so both arms run here: 72/80 onto 96
+# with the opt-in, 72/112 onto 128 without it.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("real_d,padded", [(72, 128), (80, 128), (96, 128), (112, 128)])
-def test_padded_head_dim_matches_torch_ref(real_d, padded, monkeypatch):
+@pytest.mark.parametrize("real_d,padded,pad96", [
+    (72, 128, False),
+    (112, 128, False),
+    (72, 96, True),
+    (80, 96, True),
+])
+def test_padded_head_dim_matches_torch_ref(real_d, padded, pad96, monkeypatch):
     from types import SimpleNamespace
 
     monkeypatch.setenv("GFX906_FA_PAD", "1")
+    monkeypatch.setenv("GFX906_FA_PAD96", "1" if pad96 else "0")
     dev = "cuda"
     L, hq, hkv = 64, 4, 2
     torch.manual_seed(17)
@@ -3770,3 +3779,62 @@ def test_padded_head_dim_matches_torch_ref(real_d, padded, monkeypatch):
         ref = _windowed_ref(q[t], Kf, Vf, scale, t, None)
         rel = ((got[t] - ref).norm() / ref.norm()).item()
         assert rel < 5e-2, f"D={real_d} row {t}: rel {rel:.4f}"
+
+
+# ---------------------------------------------------------------------------
+# FA-D96 (2026-09-16): 96 became an instantiated kernel head dim. Every other
+# test in this file runs D=64/128/256 (or the pad path onto one of those), so
+# the new instantiation needs its own pin on BOTH entry points: the gather
+# entry (prefill / B=1) and the direct-paged entry (decode). Both are causal
+# here; the bidirectional ViT use of D=96 is covered by
+# test_vit_bidirectional_matches_sdpa below (72 pads onto 96 now).
+# ---------------------------------------------------------------------------
+
+def test_head_dim_96_instantiated_gather_and_paged_vs_fp32_ref():
+    """D=96 runs the 96-wide kernel on both paths, vs an fp32 torch reference."""
+    dev = "cuda"
+    torch.manual_seed(20260916)
+    d, hq, hkv, L = 96, 16, 2, 256
+    n_blocks = L // BLOCK
+    bytes_per_row = (d // 32) * 34
+    kc = torch.zeros(n_blocks, BLOCK, hkv, bytes_per_row,
+                     dtype=torch.uint8, device=dev)
+    kv = torch.zeros(n_blocks, 2, BLOCK, hkv, d,
+                     dtype=torch.float16, device=dev)
+    K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    slot = torch.arange(L, dtype=torch.int64, device=dev)
+    fa.reshape_and_cache_q8(K, slot, kc)
+    staging = torch.zeros_like(kv[:, 1])
+    staging.view(-1, hkv, d)[:L].copy_(V)
+    kv[:, 1].copy_(staging)
+    vc = kv.unbind(1)[1]  # production layout: unbind(1), non-contiguous
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, -1)
+    sl = torch.tensor([L], dtype=torch.int32, device=dev)
+    scale = 1.0 / math.sqrt(d)
+    Kf, Vf = K.float(), V.float()
+
+    # direct-paged B=1 decode (Sq=1, causal)
+    q = torch.randn(1, hq, 1, d, device=dev, dtype=torch.float32) * 0.5
+    out = fa.forward_paged_direct(q, kc, vc, bt, sl, scale, None, None)[0, 0]
+    ref = _windowed_ref(q[0, :, 0], Kf, Vf, scale, L - 1, None)
+    rel = ((out - ref).norm() / ref.norm()).item()
+    assert rel < 5e-2, f"D=96 paged decode: rel {rel:.4f}"
+
+    # gather entry (B=1 prefill-shaped: Sq=8 rows at the end of one sequence).
+    # q_abs_offset is the absolute position of the FIRST query row of the tile —
+    # without it (and with mask=None) the kernel computes full bidirectional
+    # attention, which is the ViT case, not this one.
+    sq = 8
+    sk_pad = (L + 31) // 32 * 32
+    k_q8, v_b = fa.gather_paged_kv_q8(kc, vc, bt, sl, sk_pad)
+    q2 = torch.randn(1, hq, sq, d, device=dev, dtype=torch.float32) * 0.5
+    abs0 = L - sq
+    out2 = fa.forward(
+        q2, k_q8, v_b, scale, kv_max=sl,
+        q_abs_offset=torch.tensor([abs0], dtype=torch.int32, device=dev),
+    )[0]  # [Sq, hq, d]
+    for t in (0, sq // 2, sq - 1):
+        ref2 = _windowed_ref(q2[0, :, t], Kf, Vf, scale, abs0 + t, None)
+        rel2 = ((out2[t] - ref2).norm() / ref2.norm()).item()
+        assert rel2 < 5e-2, f"D=96 gather row {t}: rel {rel2:.4f}"

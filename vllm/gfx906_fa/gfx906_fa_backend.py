@@ -83,14 +83,18 @@ class Gfx906FAMetadata:
 
 
 # Kernel head dims the launcher instantiates (see csrc/gfx906_fa/gfx906_fa_launcher.cu).
-_INSTANTIATED_HEAD_DIMS = (64, 128, 256)
+# 96 was added 2026-09-16 (FA-D96) for the ViT's 72 and the head_dim-96 text class; the
+# pad MAP stays on _FALLBACK_HEAD_DIMS until that item's real-model gates pass (see
+# _pad96_enabled), so this set is the kernel whitelist, not the default pad map.
+_INSTANTIATED_HEAD_DIMS = (64, 96, 128, 256)
+_FALLBACK_HEAD_DIMS = (64, 128, 256)
 
 
 _DEBUG_SHAPES = [0]  # GFX906_FA_DEBUG_SHAPES prints the first few calls
 
 
 def _pad_head_dim(head_size: int) -> int | None:
-    """Smallest instantiated kernel head dim that fits (None if none does).
+    """Smallest servable kernel head dim that fits (None if none does).
 
     Mirrors the ViT path (`gfx906_fa_mm_encoder.py`), which serves every head dim up to
     256 by zero-padding to the next instantiated dim. Padding is exact here: padded Q
@@ -99,29 +103,53 @@ def _pad_head_dim(head_size: int) -> int | None:
     The cost is real (QK/PV work grows) but it replaces a fallback to ROCM_ATTN or
     TRITON_ATTN, which loses the tuned kernel entirely.
 
-    NOT WIRED YET (FA-COVER-1 step 2): a padded dim needs the KV-cache layout to carry
-    it (`get_kv_cache_shape`) plus padding and slicing in the write and read paths, so
-    `supports_head_size` stays restrictive until that lands.
-    See docs/gfx906/DEVLOG-fa-coverage.md.
+    96 is an instantiated kernel dim since FA-D96, but the *map* stays on (64, 128, 256)
+    until that item's real-model gates pass — so an exact 96 is padded to 128, the width
+    FA-COVER-1 gated on Phi-3, and 72/80 pad to 128 as before. ``GFX906_FA_PAD96=1`` opts
+    into the 96-wide map (exact 96 served natively, 72/80 padded onto 96). See
+    docs/gfx906/DEVLOG-fa-d96.md.
     """
-    for head_dim in _INSTANTIATED_HEAD_DIMS:
+    dims = _INSTANTIATED_HEAD_DIMS if _pad96_enabled() else _FALLBACK_HEAD_DIMS
+    for head_dim in dims:
         if head_size <= head_dim:
             return head_dim
     return None
 
 
+def _pad96_enabled() -> bool:
+    """Whether the 96-wide kernel may be used by the pad map (default off).
+
+    Off until the FA-D96 gates pass: the ViT image-prompt TTFT A/B measured
+    **-1.2 %** (5.133 -> 5.073 s, A-A-B; the third arm was lost to a GPU reset),
+    well under the -5 % that motivated the item, and the head_dim-96 text class
+    (Phi-3-mini) has kernel-level evidence only — no real-model serving gate yet.
+    Correctness is pinned (FA suite + a dedicated D=96 test on both entry points,
+    bit-identical arms), so the opt-in is safe to run; it just is not the
+    reviewed default.
+    """
+    return _os.environ.get("GFX906_FA_PAD96", "0") == "1"
+
+
 def _padded_head_size(head_size: int) -> int | None:
     """``head_size`` as a servable dim, or None when it cannot be served.
 
-    Default ON since the Phi-3-mini gate (2026-09-16, FA-COVER-1 step 2): head_dim 96 went from a
-    silent fallback to CUSTOM at 36.41 t/s vs 28.62 (+27 %), with identical top-5 tokens and PPL
-    within 0.11 % of the fallback arm (0 top-20 misses in both). The cost is KV bytes: the row
-    grows by the pad ratio (96 -> 128 is +33 % of K and V, 72 -> 128 is +78 %), and
-    ``GFX906_FA_PAD=0`` restores the old behaviour (instantiated dims only). Instantiated dims are
-    returned unchanged either way.
+    Default ON since the Phi-3-mini gate (2026-09-16, FA-COVER-1 step 2): head_dim 96 went
+    from a silent fallback to CUSTOM at 36.41 t/s vs 28.62 (+27 %), with identical top-5
+    tokens and PPL within 0.11 % of the fallback arm (0 top-20 misses in both). The cost is
+    KV bytes: the row grows by the pad ratio, and ``GFX906_FA_PAD=0`` restores the old
+    behaviour (instantiated dims only). Instantiated dims are returned unchanged either way.
+
+    96 became an instantiated kernel dim in FA-D96 (2026-09-16) but is **not in the default
+    pad map** yet (``_pad96_enabled``): the default map is (64, 128, 256), so 96 and 72/80
+    all land on 128 — the width the Phi-3 gate validated. ``GFX906_FA_PAD96=1`` opts into
+    (64, 96, 128, 256).
     """
     if _os.environ.get("GFX906_FA_PAD", "1") != "1":
-        return head_size if head_size in _INSTANTIATED_HEAD_DIMS else None
+        # No padding: only dims in the *active* map are servable. With the FA-D96 opt-in
+        # off that excludes 96 — the pre-FA-D96 semantics of this switch (Phi-3 falls
+        # back rather than being served by a dim the map does not carry).
+        dims = _INSTANTIATED_HEAD_DIMS if _pad96_enabled() else _FALLBACK_HEAD_DIMS
+        return head_size if head_size in dims else None
     return _pad_head_dim(head_size)
 
 
@@ -302,14 +330,13 @@ class Gfx906FABackend(AttentionBackend):
     def customize_spec(cls, spec):
         """Widen the KV spec's head dims to the padded one when padding is opted in.
 
-        NOTE: both halves are set to the same padded width, which is what the impl's split and
-        its zero-padding assume; a model with genuinely asymmetric K/V head dims would need
-        per-half padding here and in the impl.
+        NOTE: both halves are set to the same padded width, which is what the impl's split
+        and its zero-padding assume; a model with genuinely asymmetric K/V head dims would
+        need per-half padding here and in the impl.
 
-
-        vLLM sizes the KV cache from this spec while the kernels are dispatched on the padded
-        dim, so the two must agree. With the real dim in the spec the layer allocates a
-        2*real-byte fused row, and splitting that at the padded dim leaves a remainder
+        vLLM sizes the KV cache from this spec while the kernels are dispatched on the
+        padded dim, so the two must agree. With the real dim in the spec the layer allocates
+        a 2*real-byte fused row, and splitting that at the padded dim leaves a remainder
         (Phi-3-mini: a 128 chunk plus a 64 remainder, which trips the Q8 row check).
         """
         if _os.environ.get("GFX906_FA_DEBUG_SHAPES"):
@@ -321,10 +348,10 @@ class Gfx906FABackend(AttentionBackend):
         padded = _padded_head_size(spec.head_size)
         if padded is None or padded == spec.head_size:
             return spec
-        # BOTH halves: the 0.29 fused row is K||V, so its width is head_size + head_size_v,
-        # and our impl splits it into two padded_head_size halves. Widening only head_size
-        # leaves a row of padded + real (Phi-3: 128 + 96 = 224), which is what the allocator
-        # then built and what the Q8 row check rejected.
+        # BOTH halves: the 0.29 fused row is K||V, so its width is head_size +
+        # head_size_v, and our impl splits it into two padded_head_size halves. Widening
+        # only head_size leaves a row of padded + real (Phi-3: 128 + 96 = 224), which is
+        # what the allocator then built and what the Q8 row check rejected.
         out = dataclasses.replace(spec, head_size=padded, head_size_v=padded)
         if _os.environ.get("GFX906_FA_DEBUG_SHAPES"):
             print(f"[gfx906_fa-spec] out: head={out.head_size}", flush=True)
@@ -378,9 +405,8 @@ class Gfx906FABackend(AttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        # Kernel validated for 64/128; 256 (Qwen3.5/3.6) added. Dims that pad onto
-        # one of those are servable too, but only when GFX906_FA_PAD opts in
-        # (default off until the write path is validated on a real model).
+        # Kernel instantiated for 64/96/128/256. Dims that pad onto one of those are
+        # servable too when GFX906_FA_PAD opts in (default ON since the Phi-3 gate).
         return _padded_head_size(head_size) is not None
 
     @classmethod

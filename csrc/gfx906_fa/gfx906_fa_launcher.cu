@@ -12,7 +12,8 @@
 // на паре torch::Tensor Q/K/V + metadata → Output.
 //
 // Ограничения:
-//   - DKQ = DV = 128 (Qwen3.5 / MiniMax M2.7)
+//   - DKQ = DV = 64/96/128/256 (instantiated; 96 serves the ViT pad-72 and
+//     the head_dim-96 text class — see docs/gfx906/DEVLOG-fa-d96.md)
 //   - use_logit_softcap = false, без sinks
 //   - Causal — inline в kernel (Q_ABS_OFFSET), KV_max — per-seq cut
 //   - Direct paged: K/V читаются из paged cache через block table
@@ -61,7 +62,7 @@
 // ============================================================================
 // Entry point из C++/pybind11: C-linkage удобнее для диагностики
 // ============================================================================
-// Templated FA launch. HD is the compile-time head dimension (64/128/256).
+// Templated FA launch. HD is the compile-time head dimension (64/96/128/256).
 template <int HD>
 static hipError_t gfx906_fa_launch_impl(
     const float *      Q_fp32,
@@ -332,8 +333,9 @@ extern "C" hipError_t gfx906_fa_launch(
 ) {
     if      (head_dim == 128) return gfx906_fa_launch_impl<128>(Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, tile_clip, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream, nc2, kv_split);
     else if (head_dim == 256) return gfx906_fa_launch_impl<256>(Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, tile_clip, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream, nc2, kv_split);
+    else if (head_dim == 96)  return gfx906_fa_launch_impl<96> (Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, tile_clip, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream, nc2, kv_split);
     else if (head_dim == 64)  return gfx906_fa_launch_impl<64> (Q_fp32, K_q8, V_f16, O_fp32, O_meta, KV_max_d, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, tile_clip, batch, heads_q, heads_kv, seq_q, seq_kv, scale, stream, nc2, kv_split);
-    fprintf(stderr, "[gfx906_fa] Unsupported head_dim=%d (supported: 64, 128, 256)\n", head_dim);
+    fprintf(stderr, "[gfx906_fa] Unsupported head_dim=%d (supported: 64, 96, 128, 256)\n", head_dim);
     return hipErrorInvalidValue;
 }
 
@@ -493,11 +495,12 @@ extern "C" hipError_t gfx906_fa_launch_paged(
 ) {
     if      (head_dim == 128) return gfx906_fa_launch_paged_impl<128>(Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, tile_clip, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream, kv_split);
     else if (head_dim == 256) return gfx906_fa_launch_paged_impl<256>(Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, tile_clip, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream, kv_split);
+    else if (head_dim == 96)  return gfx906_fa_launch_paged_impl<96> (Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, tile_clip, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream, kv_split);
     else if (head_dim == 64)  return gfx906_fa_launch_paged_impl<64> (Q_fp32, K_paged, V_paged, block_table, kv_max_d, O_fp32, O_meta, MASK_f16, mask_seq_kv_padded, Q_ABS_OFFSET_d, window, KV_START_d, tile_clip, batch, heads_q, heads_kv, seq_q, max_seq_kv, block_size, max_blocks_per_seq, k_block_stride, k_token_stride, k_head_stride, v_block_stride, v_token_stride, v_head_stride, scale, stream, kv_split);
-    fprintf(stderr, "[gfx906_fa_paged] Unsupported head_dim=%d (supported: 64, 128, 256)\n", head_dim);
+    fprintf(stderr, "[gfx906_fa_paged] Unsupported head_dim=%d (supported: 64, 96, 128, 256)\n", head_dim);
     return hipErrorInvalidValue;
 }
-// Templated paged FA launch. HD is the compile-time head dimension (64/128/256).
+// Templated paged FA launch. HD is the compile-time head dimension (64/96/128/256).
 template <int HD>
 static hipError_t gfx906_fa_launch_paged_impl(
     const float *      Q_fp32,

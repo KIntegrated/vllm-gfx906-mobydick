@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
-"""Head-dim padding helpers for the gfx906 FA text path (FA-COVER-1 step 2).
+"""Head-dim padding helpers for the gfx906 FA text path (FA-COVER-1 step 2, FA-D96).
 
-Pins the padding map and the gap: text head dims outside {64,128,256} are still
-rejected, while the ViT path already pads them. When the write path learns to pad,
-the `supports_head_size` assertion below is the line to update.
+Pins the padding map and the gap: text head dims outside {64,96,128,256} are still
+rejected, while the ViT path already pads them. 96 became an instantiated kernel dim
+on 2026-09-16 (FA-D96), so 72/80 now pad to 96 rather than 128.
 """
 
 import pytest
@@ -21,74 +21,101 @@ except ImportError as exc:  # pragma: no cover - needs the built gfx906 extensio
 
 
 @pytest.mark.parametrize(
-    "head_size,want",
+    "head_size,want,pad96",
     [
-        (32, 64),
-        (64, 64),
-        (72, 128),
-        (80, 128),
-        (96, 128),
-        (112, 128),
-        (128, 128),
-        (160, 256),
-        (256, 256),
-        (288, None),
-        (1024, None),
+        (32, 64, False),
+        (64, 64, False),
+        (72, 128, False),  # default map is (64,128,256): FA-D96 is opt-in
+        (80, 128, False),
+        (96, 128, False),  # instantiated, but not in the default pad map yet
+        (112, 128, False),
+        (128, 128, False),
+        (160, 256, False),
+        (256, 256, False),
+        (288, None, False),
+        (1024, None, False),
+        (72, 96, True),  # GFX906_FA_PAD96=1: the FA-D96 arm
+        (80, 96, True),
+        (96, 96, True),
+        (112, 128, True),
     ],
 )
-def test_pad_map(head_size, want):
+def test_pad_map(head_size, want, pad96, monkeypatch):
+    monkeypatch.setenv("GFX906_FA_PAD96", "1" if pad96 else "0")
     assert _pad_head_dim(head_size) == want
 
 
 def test_padding_default_is_on_after_the_phi3_gate(monkeypatch):
     """Default ON since Phi-3: 96 -> CUSTOM at 36.41 vs 28.62 t/s."""
     monkeypatch.delenv("GFX906_FA_PAD", raising=False)
+    monkeypatch.delenv("GFX906_FA_PAD96", raising=False)
     assert _padded_head_size(128) == 128  # instantiated dims are unaffected
-    assert _padded_head_size(96) == 128
+    assert _padded_head_size(96) == 128  # FA-D96 map is opt-in, so 96 pads
+    assert _padded_head_size(72) == 128
+    monkeypatch.setenv("GFX906_FA_PAD96", "1")
+    assert _padded_head_size(96) == 96
+    assert _padded_head_size(72) == 96
+    assert _padded_head_size(80) == 96
 
 
 def test_kill_switch_restores_exact_dims_only(monkeypatch):
     monkeypatch.setenv("GFX906_FA_PAD", "0")
     assert _padded_head_size(128) == 128
-    assert _padded_head_size(96) is None
+    assert _padded_head_size(96) is None  # not in the default map
+    assert _padded_head_size(80) is None
     monkeypatch.setenv("GFX906_FA_PAD", "1")
-    assert _padded_head_size(96) == 128
+    assert _padded_head_size(80) == 128  # 96 not in the default map
+    monkeypatch.setenv("GFX906_FA_PAD96", "1")
+    assert _padded_head_size(80) == 96
     assert _padded_head_size(288) is None
 
 
 def test_supports_head_size_serves_pad_able_dims_by_default(monkeypatch):
     """Pad-able dims are servable now; dims past 256 still are not."""
     monkeypatch.delenv("GFX906_FA_PAD", raising=False)
-    # pad-able: instantiated, below 64 (32 -> 64), and 65..256 (96 -> 128)
+    monkeypatch.delenv("GFX906_FA_PAD96", raising=False)
+    # pad-able: instantiated, below 64 (32 -> 64), and 65..256 (80/112 -> 128)
     for supported in (32, 40, 64, 72, 80, 96, 112, 128, 160, 256):
         assert Gfx906FABackend.supports_head_size(supported), supported
     # only dims beyond the largest instantiated kernel dim are out of reach
     for unsupported in (257, 288, 512):
         assert not Gfx906FABackend.supports_head_size(unsupported), unsupported
-    # kill switch: back to the instantiated dims only
+    # kill switch: back to the instantiated dims only (96 is instantiated, 80 is not)
     monkeypatch.setenv("GFX906_FA_PAD", "0")
     assert Gfx906FABackend.supports_head_size(128)
     assert not Gfx906FABackend.supports_head_size(96)
+    assert not Gfx906FABackend.supports_head_size(80)
 
 def test_customize_spec_widens_both_halves(monkeypatch):
     """The spec must widen BOTH halves (this was Phi-3's 224-row bug)."""
     from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-    spec = FullAttentionSpec(
-        block_size=16, num_kv_heads=32, head_size=96, head_size_v=96,
-        dtype=torch.float16, kv_quant_mode=None,
-    )
+    def _spec(d):
+        return FullAttentionSpec(
+            block_size=16, num_kv_heads=32, head_size=d, head_size_v=d,
+            dtype=torch.float16, kv_quant_mode=None,
+        )
+
     monkeypatch.setenv("GFX906_FA_PAD", "1")
-    widened = Gfx906FABackend.customize_spec(spec)
+    monkeypatch.delenv("GFX906_FA_PAD96", raising=False)
+    # 72 pads to 128 by default: both halves must move together. Widening only
+    # one leaves padded+real (128 + 72 = 200), the class of bug the Phi-3 gate hit.
+    widened = Gfx906FABackend.customize_spec(_spec(72))
     assert widened.head_size == 128
-    # The fused row is head_size + head_size_v: widening only one leaves
-    # padded+real (128 + 96 = 224), the third width the allocator built on Phi-3.
     assert widened.head_size_v == 128
     # other fields untouched
     assert widened.block_size == 16 and widened.num_kv_heads == 32
+    # 96 is instantiated but not in the default pad map: it still widens to 128
+    assert Gfx906FABackend.customize_spec(_spec(96)).head_size == 128
+    # the FA-D96 arm widens onto 96 instead
+    monkeypatch.setenv("GFX906_FA_PAD96", "1")
+    widened96 = Gfx906FABackend.customize_spec(_spec(72))
+    assert widened96.head_size == 96 and widened96.head_size_v == 96
+    assert Gfx906FABackend.customize_spec(_spec(96)).head_size == 96
+    monkeypatch.delenv("GFX906_FA_PAD96", raising=False)
     # kill switch: unchanged
     monkeypatch.setenv("GFX906_FA_PAD", "0")
-    assert Gfx906FABackend.customize_spec(spec).head_size == 96
+    assert Gfx906FABackend.customize_spec(_spec(72)).head_size == 72
     monkeypatch.setenv("GFX906_FA_PAD", "1")
     # a dim that cannot be padded is left alone even when opted in
     big = FullAttentionSpec(
@@ -98,16 +125,19 @@ def test_customize_spec_widens_both_halves(monkeypatch):
     assert Gfx906FABackend.customize_spec(big).head_size == 512
 
 @pytest.mark.parametrize("real_d", [72, 80, 96, 112])
-def test_spec_and_shape_agree_on_the_padded_row(real_d, monkeypatch):
+@pytest.mark.parametrize("pad96", [0, 1])
+def test_spec_and_shape_agree_on_the_padded_row(real_d, pad96, monkeypatch):
     """The spec's page size and the declared shape must describe the same row.
 
     The invariant the Phi-3 gate broke: vLLM sizes a page from the spec
     (block * num_kv_heads * (head_size + head_size_v) * dtype) and builds the tensor
     get_kv_cache_shape, so a mismatch makes the allocator invent a third row width.
+    Run for both pad targets (128, and 96 under the FA-D96 opt-in).
     """
     from vllm.v1.kv_cache_interface import FullAttentionSpec
 
     monkeypatch.setenv("GFX906_FA_PAD", "1")
+    monkeypatch.setenv("GFX906_FA_PAD96", "1" if pad96 else "0")
     spec = Gfx906FABackend.customize_spec(
         FullAttentionSpec(
             block_size=16, num_kv_heads=32, head_size=real_d, head_size_v=real_d,
