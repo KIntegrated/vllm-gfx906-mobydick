@@ -94,3 +94,33 @@ justification (or the refutation) for the kernel work.
    real backend, plus the FA suite (must stay green; the flag defaults off so behaviour is unchanged
    until the flip).
 3. Only then do DFL2-3 (lookup drafting) and DFL2-1 (chains) make sense.
+
+## 2026-09-16 (implementation) — the experiment is in-tree and env-gated
+
+**VERDICT:** implemented, measurement still pending (see the two gotchas) · **GATE:** the same
+per-position acceptance number.
+
+`VLLM_DFLASH2_EAGER_ATTN=1` (default off, inert otherwise) switches `DFlashQwen3Attention.forward`
+to `_eager_windowed_attention`: it stashes the dense context K/V that
+`precompute_and_store_context_kv` already builds (`all_k_normed` post-RoPE, `all_v`, and
+`context_positions`, keyed by layer index parsed from the prefix) and computes
+`scaled_dot_product_attention` over `[context K/V ; block K/V]` with a symmetric-window mask
+(`|k_pos - q_pos| <= sliding_window`), GQA expanded by `repeat_interleave` — the
+`_maybe_symmetrize_window` semantics, without touching the paged cache. ruff-clean; the file's
+formatting is unchanged (this is a normal upstream-style file, unlike the FA test file).
+
+Two gotchas that cost runs and are worth remembering:
+
+1. **`--kv-cache-dtype` rejects `fp16`** (choices `auto`/`bfloat16`/`float16`/`fp8*`), and `vllm serve`
+   then dies in argparse *before* any logger exists — which is what silently killed the earlier
+   chained DFlash2 INT8 session (empty server log, zero rows).
+2. **The measurement client's contract**: `readme_perf/sweep_client_reps.py` posts to
+   `/v1/completions` with the hardcoded `model="qwen27"`, and derives acceptance from
+   `_sum_prefix` over `vllm:spec_decode_*_total` (bare names do not exist; the families carry
+   `_total`/`_created` suffixes and labels). Serving under any other name produces HTTP 404 and an
+   "INCOMPLETE" sweep, not a measurement. A hand-rolled metrics client also mis-sums the labelled
+   families — use the proven one.
+
+Loads on this boot wedged twice (#97 09:56, #98 11:15; a clean load in between), and the harness
+agent process itself was killed by a segfault during one of the runs — no kernel OOM/segfault
+recorded, box RAM is 31 GB with a ~15 GB model load. Reboot before the next gated run.

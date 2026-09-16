@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 
 import io
+import os
 from collections.abc import Iterable
 
 import torch
@@ -238,6 +239,13 @@ class DFlashQwen3Attention(nn.Module):
             sinks=self.attention_sink_bias,
         )
         self.causal = causal
+        self._window = int(sliding_window or 0)
+        # Index into the experimental stash; prefix is ...layers.<i>.self_attn.
+        self._eager_layer_idx = (
+            int(prefix.split("layers.")[-1].split(".")[0])
+            if "layers." in prefix
+            else -1
+        )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -264,9 +272,57 @@ class DFlashQwen3Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
-        attn_output = self.attn(q, k, v)
+        if _DFLASH2_EAGER_ATTN and self._eager_layer_idx in _DFLASH2_EAGER_CTX:
+            attn_output = self._eager_windowed_attention(q, k, v, positions)
+        else:
+            attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _eager_windowed_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Experimental: symmetric sliding-window attention in torch (non-causal).
+
+        Reference semantics (``_maybe_symmetrize_window``): a causal window ``(w, 0)``
+        becomes symmetric ``(w, w)`` when attention is non-causal, i.e. a key is visible
+        when ``|k_pos - q_pos| <= w``. Keys are the stashed context K/V plus this step's
+        block K/V, so the test does not read the paged cache.
+        """
+        ctx_k, ctx_v, ctx_pos = _DFLASH2_EAGER_CTX[self._eager_layer_idx]
+        t = q.shape[0]
+        heads, hkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
+        qf = q.view(t, heads, hd).transpose(0, 1).unsqueeze(0).float()
+        kf = (
+            torch.cat((ctx_k, k.view(t, hkv, hd)), dim=0)
+            .transpose(0, 1)
+            .unsqueeze(0)
+            .float()
+        )
+        vf = (
+            torch.cat((ctx_v, v.view(t, hkv, hd)), dim=0)
+            .transpose(0, 1)
+            .unsqueeze(0)
+            .float()
+        )
+        if hkv != heads:
+            rep = heads // hkv
+            kf = kf.repeat_interleave(rep, dim=1)
+            vf = vf.repeat_interleave(rep, dim=1)
+        mask = None
+        if self._window > 0:
+            k_pos = torch.cat((ctx_pos, positions)).to(torch.int64)
+            q_pos = positions.to(torch.int64)
+            mask = (k_pos.view(1, -1) - q_pos.view(-1, 1)).abs() <= self._window
+            mask = mask.view(1, 1, t, -1)
+        out = F.scaled_dot_product_attention(
+            qf, kf, vf, attn_mask=mask, scale=self.scaling
+        )
+        return out.squeeze(0).transpose(0, 1).reshape(t, heads * hd).to(q.dtype)
 
 
 class DFlashQwen3DecoderLayer(nn.Module):
@@ -354,6 +410,14 @@ class DFlashQwen3DecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
+
+
+# Experimental (VLLM_DFLASH2_EAGER_ATTN=1): the drafter's block attention runs in torch
+# with a symmetric sliding-window mask, bypassing the backend (our FA refuses non-causal
+# layers; the ROCM_ATTN fallback cannot be graph-captured and drafts nothing).
+# Layer index -> (context K, context V, context positions). DEVLOG-fa-noncausal.md.
+_DFLASH2_EAGER_ATTN = os.environ.get("VLLM_DFLASH2_EAGER_ATTN") == "1"
+_DFLASH2_EAGER_CTX: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
 
 def _dense_kv_rows(attn: nn.Module) -> torch.Tensor:
@@ -632,6 +696,17 @@ class DFlashQwen3Model(nn.Module):
 
         all_k, all_v = self._project_context_kv(context_states, num_ctx, L, nkv, hd)
         all_k_normed = self._normalize_context_k(all_k)
+
+        # Experimental: stash the dense context K/V (post-norm, post-RoPE) for the eager
+        # windowed-bidirectional attention path in DFlashQwen3Attention.forward.
+        if _DFLASH2_EAGER_ATTN:
+            _DFLASH2_EAGER_CTX.clear()
+            for i in range(L):
+                _DFLASH2_EAGER_CTX[i] = (
+                    all_k_normed[i].detach(),
+                    all_v[i].detach(),
+                    context_positions,
+                )
 
         # --- Fused RoPE across all layers ---
         # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
