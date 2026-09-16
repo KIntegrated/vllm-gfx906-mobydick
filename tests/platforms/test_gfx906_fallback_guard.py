@@ -106,3 +106,23 @@ def test_forced_guard_silent_off_gfx906(monkeypatch):
     )
     assert stub.warnings == []
 
+def test_hint_points_at_the_pad_knob(gfx906, monkeypatch):
+    """A Phi-3-shaped rejection (head_dim 96) must name the opt-in that serves it."""
+    monkeypatch.delenv("VLLM_GFX906_FA_STRICT", raising=False)
+    cfg = SimpleNamespace(attn_type="decoder", head_size=96)
+    rocm._guard_gfx906_fa_fallback(
+        cfg, {CUSTOM: ["head_size not supported"]}, AttentionBackendEnum.TRITON_ATTN
+    )
+    assert len(gfx906.warnings) == 1
+    assert "GFX906_FA_PAD=1" in gfx906.warnings[0]
+
+
+def test_no_hint_when_the_dim_cannot_be_padded(gfx906, monkeypatch):
+    monkeypatch.delenv("VLLM_GFX906_FA_STRICT", raising=False)
+    cfg = SimpleNamespace(attn_type="decoder", head_size=512)  # Gemma-4's class
+    rocm._guard_gfx906_fa_fallback(
+        cfg, {CUSTOM: ["head_size not supported"]}, AttentionBackendEnum.TRITON_ATTN
+    )
+    assert len(gfx906.warnings) == 1
+    assert "GFX906_FA_PAD=1" not in gfx906.warnings[0]
+

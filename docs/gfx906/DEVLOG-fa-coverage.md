@@ -217,3 +217,22 @@ What landed in `gfx906_fa_backend.py`:
 
 Cost noted honestly: the padding is per-write `torch.zeros` (opt-in path only), and the KV cache
 grows by the pad ratio (96 -> 128 is +33 % of K and V bytes).
+
+### Step 2 verified against a torch reference (2026-09-16)
+
+**VERDICT:** the padded path is verified · **GATE:** `test_padded_head_dim_matches_torch_ref`
+(D=72/80/96/112) plus the full FA suite at 101 passed.
+
+The test drives the *impl* rather than the raw op, so the padding runs end to end: the cache is the
+backend-level fused layout `[N, Hkv, BLOCK, 2*D]` (vLLM fuses the spec's logical head dim into the
+row), K/V go in through `do_kv_cache_update`, the query is padded on the way in and the result sliced
+on the way out. Two details make it a real test rather than a smoke:
+
+- the cache is **pre-filled with garbage**, so an unzeroed pad shows up as a mismatch (the test also
+  asserts the pad channels are exactly zero after the write);
+- it compares against the existing `_windowed_ref` torch reference at the *real* head dim, which is
+  the right expectation precisely because a zero pad contributes nothing.
+
+The default is still 0, and the guard now makes the opt-in discoverable: when CUSTOM is rejected for
+`head_size` on a dim that `_pad_head_dim` can reach, the warning says so and names `GFX906_FA_PAD=1`
+(Phi-3-mini / Phi-3.5-mini are 96, Phi-2 is 80, SigLIP-style ViTs are 72 — the class this serves).

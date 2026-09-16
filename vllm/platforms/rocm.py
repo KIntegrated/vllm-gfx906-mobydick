@@ -517,12 +517,22 @@ def _guard_gfx906_fa_fallback(
     ]
     if not custom_reasons:
         return
+    hint = ""
+    if any("head_size" in reason for reason in custom_reasons):
+        from vllm.gfx906_fa.gfx906_fa_backend import _pad_head_dim
+
+        if _pad_head_dim(attn_selector_config.head_size) is not None:
+            hint = (
+                f" This head dim ({attn_selector_config.head_size}) is pad-able: set "
+                "GFX906_FA_PAD=1 to serve it with the custom FA rather than the "
+                "fallback (the KV row widens to the padded dim)."
+            )
     message = (
         f"gfx906: attention backend {selected_backend.name} was selected for "
         f"{attn_selector_config.attn_type}, but the custom gfx906 FA is unavailable "
         f"({'; '.join(custom_reasons)}). Expect a large per-step slowdown (the "
         "fallback may also be unable to use CUDA graphs), and note that gfx906 FA "
-        "tuning does not apply to it. See docs/gfx906/DEVLOG-fa-coverage.md."
+        "tuning does not apply to it. See docs/gfx906/DEVLOG-fa-coverage.md." + hint
     )
     if os.environ.get("VLLM_GFX906_FA_STRICT", "0") == "1":
         raise RuntimeError(message)
