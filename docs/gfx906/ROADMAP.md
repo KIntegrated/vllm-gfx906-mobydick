@@ -12,12 +12,17 @@ tiers are do-order, sections within a tier are ordered the same way.
 
 ## High priority — user-requested (2026-09-12)
 
-### DFL2-1 — DFlash2 n-gram chains: drafter-free verify blocks while a request copies its context (**HIGH PRIORITY
+### DFL2-1 — DFlash2 n-gram chains: drafter-free verify blocks while a request copies its context (**HIGH PRIORITY**, Kevin 2026-09-12)
+
 > **Work branch: `gfx906/dflash2`** (cut from `main` 2026-09-15). The DFlash2 bring-up records
 > already on `main` — the `triton_matmul` 3-D / `[K, N]` fix, `DEVLOG-dflash2.md` and the DFL2-*
 > items — are shared; the DFlash2 feature work (DFL2-3 lookup-drafting → DFL2-1 chains, DFL2-7
 > GEMV coverage) proceeds on this branch until it passes its gates.
-**, Kevin 2026-09-12)
+>
+> **The pairing test is blocked on quantisation, not on DFlash2** (2026-09-16): the matched
+> INT8 target (`lued/Qwen3.8-27B-INT8-W8A16-DFlash2` + `…-DFlash2-W8`) is a compressed-tensors
+> `pack-quantized` checkpoint our fork cannot load → **INT8-PACKED-1**. The cards' own matched
+> bf16 pair on a stock vLLM remains the cheap decisive test.
 
 **Kevin 2026-09-12.** Port `patches/dflash2-ngram-chains.patch` from
 `../qwen38-27b-rtx3090` (`VLLM_DFLASH2_CHAIN=1`): while a request keeps
@@ -1761,6 +1766,18 @@ change.
 
 ## Tier 2 — bigger / conditional bets
 
+### INT8-PACKED-1 — compressed-tensors `pack-quantized` int8/W8A16 support (blocks the DFlash2 INT8 arm)
+
+**Status: open.** `lued/Qwen3.8-27B-INT8-W8A16-DFlash2` (W8A16, 29.6 GB — fits 2x MI50 at
+TP=2) stores every quantised linear layer in compressed-tensors' *packed* form
+(`weight_packed` + `weight_scale` + `weight_shape`, 401 tensors including `embed_tokens`
+and the GDN `in_proj_qkv`/`in_proj_z`), and loading fails with `ValueError: There is no
+module or parameter named 'embed_tokens.weight_packed' in Qwen3_5Model`. Our tree ships
+unpacked W8A16/W8A8 schemes (`compressed_tensors_w8a16_channel_dequant`, `w8a16_fp8`,
+`wNa16`, ...) but the packed int8 path exists only for nvfp4/mxfp4
+(`kernels/linear/nvfp4/humming.py`). Scope: the unpack kernel plus the scheme/loader
+plumbing. Gate: the INT8 model serves and passes PPL; then DFL2-1's INT8 pairing arm runs.
+
 ### VIT-2 — head_dim-96 instantiation for the ViT (cut the 72 → 128 padding waste)
 
 **Status: open, queued follow-up to VIT-1 (2026-09-15).** The ViT's real head dim
@@ -1794,7 +1811,7 @@ not a speed win at these S).
 
 ### KVLAYOUT-1 — verify the opt-in LEGACY=0 Q8 side-buffer under 0.29's fused layout
 
-**Status: unverified, opt-in path (default is LEGACY=1).** 0.29 standardised the
+**Status: VERIFIED + adopted for spec-decode serving (2026-09-16); default not yet flipped.** 0.29 standardised the
 KV-cache layout (#51718): one tensor with a fused content axis `[B, H, N, 2*D]`
 per layer. The default path is ported and validated (FA suite + PPL + smoke),
 and the opt-in `GFX906_FA_LEGACY=0` Q8 side-buffer *should* still be correct —
@@ -1803,6 +1820,16 @@ its K view is the `split(D, -1)` half, whose last dim is stride-1 and whose
 holds, so the uint8 byte-alias writes stay inside K's own segment and never
 touch V. That reasoning is static; the path has not been run on 0.29. Verify with
 one serving A/B before enabling LEGACY=0 for anything.
+**Resolved 2026-09-16.** `GFX906_FA_LEGACY=0` gives **PPL 10.5472** — bit-identical to the
+current build's LEGACY=1 value (0 top-20 misses) — so the static reasoning above is confirmed
+numerically. Interleaved serving A/B (L1 -> L0 -> L1, MTP k=3, 64k/120k, ms/step): **L0
+71.4/76.8 @64k and 103.7/103.8 @120k vs L1 87.8/87.5 and 128.1/128.2** = **-15.5 % / -19.1 %**
+with acceptance unchanged (1.7634/1.7634/2.0476); L1's own repeat ran 6-7 % faster and L0 still
+beat it, so the win exceeds the per-process drift. Regime split: B=1 greedy pays ~6 % for this
+path (2026-08-29), spec-decode serving saves 15-19 %. Hence **adopt LEGACY=0 for serving, keep
+LEGACY=1 as the rollback**, and flip the default (code + the four LEGACY=1-assuming test guards,
+then the FA suite under LEGACY=0). See `DEVLOG-fa-legacy0-b1-decode.md`.
+
 **Unit-suite check (2026-09-15): the suite is not the instrument for this configuration.** Run with
 `GFX906_FA_LEGACY=0 GFX906_FA_LEGACY_ALLOW_UNVERIFIED=1` it gives **4 failed / 93 passed**, and all
 four are the fork's own preconditions/diagnostics rather than numerics: two bare `assert False`

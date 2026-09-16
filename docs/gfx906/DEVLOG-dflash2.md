@@ -217,6 +217,27 @@ acceptance** (the discriminating number — ours was 0.041/0.063 at 64k and 0.0 
 prefix-off), the GDN async-spec race (crash, prefix-on). Leading: drafter/target quantisation
 pairing; secondary: the drafter's attention backend. The matched INT8 pair is the decisive test.
 
+## 2026-09-16 — the INT8 route is blocked by OUR `pack-quantized` W8A16 gap, not by DFlash2
+
+**VERDICT:** `lued/Qwen3.8-27B-INT8-W8A16-DFlash2` cannot be served on this fork today.
+It is a compressed-tensors **`pack-quantized`** checkpoint (`weight_packed` /
+`weight_scale` / `weight_shape`; **401 packed tensors**, including the embedding and the
+GDN `linear_attn.in_proj_qkv` / `in_proj_z`), and our tree handles that form only for
+nvfp4/mxfp4 (`vllm/model_executor/kernels/linear/nvfp4/humming.py`). The loader dies in
+`Qwen3_5Model` with `ValueError: There is no module or parameter named
+'embed_tokens.weight_packed'`. It is also the **VL** variant
+(`Qwen3_5ForConditionalGeneration`, `model.visual.*` keys).
+
+The checkpoint itself is fine: 6 shards totalling 29.53 GB, exactly the index's
+`total_size`. The earlier 109 % directory size was **duplicate `.incomplete` partials**
+from two concurrent downloaders (4.1 GB, removed).
+
+So the pairing question stays open *on our box* until packed int8/W8A16 support lands
+(ROADMAP `INT8-PACKED-1`). Nothing here bears on the DFlash2 mechanism itself — the
+exclusions recorded above still stand, and the cheapest decisive test remains the
+*cards' own matched pair on a stock vLLM* (their nightly has both DFlash2 and
+pack-quantized).
+
 ## Refrigerated residue
 
 `rocm_unquantized_gemm`'s 3-D branches still pass `x` (not the flattened view) to

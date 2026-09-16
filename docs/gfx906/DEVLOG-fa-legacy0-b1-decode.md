@@ -1,6 +1,41 @@
 # FA LEGACY=0 B=1 decode gap — kernel-level localization + serving
 # adjudication
 
+## 2026-09-16 — KVLAYOUT-1: LEGACY=0 verified on 0.29, and it is 15-19 % FASTER with MTP k=3
+
+**VERDICT:** ADOPT `GFX906_FA_LEGACY=0` for spec-decode serving — numerics verified, and
+the ms/step win is far outside this box's per-process drift. The 2026-08-29 B=1 *greedy*
+reading below (LEGACY=1 better by 6.3 %) stands for that regime; this is a regime split,
+not a contradiction.
+
+- **Gate 1 (numerics).** `GFX906_FA_LEGACY=0` (+`GFX906_FA_LEGACY_ALLOW_UNVERIFIED=1`)
+  gives **PPL 10.5472** (359 tokens, **0 top-20 misses**) = *bit-identical* to the current
+  build's LEGACY=1 value (10.5472; the pre-triton-3.8.0 value was 10.5516). The Q8
+  side-buffer byte-alias under 0.29's fused `[B, H, N, 2*D]` layout is therefore correct,
+  not merely plausible — the static reasoning in ROADMAP KVLAYOUT-1 is now confirmed by the
+  only numerical gate this stack has.
+- **Gate 2 (serving A/B, interleaved L1 -> L0 -> L1).** MTP k=3, dense 27B AWQ, TP=1,
+  agentic corpus, 2 reps, ms/step:
+
+  | arm | 64k ms/step | 64k t/s | 120k ms/step | 120k t/s |
+  |---|---|---|---|---|
+  | L1 (legacy, default) | 87.8 / 87.5 | 31.54 / 26.47 | 128.1 / 128.2 | 23.42 / 23.69 |
+  | L0 (Q8 side-buffer) | **71.4 / 76.8** | **38.43 / 35.73** | **103.7 / 103.8** | **29.29 / 28.54** |
+  | L1 repeat (order control) | 82.0 / 87.8 | 33.43 / 31.21 | — | — |
+
+  Acceptance is identical across arms (1.7634 / 1.7634 / 2.0476), so this is a pure
+  ms/step effect: **−15.5 % @64k, −19.1 % @120k** (means 74.1/103.8 vs 87.7/128.2). The
+  interleave control earned its keep: L1's own second run was 6-7 % faster than its first
+  (82.0 vs 87.8 @64k), yet L0 still beat even that fast L1 sample on every point but one
+  (76.8 vs 82.0) — i.e. the win exceeds the drift that has invalidated earlier A/Bs here.
+- **Regime split, plainly:** B=1 greedy decode pays ~6 % for this path; spec-decode serving
+  at 64-120k saves 15-19 %. Production on this box is MTP k=3, so the default belongs at
+  LEGACY=0, with LEGACY=1 kept as the rollback.
+- The unit suite is not the instrument here (4 preconditions/diagnostics fail under
+  LEGACY=0 — see ROADMAP KVLAYOUT-1).
+- **Follow-up:** flip the default (code + the four LEGACY=1-assuming test guards) and re-run
+  the FA suite with LEGACY=0.
+
 ## 2026-08-29 — B=1 LEGACY=1-vs-0 decode gap (roadmap item #1)
 
 **VERDICT:** DEAD-END (flip question closed: LEGACY=1 stays the
