@@ -519,6 +519,26 @@ beat eager), plus the FA suite and the ViT/text regressions. Effort: medium-high
 one kernel contract), risk: medium (a wrong mask is silent quality loss — the acceptance
 histogram is the guard).
 
+**Recon (2026-09-16, the edit list).** The plumbing is small and mirrors what TRITON_ATTN /
+ROCM_ATTN already do:
+- `vllm/v1/attention/backend.py:349` rejects a backend whose `supports_non_causal()` is False
+  when the request sets `use_non_causal` (`dflash/speculator.py:110` sets it from
+  `dflash_has_any_non_causal`), which is the string the log prints. Both triton_attn.py:350
+  and rocm_attn.py:210 simply return True, and their kernels read
+  `common_attn_metadata.causal` (bool or tensor) to pick the mask
+  (`triton_attn.py:266/834`). So: add `supports_non_causal() -> True` to
+  `Gfx906FABackend`, then honour `causal=False` in the impl/metadata builder.
+- Kernel contract already exists for the *no-window* case: `mask=None, q_abs_offset=None,
+  window=0` = full bidirectional (VIT-1's path). The only genuinely new piece is the
+  **symmetric sliding window** — today `window>0` implies the causal formula
+  (`k_pos < q_abs - window + 1` masked), which is wrong for a ±window drafter. Choose
+  between (a) first cut `window=0` (full bidirectional; cheap, but attends outside the
+  training window) and (b) a small kernel arg for the pre-window (`window_pre`) with tests —
+  measure acceptance both ways, since the drafter's own reference is the arbiter.
+- KV path: the drafter's block writes go through the same slot/block-table machinery, and the
+  Q8 side-buffer write is per-token and order-independent, so no layout change is expected —
+  but verify with the assistant arm plus a prefix/COW case.
+
 ### FD-1 — CLOSED: the MTP fused-draft path was measured (NEUTRAL, stack-confounded) and its only reader is gone
 
 **STATUS 2026-09-13 — EXECUTED: VERDICT NEUTRAL, stack-confounded.** FIX arm
