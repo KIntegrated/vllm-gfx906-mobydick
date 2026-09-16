@@ -35,8 +35,14 @@ not a contradiction.
   LEGACY=0, with LEGACY=1 kept as the rollback.
 - The unit suite is not the instrument here (4 preconditions/diagnostics fail under
   LEGACY=0 — see ROADMAP KVLAYOUT-1).
-- **Follow-up:** flip the default (code + the four LEGACY=1-assuming test guards) and re-run
-  the FA suite with LEGACY=0.
+- **Flipped 2026-09-16.** `_resolve_legacy_mode()` now defaults to the side-buffer path; the
+  fail-closed refusal and `GFX906_FA_LEGACY_ALLOW_UNVERIFIED` are removed as obsolete, and the
+  always-on "experimental read path" warning is demoted to a debug line. Five LEGACY=1-only
+  tests (gather-buffer lifecycle, q_pad capture grow, the A3 fused-loop contract, the
+  gather-retire warning) now pin `GFX906_FA_LEGACY=1` themselves, and the fail-closed test
+  became `test_legacy_default_is_side_buffer_after_kvlayout1`. Gates on the flipped tree:
+  **FA suite 97 passed**; PPL under the default **10.5472 / 10.5460 / 10.5472** across three
+  runs (LEGACY=1: 10.5472, 0 top-20 misses throughout).
 
 ## 2026-08-29 — B=1 LEGACY=1-vs-0 decode gap (roadmap item #1)
 
