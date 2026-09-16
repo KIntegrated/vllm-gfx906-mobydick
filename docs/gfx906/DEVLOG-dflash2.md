@@ -177,6 +177,46 @@ an AWQ target isolates candidate 3.
 backend | in-tree block-diffusion support | target-quantisation pairing), with the target-side FA
 excluded, and the off-fork run plus the reason-logging/profile pair are the next two cheap steps.
 
+## 2026-09-16 — the club-3090 INT8 recipe narrows it to the *pairing* (and retracts "incomplete support")
+
+Kevin supplied the external recipe for this exact model family: `lued/Qwen3.8-27B-INT8-W8A16-DFlash2`
+(29.6 GB, `Qwen3_5ForConditionalGeneration`) + `lued/Qwen3.8-27B-DFlash2-W8` (2.2 GB,
+`DFlash2DraftModel`), served with two vendored vLLM patches. Checking each against our tree:
+
+- **vLLM#52816 ("./dflash2: local convolution + candidate selector") is ALREADY IN our tree** —
+  `74a6576b9b`, merged upstream 2026-08-21, i.e. before the 0.29 tag. The recipe carries it as a
+  patch only because its pinned nightly predates that merge. So "our DFlash2 support is incomplete"
+  is **not** the explanation.
+- **vLLM#48375 ("honor `drop_eagle_block` in MambaManager") is excluded too**: the patch's own note
+  says it is *inert under the shipped prefix-off default* — the patched path only runs with prefix
+  caching enabled, and **all our DFlash2 arms ran `--no-enable-prefix-caching`**.
+- **club-3090's `vllm-gdn-mtp-async-spec-order`** (GDN + MTP + prefix caching + async scheduling)
+  is a *cross-stream race that manifests as a CUDA illegal memory access*, not as low acceptance,
+  and needs prefix caching on. Not our case.
+- **The target-side FA stays excluded** by the MTP control (same build/boot: 35.97/24.58 t/s,
+  acceptance 1.78-2.11).
+
+**Leading cause: the drafter/target quantisation pairing.** The ecosystem ships drafters *matched to
+the target's quantisation* — `qwen…-DFlash2` for bf16, `…-DFlash2-W8` for W8A16 — and there is no
+AWQ variant. We paired the **bf16** drafter with an **AWQ-INT4** target, while the drafter consumes
+the target's hidden states at layers `[5, 19, 33, 47, 61]`; `draft_vocab_size: None` (full 248 320
+vocab) rules out a draft-vocab mapping mismatch. The remaining candidate is the drafter's *attention*
+fallback (`DFL2-8`), which certainly explains the 422 -> 728 ms per-step growth but is no longer the
+front-runner for the acceptance collapse.
+
+**Plan (the INT8 route, which also fits 2x MI50):** pull the matched pair to NFS (started
+2026-09-16 05:19, `HF_HUB_CACHE=/data/cache/huggingface/hub` — 29.6 GB does not fit `/local`'s
+~27 GB), then serve it with our stack's adaptations: `--tensor-parallel-size 2`,
+**`--kv-cache-dtype fp16`** (the recipe's `fp8_e4m3` does not exist on gfx906), V2 (forced by
+dflash2), and a `--max-model-len` sized to the KV budget a ~30 GB model leaves. Gate: **per-position
+acceptance** (the discriminating number — ours was 0.041/0.063 at 64k and 0.0 at 120k against MTP's
+~0.85 at pos 0) plus ms/step. Pull rate is ~80 MB/min unauthenticated (~6 h for 29.6 GB); an
+`HF_TOKEN` would cut that by an order of magnitude.
+
+**VERDICT:** `OPEN` — causes excluded: target FA, PR52816 (already present), #48375 (inert
+prefix-off), the GDN async-spec race (crash, prefix-on). Leading: drafter/target quantisation
+pairing; secondary: the drafter's attention backend. The matched INT8 pair is the decisive test.
+
 ## Refrigerated residue
 
 `rocm_unquantized_gemm`'s 3-D branches still pass `x` (not the flattened view) to
