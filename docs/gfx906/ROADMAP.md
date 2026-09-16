@@ -455,6 +455,16 @@ This is the gate for the whole DFlash2 family — `DFL2-1`/`DFL2-3` stay behind 
 
 ### FA-COVER-1 — enumerate every config where CUSTOM is rejected or not selected
 
+**Status: recon complete 2026-09-16 (`DEVLOG-fa-coverage.md`, tool `tools/fa_coverage.py`).** The map:
+text fallbacks are `attention sinks not supported` (72 synthetic rows), `head_size not supported`
+(61), `encoder attention` (36), `non-causal` (18); vision falls back only for bf16 and head_dim > 256;
+13 real local config reads (small head_dim 32/40 encoder-shaped models) hit a non-CUSTOM config, all
+of them models we run under llama-server rather than vLLM. Next: (1) the **guard** — loud once-per-
+engine warning plus an opt-in fail-closed switch whenever a gfx906 text attention layer does not get
+CUSTOM, which is the durable payoff; (2) mirror the ViT's `_pad_head_dim` in the text path to delete
+the `head_size` class (a padded text layout is ours to declare in `get_kv_cache_shape`); (3) sinks
+only if a sink model is actually wanted; (4) non-causal only if DFlash2 is revived for performance.
+
 **Status: open (2026-09-15).** The same mechanism silently puts models on Triton-based attention
 instead of the MI50-tuned FA. Two instances found so far: **Gemma-4 → TRITON_ATTN** (noticed during
 GEMMA4-1) and the **DFlash2 drafter → ROCM_ATTN + Triton fallback** (DFL2-8). Work: log the
