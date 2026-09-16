@@ -22,6 +22,14 @@ the date an investigation began.
   the A3 fused-loop contract, the gather-retire warning) now pin `GFX906_FA_LEGACY=1`
   themselves, and the fail-closed test became
   `test_legacy_default_is_side_buffer_after_kvlayout1`.
+- **KVLAYOUT-2 is closed as stale**: the three capture/lifecycle tests it tracked
+  (`test_q_pad_buffer_survives_capture_then_prefill_grow`,
+  `test_gather_buffers_lifecycle_postfix`,
+  `test_forward_mixed_batch_pad_tile_clamp_and_host_cu`) are collected and pass
+  (`3 passed, 0 skipped`); the first two now pin `GFX906_FA_LEGACY=1` because the buffers
+  they exercise exist only on that path. The one observation left *unexplained* is recorded
+  as an open question in the roadmap: this path wins 15-19 % ms/step under MTP k=3 but loses
+  ~6 % at B=1 greedy decode.
 
 ## 2026-09-15 (MUSE-1 first signals)
 

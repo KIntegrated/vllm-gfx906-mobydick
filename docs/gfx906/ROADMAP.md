@@ -1843,7 +1843,13 @@ default (97 passed, 2026-09-16).
 
 ### KVLAYOUT-2 — migrate the three skipped fork capture/lifecycle tests to the fused layout
 
-**Status: open, small.** 0.29's fused KV-cache content axis (#51718) made the
+**Status: RESOLVED (2026-09-16) — no longer skipped.** All three named tests are collected and
+pass on the current tree (`3 passed, 0 skipped`: `test_q_pad_buffer_survives_capture_then_prefill_grow`,
+`test_gather_buffers_lifecycle_postfix`, `test_forward_mixed_batch_pad_tile_clamp_and_host_cu`), and
+the first two now pin `GFX906_FA_LEGACY=1` explicitly because the buffers they exercise exist only
+on that path (KVLAYOUT-1's flip). The text below is kept as the migration record.
+
+**Original item:** **Status: open, small.** 0.29's fused KV-cache content axis (#51718) made the
 fork's capture/lifecycle tests hand-build the pre-0.29 `[N, 2, B, Hkv, D]`
 fill/reference conventions. Eight of them were migrated (fused cache helper +
 `_kv_split`/`_write_v_fused`); three remain **skipped** with that reason:
@@ -2368,6 +2374,12 @@ duplicate-work check, rebase, tests, and submission.
 
 ## Open questions
 
+- **Why does the Q8 side-buffer KV read path win big with MTP k=3 (−15.5 %/−19.1 % ms/step at
+  64k/120k) but lose ~6 % at B=1 greedy decode (2026-08-29)?** Both are same-boot A/Bs with
+  acceptance unchanged; the read-layout/sector-waste theory that once explained the B=1 loss does
+  not predict a spec-decode win, and the number of tokens read per step differs between the two
+  regimes. No mechanism is established — this only matters for picking the default in a
+  *non*-spec-decode configuration (legacy-devlog `DEVLOG-fa-legacy0-b1-decode.md`).
 - What exact call site accounts for the remaining roughly 158 µs/step of
   MoE-adjacent `[1,2048]` copies?
 - What is llama.cpp's component-level kernel budget on the same MI50?
