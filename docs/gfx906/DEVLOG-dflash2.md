@@ -334,6 +334,47 @@ with the recommended pair and compare against syv-ai's 3.1-3.6 tokens/step.
 
 **VERDICT:** `OPEN`, now blocked on the drafter's attention path rather than on loading.
 
+## 2026-09-16 (decisive) — DFL2-8 answered: our FA refuses the drafter's *non-causal* attention
+
+**VERDICT:** ROOT-CAUSED (needs a feature, not a fix) · **GATE:** per-position acceptance of the
+matched pair; 2 reps at ~12k prompt with `--enforce-eager`.
+
+DFL2-8 step 1 paid off on its first run. With the reasons now in the INFO line:
+
+```
+Found incompatible backend(s) [CUSTOM, TURBOQUANT] with AttentionType.DECODER.
+  Overriding with ROCM_ATTN out of potential backends: ['ROCM_ATTN', 'TRITON_ATTN'].
+  Reasons: {CUSTOM: [non-causal attention not supported],
+            TURBOQUANT: [kv_cache_dtype not supported, sliding window not supported,
+                         non-causal attention not supported]}.
+```
+
+**Our CUSTOM FA is rejected for the drafter because it does not implement non-causal attention** —
+the DFlash2 drafter is `is_causal: false` with a 2048 sliding window (a windowed-bidirectional block
+drafter). The target selects CUSTOM normally (`{TURBOQUANT: [kv_cache_dtype not supported]}`), so the
+rejection is specific to the drafter. The drafter therefore runs ROCM_ATTN, which logs
+`Cannot use ROCm custom paged attention kernel, falling back to Triton implementation`, cannot be
+CUDA-graph captured (`rocm_attn.py` -> `chunked_prefill_*`: CPU<->CUDA copy inside capture), and
+produces useless drafts.
+
+**The measurement agrees.** With the recommended pair (AWQ-INT4 target + `syvai` W4A16 drafter, k=7,
+eager, ~12k prompt, 2 reps): **no accepted tokens at all** (`drafted=0`, `accepted=0`, per-position
+0.0 everywhere), 4.27/4.29 t/s = ~234 ms per decode step (~1 token/step). So a *matched* drafter does
+not fix acceptance either: the pairing was never the cause, the attention path is. This retires the
+"bf16 drafter x AWQ target" hypothesis entirely — the same failure appears with the drafter
+requantized and matched, at the same step cost order.
+
+Metrics note for future runs: this build exposes the counters with `_total`/`_created` suffixes
+(`vllm:spec_decode_num_accepted_tokens_per_pos_total`, `..._num_drafts_total`, ...), not the bare
+names our earlier client assumed.
+
+**Next (the actual work item):** give CUSTOM FA a non-causal / sliding-windowed decode path so the
+drafter can use it (or adopt the shape of syv-ai's `patches/spec-decode-attn.patch`, which adds a
+dedicated spec-decode attention for exactly this role). Only then is a DFlash2 acceptance number
+meaningful on this box. DFL2-3 (lookup drafting) and DFL2-1 (chains) remain behind it.
+
+**VERDICT:** `OPEN`, root-caused to a missing FA feature (non-causal attention for drafters).
+
 ## Refrigerated residue
 
 `rocm_unquantized_gemm`'s 3-D branches still pass `x` (not the flattened view) to
