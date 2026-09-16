@@ -32,7 +32,7 @@ from vllm.v1.attention.selector import AttentionSelectorConfig
 
 GFX906 = DeviceCapability(major=9, minor=0)
 CUSTOM = "CUSTOM"
-HEAD_SIZES = (64, 96, 128, 256)
+HEAD_SIZES = (64, 96, 128, 256, 288, 512)
 BLOCK_SIZES = (16, 32, 64)
 VISION_HEAD_SIZES = (32, 64, 72, 80, 96, 112, 128, 160, 256, 288)
 VISION_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -104,6 +104,11 @@ def text_matrix() -> None:
                             )
     print("\n".join(rows))
     print(f"  {len(rows)}/{total} synthetic text configs do not get CUSTOM")
+    print(
+        "  NOTE: above 256 (288/512 here) cannot be padded to an instantiated kernel\n"
+        "        dim, so those need a new kernel instance rather than a gate change;\n"
+        "        Gemma-4's heterogeneous 256/512 layers are in this class."
+    )
 
 
 def vision_matrix() -> None:
@@ -153,10 +158,15 @@ def text_configs(path: str) -> list[tuple[int, bool, int, int]]:
         head_dim = hidden // heads if (hidden and heads) else None
     if not head_dim or not heads:
         return []
-    sliding = bool(_dig(cfg, "sliding_window")) or any(
-        "sliding" in str(t) for t in (_dig(cfg, "layer_types") or [])
-    )
-    return [(int(head_dim), sliding, int(heads), int(kv_heads or heads))]
+    layer_types = [str(t) for t in (_dig(cfg, "layer_types") or [])]
+    kinds = {("sliding" in t) for t in layer_types} or set()
+    if not kinds:
+        kinds = {bool(_dig(cfg, "sliding_window"))}
+    # Hybrid models (e.g. iRoPE) select per layer group: evaluate each kind.
+    return [
+        (int(head_dim), sliding, int(heads), int(kv_heads or heads))
+        for sliding in kinds
+    ]
 
 
 def vision_configs(path: str) -> list[tuple[int, int, bool]]:
@@ -193,11 +203,24 @@ def scan_models(roots: list[str], tps: list[int]) -> None:
     misses = 0
     for root in roots:
         if os.path.basename(root).startswith("hub"):
+            repo_dirs = glob.glob(os.path.join(root, "models--*"))
+            stubs = [
+                d for d in repo_dirs if not glob.glob(os.path.join(d, "snapshots", "*"))
+            ]
+            if stubs:
+                print(
+                    f"  NOTE: {len(stubs)} repo(s) under {root} are refs-only stubs "
+                    "(no snapshots/, so nothing to enumerate) - e.g. "
+                    f"{os.path.basename(stubs[0])}"
+                )
             patterns = [
                 os.path.join(root, "models--*", "snapshots", "*", "config.json")
             ]
         else:
-            patterns = [os.path.join(root, "*", "config.json")]
+            patterns = [
+                os.path.join(root, pattern, "config.json")
+                for pattern in ("*", "*/*", "*/*/*")
+            ]
         for pattern in patterns:
             for path in sorted(glob.glob(pattern)):
                 name = os.path.basename(os.path.dirname(path))[:44]

@@ -67,7 +67,42 @@ def test_silent_off_gfx906(monkeypatch):
     monkeypatch.setenv("VLLM_GFX906_FA_STRICT", "1")
     rocm._guard_gfx906_fa_fallback(
         SimpleNamespace(attn_type="decoder"),
-        {CUSTOM: ["attention sinks not supported"]},
+        {CUSTOM: ["attention sinks"]},
         AttentionBackendEnum.TRITON_ATTN,
     )
     assert stub.warnings == []
+
+def test_warns_when_a_backend_is_forced(gfx906, monkeypatch):
+    """Gemma-4's class: config code picks TRITON_ATTN, bypassing the selector."""
+    monkeypatch.delenv("VLLM_GFX906_FA_STRICT", raising=False)
+    rocm._guard_gfx906_forced_backend(
+        AttentionBackendEnum.TRITON_ATTN, SimpleNamespace(attn_type="decoder")
+    )
+    assert len(gfx906.warnings) == 1
+    assert "TRITON_ATTN" in gfx906.warnings[0]
+
+
+def test_forced_guard_is_silent_for_custom(gfx906, monkeypatch):
+    monkeypatch.setenv("VLLM_GFX906_FA_STRICT", "1")
+    rocm._guard_gfx906_forced_backend(CUSTOM, SimpleNamespace(attn_type="decoder"))
+    assert gfx906.warnings == []
+
+
+def test_forced_guard_fails_closed_under_strict(gfx906, monkeypatch):
+    monkeypatch.setenv("VLLM_GFX906_FA_STRICT", "1")
+    with pytest.raises(RuntimeError, match="instead of the custom gfx906 FA"):
+        rocm._guard_gfx906_forced_backend(
+            AttentionBackendEnum.ROCM_ATTN, SimpleNamespace(attn_type="decoder")
+        )
+
+
+def test_forced_guard_silent_off_gfx906(monkeypatch):
+    monkeypatch.setattr(rocm, "on_gfx906", lambda: False)
+    stub = _LoggerStub()
+    monkeypatch.setattr(rocm, "logger", stub)
+    monkeypatch.setenv("VLLM_GFX906_FA_STRICT", "1")
+    rocm._guard_gfx906_forced_backend(
+        AttentionBackendEnum.TRITON_ATTN, SimpleNamespace(attn_type="decoder")
+    )
+    assert stub.warnings == []
+

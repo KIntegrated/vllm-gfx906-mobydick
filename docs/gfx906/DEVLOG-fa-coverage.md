@@ -123,3 +123,38 @@ Edit list for the implementation (measured, not estimated):
 - `supports_head_size` accepts pad-able dims only once all of the above is in.
 
 Tests: `tests/kernels/attention/test_gfx906_head_dim_pad.py` (13 cases, no GPU needed).
+
+## 2026-09-16 (blind spots closed) — forced backends and the inventory's own gaps
+
+**VERDICT:** both fixes in · **GATE:** FA suite 97 passed (the rocm.py selection path), 21 GPU-free
+unit tests, and the tool re-run.
+
+Asked why Gemma-4 and Muse-Glimmer were missing from the inventory; the answer was three different
+things, only one of which was a tool defect:
+
+- **Muse-Glimmer was correctly absent.** It *is* read (head_dim 128, sliding, Hq 32 / Hkv 2) and the
+  selector picks CUSTOM, matching its dev log's shipped all-CUSTOM arm (**27.90 vs 17.54 t/s, 1.59x**).
+  The ROCM_ATTN line quoted earlier was the *pre-change baseline* row of that A/B table.
+- **Gemma-4's checkpoint is not on this box at all**: its HF cache entry is a `refs`-only stub with no
+  `snapshots/`, and there is no `config.json` anywhere under `/data/models`, `/local/models` or
+  `/local/cache`. Nothing to enumerate.
+- **Its fallback is forced by model code**, not by the selector: `Gemma4Config.verify_and_update_config`
+  detects heterogeneous head dims (256/512), finds FA4 unavailable and picks `TRITON_ATTN` outright, so
+  `get_valid_backends` is never consulted. That is a blind spot in the *guard* too, not just the tool:
+  the guard fires on selector rejections, and a forced backend never reaches one.
+
+Fixes:
+
+1. `_guard_gfx906_forced_backend` (next to the fallback guard, called from the explicit-selection
+   branch of `get_attn_backend_cls`): warns once — or raises under `VLLM_GFX906_FA_STRICT=1` — whenever
+   a non-CUSTOM backend is forced on gfx906, naming the fact that it came from `--attention-backend`
+   or the model's own config. Four more GPU-free unit tests.
+2. `tools/fa_coverage.py`: reports `refs`-only repo stubs (21 at the time of writing, which is exactly
+   how Gemma-4 disappeared), recurses past depth 1 for non-hub roots (93 checkpoint config reads now
+   vs 78 before), evaluates **per `layer_types` group** so hybrid models are checked group by group,
+   and includes a >256 head-size class (288/512) that prints the distinction between "gate can be
+   widened" and "needs a new kernel instance" — the class Gemma-4's 512 is in.
+
+Ranking consequence: step 2 (padding up to 256) has **no serving-relevant beneficiary** in the zoo
+today, while Gemma-4's class needs a 512-head instance plus heterogeneous dispatch plus a config
+change. Keep step 2 as insurance; do it after anything with a real model behind it.

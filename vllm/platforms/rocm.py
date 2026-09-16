@@ -529,6 +529,31 @@ def _guard_gfx906_fa_fallback(
     logger.warning_once(message)
 
 
+def _guard_gfx906_forced_backend(selected_backend, attn_selector_config) -> None:
+    """Warn or fail (``VLLM_GFX906_FA_STRICT=1``) when a non-CUSTOM backend is forced.
+
+    ``--attention-backend`` and *model config code* (e.g. Gemma-4's
+    ``verify_and_update_config``, which forces TRITON_ATTN for its heterogeneous 256/512
+    head dims when FA4 is unavailable) both arrive as an explicit selection, so the
+    selector never sees them. Same consequence: gfx906 loses the tuned kernel and the
+    step cost grows. See DEVLOG-fa-coverage.md.
+    """
+    if not on_gfx906():
+        return
+    if selected_backend.name == AttentionBackendEnum.CUSTOM.name:
+        return
+    message = (
+        f"gfx906: attention backend {selected_backend.name} was selected explicitly "
+        f"for {attn_selector_config.attn_type} instead of the custom gfx906 FA "
+        "(either --attention-backend or the model's own config). Expect a large "
+        "per-step slowdown, and note that gfx906 FA tuning does not apply to it. "
+        "See docs/gfx906/DEVLOG-fa-coverage.md."
+    )
+    if os.environ.get("VLLM_GFX906_FA_STRICT", "0") == "1":
+        raise RuntimeError(message)
+    logger.warning_once(message)
+
+
 def _get_backend_priorities(
     use_mla: bool,
     use_sparse: bool,
@@ -738,6 +763,7 @@ class RocmPlatform(Platform):
             except ImportError:
                 sel_invalid_reasons = ["ImportError"]
             if not sel_invalid_reasons:
+                _guard_gfx906_forced_backend(selected_backend, attn_selector_config)
                 logger.info_once(
                     "Using %s backend (selected via --attention-backend).",
                     selected_backend.name,
