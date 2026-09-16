@@ -83,11 +83,21 @@ transfer.
 
 ## 2026-09-15 (late) — arm C runs: DFlash2 is *far* behind MTP k=3, and the drafter's attention is the suspect
 
-**Arm C (DFlash2, no patch, k=7, agentic 64k, rep 0, V2, same boot as the fix):**
-`2.48 t/s`, acceptance **0.0451**, **421.9 ms/step** (244 drafts for 256 tokens) — against the
-recorded MTP k=3 band on this line (plain 33.62 t/s / MTP+CAT-1 35.44 t/s at 64k). That is ~13x
-slower with essentially no accepted drafts, i.e. **plain DFlash2 is not competitive on gfx906 as
-it stands** — Q1 answered negatively for the unpatched baseline (pending the remaining reps).
+**Arm C (DFlash2, no patch, k=7, agentic, V2, same boot as the fix) — complete, 4 rows:**
+
+| context | t/s (2 reps) | acceptance | ms/step |
+|---|---|---|---|
+| 64k | 2.48 / 2.52 | 0.0451 / 0.0625 | 421.9 / 422.0 |
+| 120k | 1.37 / 1.37 | **0.0 / 0.0** | 728.4 / 728.2 |
+
+**Arm B (MTP k=3 + CAT-1, live control, same boot) — 4 rows:** 64k 35.97 / 35.44 t/s
+(ms/step 77.1 / 83.7), 120k 24.58 / 24.82 (123.5 / 123.7) → **within +0.8 % / +0.4 % of the
+recorded V2 band (35.44 / 24.61)**, so the historical anchor this arm was measured against is
+validated on this boot, and arm C's comparison is sound.
+
+So **plain DFlash2 is ~14x slower than MTP k=3 with acceptance collapsing to zero by 120k** — Q1
+answered: no benefit, and the drafter's drafts are useless as well as slow (a *wrong* draft
+context, see below). No downstream patch closes that.
 
 **Why it is that slow — the drafter's attention is not on our FA.** The engine log for this arm:
 
@@ -116,8 +126,9 @@ the item that decides whether DFlash2 is viable here at all**, and it is a corre
 much as a speed one (0.045 acceptance says the draft context itself is wrong). `DFL2-3`
 (lookup-drafting) and the rest stay queued behind it.
 
-**VERDICT:** `OPEN` — baseline gate measured and negative for the unpatched drafter; the drafter's
-attention backend is the blocking unknown.
+**VERDICT:** `OPEN` — the baseline gate is measured and **negative** (2.48/1.37 t/s, acceptance
+0.045 -> 0.0, vs MTP k=3's 35.97/24.58); the drafter's attention backend (`DFL2-8`) is the
+blocking unknown and the only plausible path to viability.
 
 ## Refrigerated residue
 
