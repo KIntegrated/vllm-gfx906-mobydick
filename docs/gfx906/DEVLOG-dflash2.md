@@ -417,6 +417,32 @@ bf16 drafter against a bf16 target, decides whether the family is dead or only t
 **VERDICT:** `PARKED` — DFL2-3 (lookup drafting) and DFL2-1 (chains) stay unbuilt; DFL2-8's kernel work
 is not justified. Re-open only on a positive result from the target check above.
 
+## 2026-09-16 (final) — the card's own pairing is degenerate too: parking is final
+
+**VERDICT:** DEAD-END for the family (the target is exonerated as well) · **GATE:** bf16
+`Qwen/Qwen3.8-27B` + bf16 `incoai/Qwen3.8-27B-DFlash2` — the model card's own documented pairing,
+with no requantisation on either side — TP=2, `--enforce-eager` (the drafter's ROCm_ATTN fallback
+cannot be captured), k=7, `real` corpus, 1 rep each.
+
+| prompt tokens | drafted | acceptance | per-position | t/s |
+|---|---|---|---|---|
+| 1,024 | 245 | 0.0408 | 0.0204 / 0.0204 / 0 elsewhere | 6.30 |
+| 2,048 | 253 | 0.0079 | 0.0079 / 0 elsewhere | 5.96 |
+
+Against syv-ai's ~0.33 per-draft / 3.1-3.4 tokens-per-step reference, that is the same degenerate
+regime we measured on our AWQ target and that the 5070 Ti box measured on upstream vLLM 0.29.0. All
+four suspects are now excluded by measurement: the **fork** (upstream 0.29.0 degenerate), the
+**attention path** (eager symmetric-window 0.0282 here; upstream FlashInfer 0.000), the **drafter's
+quantisation** (matched W4A16 drafter degenerate), and the **target** (this run, unquantised bf16 on
+both sides). The drafter contributes nothing on this family, so parking is final rather than
+provisional — DFL2-3 (lookup drafting), DFL2-1 (chains) and DFL2-8's kernel work all stay unbuilt.
+
+Incidental onboarding fact worth keeping: the 52 GB bf16 27B at TP=2 on 32 GB cards fits only with
+`--gpu-memory-utilization 0.96 --max-model-len 4096 --max-num-batched-tokens 256` (KV 9,206 tokens,
+and that is *with* `--enforce-eager`). At 0.92/32k the pool is negative (`Available KV cache memory:
+-1.66 GiB`); at 0.96/16k it is 0.17 GiB. The constraint is the activation demand (our FA's q_pad
+buffers), not the weights — the same lever as the dense-27B AWQ serving notes.
+
 ## Refrigerated residue
 
 `rocm_unquantized_gemm`'s 3-D branches still pass `x` (not the flattened view) to
