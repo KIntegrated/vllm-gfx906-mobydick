@@ -1811,7 +1811,7 @@ not a speed win at these S).
 
 ### KVLAYOUT-1 — verify the opt-in LEGACY=0 Q8 side-buffer under 0.29's fused layout
 
-**Status: VERIFIED + adopted for spec-decode serving (2026-09-16); default not yet flipped.** 0.29 standardised the
+**Status: VERIFIED and FLIPPED to the default (2026-09-16).** 0.29 standardised the
 KV-cache layout (#51718): one tensor with a fused content axis `[B, H, N, 2*D]`
 per layer. The default path is ported and validated (FA suite + PPL + smoke),
 and the opt-in `GFX906_FA_LEGACY=0` Q8 side-buffer *should* still be correct —
@@ -1820,8 +1820,9 @@ its K view is the `split(D, -1)` half, whose last dim is stride-1 and whose
 holds, so the uint8 byte-alias writes stay inside K's own segment and never
 touch V. That reasoning is static; the path has not been run on 0.29. Verify with
 one serving A/B before enabling LEGACY=0 for anything.
-**Resolved 2026-09-16.** `GFX906_FA_LEGACY=0` gives **PPL 10.5472** — bit-identical to the
-current build's LEGACY=1 value (0 top-20 misses) — so the static reasoning above is confirmed
+**Resolved 2026-09-16.** `GFX906_FA_LEGACY=0` gives **PPL 10.5472 / 10.5460** across runs vs
+**10.5472** for the current build's LEGACY=1 — the same value to within the probe's own
+run-to-run spread (<= 0.0012), 0 top-20 misses in every run — so the static reasoning above is confirmed
 numerically. Interleaved serving A/B (L1 -> L0 -> L1, MTP k=3, 64k/120k, ms/step): **L0
 71.4/76.8 @64k and 103.7/103.8 @120k vs L1 87.8/87.5 and 128.1/128.2** = **-15.5 % / -19.1 %**
 with acceptance unchanged (1.7634/1.7634/2.0476); L1's own repeat ran 6-7 % faster and L0 still

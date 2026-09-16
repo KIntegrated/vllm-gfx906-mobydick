@@ -82,32 +82,18 @@ class Gfx906FAMetadata:
 
 
 def _resolve_legacy_mode() -> bool:
-    """Resolve ``GFX906_FA_LEGACY`` (default 1) with a fail-closed guard.
+    """Resolve ``GFX906_FA_LEGACY``: 1 = LEGACY inline-quantize read path, 0/unset = Q8 side-buffer.
 
-    0.29 failure mode: upstream's KV-cache layout standardisation (#51718) fused
-    the K/V content axis, so the LEGACY=0 Q8 side-buffer now aliases bytes inside
-    a *strided* 2*D content segment instead of the old contiguous K half. The
-    alias is expected to stay correct (the split half's last dim is stride-1 and
-    the ``bytes_per_row <= row_bytes`` guard holds: 136 B into a 512 B K segment
-    at D=256), but it has NOT been verified on 0.29 and a wrong alias corrupts
-    K/V **silently** (no crash). Refuse it unless the operator opts in.
+    The side-buffer path was verified against 0.29's fused KV-cache content axis
+    (#51718) on 2026-09-16: PPL 10.5472/10.5460 across runs vs LEGACY=1's 10.5472
+    — the same to within the probe's own run-to-run spread (<= 0.0012), 0 top-20
+    misses throughout — and -15.5 % / -19.1 % ms/step with MTP k=3 at 64k / 120k
+    acceptance unchanged — hence the default. LEGACY=1 stays as the validated
+    rollback: it is ~6 % faster for B=1 greedy decode, the one regime it wins.
+    ``GFX906_FA_LEGACY_ALLOW_UNVERIFIED`` is obsolete and ignored.
+    See docs/gfx906/DEVLOG-fa-legacy0-b1-decode.md (ROADMAP KVLAYOUT-1).
     """
-    if _os.environ.get("GFX906_FA_LEGACY", "1") == "1":
-        return True
-    if _os.environ.get("GFX906_FA_LEGACY_ALLOW_UNVERIFIED", "0") == "1":
-        logger.warning(
-            "GFX906_FA_LEGACY=0 forced ON despite being unverified on 0.29 "
-            "(ROADMAP KVLAYOUT-1): the Q8 side-buffer alias writes into a fused "
-            "K/V content segment and a wrong alias corrupts K/V silently."
-        )
-        return False
-    raise RuntimeError(
-        "GFX906_FA_LEGACY=0 is refused on 0.29: the Q8 side-buffer alias has not "
-        "been verified against 0.29's fused KV-cache layout (#51718), and a wrong "
-        "alias corrupts K/V silently. See docs/gfx906/ROADMAP.md (KVLAYOUT-1). "
-        "Set GFX906_FA_LEGACY_ALLOW_UNVERIFIED=1 to accept that risk, or keep the "
-        "validated default GFX906_FA_LEGACY=1."
-    )
+    return _os.environ.get("GFX906_FA_LEGACY", "0") == "1"
 
 
 class Gfx906FAMetadataBuilder(
@@ -129,12 +115,12 @@ class Gfx906FAMetadataBuilder(
         # copies and captured writes move both halves at once). Kept as a
         # separate env-gated mode because it is a different read path
         # (experimental status until the serving gates say otherwise).
+        # The Q8 side-view path (now the default) aliases the fp16 K half, so the
+        # old desync class cannot arise; only worth a debug line for provenance.
         if not _resolve_legacy_mode():
-            logger.warning(
+            logger.debug(
                 "GFX906_FA_LEGACY=0: K is read from the Q8 side view "
-                "aliased into the fp16 K half (zero extra KV memory). "
-                "Experimental read path — the default LEGACY=1 "
-                "(inline-quantize) is the validated serving mode.")
+                "aliased into the fp16 K half (zero extra KV memory).")
         mode = _os.environ.get("GFX906_FA_CG", "decode").lower()
         if mode == "always":
             return AttentionCGSupport.ALWAYS

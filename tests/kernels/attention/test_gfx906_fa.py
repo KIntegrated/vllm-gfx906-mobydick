@@ -487,7 +487,7 @@ def test_fused_fp16_gather_matches_torch_gather():
     assert bool((v_f2[1, :, L2:] == 0).all())
 
 
-def test_q_pad_buffer_survives_capture_then_prefill_grow():
+def test_q_pad_buffer_survives_capture_then_prefill_grow(monkeypatch):
     """Review F1: a captured graph bakes in the VA of the q_pad buffer
     that was current at capture time. An eager prefill with a larger
     Sq_pad afterwards grows that buffer; the old one must be retired
@@ -502,7 +502,11 @@ def test_q_pad_buffer_survives_capture_then_prefill_grow():
     the class state like the gather-buffer lifecycle tests: the grow
     sequence must start from a clean shared buffer, and nothing leaks
     into other tests.
+
+    The q_pad buffer belongs to the LEGACY=1 read path, so the env is pinned
+    here (the side-buffer default has no such buffer).
     """
+    monkeypatch.setenv("GFX906_FA_LEGACY", "1")
     dev = "cuda"
     torch.manual_seed(7)
     from vllm.gfx906_fa.gfx906_fa_backend import (
@@ -601,7 +605,7 @@ def test_q_pad_buffer_survives_capture_then_prefill_grow():
          cls._q_pad_captured) = saved
 
 
-def test_gather_buffers_lifecycle_postfix():
+def test_gather_buffers_lifecycle_postfix(monkeypatch):
     """plan-gfx906-fa-fix.md §5 — pins the POST-FIX gather-buffer
     contract (GFX906_FA_GATHER_EXACT=0) by driving the real
     Gfx906FAImpl (class-level buffers; snapshot/restore so nothing
@@ -619,7 +623,11 @@ def test_gather_buffers_lifecycle_postfix():
     (3) eager growth (never captured) frees the old generation —
         allocator-level evidence: the delta is the new-minus-old
         excess, not the new generation on top of the old.
+
+    Gather buffers exist only on the LEGACY=1 fp16 gather path, so the env is
+    pinned here (the side-buffer default has none).
     """
+    monkeypatch.setenv("GFX906_FA_LEGACY", "1")
     dev = "cuda"
     torch.manual_seed(11)
     from vllm.gfx906_fa.gfx906_fa_backend import (
@@ -1133,7 +1141,10 @@ def test_gather_multi_retire_warns(monkeypatch):
     required `not capturing` while checking a flag that had just been
     set to `capturing`, so it could never fire. Two capture-then-B-grow
     cycles drive two retires; the third retire must not warn again.
+
+    The gather-retire guard only exists on the LEGACY=1 fp16 gather path.
     """
+    monkeypatch.setenv("GFX906_FA_LEGACY", "1")
     import vllm.gfx906_fa.gfx906_fa_backend as backend_mod
 
     class _LoggerStub:
@@ -3230,28 +3241,29 @@ def test_vit_packed_batch_matches_sdpa_and_does_not_cross_attend():
         start += ln
 
 
-def test_legacy_zero_refused_until_verified(monkeypatch):
-    """GFX906_FA_LEGACY=0 (Q8 side-buffer) is fail-closed on 0.29.
+def test_legacy_default_is_side_buffer_after_kvlayout1(monkeypatch):
+    """KVLAYOUT-1 (2026-09-16): the Q8 side-buffer path is now the default.
 
-    0.29's fused KV-cache content axis (#51718) makes the byte alias
-    unverified, and a wrong alias corrupts K/V silently, so the mode must
-    refuse to start unless the operator sets the explicit override. See
-    ROADMAP KVLAYOUT-1.
+    It was fail-closed on 0.29 until verified against the fused KV-cache content
+    axis (#51718): PPL 10.5472 bit-identical to LEGACY=1 (0 top-20 misses) and
+    -15.5 % / -19.1 % ms/step with MTP k=3 at 64k / 120k, acceptance unchanged.
+    LEGACY=1 remains the rollback (it wins ~6 % for B=1 greedy decode).
     """
     from vllm.gfx906_fa.gfx906_fa_backend import _resolve_legacy_mode
 
-    monkeypatch.setenv("GFX906_FA_LEGACY", "0")
-    monkeypatch.delenv("GFX906_FA_LEGACY_ALLOW_UNVERIFIED", raising=False)
-    with pytest.raises(RuntimeError, match="not been verified"):
-        _resolve_legacy_mode()
+    monkeypatch.delenv("GFX906_FA_LEGACY", raising=False)
+    assert _resolve_legacy_mode() is False  # default: side-buffer read path
 
-    monkeypatch.setenv("GFX906_FA_LEGACY_ALLOW_UNVERIFIED", "1")
-    assert _resolve_legacy_mode() is False  # opt-in accepted, warned
+    monkeypatch.setenv("GFX906_FA_LEGACY", "0")
+    assert _resolve_legacy_mode() is False
 
     monkeypatch.setenv("GFX906_FA_LEGACY", "1")
-    assert _resolve_legacy_mode() is True
+    assert _resolve_legacy_mode() is True  # rollback, validated at B=1 greedy
+
+    # the obsolete override must not resurrect the refusal
     monkeypatch.delenv("GFX906_FA_LEGACY")
-    assert _resolve_legacy_mode() is True  # default is the validated path
+    monkeypatch.setenv("GFX906_FA_LEGACY_ALLOW_UNVERIFIED", "1")
+    assert _resolve_legacy_mode() is False
 
 
 def test_r3_kv_split_defaults_aligned(monkeypatch):
@@ -3513,14 +3525,18 @@ def test_a3_metadata_build_is_persistent_views():
     assert md.slot_mapping.data_ptr() == smap.data_ptr()
 
 
-def test_a3_draft_step_reuse_reads_live_seq_lens():
+def test_a3_draft_step_reuse_reads_live_seq_lens(monkeypatch):
     """The fused-loop contract end-to-end: build metadata once (step 1), advance
     seq_lens + slot + KV write in place (what the captured update_draft_inputs /
     compute_slot_mappings / do_kv_cache_update kernels do between steps), call the
     (no-op) metadata update, and the second forward through the SAME metadata
     object must match a fresh reference at the advanced lengths. If any field
     were step-baked (a copy, a host scalar read by the kernel) this second
-    forward would still attend over the old lengths and mismatch."""
+    forward would still attend over the old lengths and mismatch.
+
+    Pinned to LEGACY=1 (the fp16 gather path this contract is written for); the
+    default side-buffer path has no gather buffers, so the env is forced here."""
+    monkeypatch.setenv("GFX906_FA_LEGACY", "1")
     dev = "cuda"
     torch.manual_seed(23)
     from vllm.gfx906_fa.gfx906_fa_backend import (

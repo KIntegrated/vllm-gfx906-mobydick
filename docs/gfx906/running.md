@@ -289,7 +289,12 @@ build produces no kernel/extension. Build the wheel for `gfx906`. Verify load:
   AND decode); you don't pass `--attention-backend`.
 - Escape back to stock: `--attention-backend ROCM_ATTN` (or
   `VLLM_ATTENTION_BACKEND=ROCM_ATTN`).
-- The validated decode path is LEGACY inline-Q8 KV mode (default
-  `GFX906_FA_LEGACY=1`, FULL-capture-safe). Setting `GFX906_FA_LEGACY=0`
-  selects the Q8 side-buffer fast path which desyncs on warmup (garbage output) — don't use
-  it as a default.
+- Decode KV read path: the **Q8 side-buffer is the default since 2026-09-16**
+  (`GFX906_FA_LEGACY=0`, FULL-capture-safe). The former "desyncs on warmup (garbage
+  output)" warning against this path is obsolete — the side-buffer aliases K in place, so
+  page copies and captured writes move both halves together, and it has now been verified
+  on 0.29's fused KV layout: PPL **10.5472/10.5460** (vs 10.5472 for LEGACY=1 — within the
+  probe's own ~0.001 run-to-run spread; 0 top-20 misses)
+  and **−15.5 % / −19.1 % ms/step** with MTP k=3 at 64k/120k, acceptance unchanged. Set
+  `GFX906_FA_LEGACY=1` for the LEGACY inline-Q8 path — the rollback, and ~6 % faster in
+  the one regime where it wins (B=1 greedy decode; `DEVLOG-fa-legacy0-b1-decode.md`).

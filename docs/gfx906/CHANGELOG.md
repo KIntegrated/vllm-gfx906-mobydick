@@ -6,6 +6,23 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-16 (KVLAYOUT-1 — LEGACY=0 default flip)
+
+- **`GFX906_FA_LEGACY=0` (Q8 side-buffer KV read path) is now the default.** Verified
+  against 0.29's fused KV-cache layout (#51718): PPL **10.5472 / 10.5460** vs **10.5472** for
+  LEGACY=1 (the same to within the probe's own ~0.001 run-to-run spread), 0 top-20 misses in
+  every run, and **−15.5 % / −19.1 % ms/step** (MTP k=3, dense 27B
+  AWQ, 64k/120k; acceptance unchanged at 1.7634/1.7634/2.0476; interleaved L1 → L0 → L1,
+  so the order control is included — L1's own repeat ran faster and L0 still beat it).
+- The fail-closed refusal and its `GFX906_FA_LEGACY_ALLOW_UNVERIFIED` override are
+  removed as obsolete, and the always-on "experimental read path" warning is demoted to
+  debug. `GFX906_FA_LEGACY=1` remains as the rollback: ~6 % faster for B=1 greedy decode,
+  the one regime it wins (`DEVLOG-fa-legacy0-b1-decode.md`).
+- Tests: the five LEGACY=1-assuming tests (gather-buffer lifecycle, q_pad capture grow,
+  the A3 fused-loop contract, the gather-retire warning) now pin `GFX906_FA_LEGACY=1`
+  themselves, and the fail-closed test became
+  `test_legacy_default_is_side_buffer_after_kvlayout1`.
+
 ## 2026-09-15 (MUSE-1 first signals)
 
 - **Muse-Glimmer loads and runs on both runners, and V1/V2 generation is

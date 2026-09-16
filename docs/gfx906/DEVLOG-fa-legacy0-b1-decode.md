@@ -8,9 +8,11 @@ the ms/step win is far outside this box's per-process drift. The 2026-08-29 B=1 
 reading below (LEGACY=1 better by 6.3 %) stands for that regime; this is a regime split,
 not a contradiction.
 
-- **Gate 1 (numerics).** `GFX906_FA_LEGACY=0` (+`GFX906_FA_LEGACY_ALLOW_UNVERIFIED=1`)
-  gives **PPL 10.5472** (359 tokens, **0 top-20 misses**) = *bit-identical* to the current
-  build's LEGACY=1 value (10.5472; the pre-triton-3.8.0 value was 10.5516). The Q8
+- **Gate 1 (numerics).** `GFX906_FA_LEGACY=0` gives **PPL 10.5472 / 10.5460** across runs
+  (359 tokens, **0 top-20 misses** in every run) against **10.5472** for this build's LEGACY=1
+  (the pre-triton-3.8.0 value was 10.5516) — i.e. the same value to within the probe's own
+  run-to-run spread (<= 0.0012), which the two LEGACY=0 runs and the LEGACY=1 run establish by
+  themselves. The Q8
   side-buffer byte-alias under 0.29's fused `[B, H, N, 2*D]` layout is therefore correct,
   not merely plausible — the static reasoning in ROADMAP KVLAYOUT-1 is now confirmed by the
   only numerical gate this stack has.
