@@ -191,3 +191,29 @@ Where the change actually goes (all in `gfx906_fa_backend.py`):
 Verification path stays as recorded: unit tests against a torch reference at 72/80/96/112 (no local
 decoder LM has such a dim, so a real-model gate waits for one to be onboarded — the guard will say so
 when that happens).
+
+### Step 2 implementation (2026-09-16) — the padded write/read path is in, behind the opt-in gate
+
+**VERDICT:** implemented, unreachable by default, new-path test outstanding · **GATE:** the FA suite
+(97 passed) proves no regression at D=64/128/256, since GFX906_FA_PAD defaults to 0 and instantiated
+dims return unchanged. The *new* path's own verification - a D=96 case against a torch reference - is
+the remaining piece, and the default flip stays blocked on it plus a real model.
+
+What landed in `gfx906_fa_backend.py`:
+
+- `get_kv_cache_shape` returns the padded row width (the "identical to
+  TritonAttentionBackend" property now holds only for instantiated dims);
+- `Gfx906FAImpl.__init__` keeps `head_size` as the real dim and adds `padded_head_size` /
+  `_head_pad`;
+- `_pad_last_dim` (zero-pad [.., D]) and `_zero_cache_pad` (zero a padded cache's pad channels once
+  per cache tensor, keyed on storage identity - the trick `_ensure_q8_sidebuffer` already uses,
+  because `triton_reshape_and_cache_flash` only writes the first D channels and a non-zero K pad
+  would quantise to a non-zero q8_0 block);
+- `do_kv_cache_update` splits the fused content axis by the padded dim, zeroes the pad once and
+  writes zero-padded K/V (the Q8 write inherits the padded rows, so its block count matches);
+- `forward` splits by the padded dim, zero-pads the query, grows the q_pad/gather buffers at the
+  padded width, and slices the fp32 result back to the real head dim before the output copy;
+- `supports_head_size` returns pad-able, gated by `GFX906_FA_PAD` inside `_padded_head_size`.
+
+Cost noted honestly: the padding is per-write `torch.zeros` (opt-in path only), and the KV cache
+grows by the pad ratio (96 -> 128 is +33 % of K and V bytes).

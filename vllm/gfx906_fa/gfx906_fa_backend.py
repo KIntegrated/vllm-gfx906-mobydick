@@ -303,9 +303,16 @@ class Gfx906FABackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        # Identical to TritonAttentionBackend, so backends can be
-        # switched without re-allocating the KV cache.
-        return (num_blocks, 2, block_size, num_kv_heads, head_size)
+        # Identical to TritonAttentionBackend for instantiated head dims, so backends
+        # can be swapped without re-allocating the KV cache. A pad-able dim widens
+        # the row instead (opt-in via GFX906_FA_PAD; see _padded_head_size).
+        return (
+            num_blocks,
+            2,
+            block_size,
+            num_kv_heads,
+            _padded_head_size(head_size) or head_size,
+        )
 
     @classmethod
     def supported_kv_cache_layouts(cls):
@@ -334,8 +341,10 @@ class Gfx906FABackend(AttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        # Kernel validated for 64/128; 256 (Qwen3.5/3.6) added.
-        return head_size in (64, 128, 256)
+        # Kernel validated for 64/128; 256 (Qwen3.5/3.6) added. Dims that pad onto
+        # one of those are servable too, but only when GFX906_FA_PAD opts in
+        # (default off until the write path is validated on a real model).
+        return _padded_head_size(head_size) is not None
 
     @classmethod
     def supports_sliding_window(cls) -> bool:
@@ -493,6 +502,11 @@ class Gfx906FAImpl(AttentionImpl):
 
         self.num_heads = num_heads
         self.head_size = head_size
+        # Padding to an instantiated kernel dim (opt-in). Kernels use
+        # padded_head_size; the API side (scales, slicing) stays on head_size.
+        self.padded_head_size = _padded_head_size(head_size) or head_size
+        self._head_pad = self.padded_head_size - head_size
+        self._pad_zeroed_cache: tuple | None = None
         # Sliding-window size in tokens (0 for full-attention layers).
         # The FA kernel masks keys older than the per-row window when
         # window > 0; forward_paged passes q_abs_offset for every
@@ -1002,6 +1016,42 @@ class Gfx906FAImpl(AttentionImpl):
             return b, v
         return b[:num_seqs], v[:num_seqs]
 
+    def _pad_last_dim(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Zero-pad the head dim of [.., D] (no-op when unpadded).
+
+        Exact for attention: padded Q adds 0 to the QK dot, padded K quantises to
+        zero q8_0 blocks, padded V adds 0 to P*V, and the pad is inside the head
+        dim so the softmax denominator is unchanged (as the ViT path documents).
+        """
+        if self._head_pad == 0:
+            return tensor
+        shape = (*tensor.shape[:-1], self.padded_head_size)
+        out = torch.zeros(shape, dtype=tensor.dtype, device=tensor.device)
+        out[..., : self.head_size] = tensor
+        return out
+
+    def _zero_cache_pad(
+        self, key_cache: torch.Tensor, value_cache: torch.Tensor
+    ) -> None:
+        """Zero a padded cache's pad channels once per cache tensor.
+
+        triton_reshape_and_cache_flash writes only the first D channels of a
+        padded row, so the pad would otherwise keep whatever the allocator left
+        there - and a non-zero K pad quantises to a non-zero q8_0 block,
+        corrupting scores. Nothing else writes those bytes, so one zeroing per
+        cache tensor suffices (keyed on identity: the cache is re-viewed every
+        call, so `is` would redo it 52x per step).
+        """
+        if self._head_pad == 0:
+            return
+        key = (key_cache.data_ptr(), tuple(key_cache.shape))
+        if self._pad_zeroed_cache == key:
+            return
+        with torch.no_grad():
+            key_cache[..., self.head_size :].zero_()
+            value_cache[..., self.head_size :].zero_()
+        self._pad_zeroed_cache = key
+
     def do_kv_cache_update(
         self,
         layer: AttentionLayer,
@@ -1013,7 +1063,13 @@ class Gfx906FAImpl(AttentionImpl):
         # 0.29 KV-cache layout standardisation (#51718): the cache is a single
         # tensor with a fused content axis, [B, H, N, 2*D] per layer, so K/V
         # are the two halves of the last axis (not a separate axis-1 pair).
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(
+            self.padded_head_size, dim=-1
+        )
+        if self._head_pad:
+            self._zero_cache_pad(key_cache, value_cache)
+            key = self._pad_last_dim(key)
+            value = self._pad_last_dim(value)
 
         # 1) Primary fp16 write — the vLLM-standard path for V (and for K
         #    in LEGACY mode).
@@ -1086,19 +1142,23 @@ class Gfx906FAImpl(AttentionImpl):
 
         # Split the fused content axis: (B, H, N, 2*D) → (K, V) each
         # [num_blocks, block_size, Hkv, D] (0.29 layout standardisation).
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(
+            self.padded_head_size, dim=-1
+        )
 
         # query [num_tokens, Hq, D] fp16 (forward_paged casts it into the
         # fp32 q_pad buffer inside the copy_ — a standalone .float() was
         # an extra kernel per layer).
         q_actual = query[:num_actual_tokens]
+        if self._head_pad:
+            q_actual = self._pad_last_dim(q_actual)
         out_actual = output[:num_actual_tokens]
 
         # Lazy-grow the forward buffers (q_pad / mask).
         num_seqs = attn_metadata.seq_lens.shape[0]
         self._ensure_forward_buffers(
             num_heads=self.num_heads,
-            head_size=self.head_size,
+            head_size=self.padded_head_size,
             num_seqs=num_seqs,
             max_seqlen_q=attn_metadata.max_query_len,
             max_seqlen_k=attn_metadata.max_seq_len,
@@ -1140,6 +1200,15 @@ class Gfx906FAImpl(AttentionImpl):
             v_gather_buf=v_gather_buf,
             window=self.sliding_window,
         )  # [num_tokens, Hq*D] fp32
+
+        if self._head_pad:
+            out_flat = (
+                out_flat.view(num_actual_tokens, self.num_heads, self.padded_head_size)[
+                    ..., : self.head_size
+                ]
+                .contiguous()
+                .view(num_actual_tokens, -1)
+            )
 
         # Write the result into output in-place (it is either
         # [num_tokens, Hq, D] or [num_tokens, Hq*D], depending on the
