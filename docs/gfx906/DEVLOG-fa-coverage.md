@@ -72,3 +72,23 @@ silent ~3-10x step cost into a bounded arithmetic overhead, and the paging is ou
 .venv/bin/python tools/fa_coverage.py --skip-matrix        # checkpoints only
 .venv/bin/python tools/fa_coverage.py --models /data/models --tp 1,2,4,8
 ```
+
+## 2026-09-16 (step 1 of the plan) — the guard is in
+
+**VERDICT:** ADOPTED (the durable piece of this topic) · **GATE:** FA suite 97 passed with the guard
+live on the selection path, plus 4 GPU-free unit tests.
+
+A non-CUSTOM pick for a gfx906 attention layer is now a loud, once-per-engine warning naming the
+reason (`_guard_gfx906_fa_fallback` in `platforms/rocm.py`, called from the rejection branch that now
+also carries the reasons). `VLLM_GFX906_FA_STRICT=1` turns it into a `RuntimeError`, so a deployment
+that must not lose the tuned kernel fails closed instead of degrading quietly.
+
+It fires only when CUSTOM was *actually rejected* (so no false alarms when some other backend was
+rejected for an unrelated reason, e.g. a cache-dtype mismatch), and only on gfx906. The unit tests
+cover exactly those four cases: warns when CUSTOM is rejected, raises under strict, silent when
+CUSTOM was never a candidate, silent off gfx906. Both of today's silent losses — the DFlash2 drafter
+and Gemma-4 — would have been a one-line warning with this in place.
+
+Next per the rank: mirror the ViT's `_pad_head_dim` in the text path to delete the
+`head_size not supported` class (61 synthetic rows), then reconsider sinks only if a sink model is
+wanted.

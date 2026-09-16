@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 
 import os
 import platform
@@ -493,6 +494,41 @@ def flash_attn_triton_available() -> bool:
         return False
 
 
+def _guard_gfx906_fa_fallback(
+    attn_selector_config,
+    invalid_reasons,
+    selected_backend,
+) -> None:
+    """Fail loudly when gfx906 loses the custom FA to a fallback backend.
+
+    A non-CUSTOM pick is a silent performance cliff: the fallback may be unable to
+    use CUDA graphs and is typically several times slower per step, and gfx906 FA
+    tuning does not apply to it. Warn once, or raise when
+    ``VLLM_GFX906_FA_STRICT=1`` so a deployment that must not degrade quietly fails
+    closed instead. See DEVLOG-fa-coverage.md.
+    """
+    if not on_gfx906():
+        return
+    custom_reasons = [
+        reason
+        for backend, reasons in invalid_reasons.items()
+        if backend.name == AttentionBackendEnum.CUSTOM.name
+        for reason in reasons
+    ]
+    if not custom_reasons:
+        return
+    message = (
+        f"gfx906: attention backend {selected_backend.name} was selected for "
+        f"{attn_selector_config.attn_type}, but the custom gfx906 FA is unavailable "
+        f"({'; '.join(custom_reasons)}). Expect a large per-step slowdown (the "
+        "fallback may also be unable to use CUDA graphs), and note that gfx906 FA "
+        "tuning does not apply to it. See docs/gfx906/DEVLOG-fa-coverage.md."
+    )
+    if os.environ.get("VLLM_GFX906_FA_STRICT", "0") == "1":
+        raise RuntimeError(message)
+    logger.warning_once(message)
+
+
 def _get_backend_priorities(
     use_mla: bool,
     use_sparse: bool,
@@ -767,6 +803,9 @@ class RocmPlatform(Platform):
         )
         if invalid_reasons:
             rejected_str = ", ".join(b.name for b in invalid_reasons)
+            _guard_gfx906_fa_fallback(
+                attn_selector_config, invalid_reasons, selected_backend
+            )
             logger.info(
                 "Found incompatible backend(s) [%s] with %s. "
                 "Overriding with %s out of potential backends: %s.",
@@ -830,7 +869,9 @@ class RocmPlatform(Platform):
             if vit_auto_enabled():
                 reason = vit_unsupported_reason(head_size, dtype)
                 if reason is None:
-                    logger.info_once("Using CUSTOM (gfx906 FA) backend for ViT attention.")
+                    logger.info_once(
+                        "Using CUSTOM (gfx906 FA) backend for ViT attention."
+                    )
                     return AttentionBackendEnum.CUSTOM
                 # LOUD on purpose: this is a silent-loss path otherwise. The ViT
                 # keeps working, but it loses the MI50-tuned kernel and pays the
