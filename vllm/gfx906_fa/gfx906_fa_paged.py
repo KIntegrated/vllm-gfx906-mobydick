@@ -50,6 +50,7 @@ _DBG   = (_os.environ.get("GFX906_FA_FWD_DEBUG", "0") == "1" or _FA_DEBUG)
 # через GFX906_FA_FUSED=0 — тогда работает старый путь через fancy-indexing
 # (для A/B-замеров и как быстрый safety-fallback при регрессиях).
 _FUSED = _os.environ.get("GFX906_FA_FUSED", "1") != "0"
+_DEBUG_PRINTS = [0]  # GFX906_FA_DEBUG_SHAPES prints the first few calls
 # M3 (2026-09-12): use the host-side cu_seqlens (query_start_loc_cpu) in the
 # variable-Q branches instead of int(cu[...]) device reads. Each int() is
 # a D2H sync that blocks on the queued GPU work (~10.8 syncs per layer
@@ -395,6 +396,15 @@ def forward_paged(
     Возвращает out: [num_tokens, Hq*D] fp32 (для совместимости с vLLM).
     """
     num_tokens, Hq, D = query.shape
+    if _os.environ.get("GFX906_FA_DEBUG_SHAPES") and _DEBUG_PRINTS[0] < 3:
+        _DEBUG_PRINTS[0] += 1
+        print(
+            f"[gfx906_fa] key_cache={tuple(key_cache.shape)} "
+            f"value_cache={tuple(value_cache.shape)} query={tuple(query.shape)} "
+            f"k_q8={None if key_cache_q8 is None else tuple(key_cache_q8.shape)} "
+            f"D={D} q_pad={None if q_pad_buf is None else tuple(q_pad_buf.shape)}",
+            flush=True,
+        )
     assert query.dtype in (torch.float16, torch.float32), (
         "query must be fp16/fp32 for FA-q8 path (cast into the fp32 "
         "q_pad buffer at store)")

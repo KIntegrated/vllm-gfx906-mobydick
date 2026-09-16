@@ -29,6 +29,7 @@ into contiguous fp16 buffers with a fused HIP gather kernel, quantizes
 K to Q8 on device, and runs the Q8 FA kernel.
 """
 
+import dataclasses
 import os as _os
 from dataclasses import dataclass
 from typing import ClassVar
@@ -83,6 +84,9 @@ class Gfx906FAMetadata:
 
 # Kernel head dims the launcher instantiates (see csrc/gfx906_fa/gfx906_fa_launcher.cu).
 _INSTANTIATED_HEAD_DIMS = (64, 128, 256)
+
+
+_DEBUG_SHAPES = [0]  # GFX906_FA_DEBUG_SHAPES prints the first few calls
 
 
 def _pad_head_dim(head_size: int) -> int | None:
@@ -292,6 +296,20 @@ class Gfx906FABackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["Gfx906FAImpl"]:
         return Gfx906FAImpl
+
+    @classmethod
+    def customize_spec(cls, spec):
+        """Widen the KV spec's head dim to the padded one when padding is opted in.
+
+        vLLM sizes the KV cache from this spec while the kernels are dispatched on the padded
+        dim, so the two must agree. With the real dim in the spec the layer allocates a
+        2*real-byte fused row, and splitting that at the padded dim leaves a remainder
+        (Phi-3-mini: a 128 chunk plus a 64 remainder, which trips the Q8 row check).
+        """
+        padded = _padded_head_size(spec.head_size)
+        if padded is None or padded == spec.head_size:
+            return spec
+        return dataclasses.replace(spec, head_size=padded)
 
     @staticmethod
     def get_kv_cache_shape(
@@ -1145,6 +1163,14 @@ class Gfx906FAImpl(AttentionImpl):
         key_cache, value_cache = kv_cache.transpose(1, 2).split(
             self.padded_head_size, dim=-1
         )
+        if _os.environ.get("GFX906_FA_DEBUG_SHAPES") and _DEBUG_SHAPES[0] < 3:
+            _DEBUG_SHAPES[0] += 1
+            print(
+                f"[gfx906_fa-impl] kv_cache={tuple(kv_cache.shape)} "
+                f"head={self.head_size} padded={self.padded_head_size} "
+                f"K={tuple(key_cache.shape)} V={tuple(value_cache.shape)}",
+                flush=True,
+            )
 
         # query [num_tokens, Hq, D] fp16 (forward_paged casts it into the
         # fp32 q_pad buffer inside the copy_ — a standalone .float() was

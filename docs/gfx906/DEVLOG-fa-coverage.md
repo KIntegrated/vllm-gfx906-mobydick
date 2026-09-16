@@ -236,3 +236,36 @@ on the way out. Two details make it a real test rather than a smoke:
 The default is still 0, and the guard now makes the opt-in discoverable: when CUSTOM is rejected for
 `head_size` on a dim that `_pad_head_dim` can reach, the warning says so and names `GFX906_FA_PAD=1`
 (Phi-3-mini / Phi-3.5-mini are 96, Phi-2 is 80, SigLIP-style ViTs are 72 — the class this serves).
+
+### Step 2, real-model gate: Phi-3-mini (head_dim 96) — WIP, one allocator interaction left
+
+**VERDICT:** OPEN (diagnosed, not fixed) · **GATE:** `GFX906_FA_PAD=1` vs `0` on Phi-3-mini-4k-instruct,
+same model and prompts; the fallback arm is green (PPL **15.0090**, 421 tokens, 0 top-20 misses) and
+is the reference the padded arm must match.
+
+What the real model showed that the unit test could not (the unit test hand-builds the cache, so it
+never exercises vLLM's allocation):
+
+- with padding opted in, the gate *opens* — Phi-3's head_dim 96 is accepted and the log says
+  `Overriding with CUSTOM`;
+- it then dies in the Q8 gather with `bytes_per_row must equal (D/32)*34, got 136 vs expected N`,
+  where N moved from 68 to 102 as the fix below landed — i.e. the failure is a **width disagreement
+  between the two views the kernel receives**;
+- the shapes (env-gated `GFX906_FA_DEBUG_SHAPES`) are the smoking gun:
+  `kv_cache=(2, 32, 16, 224)`, `head=96 padded=128`, `K=(2, 16, 32, 128)`, `V=(2, 16, 32, 96)`.
+  224 is **neither** 2*96 (real) nor 2*128 (padded) — it is 128 + 96, i.e. the allocator built a
+  2*112 row.
+
+Mechanism: vLLM sizes a page from the **spec** (`page_size_bytes` = block_size * num_kv_heads * 2 *
+head_size * dtype_size) and builds the tensor from the backend's `get_kv_cache_shape`. Padding the
+spec's `head_size` (via `customize_spec`, which the sliding-window branch already calls and the
+full-attention branch now does too) makes those two disagree, and the reconciliation yields a third
+row width. So the padded dim has to be expressed through vLLM's **page-size** mechanism that the spec
+already has (`page_size_padded`, used by the sliding branch), not by widening the shape and the spec
+independently.
+
+Landing here as WIP on `gfx906/fa-cover-1`: the `customize_spec` route for full attention (a 3-line
+change in `attention.py` mirroring the sliding branch, plus the backend override), the env-gated
+shape debug prints (`GFX906_FA_DEBUG_SHAPES`, kept because this class of bug is otherwise invisible),
+and a test pinning that the spec widens only when opted in. Defaults are unchanged: `GFX906_FA_PAD`
+is still 0, so nothing serves a padded dim by accident.

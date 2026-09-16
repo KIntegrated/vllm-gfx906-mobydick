@@ -8,6 +8,7 @@ the `supports_head_size` assertion below is the line to update.
 """
 
 import pytest
+import torch
 
 try:
     from vllm.gfx906_fa.gfx906_fa_backend import (
@@ -66,3 +67,26 @@ def test_supports_head_size_is_still_restrictive(monkeypatch):
     assert _padded_head_size(96) is None  # opt-in default
     monkeypatch.setenv("GFX906_FA_PAD", "1")
     assert _padded_head_size(96) == 128
+
+def test_customize_spec_widens_only_when_opted_in(monkeypatch):
+    """The spec must carry the padded dim, or vLLM allocates a 2*real row (Phi-3's bug)."""
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=32, head_size=96, dtype=torch.float16,
+        kv_quant_mode=None,
+    )
+    monkeypatch.delenv("GFX906_FA_PAD", raising=False)
+    assert Gfx906FABackend.customize_spec(spec).head_size == 96
+    monkeypatch.setenv("GFX906_FA_PAD", "1")
+    widened = Gfx906FABackend.customize_spec(spec)
+    assert widened.head_size == 128
+    # other fields untouched
+    assert widened.block_size == 16 and widened.num_kv_heads == 32
+    # a dim that cannot be padded is left alone even when opted in
+    big = FullAttentionSpec(
+        block_size=16, num_kv_heads=32, head_size=512, dtype=torch.float16,
+        kv_quant_mode=None,
+    )
+    assert Gfx906FABackend.customize_spec(big).head_size == 512
+
