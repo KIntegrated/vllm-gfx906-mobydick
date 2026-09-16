@@ -238,6 +238,57 @@ exclusions recorded above still stand, and the cheapest decisive test remains th
 *cards' own matched pair on a stock vLLM* (their nightly has both DFlash2 and
 pack-quantized).
 
+## 2026-09-16 (later) — syv-ai's pairing answer, and our tree cannot load a *quantized* drafter
+
+**VERDICT:** OPEN, but the question is now sharp and externally grounded · **GATE:** per-position
+acceptance with the recommended pairing on our tree (run attempted; blocked by a load gap).
+
+**The pairing question is answered** from syv-ai's own docs and model card
+(`syvai/Qwen3.8-27B-DFlash2-W4A16`, card + `qwen38-27b-rtx3090/drafter/README.md`):
+
+- `base_model: incoai/Qwen3.8-27B-DFlash2` — i.e. it is **the same drafter we already tested**,
+  GPTQ-requantized to W4A16 (1.19 GB) so it fits beside a 27B target on a 24 GB card. Their own
+  target is `Qwen3.8-27B-Uncensored-W4A16`, i.e. **their pairing is also 4-bit**, so "4-bit target"
+  is not the fault. **Switching drafters is therefore not a fix by itself** — the fault is on our side.
+- Their measured references (RTX 3090, 8 prompts × 1k, vLLM 0.27.1 + their patches): the DFlash2
+  block drafter gives **3.14 / 3.34 tokens per step** (118 / 126 tok/s) and the int4 requant keeps
+  greedy acceptance (3.34-3.65 vs 3.54 for bf16). The *bare* dratfer costs **~5 ms per decode step**;
+  a whole int4 DFlash2 step is ~28 ms. Ours was **422 / 728 ms per step** at 64k/120k — a ~100x
+  anomaly, which is the strongest signal we have that our DFlash2 path is behaving pathologically
+  rather than merely slowly.
+- Their notes that matter to us: greedy with speculation is not bit-deterministic across drafter
+  configs (verify batches of 5 vs 1 token round differently; **3.1-3.6 tokens/step spread across
+  launch configs**), per-position acceptance is measured after rejections and sits ~5 points below a
+  whole-sequence top-1 rate, and `VLLM_DFLASH2_DRAFT_TOPK_TOPP=0` disables their selector-walk
+  top-k/top-p proposal.
+- The caveat in their card — a **quantized target lm_head** needs their patch because upstream refuses
+  a non-bf16 lm_head for the candidate top-k — does **not** apply to our targets: the AWQ-INT4
+  `cyankiwi` checkpoint stores `lm_head.weight` unquantized (plain `.weight`, and this is in its
+  `ignore` list), and the `lued` INT8 checkpoint lists `lm_head` in `ignore` too.
+
+**New hard finding from the run: our tree cannot load a quantized DFlash2 drafter.** Serving the
+recommended pair (INT8/W8A16 `lued` target + `syvai/...-DFlash2-W4A16`, TP=2, fp16 KV, k=7) fails at
+load with `Error: 'QKVParallelLinear' object has no attribute 'weight'`. That is exactly the case
+their README documents: the fused `qkv_proj.weight_shape` only holds the last-loaded shard's shape, so
+the dense shape must be derived from `weight_packed`/`input_size` — their backport's `_dense_kv_rows`
+does this, and upstream PR #52816 (all our tree has) does not. So: a **bf16 drafter loads** (the
+incoai one did) while a **pack-quantized drafter cannot** — a small, well-specified port.
+
+**Also reproduced** (the DFL2-8 signature, now with both roles visible in one log):
+`Found incompatible backend(s) [CUSTOM, TURBOQUANT] with AttentionType.DECODER` -> `Overriding with
+ROCM_ATTN` (the **drafter**), while the **target** gets `Overriding with CUSTOM` (our FA). Our FA is
+rejected for the drafter and the rejection *reason* is still unlogged (DFL2-8 step 1).
+
+**Next (in order):** (1) port `_dense_kv_rows` (from `qwen38-27b-rtx3090/patches/dflash2-backport.patch`)
+so a quantized drafter loads; (2) log the drafter's backend-rejection reason (DFL2-8 step 1) and decide
+whether CUSTOM can serve the windowed-bidirectional D=128 drafter; (3) re-run per-position acceptance
+with the recommended pair and compare against their 3.1-3.6 tokens/step, remembering the per-position
+protocol note above.
+
+**VERDICT:** `OPEN` — pairing question closed (same drafter, 4-bit target; fault is ours); two
+concrete stack gaps identified (`_dense_kv_rows` for quantized drafters, the drafter's attention
+backend), plus the unexplained ~100x step-time anomaly.
+
 ## Refrigerated residue
 
 `rocm_unquantized_gemm`'s 3-D branches still pass `x` (not the flattened view) to
