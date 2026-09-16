@@ -109,10 +109,13 @@ def _pad_head_dim(head_size: int) -> int | None:
 def _padded_head_size(head_size: int) -> int | None:
     """``head_size`` as a servable dim, or None when it cannot be served.
 
-    ``GFX906_FA_PAD=0`` restores the old behaviour (only exactly instantiated dims) as a
-    kill switch for the eventual flip; already-instantiated dims are returned unchanged.
+    Opt-in while the write path is unfinished: ``GFX906_FA_PAD`` defaults to 0.
+    Until the KV-cache layout carries the pad, serving a non-instantiated dim would
+    feed unpadded tensors to the kernels (silent garbage, not a fallback).
+    Instantiated dims are returned unchanged either way; flipping the default is
+    gated on a real model.
     """
-    if _os.environ.get("GFX906_FA_PAD", "1") != "1":
+    if _os.environ.get("GFX906_FA_PAD", "0") != "1":
         return head_size if head_size in _INSTANTIATED_HEAD_DIMS else None
     return _pad_head_dim(head_size)
 

@@ -158,3 +158,36 @@ Fixes:
 Ranking consequence: step 2 (padding up to 256) has **no serving-relevant beneficiary** in the zoo
 today, while Gemma-4's class needs a 512-head instance plus heterogeneous dispatch plus a config
 change. Keep step 2 as insurance; do it after anything with a real model behind it.
+
+### Step 2 implementation notes (measured while starting it, 2026-09-16)
+
+Reading the plumbing before touching it produced a precise edit list, and one prerequisite that
+landed first: **`GFX906_FA_PAD` is opt-in (default 0)**. Until the KV layout carries the pad, serving
+a non-instantiated dim would feed unpadded tensors to the kernels — silent garbage rather than a
+fallback — so the default must stay off until a real model validates the path. The tests now pin that
+(unset -> only instantiated dims; `=1` -> the pad map; 14 cases).
+
+Where the change actually goes (all in `gfx906_fa_backend.py`):
+
+- `get_kv_cache_shape` (static): the row width is `head_size`; it must return the padded dim. The
+  "identical to TritonAttentionBackend, so backends can be swapped without re-allocating" note only
+  holds for unpadded dims.
+- `Gfx906FAImpl.__init__`: keep `self.head_size` as the *real* dim and add `self.padded_head_size`;
+  the fused K||V split (`kv_cache.transpose(1, 2).split(self.head_size, dim=-1)`) appears twice —
+  `do_kv_cache_update` (write) and `forward` (read) — and both must split by the padded dim.
+- `do_kv_cache_update`: `triton_reshape_and_cache_flash` writes only the first D channels of a
+  padded row, so the pad must be **zeroed explicitly**. Cheap approach: zero the pad slices of the
+  cache once per cache tensor (identity on the underlying storage, the same trick
+  `_ensure_q8_sidebuffer` already uses) — after that nothing writes those bytes, and a zero pad is
+  exactly what keeps the math exact.
+- the Q8 side view needs no change in principle: its row ((D/32)*34 bytes) fits the fp16 K row
+  (2D bytes) — 136 <= 256 at D=128 — and it derives from the cache tensor, so it follows the padded
+  shape. Worth an assertion that the fit still holds for a padded dim.
+- `forward`/`forward_paged`: pass the padded dim to the op, zero-pad the query, and slice the output
+  head dim back to `head_size` (the reshape/slice happens where the fp32 result is copied into
+  `output`, alongside the existing `q_pad` machinery).
+- `supports_head_size` returns pad-able only once all of the above is in.
+
+Verification path stays as recorded: unit tests against a torch reference at 72/80/96/112 (no local
+decoder LM has such a dim, so a real-model gate waits for one to be onboarded — the guard will say so
+when that happens).
