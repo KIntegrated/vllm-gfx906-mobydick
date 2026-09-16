@@ -124,3 +124,46 @@ Two gotchas that cost runs and are worth remembering:
 Loads on this boot wedged twice (#97 09:56, #98 11:15; a clean load in between), and the harness
 agent process itself was killed by a segfault during one of the runs — no kernel OOM/segfault
 recorded, box RAM is 31 GB with a ~15 GB model load. Reboot before the next gated run.
+
+## 2026-09-16 (result) — correct non-causal attention did NOT restore acceptance: STOP the kernel work
+
+**VERDICT:** DEAD-END for this hypothesis (attention masking is not the cause) — the ~25-30-edit
+non-causal kernel change is **not** justified · **GATE:** per-position acceptance of the recommended
+pair with the eager symmetric-window path, 64k agentic, k=7, 1 rep.
+
+Result (`sweep_client_reps.py`, arm `eager_dfl2`, `VLLM_DFLASH2_EAGER_ATTN=1`, TP=2, eager,
+AWQ-INT4 target + `syvai/Qwen3.8-27B-DFlash2-W4A16`):
+
+| arm | accepted/draft | drafts | t/s |
+|---|---|---|---|
+| backend fallback (ROCM_ATTN + Triton), earlier runs | 0.045 / 0.0 | — | 2.48 |
+| **eager symmetric-window (non-causal) attention** | **0.0282** | 248 | **2.52** |
+
+So implementing the reference semantics (no causal clip, symmetric ±2048 window) leaves acceptance
+where it was: ~1 token/step, ~2.5 t/s, against syv-ai's 3.1-3.6 tokens/step reference. Two very
+different attention implementations (the upstream ROCM_ATTN fallback and a torch
+`scaled_dot_product_attention` with the symmetrized window) agree, which is the strongest form this
+negative can take: **the drafter's masking is not why acceptance collapses.**
+
+Caveat stated plainly: `_eager_windowed_attention` is hand-rolled and has not been validated
+numerically against a reference, so "attention is not the cause" rests on the agreement of two
+independent implementations rather than on a verified-correct one. If anyone wants to re-open this
+hypothesis, the cheap next check is to compare the drafter's logits under the two paths on one
+prompt, not to write kernels.
+
+**What this does NOT excuse:** the drafter still cannot use our FA (`supports_non_causal` absent), so
+DFlash2 on this box still runs a backend that cannot be graph-captured and costs ~10x per step. If
+DFlash2 is ever revived for *performance* reasons, the kernel work remains a prerequisite — but it
+would be premature to spend it while acceptance is 2.8%.
+
+**Remaining suspects, in order of cheapness:** (1) which target layers' hidden states the drafter
+actually receives — `combine_hidden_states` validates only the *width* (25600 = 5 x 5120), so a
+wrong-but-same-count layer set would pass silently; `set_aux_hidden_state_layers` is fed from
+`dflash_config.target_layer_ids` in `config/speculative.py`, so verify it is applied for this target
+rather than assuming; (2) the drafter's own selector/vocab machinery under our engine version
+(upstream #52816 is in our tree, but this fork's V2 runner is not upstream's); (3) the general
+draft/target compatibility question, which the other box can settle with syv-ai's own stack.
+
+**Recommendation:** park the DFlash2 acceptance hunt rather than spend kernel time on it. The family
+has now been excluded at: pairing (matched drafter, same result), loading (fixed, zero skipped
+tensors), and attention masking (this entry).
