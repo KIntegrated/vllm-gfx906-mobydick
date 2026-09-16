@@ -222,10 +222,17 @@ pairing; secondary: the drafter's attention backend. The matched INT8 pair is th
 **VERDICT:** `lued/Qwen3.8-27B-INT8-W8A16-DFlash2` cannot be served on this fork today.
 It is a compressed-tensors **`pack-quantized`** checkpoint (`weight_packed` /
 `weight_scale` / `weight_shape`; **401 packed tensors**, including the embedding and the
-GDN `linear_attn.in_proj_qkv` / `in_proj_z`), and our tree handles that form only for
-nvfp4/mxfp4 (`vllm/model_executor/kernels/linear/nvfp4/humming.py`). The loader dies in
-`Qwen3_5Model` with `ValueError: There is no module or parameter named
-'embed_tokens.weight_packed'`. It is also the **VL** variant
+GDN `linear_attn.in_proj_qkv` / `in_proj_z`), and the loader died in `Qwen3_5Model` with
+`ValueError: There is no module or parameter named 'embed_tokens.weight_packed'`.
+
+**Correction (2026-09-16, INT8-PACKED-1):** the cause was **not** missing quantisation
+support. Our tree already routes these groups to `CompressedTensorsWNA16(strategy=group,
+num_bits=8, group_size=128)` and already ships a pack-quantized embedding scheme
+(`compressed_tensors_embedding.py`, a Triton gather that unpacks int32-packed INT weights and
+dequantises in one pass). `Qwen3_5Model` simply built `embed_tokens` without
+`quant_config`/`prefix`, so the quantized embedding never registered packed parameters. Fixed
+in two lines on `gfx906/int8-packed`; the checkpoint then loads with zero skipped tensors and
+generates coherent output (`DEVLOG-int8-packed.md`). It is also the **VL** variant
 (`Qwen3_5ForConditionalGeneration`, `model.visual.*` keys).
 
 The checkpoint itself is fine: 6 shards totalling 29.53 GB, exactly the index's
