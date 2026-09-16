@@ -433,6 +433,20 @@ counterfactually). Full analysis + probe design:
 
 ### DFL2-8 — the DFlash2 drafter's attention backend (blocking unknown; correctness + speed)
 
+**Status: ROOT-CAUSED 2026-09-16 — it is a missing FA *feature* (non-causal attention), not a
+backend choice; work item designed in `DEVLOG-fa-noncausal.md`.** Step 1 (log the reasons) landed and
+answered it on the first run: `Reasons: {CUSTOM: [non-causal attention not supported], ...}` — the
+drafter is `is_causal: false` with `sliding_window: 2048`, and `Gfx906FABackend` does not define
+`supports_non_causal()`, so `vllm/v1/attention/backend.py` rejects us for it while the target keeps
+CUSTOM. With the **matched** pair (AWQ target + `syvai/Qwen3.8-27B-DFlash2-W4A16`, k=7) acceptance is
+still 0.0, so the quantisation pairing is exonerated. Caveat found on the way: the drafter's ROCM_ATTN
+fallback cannot be CUDA-graph captured (`rocm_attn.py` -> `chunked_prefill_*`). Plan: (a) cheap
+decisive experiment — an env-gated eager symmetric-window attention path for the drafter, to learn
+whether correct non-causal attention restores acceptance *before* spending the ~25-30-edit kernel +
+plumbing change; (b) implement a symmetric-window / no-causal-clip mode in the four kernels, plumb it
+through the launcher and op, then define `supports_non_causal()`; (c) gate on the FA suite plus
+DFlash2 per-position acceptance. Original text:
+
 **Status: open — highest priority in the DFlash2 family (2026-09-15).** With the bring-up crash
 fixed, arm C measured **2.48 t/s / acceptance 0.045 / 421.9 ms/step** at 64k against the MTP k=3
 band (33.62 plain, 35.44 with CAT-1) — a 13x gap that no downstream patch can close. The log says
