@@ -276,12 +276,21 @@ correctly. Our fork measured the same regime (0.045 accepted/draft on the fallba
 eager symmetric-window path). So **the fork is exonerated and the mechanism is dead upstream too**:
 DFlash2 is **parked** for this target family (`DEVLOG-dflash2.md`, "external, decisive").
 
-**One check remains before it is buried for good** — the *target*. The 5070 Ti run used
-`cyankiwi/Qwen3.8-27B-AWQ-INT4`, whereas syv-ai's 3.1-3.4 tokens/step reference is with
-`Qwen3.8-27B-Uncensored-W4A16`. The aux hidden-state layers are declared by the *target*, and the
-drafter's `combine_hidden_states` validates only the *width* (25600 = 5 x 5120), so a wrong-but-equal
-**count** layer set passes silently and would look exactly like this. One run with syv-ai's own target
-(or the bf16 drafter against a bf16 target) settles whether the family is dead or only this target is.
+**The remaining check is answered too — the target is exonerated.** We ran the model card's own
+documented pairing, **unquantised on both sides** (bf16 `Qwen/Qwen3.8-27B` + bf16
+`incoai/Qwen3.8-27B-DFlash2`, TP=2, eager, k=7): acceptance **0.0408** at 1,024 prompt tokens (245
+drafted; per-position 0.0204 / 0.0204 / 0 elsewhere) and **0.0079** at 2,048 (253 drafted), 6.30 and
+5.96 t/s — the same degenerate regime, against syv-ai's ~0.33 per-draft reference.
+
+So all four suspects are now excluded by measurement — **fork** (upstream 0.29.0 degenerate), **attention
+path** (eager symmetric-window 0.0282 here, upstream FlashInfer 0.000), **drafter quantisation** (matched
+W4A16 drafter degenerate), **target** (this run) — and **DFlash2 is dead for this family**. Nothing
+further to run; the topic is parked finally, not provisionally (`DEVLOG-dflash2.md`).
+
+For reference, if you ever need the bf16 pair on a 32 GB-class card: at TP=2 it fits only with
+`--gpu-memory-utilization 0.96 --max-model-len 4096 --max-num-batched-tokens 256` (KV 9,206 tokens,
+and that is *with* `--enforce-eager`); 0.92 with 32k gives a **negative** pool. On 2x16 GB cards the
+unquantised 54 GB target does not fit at all, which is why your W4A16 route was the right one.
 
 ## 9. Links
 
