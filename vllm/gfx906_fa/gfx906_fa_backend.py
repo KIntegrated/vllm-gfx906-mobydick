@@ -29,6 +29,7 @@ into contiguous fp16 buffers with a fused HIP gather kernel, quantizes
 K to Q8 on device, and runs the Q8 FA kernel.
 """
 
+import dataclasses
 import os as _os
 from dataclasses import dataclass
 from typing import ClassVar
@@ -71,14 +72,57 @@ class Gfx906FAMetadata:
     num_actual_tokens: int
     max_query_len: int
     max_seq_len: int
-    query_start_loc: torch.Tensor      # [B+1] int32
-    seq_lens: torch.Tensor             # [B]   int32
-    block_table: torch.Tensor          # [B, max_num_blocks] int32
-    slot_mapping: torch.Tensor         # [num_tokens] int64
+    query_start_loc: torch.Tensor  # [B+1] int32
+    seq_lens: torch.Tensor  # [B]   int32
+    block_table: torch.Tensor  # [B, max_num_blocks] int32
+    slot_mapping: torch.Tensor  # [num_tokens] int64
     query_start_loc_cpu: torch.Tensor | None = None  # [B+1] host int (M3:
     # lets forward_paged skip the per-seq int(cu[...]) D2H syncs)
     use_cascade: bool = False
     common_prefix_len: int = 0
+
+
+# Kernel head dims the launcher instantiates (see csrc/gfx906_fa/gfx906_fa_launcher.cu).
+_INSTANTIATED_HEAD_DIMS = (64, 128, 256)
+
+
+_DEBUG_SHAPES = [0]  # GFX906_FA_DEBUG_SHAPES prints the first few calls
+
+
+def _pad_head_dim(head_size: int) -> int | None:
+    """Smallest instantiated kernel head dim that fits (None if none does).
+
+    Mirrors the ViT path (`gfx906_fa_mm_encoder.py`), which serves every head dim up to
+    256 by zero-padding to the next instantiated dim. Padding is exact here: padded Q
+    dims add 0 to the QK dot, padded K dims quantise to zero q8_0 blocks, padded V dims
+    add 0 to P*V, and the head-dim padding leaves the softmax denominator unchanged.
+    The cost is real (QK/PV work grows) but it replaces a fallback to ROCM_ATTN or
+    TRITON_ATTN, which loses the tuned kernel entirely.
+
+    NOT WIRED YET (FA-COVER-1 step 2): a padded dim needs the KV-cache layout to carry
+    it (`get_kv_cache_shape`) plus padding and slicing in the write and read paths, so
+    `supports_head_size` stays restrictive until that lands.
+    See docs/gfx906/DEVLOG-fa-coverage.md.
+    """
+    for head_dim in _INSTANTIATED_HEAD_DIMS:
+        if head_size <= head_dim:
+            return head_dim
+    return None
+
+
+def _padded_head_size(head_size: int) -> int | None:
+    """``head_size`` as a servable dim, or None when it cannot be served.
+
+    Default ON since the Phi-3-mini gate (2026-09-16, FA-COVER-1 step 2): head_dim 96 went from a
+    silent fallback to CUSTOM at 36.41 t/s vs 28.62 (+27 %), with identical top-5 tokens and PPL
+    within 0.11 % of the fallback arm (0 top-20 misses in both). The cost is KV bytes: the row
+    grows by the pad ratio (96 -> 128 is +33 % of K and V, 72 -> 128 is +78 %), and
+    ``GFX906_FA_PAD=0`` restores the old behaviour (instantiated dims only). Instantiated dims are
+    returned unchanged either way.
+    """
+    if _os.environ.get("GFX906_FA_PAD", "1") != "1":
+        return head_size if head_size in _INSTANTIATED_HEAD_DIMS else None
+    return _pad_head_dim(head_size)
 
 
 def _resolve_legacy_mode() -> bool:
@@ -96,9 +140,7 @@ def _resolve_legacy_mode() -> bool:
     return _os.environ.get("GFX906_FA_LEGACY", "0") == "1"
 
 
-class Gfx906FAMetadataBuilder(
-    AttentionMetadataBuilder[Gfx906FAMetadata]
-):
+class Gfx906FAMetadataBuilder(AttentionMetadataBuilder[Gfx906FAMetadata]):
     # P3-3a M2: the LEGACY (inline-quant) decode path is FULL-capture-safe
     # (first FULL capture runs at profile_seq_lens=max_model_len, so
     # Sk-sized buffers allocate at capacity; metadata is runner-staged and
@@ -120,7 +162,8 @@ class Gfx906FAMetadataBuilder(
         if not _resolve_legacy_mode():
             logger.debug(
                 "GFX906_FA_LEGACY=0: K is read from the Q8 side view "
-                "aliased into the fp16 K half (zero extra KV memory).")
+                "aliased into the fp16 K half (zero extra KV memory)."
+            )
         mode = _os.environ.get("GFX906_FA_CG", "decode").lower()
         if mode == "always":
             return AttentionCGSupport.ALWAYS
@@ -207,7 +250,8 @@ class Gfx906FAMetadataBuilder(
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
             query_start_loc_cpu=getattr(
-                common_attn_metadata, "query_start_loc_cpu", None),
+                common_attn_metadata, "query_start_loc_cpu", None
+            ),
             use_cascade=(common_prefix_len > 0),
             common_prefix_len=common_prefix_len,
         )
@@ -254,6 +298,38 @@ class Gfx906FABackend(AttentionBackend):
     def get_impl_cls() -> type["Gfx906FAImpl"]:
         return Gfx906FAImpl
 
+    @classmethod
+    def customize_spec(cls, spec):
+        """Widen the KV spec's head dims to the padded one when padding is opted in.
+
+        NOTE: both halves are set to the same padded width, which is what the impl's split and
+        its zero-padding assume; a model with genuinely asymmetric K/V head dims would need
+        per-half padding here and in the impl.
+
+
+        vLLM sizes the KV cache from this spec while the kernels are dispatched on the padded
+        dim, so the two must agree. With the real dim in the spec the layer allocates a
+        2*real-byte fused row, and splitting that at the padded dim leaves a remainder
+        (Phi-3-mini: a 128 chunk plus a 64 remainder, which trips the Q8 row check).
+        """
+        if _os.environ.get("GFX906_FA_DEBUG_SHAPES"):
+            print(
+                f"[gfx906_fa-spec] in: head={spec.head_size} head_v={spec.head_size_v} "
+                f"block={spec.block_size} hkv={spec.num_kv_heads}",
+                flush=True,
+            )
+        padded = _padded_head_size(spec.head_size)
+        if padded is None or padded == spec.head_size:
+            return spec
+        # BOTH halves: the 0.29 fused row is K||V, so its width is head_size + head_size_v,
+        # and our impl splits it into two padded_head_size halves. Widening only head_size
+        # leaves a row of padded + real (Phi-3: 128 + 96 = 224), which is what the allocator
+        # then built and what the Q8 row check rejected.
+        out = dataclasses.replace(spec, head_size=padded, head_size_v=padded)
+        if _os.environ.get("GFX906_FA_DEBUG_SHAPES"):
+            print(f"[gfx906_fa-spec] out: head={out.head_size}", flush=True)
+        return out
+
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
@@ -264,9 +340,16 @@ class Gfx906FABackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        # Identical to TritonAttentionBackend, so backends can be
-        # switched without re-allocating the KV cache.
-        return (num_blocks, 2, block_size, num_kv_heads, head_size)
+        # Identical to TritonAttentionBackend for instantiated head dims, so backends
+        # can be swapped without re-allocating the KV cache. A pad-able dim widens
+        # the row instead (opt-in via GFX906_FA_PAD; see _padded_head_size).
+        return (
+            num_blocks,
+            2,
+            block_size,
+            num_kv_heads,
+            _padded_head_size(head_size) or head_size,
+        )
 
     @classmethod
     def supported_kv_cache_layouts(cls):
@@ -295,8 +378,10 @@ class Gfx906FABackend(AttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        # Kernel validated for 64/128; 256 (Qwen3.5/3.6) added.
-        return head_size in (64, 128, 256)
+        # Kernel validated for 64/128; 256 (Qwen3.5/3.6) added. Dims that pad onto
+        # one of those are servable too, but only when GFX906_FA_PAD opts in
+        # (default off until the write path is validated on a real model).
+        return _padded_head_size(head_size) is not None
 
     @classmethod
     def supports_sliding_window(cls) -> bool:
@@ -354,7 +439,6 @@ class Gfx906FABackend(AttentionBackend):
 # Impl
 # -----------------------------------------------------------------------------
 class Gfx906FAImpl(AttentionImpl):
-
     # ------------------------------------------------------------------
     # CLASS-LEVEL shared gather buffers (K_q8, V_fp16).
     #
@@ -404,7 +488,8 @@ class Gfx906FAImpl(AttentionImpl):
     # a serving A/B. Until then every lifecycle edit must touch BOTH
     # policies and keep them divergence-free.
     _gather_exact: ClassVar[bool] = (
-        _os.environ.get("GFX906_FA_GATHER_EXACT", "0") == "1")
+        _os.environ.get("GFX906_FA_GATHER_EXACT", "0") == "1"
+    )
     # One-shot warning once more than one capture-baked generation has
     # been retired (capture-order coupling or repeated captures — see
     # _ensure_gather_buffers).
@@ -446,17 +531,19 @@ class Gfx906FAImpl(AttentionImpl):
         if alibi_slopes is not None:
             raise NotImplementedError("GFX906_FA: alibi_slopes unsupported")
         if logits_soft_cap not in (None, 0, 0.0):
-            raise NotImplementedError(
-                "GFX906_FA: logits_soft_cap unsupported")
+            raise NotImplementedError("GFX906_FA: logits_soft_cap unsupported")
         if sinks is not None:
             raise NotImplementedError("GFX906_FA: sinks unsupported")
         if attn_type != AttentionType.DECODER:
-            raise NotImplementedError(
-                f"GFX906_FA: attn_type={attn_type} unsupported"
-            )
+            raise NotImplementedError(f"GFX906_FA: attn_type={attn_type} unsupported")
 
         self.num_heads = num_heads
         self.head_size = head_size
+        # Padding to an instantiated kernel dim (opt-in). Kernels use
+        # padded_head_size; the API side (scales, slicing) stays on head_size.
+        self.padded_head_size = _padded_head_size(head_size) or head_size
+        self._head_pad = self.padded_head_size - head_size
+        self._pad_zeroed_cache: tuple | None = None
         # Sliding-window size in tokens (0 for full-attention layers).
         # The FA kernel masks keys older than the per-row window when
         # window > 0; forward_paged passes q_abs_offset for every
@@ -471,7 +558,8 @@ class Gfx906FAImpl(AttentionImpl):
             logger.warning(
                 "GFX906_FA_NO_WINDOW is set: sliding-window masking is "
                 "disabled on all layers — output is WRONG for windowed "
-                "layers beyond the window (perf A/B arm only).")
+                "layers beyond the window (perf A/B arm only)."
+            )
         else:
             self.sliding_window = sliding_window or 0
         self.scale = float(scale)
@@ -543,10 +631,13 @@ class Gfx906FAImpl(AttentionImpl):
         # underlying storage/layout actually changed (profile-run dummy
         # cache -> live pool, layout re-slices).
         src = self._k_cache_q8_src
-        if (self._k_cache_q8 is not None and src is not None
-                and src.data_ptr() == key_cache.data_ptr()
-                and src.shape == key_cache.shape
-                and src.stride() == key_cache.stride()):
+        if (
+            self._k_cache_q8 is not None
+            and src is not None
+            and src.data_ptr() == key_cache.data_ptr()
+            and src.shape == key_cache.shape
+            and src.stride() == key_cache.stride()
+        ):
             return
         num_blocks, block_size, Hkv, D = key_cache.shape
         assert D % 32 == 0, f"D={D} must be multiple of 32"
@@ -556,13 +647,13 @@ class Gfx906FAImpl(AttentionImpl):
             f"Q8 row ({bytes_per_row} B) must fit in the K row "
             f"({row_bytes} B at {key_cache.element_size()} B/elt) — "
             "the uint8 slice [:, :, :, :bytes_per_row] would clamp to "
-            f"the row width and straddle into the next row")
+            f"the row width and straddle into the next row"
+        )
         # key_cache is kv_cache.unbind(1) of [num_blocks, 2, bs, Hkv, D]
         # — non-contiguous, last dim stride 1, so the uint8 view and the
         # last-dim slice below are legal (verified: strides come from the
         # real tensor and every consumer kernel is stride-parameterized).
-        self._k_cache_q8 = \
-            key_cache.view(torch.uint8)[:, :, :, :bytes_per_row]
+        self._k_cache_q8 = key_cache.view(torch.uint8)[:, :, :, :bytes_per_row]
         self._k_cache_q8_src = key_cache
         # NOTE: no zero-fill here, ever. The alias may be re-derived while
         # the cache holds live data (layout re-slices mid-run); zeroing
@@ -623,12 +714,15 @@ class Gfx906FAImpl(AttentionImpl):
         if cls._q_pad_buf is None:
             cls._q_pad_buf = torch.empty(
                 (qpad_num_seqs, num_heads, Sq_pad, head_size),
-                dtype=dtype, device=device,
+                dtype=dtype,
+                device=device,
             )
             cls._q_pad_captured = torch.cuda.is_current_stream_capturing()
-        elif (cls._q_pad_buf.shape[0] < qpad_num_seqs
-                or cls._q_pad_buf.shape[2] < Sq_pad
-                or cls._q_pad_buf.dtype != dtype):
+        elif (
+            cls._q_pad_buf.shape[0] < qpad_num_seqs
+            or cls._q_pad_buf.shape[2] < Sq_pad
+            or cls._q_pad_buf.dtype != dtype
+        ):
             capturing = torch.cuda.is_current_stream_capturing()
             cur = cls._q_pad_buf
             new_shape = (
@@ -652,24 +746,24 @@ class Gfx906FAImpl(AttentionImpl):
             if cls._q_pad_decode_buf is None:
                 cls._q_pad_decode_buf = torch.empty(
                     (num_seqs, num_heads, 2, head_size),
-                    dtype=torch.float32, device=device,
+                    dtype=torch.float32,
+                    device=device,
                 )
                 cls._q_pad_captured = (
-                    cls._q_pad_captured
-                    or torch.cuda.is_current_stream_capturing())
+                    cls._q_pad_captured or torch.cuda.is_current_stream_capturing()
+                )
             elif cls._q_pad_decode_buf.shape[0] < num_seqs:
                 capturing = torch.cuda.is_current_stream_capturing()
                 if cls._q_pad_captured or capturing:
                     cls._q_pad_retired.append(cls._q_pad_decode_buf)
                 cls._q_pad_decode_buf = torch.empty(
                     (num_seqs, num_heads, 2, head_size),
-                    dtype=torch.float32, device=device,
+                    dtype=torch.float32,
+                    device=device,
                 )
-                cls._q_pad_captured = (
-                    cls._q_pad_captured or capturing)
+                cls._q_pad_captured = cls._q_pad_captured or capturing
 
     @classmethod
-
     # ------------------------------------------------------------------
     # M3 follow-up (co-review F3, 2026-09-12): headroom advisory for the
     # long-context activation transients that live OUTSIDE the profiled
@@ -696,6 +790,7 @@ class Gfx906FAImpl(AttentionImpl):
         if num_seqs <= 0 or max_seqlen_q <= 0:
             return 0
         from vllm import _gfx906_fa_C as gfx906_fa
+
         try:
             y = gfx906_fa.kv_split_default(max_seqlen_q, num_seqs, False)
         except Exception:
@@ -703,9 +798,19 @@ class Gfx906FAImpl(AttentionImpl):
         if y <= 1:
             return 0
         # launcher ncols1 table (switch by Sq bucket), then pad to it
-        ncols1 = (64 if max_seqlen_q > 32 else 32 if max_seqlen_q > 16 else
-                  16 if max_seqlen_q > 8 else 8 if max_seqlen_q > 4 else
-                  4 if max_seqlen_q > 2 else 2)
+        ncols1 = (
+            64
+            if max_seqlen_q > 32
+            else 32
+            if max_seqlen_q > 16
+            else 16
+            if max_seqlen_q > 8
+            else 8
+            if max_seqlen_q > 4
+            else 4
+            if max_seqlen_q > 2
+            else 2
+        )
         sq_pad = ((max_seqlen_q + ncols1 - 1) // ncols1) * ncols1
         t = num_seqs * sq_pad * num_heads * y * head_size * 4
         # Over budget the C++ forces y=1 (fa_apply_kv_split_budget) — the
@@ -720,23 +825,32 @@ class Gfx906FAImpl(AttentionImpl):
         free VRAM. error = deterministic failure; warning = >60% of the
         remaining headroom (spikes may tip it)."""
         if free_bytes <= 0:
-            return ("GFX906_FA: no free device memory reported before a "
-                    f"{demand_bytes / 2**30:.2f} GiB long-context "
-                    "activation allocation.", None)
+            return (
+                "GFX906_FA: no free device memory reported before a "
+                f"{demand_bytes / 2**30:.2f} GiB long-context "
+                "activation allocation.",
+                None,
+            )
         if demand_bytes > free_bytes:
-            return (f"GFX906_FA: long-context activation demand "
-                    f"{demand_bytes / 2**30:.2f} GiB exceeds free device "
-                    f"memory {free_bytes / 2**30:.2f} GiB - the next "
-                    "allocation will fail. Levers: reduce "
-                    "gpu_memory_utilization, max_model_len or batch size; "
-                    "or lower GFX906_FA_KVSPLIT_MAX_BYTES to drop the "
-                    "KV-split transient.", None)
+            return (
+                f"GFX906_FA: long-context activation demand "
+                f"{demand_bytes / 2**30:.2f} GiB exceeds free device "
+                f"memory {free_bytes / 2**30:.2f} GiB - the next "
+                "allocation will fail. Levers: reduce "
+                "gpu_memory_utilization, max_model_len or batch size; "
+                "or lower GFX906_FA_KVSPLIT_MAX_BYTES to drop the "
+                "KV-split transient.",
+                None,
+            )
         if demand_bytes > 0.6 * free_bytes:
-            return (None, f"GFX906_FA: long-context activation demand "
-                    f"{demand_bytes / 2**30:.2f} GiB is above 60% of free "
-                    f"device memory {free_bytes / 2**30:.2f} GiB - "
-                    "prefill transients may OOM at spikes. Levers: reduce "
-                    "gpu_memory_utilization, max_model_len or batch size.")
+            return (
+                None,
+                f"GFX906_FA: long-context activation demand "
+                f"{demand_bytes / 2**30:.2f} GiB is above 60% of free "
+                f"device memory {free_bytes / 2**30:.2f} GiB - "
+                "prefill transients may OOM at spikes. Levers: reduce "
+                "gpu_memory_utilization, max_model_len or batch size.",
+            )
         return None, None
 
     @classmethod
@@ -808,12 +922,17 @@ class Gfx906FAImpl(AttentionImpl):
 
         cur = cls._k_gather_buf
         if cur is not None:
-            fit = (cur.shape[1] == num_kv_heads
-                   and cur.shape[3] == bytes_per_row
-                   and cur.device == device
-                   and cur.shape[0] >= num_seqs
-                   and (cur.shape[2] == Sk_pad if cls._gather_exact
-                        else cur.shape[2] >= Sk_pad))
+            fit = (
+                cur.shape[1] == num_kv_heads
+                and cur.shape[3] == bytes_per_row
+                and cur.device == device
+                and cur.shape[0] >= num_seqs
+                and (
+                    cur.shape[2] == Sk_pad
+                    if cls._gather_exact
+                    else cur.shape[2] >= Sk_pad
+                )
+            )
             if fit:
                 # Reuse; latch the capture flag within THIS generation's
                 # lifetime only (the buffer VA may be getting baked into
@@ -839,16 +958,19 @@ class Gfx906FAImpl(AttentionImpl):
         new_b = num_seqs
         new_sk = Sk_pad
         if cur is not None:
-            keep = ((cls._gather_captured or capturing)
-                    if cls._gather_exact
-                    else cls._gather_buf_captured)
+            keep = (
+                (cls._gather_captured or capturing)
+                if cls._gather_exact
+                else cls._gather_buf_captured
+            )
             if keep:
                 # Graph-baked VA: must outlive every replay.
-                cls._gather_retired[cur.data_ptr()] = (
-                    cur, cls._v_gather_buf)
-                if (not cls._gather_exact
-                        and not cls._gather_retired_warned
-                        and len(cls._gather_retired) > 1):
+                cls._gather_retired[cur.data_ptr()] = (cur, cls._v_gather_buf)
+                if (
+                    not cls._gather_exact
+                    and not cls._gather_retired_warned
+                    and len(cls._gather_retired) > 1
+                ):
                     # Post-fix, ONE capture-baked generation is the norm
                     # (the FULL-capture sweep reuses a single base VA
                     # across every captured batch size). A second retire
@@ -859,7 +981,8 @@ class Gfx906FAImpl(AttentionImpl):
                         "GFX906_FA: %d retired capture-baked gather "
                         "generations (expected <= 1; capture-order "
                         "coupling — see plan-gfx906-fa-fix.md §2.2b)",
-                        len(cls._gather_retired))
+                        len(cls._gather_retired),
+                    )
                     cls._gather_retired_warned = True
                 if not cls._gather_exact:
                     # The retired generation's block stays resident
@@ -887,12 +1010,22 @@ class Gfx906FAImpl(AttentionImpl):
         # post-pool headroom; mem_get_info right here already reflects any
         # retired generation.
         import os as _os
-        demand = (new_b * num_kv_heads * new_sk * bytes_per_row
-                  + new_b * num_kv_heads * new_sk * head_size * 2
-                  + cls._kv_split_transient_cap(
-                      num_seqs, max_seqlen_q, num_heads, head_size,
-                      int(_os.environ.get("GFX906_FA_KVSPLIT_MAX_BYTES",
-                                          str(512 * 1024 * 1024)))))
+
+        demand = (
+            new_b * num_kv_heads * new_sk * bytes_per_row
+            + new_b * num_kv_heads * new_sk * head_size * 2
+            + cls._kv_split_transient_cap(
+                num_seqs,
+                max_seqlen_q,
+                num_heads,
+                head_size,
+                int(
+                    _os.environ.get(
+                        "GFX906_FA_KVSPLIT_MAX_BYTES", str(512 * 1024 * 1024)
+                    )
+                ),
+            )
+        )
         _free = torch.cuda.mem_get_info(device)[0]
         _err, _warn = cls._headroom_advisory(demand, _free)
         if _err:
@@ -901,11 +1034,13 @@ class Gfx906FAImpl(AttentionImpl):
             logger.warning("%s", _warn)
         cls._k_gather_buf = torch.empty(
             (new_b, num_kv_heads, new_sk, bytes_per_row),
-            dtype=torch.uint8, device=device,
+            dtype=torch.uint8,
+            device=device,
         )
         cls._v_gather_buf = torch.empty(
             (new_b, num_kv_heads, new_sk, head_size),
-            dtype=torch.float16, device=device,
+            dtype=torch.float16,
+            device=device,
         )
         if cls._gather_exact:
             cls._gather_captured = cls._gather_captured or capturing
@@ -918,6 +1053,42 @@ class Gfx906FAImpl(AttentionImpl):
             return b, v
         return b[:num_seqs], v[:num_seqs]
 
+    def _pad_last_dim(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Zero-pad the head dim of [.., D] (no-op when unpadded).
+
+        Exact for attention: padded Q adds 0 to the QK dot, padded K quantises to
+        zero q8_0 blocks, padded V adds 0 to P*V, and the pad is inside the head
+        dim so the softmax denominator is unchanged (as the ViT path documents).
+        """
+        if self._head_pad == 0:
+            return tensor
+        shape = (*tensor.shape[:-1], self.padded_head_size)
+        out = torch.zeros(shape, dtype=tensor.dtype, device=tensor.device)
+        out[..., : self.head_size] = tensor
+        return out
+
+    def _zero_cache_pad(
+        self, key_cache: torch.Tensor, value_cache: torch.Tensor
+    ) -> None:
+        """Zero a padded cache's pad channels once per cache tensor.
+
+        triton_reshape_and_cache_flash writes only the first D channels of a
+        padded row, so the pad would otherwise keep whatever the allocator left
+        there - and a non-zero K pad quantises to a non-zero q8_0 block,
+        corrupting scores. Nothing else writes those bytes, so one zeroing per
+        cache tensor suffices (keyed on identity: the cache is re-viewed every
+        call, so `is` would redo it 52x per step).
+        """
+        if self._head_pad == 0:
+            return
+        key = (key_cache.data_ptr(), tuple(key_cache.shape))
+        if self._pad_zeroed_cache == key:
+            return
+        with torch.no_grad():
+            key_cache[..., self.head_size :].zero_()
+            value_cache[..., self.head_size :].zero_()
+        self._pad_zeroed_cache = key
+
     def do_kv_cache_update(
         self,
         layer: AttentionLayer,
@@ -929,7 +1100,13 @@ class Gfx906FAImpl(AttentionImpl):
         # 0.29 KV-cache layout standardisation (#51718): the cache is a single
         # tensor with a fused content axis, [B, H, N, 2*D] per layer, so K/V
         # are the two halves of the last axis (not a separate axis-1 pair).
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(
+            self.padded_head_size, dim=-1
+        )
+        if self._head_pad:
+            self._zero_cache_pad(key_cache, value_cache)
+            key = self._pad_last_dim(key)
+            value = self._pad_last_dim(value)
 
         # 1) Primary fp16 write — the vLLM-standard path for V (and for K
         #    in LEGACY mode).
@@ -960,6 +1137,7 @@ class Gfx906FAImpl(AttentionImpl):
         if not self._legacy:
             self._ensure_q8_sidebuffer(key_cache)
             from vllm import _gfx906_fa_C as gfx906_fa
+
             if slot_mapping.dtype != torch.int64:
                 slot_mapping = slot_mapping.to(torch.int64)
             gfx906_fa.reshape_and_cache_q8(
@@ -977,11 +1155,11 @@ class Gfx906FAImpl(AttentionImpl):
     def forward(
         self,
         layer: torch.nn.Module,
-        query: torch.Tensor,      # [num_tokens, num_heads, head_size]
-        key: torch.Tensor,        # [num_tokens, num_kv_heads, head_size]
-                                 # (already in kv_cache via do_kv_cache_update)
+        query: torch.Tensor,  # [num_tokens, num_heads, head_size]
+        key: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
+        # (already in kv_cache via do_kv_cache_update)
         value: torch.Tensor,
-        kv_cache: torch.Tensor,   # [num_blocks, 2, block_size, num_kv_heads, head_size]
+        kv_cache: torch.Tensor,  # [num_blocks, 2, block_size, num_kv_heads, head_size]
         attn_metadata: Gfx906FAMetadata,
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
@@ -989,33 +1167,43 @@ class Gfx906FAImpl(AttentionImpl):
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
         if output_scale is not None or output_block_scale is not None:
-            raise NotImplementedError(
-                "GFX906_FA: output quantization unsupported")
+            raise NotImplementedError("GFX906_FA: output quantization unsupported")
 
         if attn_metadata is None:
             # Profiling run.
             return output.fill_(0)
 
-        assert not attn_metadata.use_cascade, (
-            "GFX906_FA: cascade unsupported")
+        assert not attn_metadata.use_cascade, "GFX906_FA: cascade unsupported"
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         # Split the fused content axis: (B, H, N, 2*D) → (K, V) each
         # [num_blocks, block_size, Hkv, D] (0.29 layout standardisation).
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(
+            self.padded_head_size, dim=-1
+        )
+        if _os.environ.get("GFX906_FA_DEBUG_SHAPES") and _DEBUG_SHAPES[0] < 3:
+            _DEBUG_SHAPES[0] += 1
+            print(
+                f"[gfx906_fa-impl] kv_cache={tuple(kv_cache.shape)} "
+                f"head={self.head_size} padded={self.padded_head_size} "
+                f"K={tuple(key_cache.shape)} V={tuple(value_cache.shape)}",
+                flush=True,
+            )
 
         # query [num_tokens, Hq, D] fp16 (forward_paged casts it into the
         # fp32 q_pad buffer inside the copy_ — a standalone .float() was
         # an extra kernel per layer).
         q_actual = query[:num_actual_tokens]
+        if self._head_pad:
+            q_actual = self._pad_last_dim(q_actual)
         out_actual = output[:num_actual_tokens]
 
         # Lazy-grow the forward buffers (q_pad / mask).
         num_seqs = attn_metadata.seq_lens.shape[0]
         self._ensure_forward_buffers(
             num_heads=self.num_heads,
-            head_size=self.head_size,
+            head_size=self.padded_head_size,
             num_seqs=num_seqs,
             max_seqlen_q=attn_metadata.max_query_len,
             max_seqlen_k=attn_metadata.max_seq_len,
@@ -1058,6 +1246,15 @@ class Gfx906FAImpl(AttentionImpl):
             window=self.sliding_window,
         )  # [num_tokens, Hq*D] fp32
 
+        if self._head_pad:
+            out_flat = (
+                out_flat.view(num_actual_tokens, self.num_heads, self.padded_head_size)[
+                    ..., : self.head_size
+                ]
+                .contiguous()
+                .view(num_actual_tokens, -1)
+            )
+
         # Write the result into output in-place (it is either
         # [num_tokens, Hq, D] or [num_tokens, Hq*D], depending on the
         # caller). copy_ fuses the fp32->fp16 cast (a .to() first was
@@ -1088,6 +1285,7 @@ def register() -> None:
         AttentionBackendEnum,
         register_backend,
     )
+
     register_backend(
         AttentionBackendEnum.CUSTOM,
         f"{__name__}.Gfx906FABackend",

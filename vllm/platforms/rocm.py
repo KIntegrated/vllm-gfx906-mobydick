@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 
 import os
 import platform
@@ -493,6 +494,76 @@ def flash_attn_triton_available() -> bool:
         return False
 
 
+def _guard_gfx906_fa_fallback(
+    attn_selector_config,
+    invalid_reasons,
+    selected_backend,
+) -> None:
+    """Fail loudly when gfx906 loses the custom FA to a fallback backend.
+
+    A non-CUSTOM pick is a silent performance cliff: the fallback may be unable to
+    use CUDA graphs and is typically several times slower per step, and gfx906 FA
+    tuning does not apply to it. Warn once, or raise when
+    ``VLLM_GFX906_FA_STRICT=1`` so a deployment that must not degrade quietly fails
+    closed instead. See DEVLOG-fa-coverage.md.
+    """
+    if not on_gfx906():
+        return
+    custom_reasons = [
+        reason
+        for backend, reasons in invalid_reasons.items()
+        if backend.name == AttentionBackendEnum.CUSTOM.name
+        for reason in reasons
+    ]
+    if not custom_reasons:
+        return
+    hint = ""
+    if any("head_size" in reason for reason in custom_reasons):
+        from vllm.gfx906_fa.gfx906_fa_backend import _pad_head_dim
+
+        if _pad_head_dim(attn_selector_config.head_size) is not None:
+            hint = (
+                f" This head dim ({attn_selector_config.head_size}) is pad-able: set "
+                "GFX906_FA_PAD=1 to serve it with the custom FA rather than the "
+                "fallback (the KV row widens to the padded dim)."
+            )
+    message = (
+        f"gfx906: attention backend {selected_backend.name} was selected for "
+        f"{attn_selector_config.attn_type}, but the custom gfx906 FA is unavailable "
+        f"({'; '.join(custom_reasons)}). Expect a large per-step slowdown (the "
+        "fallback may also be unable to use CUDA graphs), and note that gfx906 FA "
+        "tuning does not apply to it. See docs/gfx906/DEVLOG-fa-coverage.md." + hint
+    )
+    if os.environ.get("VLLM_GFX906_FA_STRICT", "0") == "1":
+        raise RuntimeError(message)
+    logger.warning_once(message)
+
+
+def _guard_gfx906_forced_backend(selected_backend, attn_selector_config) -> None:
+    """Warn or fail (``VLLM_GFX906_FA_STRICT=1``) when a non-CUSTOM backend is forced.
+
+    ``--attention-backend`` and *model config code* (e.g. Gemma-4's
+    ``verify_and_update_config``, which forces TRITON_ATTN for its heterogeneous 256/512
+    head dims when FA4 is unavailable) both arrive as an explicit selection, so the
+    selector never sees them. Same consequence: gfx906 loses the tuned kernel and the
+    step cost grows. See DEVLOG-fa-coverage.md.
+    """
+    if not on_gfx906():
+        return
+    if selected_backend.name == AttentionBackendEnum.CUSTOM.name:
+        return
+    message = (
+        f"gfx906: attention backend {selected_backend.name} was selected explicitly "
+        f"for {attn_selector_config.attn_type} instead of the custom gfx906 FA "
+        "(either --attention-backend or the model's own config). Expect a large "
+        "per-step slowdown, and note that gfx906 FA tuning does not apply to it. "
+        "See docs/gfx906/DEVLOG-fa-coverage.md."
+    )
+    if os.environ.get("VLLM_GFX906_FA_STRICT", "0") == "1":
+        raise RuntimeError(message)
+    logger.warning_once(message)
+
+
 def _get_backend_priorities(
     use_mla: bool,
     use_sparse: bool,
@@ -702,6 +773,7 @@ class RocmPlatform(Platform):
             except ImportError:
                 sel_invalid_reasons = ["ImportError"]
             if not sel_invalid_reasons:
+                _guard_gfx906_forced_backend(selected_backend, attn_selector_config)
                 logger.info_once(
                     "Using %s backend (selected via --attention-backend).",
                     selected_backend.name,
@@ -767,6 +839,9 @@ class RocmPlatform(Platform):
         )
         if invalid_reasons:
             rejected_str = ", ".join(b.name for b in invalid_reasons)
+            _guard_gfx906_fa_fallback(
+                attn_selector_config, invalid_reasons, selected_backend
+            )
             logger.info(
                 "Found incompatible backend(s) [%s] with %s. "
                 "Overriding with %s out of potential backends: %s. "
@@ -832,7 +907,9 @@ class RocmPlatform(Platform):
             if vit_auto_enabled():
                 reason = vit_unsupported_reason(head_size, dtype)
                 if reason is None:
-                    logger.info_once("Using CUSTOM (gfx906 FA) backend for ViT attention.")
+                    logger.info_once(
+                        "Using CUSTOM (gfx906 FA) backend for ViT attention."
+                    )
                     return AttentionBackendEnum.CUSTOM
                 # LOUD on purpose: this is a silent-loss path otherwise. The ViT
                 # keeps working, but it loses the MI50-tuned kernel and pays the

@@ -3689,3 +3689,84 @@ def test_a3_draft_step_reuse_reads_live_seq_lens(monkeypatch):
             cls._gather_captured,
             cls._gather_buf_captured,
         ) = saved
+
+
+# ---------------------------------------------------------------------------
+# FA-COVER-1 step 2: a padded head dim must reproduce the real-dim causal
+# reference. Drives the *impl* rather than the raw op, so the padding runs end
+# to end: the cache is allocated through the backend's get_kv_cache_shape (so
+# the row is padded), K/V go in through do_kv_cache_update - which must zero
+# the pad, and the cache is pre-filled with garbage so an unzeroed pad shows up
+# as a mismatch - and the query is padded on the way in and sliced on the way
+# out. Opted in per test via GFX906_FA_PAD (the default is off).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("real_d,padded", [(72, 128), (80, 128), (96, 128), (112, 128)])
+def test_padded_head_dim_matches_torch_ref(real_d, padded, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("GFX906_FA_PAD", "1")
+    dev = "cuda"
+    L, hq, hkv = 64, 4, 2
+    torch.manual_seed(17)
+
+    from vllm.gfx906_fa.gfx906_fa_backend import (
+        Gfx906FABackend,
+        Gfx906FAImpl,
+        Gfx906FAMetadata,
+    )
+
+    n_blocks = L // BLOCK
+    # The spec keeps the logical dim; vLLM fuses it into the physical cache row.
+    spec = Gfx906FABackend.get_kv_cache_shape(n_blocks, BLOCK, hkv, real_d)
+    assert spec[-1] == padded
+    assert Gfx906FABackend.supports_head_size(real_d)
+
+    # Backend-level (impl) cache in the 0.29 fused layout: [N, Hkv, BLOCK, 2*D], which
+    # the impl splits on the last axis after transpose(1, 2). Garbage on purpose: the
+    # pad channels must be zeroed by the write path, or a non-zero q8_0 block appears.
+    kv = torch.randn(n_blocks, hkv, BLOCK, 2 * padded, dtype=torch.float16, device=dev)
+    impl = Gfx906FAImpl(
+        num_heads=hq,
+        head_size=real_d,
+        scale=1.0 / math.sqrt(real_d),
+        num_kv_heads=hkv,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="float16",
+    )
+    assert impl.padded_head_size == padded
+    assert impl._head_pad == padded - real_d
+
+    layer = SimpleNamespace(_k_scale=1.0, _v_scale=1.0)
+    K = torch.randn(L, hkv, real_d, dtype=torch.float16, device=dev) * 0.5
+    V = torch.randn(L, hkv, real_d, dtype=torch.float16, device=dev) * 0.5
+    slot = torch.arange(L, dtype=torch.int64, device=dev)
+    impl.do_kv_cache_update(layer, K, V, kv, slot)
+
+    kc, vc = kv.transpose(1, 2).split(padded, dim=-1)
+    assert kc[..., real_d:].abs().max().item() == 0.0, "K pad not zeroed"
+    assert vc[..., real_d:].abs().max().item() == 0.0, "V pad not zeroed"
+
+    m = Gfx906FAMetadata(
+        num_actual_tokens=L,
+        max_query_len=L,
+        max_seq_len=L,
+        query_start_loc=torch.tensor([0, L], dtype=torch.int32, device=dev),
+        seq_lens=torch.tensor([L], dtype=torch.int32, device=dev),
+        block_table=torch.arange(n_blocks, dtype=torch.int32, device=dev).view(
+            1, n_blocks
+        ),
+        slot_mapping=slot,
+    )
+    q = torch.randn(L, hq, real_d, dtype=torch.float32, device=dev) * 0.5
+    out = torch.empty(L, hq, real_d, dtype=torch.float16, device=dev)
+    got = impl.forward(layer, q, K, V, kv, m, output=out)
+    got = (out if got is None else got).float().view(L, hq, real_d)
+
+    Kf, Vf = K.float(), V.float()
+    scale = 1.0 / math.sqrt(real_d)
+    for t in (0, 1, L // 2, L - 2, L - 1):
+        ref = _windowed_ref(q[t], Kf, Vf, scale, t, None)
+        rel = ((got[t] - ref).norm() / ref.norm()).item()
+        assert rel < 5e-2, f"D={real_d} row {t}: rel {rel:.4f}"

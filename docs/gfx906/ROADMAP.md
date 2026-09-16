@@ -455,6 +455,23 @@ This is the gate for the whole DFlash2 family — `DFL2-1`/`DFL2-3` stay behind 
 
 ### FA-COVER-1 — enumerate every config where CUSTOM is rejected or not selected
 
+**Status: RESOLVED 2026-09-16 — padding adopted as the default.** Phi-3-mini (head_dim 96) went from
+a silent ROCM_ATTN fallback to CUSTOM: identical top-5 tokens, PPL within 0.11 %, **+27 % decode**
+(36.41 vs 28.62 t/s, A-B-A), FA suite 101 passed. The fixes: the full-attention KV-spec branch now
+routes through `customize_spec` (as the sliding branch did), and the backend widens both halves of the
+fused row because vLLM sizes a page from the spec while building the tensor from
+`get_kv_cache_shape`. `GFX906_FA_PAD=0` is the kill switch; the remaining classes (sinks, > 256 dims,
+encoder attn) are unchanged. See `DEVLOG-fa-coverage.md`.
+
+**Status: recon complete 2026-09-16 (`DEVLOG-fa-coverage.md`, tool `tools/fa_coverage.py`).** The map:
+text fallbacks are `attention sinks not supported` (72 synthetic rows), `head_size not supported`
+(61), `encoder attention` (36), `non-causal` (18); vision falls back only for bf16 and head_dim > 256;
+13 real local config reads (small head_dim 32/40 encoder-shaped models) hit a non-CUSTOM config, all
+of them models we run under llama-server rather than vLLM. Next: (1) the **guard** — DONE (2026-09-16: `_guard_gfx906_fa_fallback` + `VLLM_GFX906_FA_STRICT`,
+loud once-per-engine warning, FA suite 97 passed); (2) mirror the ViT's `_pad_head_dim` in the text path to delete
+the `head_size` class (a padded text layout is ours to declare in `get_kv_cache_shape`); (3) sinks
+only if a sink model is actually wanted; (4) non-causal only if DFlash2 is revived for performance.
+
 **Status: open (2026-09-15).** The same mechanism silently puts models on Triton-based attention
 instead of the MI50-tuned FA. Two instances found so far: **Gemma-4 → TRITON_ATTN** (noticed during
 GEMMA4-1) and the **DFlash2 drafter → ROCM_ATTN + Triton fallback** (DFL2-8). Work: log the
