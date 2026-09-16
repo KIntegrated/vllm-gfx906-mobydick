@@ -130,6 +130,53 @@ much as a speed one (0.045 acceptance says the draft context itself is wrong). `
 0.045 -> 0.0, vs MTP k=3's 35.97/24.58); the drafter's attention backend (`DFL2-8`) is the
 blocking unknown and the only plausible path to viability.
 
+## 2026-09-15 (late) — is this our stack, the drafter's attention, or the pairing? (Kevin's challenge)
+
+Kevin's question is the right one: *can an attention-path problem really produce acceptance ~0, or
+is the drafter model itself wrong?* The evidence, cheapest first:
+
+- **Our target-side FA is excluded as the cause.** The same build/boot runs MTP k=3 + CAT-1 at
+  35.97/24.58 t/s with acceptance 1.78-2.11; a corrupted target attention would sink that arm too.
+  So this is *not* our FA on the decoder path.
+- **Per-position acceptance says the drafter's *first* token is wrong**, not that the trajectories
+  drift: pos0 = 0.041 / 0.0625 at 64k and **0.0 / 0.0 at 120k**, pos1+ = 0 everywhere (MTP's pos0 is
+  ~0.85). A draft whose first token is essentially never right is mis-conditioned or mis-mapped —
+  not merely badly tuned.
+- **The drafter is a block-diffusion model fed by the target's hidden states.** Its config says
+  `dflash_config.target_layer_ids: [5, 19, 33, 47, 61]`, `mask_token_id: 248070`, `block_size: 8`,
+  `selector_rank: 256`, `selector_top_k: 16`; the card calls it a "block-diffusion drafter" that is
+  "not a standalone language model" and pairs it with **`Qwen/Qwen3.8-27B` (bf16)**. Ours runs
+  against an **AWQ-INT4** target.
+- **Its attention is windowed-bidirectional** (all 5 layers `sliding_attention`,
+  `sliding_window 2048`, `is_causal: false`) and our CUSTOM FA is *rejected* for it, so it runs
+  upstream ROCM_ATTN whose paged kernel falls back to Triton.
+
+Three candidate causes, in the order a cheap test can decide them:
+
+1. **The drafter's attention fallback masks/conditions wrongly** (e.g. causal masking applied to a
+   non-causal block drafter, and/or the 2048 window not applied — the latter would also explain the
+   O(context) step cost, 422 ms at 64k vs 728 ms at 120k). Decidable by profiling the drafter's
+   kernels (`DFL2-8`/subtask 1, rocprofv3) and by logging *why* CUSTOM was rejected (step 1 of
+   DFL2-8: the reasons are already computed, only the names are logged).
+2. **The block-diffusion machinery is incomplete/mismatched in our tree** (mask tokens, selector,
+   the z/lookup schedule). The RTX3090 fork needed a dedicated DFlash2 backport, so this is a live
+   possibility; decidable by running the card's pairing on a non-fork stack.
+3. **Pairing**: the drafter consumes the *target's* hidden states at layers 5/19/33/47/61, and it was
+   published for the bf16 `Qwen/Qwen3.8-27B`; an AWQ-INT4 target's activations differ (weight-only
+   quantisation noise). Normally that costs some acceptance, not all of it — but it is cheap to rule
+   out on a non-fork box by running bf16 vs AWQ.
+
+**Cheap decisive test (Kevin can run it off-fork):** the card's own recipe — `Qwen/Qwen3.8-27B` +
+`incoai/Qwen3.8-27B-DFlash2`, `--speculative-config {"method":"dflash","model":…,
+"num_speculative_tokens":7}` — and report per-position acceptance and ms/step. If acceptance is
+normal (~2-3) there, the checkpoint is fine and the fault is ours (pairing or the drafter's attention
+backend); if it is degenerate there too, the checkpoint/mechanism is the problem. Running the same on
+an AWQ target isolates candidate 3.
+
+**VERDICT:** `OPEN` — the negative baseline stands; the cause is narrowed to (drafter attention
+backend | in-tree block-diffusion support | target-quantisation pairing), with the target-side FA
+excluded, and the off-fork run plus the reason-logging/profile pair are the next two cheap steps.
+
 ## Refrigerated residue
 
 `rocm_unquantized_gemm`'s 3-D branches still pass `x` (not the flattened view) to
