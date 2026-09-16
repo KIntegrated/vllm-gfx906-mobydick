@@ -375,6 +375,48 @@ meaningful on this box. DFL2-3 (lookup drafting) and DFL2-1 (chains) remain behi
 
 **VERDICT:** `OPEN`, root-caused to a missing FA feature (non-causal attention for drafters).
 
+## 2026-09-16 (external, decisive) — upstream vLLM 0.29.0 is degenerate too: **parked**
+
+**VERDICT:** PARKED — the mechanism, not our fork · **GATE:** the other box's run of the handover's
+matched pair on **upstream vLLM 0.29.0** (2x 5070 Ti, TP=2, real FLASHINFER attention), per-position
+acceptance.
+
+| prompt tokens | drafted | accepted | acceptance | pos0 | pos1..6 | mean accept len | t/s |
+|---|---|---|---|---|---|---|---|
+| 1,242 | 1,785 | 0 | 0.000 | 0.000 | all 0.000 | 1.00 | 7.78 |
+| 9,453 | 889 | 0 | 0.000 | 0.000 | all 0.000 | 1.00 | 5.07 |
+| 52,837 | 665 | 0 | 0.000 | 0.000 | all 0.000 | 1.00 | 1.38 |
+
+Their server's own summary: "Mean acceptance length: 1.00, Accepted: 0, Drafted: 665, Per-position
+acceptance rate: 0.000 x7, Avg Draft acceptance rate: 0.0%". The spec-off sanity gate answered
+correctly, so the model and the plumbing are healthy — the drafter simply contributes nothing. Ours
+measured 0.045 accepted/draft on the fallback path and 0.0282 with the eager symmetric-window path,
+i.e. the same degenerate regime on a completely different stack.
+
+What this settles:
+
+1. **Not the fork.** Degenerate on upstream 0.29.0 with real FlashInfer attention, so our V2 runner,
+   the aux hidden-state collection path, and our attention fallback are not the cause. The
+   fork-vs-upstream question in the handover's §8 is answered: it is dead upstream too.
+2. **Not the attention masking**, consistent with the eager symmetric-window experiment here
+   (0.0282, 248 drafts). Two independent attention implementations on two different stacks agree.
+3. **`_dense_kv_rows` is confirmed necessary and correct, and is not fork-specific.** They hit the same
+   `.weight`-on-a-quantized-`qkv_proj` failure on 0.29.0, applied syv-ai's helper, and independently
+   validated the dequantization (`unpack_from_int32` is signed; `q*scale` matches
+   compressed_tensors' decompressor exactly). So the port on this branch is not a patch artifact —
+   and since upstream 0.29.0 needs it too, it is a candidate for the upstream contribution queue
+   rather than a local-only fix.
+
+**The one remaining cheap check** (handover §8 suspect 1, now the only one): the *target*. Their run
+used `cyankiwi/Qwen3.8-27B-AWQ-INT4`; syv-ai's reference (3.1-3.4 tokens/step) is with
+`Qwen3.8-27B-Uncensored-W4A16`. The aux hidden-state layers are declared by the *target*, and
+`combine_hidden_states` validates only the *width* (25600 = 5 x 5120) — so a wrong-but-equal-count
+layer set would pass silently and look exactly like this. One run with syv-ai's own target, or the
+bf16 drafter against a bf16 target, decides whether the family is dead or only this target is.
+
+**VERDICT:** `PARKED` — DFL2-3 (lookup drafting) and DFL2-1 (chains) stay unbuilt; DFL2-8's kernel work
+is not justified. Re-open only on a positive result from the target check above.
+
 ## Refrigerated residue
 
 `rocm_unquantized_gemm`'s 3-D branches still pass `x` (not the flattened view) to

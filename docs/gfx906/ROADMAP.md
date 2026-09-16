@@ -433,8 +433,11 @@ counterfactually). Full analysis + probe design:
 
 ### DFL2-8 — the DFlash2 drafter's attention backend (blocking unknown; correctness + speed)
 
-**Status: ROOT-CAUSED 2026-09-16 — it is a missing FA *feature* (non-causal attention), not a
-backend choice; work item designed in `DEVLOG-fa-noncausal.md`.** Step 1 (log the reasons) landed and
+**Status: PARKED 2026-09-16 — not the attention path after all.** Upstream vLLM 0.29.0 with real
+FlashInfer attention is equally degenerate (0 accepted of 665-1785 drafted, per-position 0.000 x7),
+and the eager symmetric-window experiment here also gave 0.0282 accepted/draft, so the masking is not
+the cause and this kernel work is not justified. See `DEVLOG-dflash2.md` (external, decisive).
+Original root-cause text: Step 1 (log the reasons) landed and
 answered it on the first run: `Reasons: {CUSTOM: [non-causal attention not supported], ...}` — the
 drafter is `is_causal: false` with `sliding_window: 2048`, and `Gfx906FABackend` does not define
 `supports_non_causal()`, so `vllm/v1/attention/backend.py` rejects us for it while the target keeps
