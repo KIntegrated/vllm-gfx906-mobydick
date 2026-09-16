@@ -1829,26 +1829,31 @@ plumbing. Gate: the INT8 model serves and passes PPL; then DFL2-1's INT8 pairing
 
 ### VIT-2 — head_dim-96 instantiation for the ViT (cut the 72 → 128 padding waste)
 
-**Status: KERNEL SHIPPED, PAD MAP OPT-IN (2026-09-16, `gfx906/fa-d96` → `main`; see
-[`DEVLOG-fa-d96.md`](DEVLOG-fa-d96.md)).** The kernel-side work is done: the launcher
-instantiates 96 (`gfx906_fa_launch_impl<96>` + the paged twin), the Python side carries
-`_INSTANTIATED_HEAD_DIMS = (64, 96, 128, 256)`, and `GFX906_FA_PAD96=1` selects the 96 pad
-map while the **default stays `(64,128,256)`** (72/80 → 128, the width FA-COVER-1 gated).
+**Status: DONE — DEFAULT ON (2026-09-16; see [`DEVLOG-fa-d96.md`](DEVLOG-fa-d96.md)).**
+The launcher instantiates 96 (`gfx906_fa_launch_impl<96>` + the paged twin), the Python
+side serves it, and the pad map is now `(64, 96, 128, 256)`: an exact 96 runs natively
+and 72/80 pad onto 96. `GFX906_FA_PAD96=0` restores `(64, 128, 256)` — the pre-FA-D96
+behaviour, and the rollback.
+
+**Gates (two same-boot A-B-A runs, mclk 1000):** image-prompt TTFT on the dense 27B VL,
+1024×1024 fresh image per rep, 6 reps/arm — pad128 **5.151** / pad96 **5.080** / pad128
+**5.155** s = **−1.46 %**, order control +0.08 %, distributions disjoint. Phi-3-mini
+(head_dim 96, pp2048/tg256, 4 samples) — 36.164 / **36.379** / 36.092 t/s = **+0.69 %**,
+order control −0.2 %. Both are far below the −5 % this item estimated: the ViT attention
+is ~19 % of TTFT and the kernel removes ~12 % of that call, so the ceiling was ~−2.3 %.
+The class also gains a 25 % narrower KV row.
 
 **Two findings that changed the item:** (a) the inherited `(96,96)` tile-config row was
-**wrong for this Q8 kernel** (`nbatch_K=48` is not a multiple of 32, so only 64 of 96 dims
-were scored — rel err 0.24 vs the fp32 ref); it is now `nbatch_K=96` with `nbatch_fa`
-retuned to the D=128 pattern, and both kernel copies carry a `static_assert(nbatch_K % 32
-== 0)` so the next instantiation cannot repeat it. (b) The cost model over-predicted: the
-ViT attention is ~19 % of TTFT and the 96-wide kernel is only **−11.8 %** of that call
-(launch-regime, bit-identical), so the TTFT effect is ~−2 %, not −5 %. Measured serving
-A-B(‑A lost to a GPU reset burst): **5.133 → 5.073 s = −1.2 %** (A-A-B, n=3/arm).
+**wrong for this Q8 kernel** (`nbatch_K=48` is not a multiple of 32, so only 64 of 96
+dims were scored — rel err 0.24 vs the fp32 ref); it is now `nbatch_K=96` with
+`nbatch_fa` retuned to the D=128 pattern, and both kernel copies carry
+`static_assert(nbatch_K % 32 == 0)`. (b) The cost model over-predicted the transfer, as
+above.
 
-**Promotion gate (not run):** one clean boot, A-B-A with ~6 reps/arm on the dense 27B VL
-at 1024×1024, **plus** the Phi-3-mini text arm (`GFX906_FA_PAD96=1` vs `0`) — if both
-hold, default-on with the env as rollback. Also open: the `nbatch_fa` column for ncols
-2/4/8 (set by analogy with D=128) and D=80/112, which cannot be instantiated at all
-(no common solution to `nbatch_K % 32 == 0` and `DV % nbatch_K == 0`).
+**Residue:** the `nbatch_fa` column for the 96 rows (set by analogy with D=128) has only
+been exercised at the ncols values the ViT and Phi-3 shapes select; a full sweep at
+ncols 2/4/8 is open. D=80/112 cannot be instantiated at all (no common solution to
+`nbatch_K % 32 == 0` and `DV % nbatch_K == 0`).
 
 **Original item (kept):** open, queued follow-up to VIT-1 (2026-09-15). The ViT's real head dim
 is 72 and the launcher dispatches only {64,128,256}, so it is padded to 128 and the

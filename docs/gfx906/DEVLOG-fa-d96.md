@@ -4,15 +4,17 @@
 > image prompt) + Phi-3-mini-class text shapes · date `2026-09-16` ·
 > roadmap item `VIT-2` (broadened) · follows `FA-COVER-1` step 2.
 
-**VERDICT:** `SHIPPED` as an **opt-in** (`GFX906_FA_PAD96=1`); the reviewed default
-map stays `(64,128,256)` · **GATE:** image-prompt TTFT A/B, serving, TP=1 GPU0,
-1024×1024 **fresh** image per rep, `--no-enable-prefix-caching`, 3 reps/arm +
-encoder-cache control.
+**VERDICT:** `SHIPPED — DEFAULT ON` (2026-09-16, after a clean-boot re-read of the gate;
+`GFX906_FA_PAD96=0` is the rollback) · **GATE:** two A-B-A serving runs, both same-boot
+and mclk-1000 — (1) image-prompt TTFT, dense 27B VL, 1024×1024 **fresh** image per rep,
+`--no-enable-prefix-caching`, 6 reps/arm; (2) Phi-3-mini (head_dim 96), pp2048/tg256,
+4 samples.
 
-**Gate result: −1.2 % (5.133 → 5.073 s), and the A-B-A order control was lost to a
-GPU reset burst — so the default does not move.** The kernel instantiation, the
-table fix and the tests ship; the pad map is opt-in until a clean-boot re-read of
-the gate. Standalone numbers below are **launch-regime evidence**, not the gate.
+**Gate result: ViT −1.46 % TTFT (5.151 / 5.080 / 5.155 s, A-B-A) and Phi-3 +0.69 %
+(36.164 / 36.379 / 36.092 t/s, A-B-A).** Both far below the item's −5 % estimate, but
+consistent, order-controlled, and the class also gains a 25 % narrower KV row — so the
+pad map moves to `(64, 96, 128, 256)` with the env as rollback. Standalone numbers below
+are **launch-regime evidence**, not the gate.
 
 ---
 
@@ -68,26 +70,31 @@ passes, second pass reported; all outputs **bit-identical** between arms):
 
 Serving gate (dense 27B VL, image prompt, `prompt_sha1=d09bb2875f57` on every rep):
 
-| arm (load) | fresh-image TTFT | mean | encoder-cache control |
+**First read (previous boot, 3 reps, A-A-B):** pad 128 5.129/5.136, pad 96 5.073 →
+−1.2 %; the A-B-A order control was lost to the GPU reset burst (wedge #97).
+
+**Clean re-read (fresh boot, 6 reps/arm, A-B-A, all arms mclk-1000, encoder-cache
+control 4.16 s on every arm):**
+
+| arm | fresh-image TTFT (6 reps) | mean | sd |
 |---|---|---|---|
-| pad 128 (default), load 1 | 5.152 / 5.118 / 5.118 s | 5.129 | 4.142 s |
-| pad 128 (default), load 2 | 5.176 / 5.114 / 5.119 s | 5.136 | 4.141 s |
-| pad 96 (`GFX906_FA_PAD96=1`) | 5.110 / 5.054 / 5.055 s | **5.073** | 4.148 s |
-| pad 128 (A-B-A order control) | — | — | **lost: load died, wedge #97 (GPU reset burst)** |
+| pad 128, load 1 | 5.174 / 5.127 / 5.131 / 5.131 / 5.135 / 5.210 | 5.151 | 0.031 |
+| pad 96 | 5.133 / 5.059 / 5.059 / 5.069 / 5.067 / 5.091 | **5.080** | 0.029 |
+| pad 128, load 2 (order control) | 5.195 / 5.134 / 5.138 / 5.140 / 5.157 / 5.167 | 5.155 | 0.022 |
 
-**Population: A, A, B** (not A-B-A). The 96 arm is 0.060 s / **−1.2 %** faster than
-either 128 arm, and its three reps (spread 0.056 s) sit below all six 128-arm reps
-(5.114–5.176 s) — but with the order control missing and the effect inside ~2 σ of
-the 128 arm's own spread (sd ≈ 0.024 s), this is *directional*, not a gate pass.
-The control (repeat image → 4.14 s) is the "assert the work under test runs" guard:
-the ViT is ≈1.0 s of the 5.13 s TTFT, so a −11.8 % ViT attention predicts ≈ −0.12 s
-and only −0.06 s materialised. The server log confirms
-`Using CUSTOM (gfx906 FA) backend for ViT attention` on every arm.
+→ **−1.46 %** vs the mean of the two 128 arms; order control +0.08 %; the 6-rep
+distributions do not overlap (pad96 max 5.133 < pad128 min 5.127). A second pad-96
+arm on the same boot (6 reps, mean 5.060) agrees.
 
-**Consequence: `GFX906_FA_PAD96` stays opt-in.** The pre-registered expectation for
-this item was −5 % TTFT at 1024×1024 (`ROADMAP.md` VIT-2); −1.2 % is below it, and
-the repo rule is that a dispatch/default change ships on a measured gate, not on a
-directionally-correct one.
+**Text class — Phi-3-mini (head_dim 96), A-B-A, 4 samples:** pad 128 36.164 / native
+96 36.379 / pad 128 36.092 t/s → **+0.69 %**, order control −0.2 % (native-96 min
+36.339 > pad128 max 36.258). This also reproduces FA-COVER-1's padded-128 record
+(36.41/36.18) within noise, so today's change is a delta on top of that gate, not a
+re-run of it.
+
+**Why so much less than the item predicted:** the ViT attention is ~19 % of the TTFT
+and the 96-wide kernel removes ~12 % of that call, so the ceiling is ~−2.3 % — the
+item's −5 % priced the kernel ratio, not the kernel's share.
 
 ## Evidence — AGAINST
 
@@ -112,17 +119,18 @@ directionally-correct one.
    tile overhead do not shrink with the head dim). The TTFT consequence is
    therefore ~−2 %, not ~−5 %.
 
-## Why it (partly) fails / caveats
+## Caveats / residue after the flip
 
-- The measured TTFT win (−1.2 %) is far below the item's −5 % expectation: the ViT
-  attention is ~19 % of the TTFT and the 96-wide kernel only removes ~12 % of that
-  call, so the ceiling is ~−2.3 % even with a perfect arm read. **The item's own
-  estimate was wrong** (it priced the kernel ratio, not the kernel's share).
-- The default therefore does not move tonight: with the order control lost to wedge
-  #97 the evidence is A-A-B, and the policy is not to flip a default on a miss.
+- The win is small and the item's −5 % estimate was wrong (see above); the flip rests
+  on two order-controlled A-B-A runs, not on a large effect. If a future regression
+  hunt shows a 1–2 % TTFT movement it will be indistinguishable from this change —
+  `GFX906_FA_PAD96=0` is the rollback.
 - D=80 (and 40/112) still cannot be served by this kernel: `DV % nbatch_K == 0`
   and `nbatch_K % 32 == 0` have no common solution for 40/80/112 (a 96-pad is the
   nearest servable target, which is what the pad map already does).
+- The `nbatch_fa` column for the 96 rows was set by analogy with D=128 and only the
+  ViT/prefill-like ncols values have been exercised (ncols 64 and 2 via the benches);
+  a full `nbatch_fa` sweep for ncols 2/4/8 is still open (refrigerated below).
 
 ## Interactions / superseded-by
 
@@ -136,11 +144,9 @@ directionally-correct one.
 
 ## Refrigerated residue
 
-- **Promotion gate (one clean boot, 2 loads):** A-B-A on the dense 27B VL at
-  1024×1024 with ~6 reps/arm (the effect is ~2 σ at 3 reps), **plus** the Phi-3-mini
-  arm for the head_dim-96 text class (`GFX906_FA_PAD96=1` vs `0`, the same
-  `_bench_gfx906.py` shape FA-COVER-1 used for 36.41/36.18 t/s): if both arms hold,
-  flip `_pad96_enabled` to default-on and keep the env as the rollback.
+- ~~Promotion gate~~ **run and green (2026-09-16): default flipped**, env kept as
+  rollback. A third arm pair on a different boot would be the cheap confirmation if a
+  1.5 % TTFT regression is ever suspected.
 - **fp16-K for the ViT / Pad-D96** (removes the ~2e-2 Q8 error, VIT-2 residue) is a
   separate accuracy-not-speed item.
 - **`nbatch_fa` sweep for D=96** at ncols 2/4/8 (the column set by analogy with

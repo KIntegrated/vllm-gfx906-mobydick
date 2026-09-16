@@ -29,9 +29,8 @@ item, optionally padded) is also handled — per-item calls when lengths differ,
 one batched call when they do not.
 
 Why head_dim is padded: the launcher serves `head_dim in {64, 96, 128, 256}` and
-requires `head_size % 32 == 0`. The pad map is `{64, 128, 256}` — so 72 is
-zero-padded to **128**, and `GFX906_FA_PAD96=1` (the FA-D96 item, opt-in) moves it
-to **96**. The padding is exact:
+requires `head_size % 32 == 0`. The pad map is `{64, 96, 128, 256}` — so 72 is
+zero-padded to **96** (`GFX906_FA_PAD96=0` restores 128). The padding is exact:
 
 * padded `Q` dims contribute 0 to the QK dot,
 * padded `K` dims quantise to zero q8_0 blocks (0 contribution),
@@ -58,11 +57,9 @@ _FALLBACK_HEAD_DIMS = (64, 128, 256)
 def _pad_head_dim(head_size: int) -> int | None:
     """Smallest servable kernel head dim that fits (None if none does).
 
-    The kernel instantiates (64, 96, 128, 256) since FA-D96, but the *pad map* stays on
-    (64, 128, 256) until that item's real-model gates pass (the ViT TTFT A/B measured
-    only -1.2 %; the head_dim-96 text class gate is queued), so 72 and 80 pad to 128 as
-    before. ``GFX906_FA_PAD96=1`` opts into 96 (72/80 -> 96; an exact 96 served
-    natively). Mirrors `gfx906_fa_backend._pad_head_dim` (the text path).
+    The pad map is (64, 96, 128, 256) since the FA-D96 gate (2026-09-16, default on): the
+    ViT's 72 pads onto 96 instead of 128. ``GFX906_FA_PAD96=0`` restores the
+    (64, 128, 256) map. Mirrors `gfx906_fa_backend._pad_head_dim` (the text path).
     """
     dims = _INSTANTIATED_HEAD_DIMS if _pad96_enabled() else _FALLBACK_HEAD_DIMS
     for hd in dims:
@@ -72,8 +69,8 @@ def _pad_head_dim(head_size: int) -> int | None:
 
 
 def _pad96_enabled() -> bool:
-    """Opt-in for the 96-wide pad map (see the backend's twin). Default off."""
-    return os.environ.get("GFX906_FA_PAD96", "0") == "1"
+    """96-wide pad map (see the backend's twin for the gate evidence). Default on."""
+    return os.environ.get("GFX906_FA_PAD96", "1") == "1"
 
 
 def vit_enabled() -> bool:

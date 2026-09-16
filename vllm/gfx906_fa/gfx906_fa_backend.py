@@ -103,11 +103,9 @@ def _pad_head_dim(head_size: int) -> int | None:
     The cost is real (QK/PV work grows) but it replaces a fallback to ROCM_ATTN or
     TRITON_ATTN, which loses the tuned kernel entirely.
 
-    96 is an instantiated kernel dim since FA-D96, but the *map* stays on (64, 128, 256)
-    until that item's real-model gates pass — so an exact 96 is padded to 128, the width
-    FA-COVER-1 gated on Phi-3, and 72/80 pad to 128 as before. ``GFX906_FA_PAD96=1`` opts
-    into the 96-wide map (exact 96 served natively, 72/80 padded onto 96). See
-    docs/gfx906/DEVLOG-fa-d96.md.
+    96 is in the pad map since the FA-D96 gate (2026-09-16, default on): an exact 96 is
+    served natively and 72/80 pad onto 96 instead of 128. ``GFX906_FA_PAD96=0`` restores
+    the (64, 128, 256) map. See docs/gfx906/DEVLOG-fa-d96.md.
     """
     dims = _INSTANTIATED_HEAD_DIMS if _pad96_enabled() else _FALLBACK_HEAD_DIMS
     for head_dim in dims:
@@ -117,17 +115,26 @@ def _pad_head_dim(head_size: int) -> int | None:
 
 
 def _pad96_enabled() -> bool:
-    """Whether the 96-wide kernel may be used by the pad map (default off).
+    """Whether the 96-wide kernel is used by the pad map (default ON since 2026-09-16).
 
-    Off until the FA-D96 gates pass: the ViT image-prompt TTFT A/B measured
-    **-1.2 %** (5.133 -> 5.073 s, A-A-B; the third arm was lost to a GPU reset),
-    well under the -5 % that motivated the item, and the head_dim-96 text class
-    (Phi-3-mini) has kernel-level evidence only — no real-model serving gate yet.
-    Correctness is pinned (FA suite + a dedicated D=96 test on both entry points,
-    bit-identical arms), so the opt-in is safe to run; it just is not the
-    reviewed default.
+    Gated on two A-B-A serving runs, both same-boot and mclk-1000:
+
+    * **ViT (72 -> 96)**: image-prompt TTFT, dense 27B VL, 1024x1024 fresh image per
+      rep, encoder-cache control — pad128 **5.151** / pad96 **5.080** / pad128
+      **5.155** s (6 reps/arm; order control +0.08 %), i.e. **-1.46 %**. The 6-rep
+      distributions do not overlap (pad96 max 5.133 < pad128 min 5.127).
+    * **head_dim-96 text (Phi-3-mini, native 96)**: pp2048/tg256, 4 samples —
+      pad128 **36.164** / native96 **36.379** / pad128 **36.092** t/s, i.e. **+0.69 %**
+      (order control -0.2 %).
+
+    Both are far smaller than the -5 % the item estimated (the ViT attention is ~19 %
+    of TTFT and the kernel only removes ~12 % of that call), but they are consistent
+    and the class also gains a 25 % narrower KV row. Kernel outputs are bit-identical
+    between arms (the removed dims are the all-zero q8_0 block) and the FA suite plus
+    a dedicated D=96 test pin correctness on both entry points.
+    ``GFX906_FA_PAD96=0`` is the rollback to the (64, 128, 256) map.
     """
-    return _os.environ.get("GFX906_FA_PAD96", "0") == "1"
+    return _os.environ.get("GFX906_FA_PAD96", "1") == "1"
 
 
 def _padded_head_size(head_size: int) -> int | None:
@@ -139,10 +146,9 @@ def _padded_head_size(head_size: int) -> int | None:
     KV bytes: the row grows by the pad ratio, and ``GFX906_FA_PAD=0`` restores the old
     behaviour (instantiated dims only). Instantiated dims are returned unchanged either way.
 
-    96 became an instantiated kernel dim in FA-D96 (2026-09-16) but is **not in the default
-    pad map** yet (``_pad96_enabled``): the default map is (64, 128, 256), so 96 and 72/80
-    all land on 128 — the width the Phi-3 gate validated. ``GFX906_FA_PAD96=1`` opts into
-    (64, 96, 128, 256).
+    FA-D96 (2026-09-16) added 96 to the map (`_pad96_enabled`, default on): 96 is served
+    natively, 72/80 pad onto 96. ``GFX906_FA_PAD96=0`` restores (64, 128, 256), which is
+    what the pre-FA-D96 builds did.
     """
     if _os.environ.get("GFX906_FA_PAD", "1") != "1":
         # No padding: only dims in the *active* map are servable. With the FA-D96 opt-in

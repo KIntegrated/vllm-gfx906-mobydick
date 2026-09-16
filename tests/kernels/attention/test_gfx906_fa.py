@@ -3699,16 +3699,15 @@ def test_a3_draft_step_reuse_reads_live_seq_lens(monkeypatch):
 # the pad, and the cache is pre-filled with garbage so an unzeroed pad shows up
 # as a mismatch - and the query is padded on the way in and sliced on the way
 # out. Opted in per test via GFX906_FA_PAD (the default is off).
-# D=96 is instantiated since FA-D96, but a dim that would *pad onto* 96 is gated
-# behind GFX906_FA_PAD96 (the ViT/TTFT arm), so both arms run here: 72/80 onto 96
-# with the opt-in, 72/112 onto 128 without it.
+# The 96 map is the default since the FA-D96 gate, so 72/80 pad onto 96 and 112 onto
+# 128; GFX906_FA_PAD96=0 is the rollback map (everything onto 128).
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("real_d,padded,pad96", [
-    (72, 128, False),
-    (112, 128, False),
-    (72, 96, True),
+    (72, 96, True),    # default since the FA-D96 gate
     (80, 96, True),
+    (112, 128, True),
+    (72, 128, False),  # rollback map
 ])
 def test_padded_head_dim_matches_torch_ref(real_d, padded, pad96, monkeypatch):
     from types import SimpleNamespace
