@@ -1831,17 +1831,15 @@ path (2026-08-29), spec-decode serving saves 15-19 %. Hence **adopt LEGACY=0 for
 LEGACY=1 as the rollback**, and flip the default (code + the four LEGACY=1-assuming test guards,
 then the FA suite under LEGACY=0). See `DEVLOG-fa-legacy0-b1-decode.md`.
 
-**Unit-suite check (2026-09-15): the suite is not the instrument for this configuration.** Run with
-`GFX906_FA_LEGACY=0 GFX906_FA_LEGACY_ALLOW_UNVERIFIED=1` it gives **4 failed / 93 passed**, and all
-four are the fork's own preconditions/diagnostics rather than numerics: two bare `assert False`
-guards in tests written for the LEGACY=1 path, `test_a3_draft_step_reuse_reads_live_seq_lens`
-("test must exercise the LEGACY=1 fp16 gather path"), and `test_gather_multi_retire_warns`, which
-asserts on the warning set and trips over the fail-closed warning this override emits. The gates are
-therefore **numerics — the PPL probe, expected 10.5516 (the LEGACY=1 value)** — and the serving A/B.
-**ENQUEUED 2026-09-15 (tonight, Kevin):** run that A/B — LEGACY=1 vs LEGACY=0, same boot,
-interleaved, agentic corpus, ms/step lead. The outcome either enables the Q8 side-buffer or
-retires the opt-in with evidence; note it currently *fails closed* (refuses without
-`GFX906_FA_LEGACY_ALLOW_UNVERIFIED=1`), so only the LEGACY=0 arm needs that override.
+**Unit-suite check (2026-09-15, historical): the suite is not the instrument for this
+configuration.** Run with `GFX906_FA_LEGACY=0` (then still behind the fail-closed guard, hence the
+`ALLOW_UNVERIFIED` override) it gave **4 failed / 93 passed**, all four the fork's own
+preconditions/diagnostics rather than numerics: guards in tests written for the LEGACY=1 path,
+`test_a3_draft_step_reuse_reads_live_seq_lens` ("test must exercise the LEGACY=1 fp16 gather
+path"), and `test_gather_multi_retire_warns`, which asserts on the warning set and tripped over the
+fail-closed warning. The gates are therefore **numerics** (the PPL probe) **and the serving A/B**.
+Those five tests now pin `GFX906_FA_LEGACY=1` themselves, so the suite is green under the new
+default (97 passed, 2026-09-16).
 
 ### KVLAYOUT-2 — migrate the three skipped fork capture/lifecycle tests to the fused layout
 
