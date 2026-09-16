@@ -92,3 +92,34 @@ and Gemma-4 — would have been a one-line warning with this in place.
 Next per the rank: mirror the ViT's `_pad_head_dim` in the text path to delete the
 `head_size not supported` class (61 synthetic rows), then reconsider sinks only if a sink model is
 wanted.
+
+## 2026-09-16 (step 2) — text head-dim padding: helpers landed, the gap pinned
+
+**VERDICT:** design landed, implementation next (behind `GFX906_FA_PAD`) · **GATE:** unit tests only
+(13 passed) — no local decoder LM has head_dim outside {64,128,256}, so the real-model gate has to
+wait for one to be onboarded.
+
+The ViT path already pads (any head dim up to 256 -> the next instantiated kernel dim) and its
+docstring carries the exactness argument: padded Q dims add 0 to the QK dot, padded K dims quantise
+to zero q8_0 blocks, padded V dims add 0 to P*V, and the padding is inside the head dim, so the
+softmax denominator is unchanged. The text path refuses those dims outright instead, and falls back
+to ROCM_ATTN or TRITON_ATTN.
+
+This session adds the mirror of that rule as **helpers only** (`_pad_head_dim`,
+`_padded_head_size`, plus the `GFX906_FA_PAD` kill switch) and a test that pins both the map
+(32->64, 72/80/96/112->128, 160->256, 288->None) and the current restriction, so the flip has an
+assertion to update. Nothing calls them yet: a padded dim also needs the KV-cache layout to carry the
+pad, and wiring the predicate first would feed unpadded tensors to the kernels.
+
+Edit list for the implementation (measured, not estimated):
+
+- `get_kv_cache_shape` must return the **padded** dim — the row width is `head_size` today, and the
+  "identical to TritonAttentionBackend" note only holds for unpadded dims;
+- `do_kv_cache_update` and `forward` split the fused K||V content axis by `head_size`; both need the
+  padded dim, and the write path must **zero the pad on every store** (the cache is allocated once,
+  so stale bytes there would quantise to a non-zero q8_0 block and corrupt K);
+- `forward_paged` must receive the padded dim and a zero-padded Q, with the output sliced back;
+- the Q8 side view derives from the cache tensor, so it follows the new shape automatically;
+- `supports_head_size` accepts pad-able dims only once all of the above is in.
+
+Tests: `tests/kernels/attention/test_gfx906_head_dim_pad.py` (13 cases, no GPU needed).
