@@ -110,6 +110,15 @@ answer needs it. DFlash2 **forces V2**, so the production bar is already on reco
 at 33.62 / 23.75. Boot-to-boot spread for these arms is ~1–3 % (parity restamps: MoE 58.36 vs
 58.43, dense 24.90 vs 24.82).
 
+**RESULT (arm C complete, 2026-09-15)** — DFlash2 without the patch is **2.48/2.52 t/s at 64k**
+(acceptance 0.045/0.063) and **1.37/1.37 t/s at 120k** (acceptance **0.0/0.0**), at 422/728 ms per
+step: ~14x behind MTP k=3, with drafts that stop being accepted entirely by 120k. The live control
+(arm B, MTP k=3 + CAT-1, same boot) reproduced the recorded band within **+0.8 %/+0.4 %**
+(35.97/35.44 at 64k, 24.58/24.82 at 120k), so the historical anchor is validated and the negative
+result is sound. `DFL2-8` (the drafter's attention backend: upstream ROCM_ATTN + a Triton fallback,
+our CUSTOM rejected) is the gate for the whole family — no downstream patch closes a 14x gap.
+Details: [`DEVLOG-dflash2.md`](DEVLOG-dflash2.md).
+
 1. **Run arm C alone first** (DFlash2, no patch; 1 load). If it lands outside the MTP+CAT-1
    band by more than ~3 %, that is the answer for Q1 — citation-grade with the boot caveat
    stated, and no extra wedge draws. *(Agreed with Kevin 2026-09-15: **C → D → B** if the
@@ -1794,6 +1803,13 @@ its K view is the `split(D, -1)` half, whose last dim is stride-1 and whose
 holds, so the uint8 byte-alias writes stay inside K's own segment and never
 touch V. That reasoning is static; the path has not been run on 0.29. Verify with
 one serving A/B before enabling LEGACY=0 for anything.
+**Unit-suite check (2026-09-15): the suite is not the instrument for this configuration.** Run with
+`GFX906_FA_LEGACY=0 GFX906_FA_LEGACY_ALLOW_UNVERIFIED=1` it gives **4 failed / 93 passed**, and all
+four are the fork's own preconditions/diagnostics rather than numerics: two bare `assert False`
+guards in tests written for the LEGACY=1 path, `test_a3_draft_step_reuse_reads_live_seq_lens`
+("test must exercise the LEGACY=1 fp16 gather path"), and `test_gather_multi_retire_warns`, which
+asserts on the warning set and trips over the fail-closed warning this override emits. The gates are
+therefore **numerics — the PPL probe, expected 10.5516 (the LEGACY=1 value)** — and the serving A/B.
 **ENQUEUED 2026-09-15 (tonight, Kevin):** run that A/B — LEGACY=1 vs LEGACY=0, same boot,
 interleaved, agentic corpus, ms/step lead. The outcome either enables the Q8 side-buffer or
 retires the opt-in with evidence; note it currently *fails closed* (refuses without
