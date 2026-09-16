@@ -3718,12 +3718,13 @@ def test_padded_head_dim_matches_torch_ref(real_d, padded, monkeypatch):
 
     n_blocks = L // BLOCK
     # The spec keeps the logical dim; vLLM fuses it into the physical cache row.
-    assert Gfx906FABackend.get_kv_cache_shape(n_blocks, BLOCK, hkv, real_d)[-1] == padded
+    spec = Gfx906FABackend.get_kv_cache_shape(n_blocks, BLOCK, hkv, real_d)
+    assert spec[-1] == padded
     assert Gfx906FABackend.supports_head_size(real_d)
 
-    # Backend-level (impl) cache in the 0.29 fused layout: [N, Hkv, BLOCK, 2*D], which the impl
-    # splits on the last axis after transpose(1, 2). Filled with garbage on purpose: the pad
-    # channels must be zeroed by the write path, or the scores gain a non-zero q8_0 block.
+    # Backend-level (impl) cache in the 0.29 fused layout: [N, Hkv, BLOCK, 2*D], which
+    # the impl splits on the last axis after transpose(1, 2). Garbage on purpose: the
+    # pad channels must be zeroed by the write path, or a non-zero q8_0 block appears.
     kv = torch.randn(n_blocks, hkv, BLOCK, 2 * padded, dtype=torch.float16, device=dev)
     impl = Gfx906FAImpl(
         num_heads=hq,
@@ -3753,7 +3754,9 @@ def test_padded_head_dim_matches_torch_ref(real_d, padded, monkeypatch):
         max_seq_len=L,
         query_start_loc=torch.tensor([0, L], dtype=torch.int32, device=dev),
         seq_lens=torch.tensor([L], dtype=torch.int32, device=dev),
-        block_table=torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, n_blocks),
+        block_table=torch.arange(n_blocks, dtype=torch.int32, device=dev).view(
+            1, n_blocks
+        ),
         slot_mapping=slot,
     )
     q = torch.randn(L, hq, real_d, dtype=torch.float32, device=dev) * 0.5
