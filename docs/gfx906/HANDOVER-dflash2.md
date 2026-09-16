@@ -36,12 +36,38 @@ attention/mechanism is the problem and we stop investing in this family.
 
 ## 2. Artifacts — everything is already on the shared `/data` mount
 
+**The pair we actually ran (use this to reproduce our numbers)** — both already on `/data`, no
+downloads needed:
+
+| role | path on `/data` | revision |
+|---|---|---|
+| 4-bit target (our production quant) | `/data/cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/63768c10df38c0395e12ef49edac1bd539eaeeea` | `63768c10df38c0395e12ef49edac1bd539eaeeea` |
+| W4A16 drafter (**the model syv-ai publishes**, GPTQ of `incoai/Qwen3.8-27B-DFlash2`) | `/data/cache/huggingface/hub/models--syvai--Qwen3.8-27B-DFlash2-W4A16/snapshots/4d30ec736ffc6b8688dc2ae2b5...` | 1.19 GB, 4 files (`config.json`, `model.safetensors`) |
+
+This is the pairing syv-ai themselves measure at **3.14 / 3.34 tokens per step** on a 3090
+(their target is `Qwen3.8-27B-Uncensored-W4A16`, a 4-bit requant, with their patch for the quantized
+`lm_head`; ours stores `lm_head` unquantized, so that patch does not apply to us).
+
+**What we measured with exactly these two models on our fork** (TP=2, `--enforce-eager`, 64k agentic,
+k=7, 1 rep), and why the drafter is *not* the variable:
+
+| arm | accepted/draft | drafts | t/s |
+|---|---|---|---|
+| backend fallback (our FA refuses the drafter -> ROCM_ATTN + Triton) | 0.045 | — | 2.48 |
+| eager symmetric-window (non-causal) attention in torch | **0.0282** | 248 | 2.52 |
+
+Against syv-ai's 3.1-3.6 tokens/step, i.e. ~1 token/step. The **matched** drafter did not change
+anything versus the bf16 one, and two independent attention implementations agree — so neither the
+quantisation pairing nor the drafter's masking is the cause on our fork. See `DEVLOG-dflash2.md`
+and `DEVLOG-fa-noncausal.md`.
+
+
 Both repos below are complete and verified (target: 6 shards, 1986 tensors, 29.53 GB = the index's
 `total_size`; drafter: 6 files, 2.2 GB). Revisions, so you load byte-identical files:
 
 | role | path on `/data` | revision |
 |---|---|---|
-| INT8 W8A16 target (matched pair, **recommended**) | `/data/cache/huggingface/hub/models--lued--Qwen3.8-27B-INT8-W8A16-DFlash2/snapshots/2971c64ba386dd3faa6884cc215f67b3b2477a3e` | `2971c64ba386dd3faa6884cc215f67b3b2477a3e` |
+| INT8 W8A16 target (second arm; see the table above for what we ran) | `/data/cache/huggingface/hub/models--lued--Qwen3.8-27B-INT8-W8A16-DFlash2/snapshots/2971c64ba386dd3faa6884cc215f67b3b2477a3e` | `2971c64ba386dd3faa6884cc215f67b3b2477a3e` |
 | W8 drafter for it | `/data/cache/huggingface/hub/models--lued--Qwen3.8-27B-DFlash2-W8/snapshots/f454fa8e6a84387bf006f849584f72541cc29118` | `f454fa8e6a84387bf006f849584f72541cc29118` |
 | bf16 target (card's own pairing) | `/data/cache/huggingface/hub/models--Qwen--Qwen3.8-27B` | (already present) |
 | bf16 drafter for it | **not on /data** — `incoai/Qwen3.8-27B-DFlash2` (3.6 GB, pull it if you want the card's exact pair) | — |
@@ -50,9 +76,10 @@ Notes:
 - The INT8 target is a **VL** checkpoint (`Qwen3_5ForConditionalGeneration`, keys nested under
   `model.language_model.*`, plus `model.visual.*`) and uses compressed-tensors
   **`pack-quantized`** (`weight_packed`/`weight_scale`/`weight_shape`). A recent vLLM nightly
-  handles it; our fork does not yet (`ValueError: no module or parameter named
-  'embed_tokens.weight_packed'`) — that gap is ours, not a DFlash2 issue, so if it fails to load
-  for you, say so, it's a different bug.
+  handles it. Our fork could not until 2026-09-16 — the failure was model wiring, not quantisation
+  support (`ValueError: no module or parameter named 'embed_tokens.weight_packed'`) — and that is
+  **fixed on `main`** now: the checkpoint loads with zero skipped tensors and generates coherent
+  output (`DEVLOG-int8-packed.md`). If it fails to load on your stack, that is a different bug.
 - Sanity-check what you actually loaded: `ls -l <snapshot>/model.safetensors.index.json` and
   compare the revision against the table above.
 
@@ -84,6 +111,26 @@ podman run --rm --replace --device nvidia.com/gpu=all --ipc=host -p 8080:8080 \
 - Add the Qwen parsers if you want tool-calling/reasoning, and **always prompt through the chat
   template** (see §6).
 - If a single GPU has enough memory, TP=1 is fine; TP=2 as above is what Kevin used.
+
+### The command we ran (for reproducing our numbers)
+
+```bash
+# on our box: /local is fast, /data is NFS; the drafter lives on /data, the target has both copies
+vllm serve <AWQ-INT4 target dir> \
+  --served-model-name qwen27 --dtype float16 --tensor-parallel-size 2 \
+  --max-model-len 131072 --max-num-seqs 2 --gpu-memory-utilization 0.85 \
+  --kv-cache-dtype float16 --no-enable-prefix-caching --enforce-eager \
+  --speculative-config '{"method":"dflash","model":"<syvai W4A16 drafter dir>","num_speculative_tokens":7}'
+```
+
+- `--kv-cache-dtype float16` is *our* spelling; their card uses `--kv-cache-dtype bfloat16` (and
+  `fp8_e4m3` in Kevin's recipe). Note `vllm serve` rejects `fp16` and dies in argparse *before any
+  logger exists* — a silent-looking empty log.
+- `--enforce-eager` is needed **on our box only**, because the drafter's ROCM_ATTN fallback cannot be
+  CUDA-graph captured (`Cannot copy between CPU and CUDA tensors during CUDA graph capture`, via
+  `rocm_attn.py` -> `chunked_prefill_*`). With real FA it is unnecessary.
+- Keep `--max-model-len` >= your prompt: a 65k prompt against an 8k/32k limit returns HTTP 400,
+  which the sweep client reports as an incomplete run rather than an error.
 
 ## 4. Instrumentation — the number we need is per-position acceptance
 
@@ -181,6 +228,17 @@ builds agree, not that the model works.
   illegal memory access, not as low acceptance (and needs prefix caching on).
 - **Draft-vocab mapping**: the bf16 drafter has `draft_vocab_size: None` (full 248,320 vocab), so
   there is no shortlist to mis-map.
+- **The drafter/target quantisation pairing** (2026-09-16): the *matched* W4A16 drafter against the
+  4-bit target gives the same degenerate result as the bf16 drafter against it (0.0282 vs 0.045
+  accepted/draft), so "which drafter" is not the variable.
+- **The drafter's attention masking**: an eager torch path implementing the reference semantics
+  (no causal clip, symmetric ±2024 window — `_maybe_symmetrize_window`) also gives ~0
+  (0.0282, 248 drafts, 2.52 t/s), and both implementations agree.
+- **Remaining suspects** on our side, in order of cheapness: which target layers' hidden states the
+  drafter actually receives (`combine_hidden_states` validates only the *width* 25600 = 5 x 5120, so a
+  wrong-but-equal-count layer set would pass silently), and the selector/vocab machinery under this
+  fork's V2 runner (upstream #52816 is present, but our V2 runner is not upstream's). Your stack can
+  separate those two from the model itself.
 
 ## 8. Report back (what to send)
 
@@ -195,6 +253,14 @@ you want to reproduce our failure):
 (and our fork's missing `pack-quantized` support becomes the blocker, not DFlash2). Acceptance ~0
 there too => the drafter/mechanism is broken independently of our fork, and DFlash2 should be
 de-prioritised rather than ported further.
+
+**Updated (2026-09-16):** we have already excluded the pairing and the masking on our fork, so the
+decisive question for you is now **fork vs upstream**: run the same drafter against the same 4-bit
+target on your stack (syv-ai's patches + real FA) and report per-position acceptance.
+- Normal (~3 tokens/step) => the fault is in our fork's DFlash2 plumbing — worth us checking the aux
+  hidden-state layer selection next.
+- Degenerate (~1 token/step) => the drafter/mechanism is broken for this target family generally, and
+  DFlash2 should be parked everywhere, not just here.
 
 ## 9. Links
 
