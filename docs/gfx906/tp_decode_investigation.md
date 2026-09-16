@@ -85,7 +85,7 @@ control run, MTP `num_speculative_tokens=3`).
 `GFX906_FA` (`vllm/gfx906_fa/`) is a **gather-then-dense-attention**
 design, structurally different from the two Triton kernels above:
 
-1. Decode (`GFX906_FA_LEGACY=1`, the default) gathers K/V from the
+1. Decode (`GFX906_FA_LEGACY=1`, then the default — **now the rollback**, see the 2026-09-16 note at the end of this section) gathers K/V from the
    paged fp16 cache into a **dense** buffer of shape
    `[B, Hkv, Sk_pad, D]` via the fused HIP kernels
    `gather_paged_kv_quantized`/`gather_paged_kv_fp16`
@@ -515,8 +515,9 @@ same `Sk`-sweep gate as everything else here), routing `GFX906_FA`'s
 FULL-graph decode through this path would sidestep writing a new
 kernel entirely. **It is not free to enable today**: it requires the
 Q8 K side-buffer (`key_cache_q8 is not None`, i.e. `GFX906_FA_LEGACY=0`),
-and `GFX906_FA_LEGACY=0` is currently flagged experimental and
-**fails closed** (`RuntimeError`) when combined with prefix caching
+and `GFX906_FA_LEGACY=0` was, at the time of this investigation, flagged experimental and
+**failing closed** (`RuntimeError`); both no longer apply — it is the default, the refusal is gone
+(2026-09-16)
 (`get_cudagraph_support`, per the completed R2 review item in
 `CHANGELOG.md`) —
 because the Q8 side-buffer misses COW'd prefix-cache blocks and
@@ -562,3 +563,14 @@ All house-protocol gates passed, including the serving A/B (THE gate):
 0.07% (noise). `GFX906_FA_PERSIST` default ON. Full record:
 `DEVLOG-masked-fa.md`. Status of this doc: diagnosis final; fix lever
 realized as the kernel route; roadmap N4 → RESOLVED (pending merge).
+
+---
+
+## Update 2026-09-16 (KVLAYOUT-1 resolved)
+
+`GFX906_FA_LEGACY=0` (the Q8 side-buffer read path this report analyses) is now the **default**,
+not an experimental opt-in: verified against 0.29's fused KV-cache layout (#51718) — PPL within
+the probe's ~0.001 run-to-run spread of LEGACY=1 (0 top-20 misses) and **−15.5 % / −19.1 % ms/step**
+with MTP k=3 at 64k/120k (acceptance unchanged, interleaved A/B). The fail-closed refusal and
+`GFX906_FA_LEGACY_ALLOW_UNVERIFIED` are removed; `GFX906_FA_LEGACY=1` is the rollback.
+See `DEVLOG-fa-legacy0-b1-decode.md`.
