@@ -172,8 +172,13 @@ supporting detail that separates a cost effect from a depth effect.
 
 ### DFL2-2 — V2 runner up to speed on gfx906 (**V1 removal lands in 0.32.0**) (**HIGH PRIORITY**, Kevin 2026-09-12)
 
-**STATUS 2026-09-15 — the bring-up is DONE for every model whose gate exists; one
-pin left.** V2 is validated and default for the dense 27B, MoE 35B, Nemotron 3.5
+**STATUS 2026-09-16 — DONE; the last V1 pin is lifted and `DFL2-2` is closed as an active
+item.** Muse-Glimmer's V1/V2 serving A/B passed (TTFT parity, decode −1.8 % @2k / −1.0 % @8k,
+KV pool 53 k vs 68 k tokens; accepted because 0.32.0 removes V1) — no model here needs
+`VLLM_USE_V2_MODEL_RUNNER=0` any more. See `DEVLOG-muse-glimmer.md` (MUSE-1).
+
+**STATUS 2026-09-15 — the bring-up was DONE for every model whose gate existed; one
+pin was left.** V2 is validated and default for the dense 27B, MoE 35B, Nemotron 3.5
 Lightning, Ornith, **and Gemma-4** (gated today through its chat template — see
 GEMMA4-1); evidence and numbers in [`V2-bringup.md`](V2-bringup.md) (PPL bit-identity,
 in-process bench parity, agentic ms/step parity, MoE +0.9 %). **Muse-Glimmer is the only
@@ -479,7 +484,9 @@ text fallbacks are `attention sinks not supported` (72 synthetic rows), `head_si
 of them models we run under llama-server rather than vLLM. Next: (1) the **guard** — DONE (2026-09-16: `_guard_gfx906_fa_fallback` + `VLLM_GFX906_FA_STRICT`,
 loud once-per-engine warning, FA suite 97 passed); (2) mirror the ViT's `_pad_head_dim` in the text path to delete
 the `head_size` class (a padded text layout is ours to declare in `get_kv_cache_shape`); (3) sinks
-only if a sink model is actually wanted; (4) non-causal only if DFlash2 is revived for performance.
+only if a sink model is actually wanted; (4) non-causal — **now a live item, not a
+conditional: see FA-NONCAUSAL below** (the Muse-Glimmer DFlash assistant is a working
+non-causal drafter, MUSE-2).
 
 **Status: open (2026-09-15).** The same mechanism silently puts models on Triton-based attention
 instead of the MI50-tuned FA. Two instances found so far: **Gemma-4 → TRITON_ATTN** (noticed during
@@ -490,6 +497,27 @@ genuine kernel limitation or a declaration/dispatch gap that our FA already cove
 surface: head sizes {64,128,256}, sliding window, bidirectional, DECODER, MM-encoder/ViT) and close
 the reachable ones. Any model that silently runs Triton attention is a candidate for a VIT-1-style
 wiring win, and this is the cheapest way to find them.
+
+### FA-NONCAUSAL — serve decoder-shaped non-causal attention from the custom FA (unlocks spec drafters)
+
+**Status: OPEN, promoted 2026-09-16 (was "only if DFlash2 is revived").** Its live use case is
+**MUSE-2**: the official Muse-Glimmer DFlash assistant is a *healthy* non-causal drafter
+(mean acceptance 2.95, pos0 0.844) but the gfx906 selector rejects CUSTOM for its attention
+class, so it runs ROCM_ATTN, which cannot be CUDA-graph captured → the arm needed
+`--enforce-eager` (and still measured +11 % decode vs non-spec, eager).
+
+What is already there: the kernel computes full bidirectional attention when it gets
+`mask=None` and `q_abs_offset=None` (VIT-1 proved that path end to end for the ViT), so the
+missing part is the *decoder-shaped* non-causal case, not the arithmetic. Work items:
+(1) teach the backend/selector to accept `AttentionType.DECODER` + non-causal (today it emits
+`non-causal attention not supported`); (2) decide the mask contract for a
+windowed-bidirectional drafter (the DFlash2 handover has `_maybe_symmetrize_window`: no causal
+clip, symmetric ±window — get this from the model's own reference, not by guessing);
+(3) KV write/read for that layout, including the Q8 side-buffer path; (4) gate: the assistant
+arm with graphs enabled vs the eager numbers above (acceptance must stay 2.95, decode must
+beat eager), plus the FA suite and the ViT/text regressions. Effort: medium-high (backend +
+one kernel contract), risk: medium (a wrong mask is silent quality loss — the acceptance
+histogram is the guard).
 
 ### FD-1 — CLOSED: the MTP fused-draft path was measured (NEUTRAL, stack-confounded) and its only reader is gone
 
@@ -2018,7 +2046,36 @@ per-model split.
 exercises `BENCH_CHAT_TEMPLATE=1` end-to-end is in flight), and the same templated gate
 for Muse-Glimmer (MUSE-1).
 
-### MUSE-1 —### MUSE-1 — Muse-Glimmer: V2 parity looks good, but the PPL probe is not its gate
+### MUSE-1 — Muse-Glimmer: V2 pin LIFTED (2026-09-16); spec method = the official DFlash assistant
+
+**Status: RESOLVED (2026-09-16, `DEVLOG-muse-glimmer.md`).** The PPL probe was never its gate
+(VLM + chat template); the gate was a serving A/B, now run: Muse-Glimmer-30B-AWQ-INT4, TP=1,
+util 0.90, maxlen 8192, greedy, chat template, identical prompts, 3 reps/point, A-B-A same
+boot, mclk 1000. **V2 TTFT at parity** (4.773 vs 4.773 s @2k; −0.3 % @8k) with **decode
+−1.8 % @2k / −1.0 % @8k** vs V1 (order control 0.4 %), and a **21 % smaller KV pool**
+(53,235 vs 67,722 tokens). The pin is lifted because upstream removes V1 in 0.32.0; the
+decode cost is recorded rather than hidden. First real-payload numbers for this model:
+**27.1 t/s decode @2k / 26.7 @8k, TTFT 4.77 / 11.74 s** (filler body, chat template, greedy).
+
+**Spec method:** MTP does not exist for this checkpoint (no MTP tensors/keys), ngram is
+deprecated, and DSpark would be a port (its drafter arch maps to the DeepSeek-V4 class). The
+answer is the **official `meta-models/Muse-Glimmer-30B-assistant`**, which our tree already
+supports as method `dflash` — validated tonight as **MUSE-2**.
+
+### MUSE-2 — Muse-Glimmer + the official DFlash assistant (drafter validated, graphs blocked)
+
+**Status: OPEN — drafter healthy, FA non-causal is the enabler (2026-09-16).** TP=2, k=7,
+`--enforce-eager`, chat-templated prompt, 3×128 tokens: **mean acceptance length 2.95**
+(2.98 tokens/step), per-position **0.844 / 0.508 / 0.305 / 0.180 / 0.117 / 0.023 / 0.000**,
+decode **30.5 t/s** — i.e. +11 % over non-spec *while eager*. The blocker is that the
+assistant attends **non-causally**, our CUSTOM FA rejects that class, and the ROCM_ATTN
+fallback cannot be CUDA-graph captured (`Cannot copy between CPU and CUDA tensors during CUDA
+graph capture`). So the production path needs **FA-NONCAUSAL** (see that item — this is now
+its live use case: a supported spec method for a served model, replacing deprecated ngram).
+Cheap follow-ups: k sweep (the histogram is still productive at pos3-4, so k>7 may pay),
+k=7 with graphs once FA-NONCAUSAL lands, and B=4.
+
+### MUSE-1 (original entry) — Muse-Glimmer: V2 parity looks good, but the PPL probe is not its gate
 
 **Status: open (2026-09-15) — checkpoint obtained, gate run, verdict: V1/V2 parity holds
 at the token that matters; the RBLOCK workaround is obsolete.** The 24 GB AWQ
