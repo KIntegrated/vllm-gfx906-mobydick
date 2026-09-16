@@ -455,6 +455,14 @@ This is the gate for the whole DFlash2 family — `DFL2-1`/`DFL2-3` stay behind 
 
 ### FA-COVER-1 — enumerate every config where CUSTOM is rejected or not selected
 
+**Status: RESOLVED 2026-09-16 — padding adopted as the default.** Phi-3-mini (head_dim 96) went from
+a silent ROCM_ATTN fallback to CUSTOM: identical top-5 tokens, PPL within 0.11 %, **+27 % decode**
+(36.41 vs 28.62 t/s, A-B-A), FA suite 101 passed. The fixes: the full-attention KV-spec branch now
+routes through `customize_spec` (as the sliding branch did), and the backend widens both halves of the
+fused row because vLLM sizes a page from the spec while building the tensor from
+`get_kv_cache_shape`. `GFX906_FA_PAD=0` is the kill switch; the remaining classes (sinks, > 256 dims,
+encoder attn) are unchanged. See `DEVLOG-fa-coverage.md`.
+
 **Status: recon complete 2026-09-16 (`DEVLOG-fa-coverage.md`, tool `tools/fa_coverage.py`).** The map:
 text fallbacks are `attention sinks not supported` (72 synthetic rows), `head_size not supported`
 (61), `encoder attention` (36), `non-causal` (18); vision falls back only for bf16 and head_dim > 256;

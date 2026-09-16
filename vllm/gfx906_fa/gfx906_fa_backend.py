@@ -113,13 +113,14 @@ def _pad_head_dim(head_size: int) -> int | None:
 def _padded_head_size(head_size: int) -> int | None:
     """``head_size`` as a servable dim, or None when it cannot be served.
 
-    Opt-in while the write path is unfinished: ``GFX906_FA_PAD`` defaults to 0.
-    Until the KV-cache layout carries the pad, serving a non-instantiated dim would
-    feed unpadded tensors to the kernels (silent garbage, not a fallback).
-    Instantiated dims are returned unchanged either way; flipping the default is
-    gated on a real model.
+    Default ON since the Phi-3-mini gate (2026-09-16, FA-COVER-1 step 2): head_dim 96 went from a
+    silent fallback to CUSTOM at 36.41 t/s vs 28.62 (+27 %), with identical top-5 tokens and PPL
+    within 0.11 % of the fallback arm (0 top-20 misses in both). The cost is KV bytes: the row
+    grows by the pad ratio (96 -> 128 is +33 % of K and V, 72 -> 128 is +78 %), and
+    ``GFX906_FA_PAD=0`` restores the old behaviour (instantiated dims only). Instantiated dims are
+    returned unchanged either way.
     """
-    if _os.environ.get("GFX906_FA_PAD", "0") != "1":
+    if _os.environ.get("GFX906_FA_PAD", "1") != "1":
         return head_size if head_size in _INSTANTIATED_HEAD_DIMS else None
     return _pad_head_dim(head_size)
 
@@ -299,17 +300,35 @@ class Gfx906FABackend(AttentionBackend):
 
     @classmethod
     def customize_spec(cls, spec):
-        """Widen the KV spec's head dim to the padded one when padding is opted in.
+        """Widen the KV spec's head dims to the padded one when padding is opted in.
+
+        NOTE: both halves are set to the same padded width, which is what the impl's split and
+        its zero-padding assume; a model with genuinely asymmetric K/V head dims would need
+        per-half padding here and in the impl.
+
 
         vLLM sizes the KV cache from this spec while the kernels are dispatched on the padded
         dim, so the two must agree. With the real dim in the spec the layer allocates a
         2*real-byte fused row, and splitting that at the padded dim leaves a remainder
         (Phi-3-mini: a 128 chunk plus a 64 remainder, which trips the Q8 row check).
         """
+        if _os.environ.get("GFX906_FA_DEBUG_SHAPES"):
+            print(
+                f"[gfx906_fa-spec] in: head={spec.head_size} head_v={spec.head_size_v} "
+                f"block={spec.block_size} hkv={spec.num_kv_heads}",
+                flush=True,
+            )
         padded = _padded_head_size(spec.head_size)
         if padded is None or padded == spec.head_size:
             return spec
-        return dataclasses.replace(spec, head_size=padded)
+        # BOTH halves: the 0.29 fused row is K||V, so its width is head_size + head_size_v,
+        # and our impl splits it into two padded_head_size halves. Widening only head_size
+        # leaves a row of padded + real (Phi-3: 128 + 96 = 224), which is what the allocator
+        # then built and what the Q8 row check rejected.
+        out = dataclasses.replace(spec, head_size=padded, head_size_v=padded)
+        if _os.environ.get("GFX906_FA_DEBUG_SHAPES"):
+            print(f"[gfx906_fa-spec] out: head={out.head_size}", flush=True)
+        return out
 
     @staticmethod
     def get_kv_cache_shape(

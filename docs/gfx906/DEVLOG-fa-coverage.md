@@ -269,3 +269,44 @@ change in `attention.py` mirroring the sliding branch, plus the backend override
 shape debug prints (`GFX906_FA_DEBUG_SHAPES`, kept because this class of bug is otherwise invisible),
 and a test pinning that the spec widens only when opted in. Defaults are unchanged: `GFX906_FA_PAD`
 is still 0, so nothing serves a padded dim by accident.
+
+### Step 2 RESOLVED — Phi-3-mini gate green, padding on by default (2026-09-16)
+
+**VERDICT:** ADOPTED · **GATE:** Phi-3-mini-4k-instruct (head_dim 96), two arms, same model and
+prompts: IFT logprobs (the templated comparability tool) + PPL + an interleaved speed A/B.
+
+| arm | backend | PPL | top-20 misses | tokens/s (A-B-A, 4 samples) |
+|---|---|---|---|---|
+| padded (`GFX906_FA_PAD=1`) | CUSTOM | 15.0254 | 0 | **36.41 / 36.18** |
+| fallback (`=0`) | ROCM_ATTN | 15.0090 | 0 | 28.62 |
+
+- **Numerical:** PPL within 0.11 %, and the IFT gate gives **identical top-5 tokens in the same
+  order** (3681/450/1459/25343/3579 and 315/7521/822/2266/18585) with logprobs within 0.06 — two
+  different attention implementations agreeing, which is the gate this tool was built for.
+- **Speed:** **+27 %** decode (36.41 vs 28.62 t/s), order-controlled by the A-B-A repeat (36.18,
+  within 0.6 % of the first padded run).
+- **Regression:** FA suite 101 passed.
+
+**What the real model caught that no unit test could.** vLLM sizes a KV *page* from the **spec**
+(`block_size * num_kv_heads * (head_size + head_size_v) * dtype_size`) and builds the *tensor* from
+the backend's `get_kv_cache_shape`. Widening only `head_size` in the spec gave a fused row of
+128 + 96 = **224**, the allocator built exactly that third width, and the Q8 gather rejected it
+(`bytes_per_row must equal (D/32)*34, got 136 vs expected 102`). The fixes:
+
+1. the **full-attention** branch of `Attention.get_kv_cache_spec` now routes through
+   `attn_backend.customize_spec` (the sliding-window branch already did — a 3-line change);
+2. our override widens **both** `head_size` and `head_size_v`, since the fused row is their sum.
+
+Two tests now pin that: the spec must widen both halves, and the spec's page size must equal the row
+width our `get_kv_cache_shape` declares (the invariant whose absence caused this).
+
+**Broader reach than expected:** `_pad_head_dim(32)` is 64 and `_pad_head_dim(160)` is 256, so the
+padding serves **any** head dim up to 256 — including the small encoder-shaped checkpoints the
+inventory flagged (they still fall back on `attn_type`, since this backend is DECODER-only).
+
+**Cost, stated plainly:** KV bytes grow with the pad ratio (96 -> 128 is +33 % of K and V; 72 -> 128
+is +78 %). `GFX906_FA_PAD=0` restores the old fallback behaviour, and the guard still names the knob
+when a dim cannot be padded at all (> 256, e.g. Gemma-4's 512).
+
+Kept for the next such bug: `GFX906_FA_DEBUG_SHAPES=1` prints the spec in/out and the first few
+kernel-boundary shapes (this bug was invisible without it).
