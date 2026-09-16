@@ -834,11 +834,13 @@ class RocmPlatform(Platform):
             )
             logger.info(
                 "Found incompatible backend(s) [%s] with %s. "
-                "Overriding with %s out of potential backends: %s.",
+                "Overriding with %s out of potential backends: %s. "
+                "Reasons: %s.",
                 rejected_str,
                 attn_selector_config.attn_type,
                 selected_backend.name,
                 valid_str,
+                reasons_str,
             )
         else:
             logger.info_once(

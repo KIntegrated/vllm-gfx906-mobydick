@@ -126,6 +126,13 @@ vllm serve <AWQ-INT4 target dir> \
 - `--kv-cache-dtype float16` is *our* spelling; their card uses `--kv-cache-dtype bfloat16` (and
   `fp8_e4m3` in Kevin's recipe). Note `vllm serve` rejects `fp16` and dies in argparse *before any
   logger exists* — a silent-looking empty log.
+- **A *quantized* drafter needs a patch on vLLM 0.29.0** (we hit it as `'QKVParallelLinear' object has
+  no attribute 'weight'`, and the 5070 Ti box hit the same): `qwen3_dflash.py` builds the fused
+  context-KV weight from `qkv_proj.weight`, which a pack-quantized layer does not have. syv-ai's
+  `_dense_kv_rows` (in their `dflash2-lookup-drafting.patch`) dequantizes from
+  `weight_packed`/`weight_scale` and derives the shape from the tensors, because vLLM's fused
+  `weight_shape` keeps only the last shard's. A bf16 drafter loads without it; ours is on
+  `gfx906/dflash2` (port validated: q_proj (4096,5120), k/v (1024,5120), `[q_size:]` -> (2048,5120)).
 - `--enforce-eager` is needed **on our box only**, because the drafter's ROCM_ATTN fallback cannot be
   CUDA-graph captured (`Cannot copy between CPU and CUDA tensors during CUDA graph capture`, via
   `rocm_attn.py` -> `chunked_prefill_*`). With real FA it is unnecessary.
@@ -261,6 +268,20 @@ target on your stack (syv-ai's patches + real FA) and report per-position accept
   hidden-state layer selection next.
 - Degenerate (~1 token/step) => the drafter/mechanism is broken for this target family generally, and
   DFlash2 should be parked everywhere, not just here.
+
+**RESULT (2026-09-16, from the 2x 5070 Ti box, upstream vLLM 0.29.0, TP=2, real FLASHINFER attention):**
+degenerate — **0 accepted of 665 / 889 / 1785 drafted**, per-position acceptance `0.000 x7`, mean
+acceptance length 1.00, at 1,242 / 9,453 / 52,837 prompt tokens; the spec-off sanity gate answered
+correctly. Our fork measured the same regime (0.045 accepted/draft on the fallback path, 0.0282 with an
+eager symmetric-window path). So **the fork is exonerated and the mechanism is dead upstream too**:
+DFlash2 is **parked** for this target family (`DEVLOG-dflash2.md`, "external, decisive").
+
+**One check remains before it is buried for good** — the *target*. The 5070 Ti run used
+`cyankiwi/Qwen3.8-27B-AWQ-INT4`, whereas syv-ai's 3.1-3.4 tokens/step reference is with
+`Qwen3.8-27B-Uncensored-W4A16`. The aux hidden-state layers are declared by the *target*, and the
+drafter's `combine_hidden_states` validates only the *width* (25600 = 5 x 5120), so a wrong-but-equal
+**count** layer set passes silently and would look exactly like this. One run with syv-ai's own target
+(or the bf16 drafter against a bf16 target) settles whether the family is dead or only this target is.
 
 ## 9. Links
 
