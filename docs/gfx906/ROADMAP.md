@@ -12,8 +12,13 @@ tiers are do-order, sections within a tier are ordered the same way.
 
 ## High priority — user-requested (2026-09-12)
 
-### DFL2-1 — DFlash2 n-gram chains: drafter-free verify blocks while a request copies its context (**HIGH PRIORITY**, Kevin 2026-09-12)
+### DFL2-1 — DFlash2 n-gram chains: drafter-free verify blocks while a request copies its context (**PARKED — do not start**, Kevin 2026-09-12)
 
+> **PARKED FINALLY 2026-09-16 (external result):** upstream vLLM 0.29 is degenerate on the
+> card's own matched pair, and so is our bf16+bf16 control — see `HANDOVER-dflash2.md` §8/§9
+> (`DEVLOG-dflash2.md`, "external, decisive"). No downstream patch can close that, so the whole
+> DFL2-* family is off the queue; the text below is kept as the mechanism record.
+>
 > **Work branch: `gfx906/dflash2`** (cut from `main` 2026-09-15). The DFlash2 bring-up records
 > already on `main` — the `triton_matmul` 3-D / `[K, N]` fix, `DEVLOG-dflash2.md` and the DFL2-*
 > items — are shared; the DFlash2 feature work (DFL2-3 lookup-drafting → DFL2-1 chains, DFL2-7
@@ -258,7 +263,11 @@ appear); **risk:** low-medium (probe first, one load, no new code).
 
 **Status: open — and it is the *prerequisite* for DFL2-1** (verified 2026-09-15: the chain
 patch imports `dflash2.lookup` and refuses to enable itself without `VLLM_DFLASH2_LOOKUP=1`,
-while our tree has no `lookup.py`). Touches the model too (`qwen3_dflash2.py`), and is written
+while our tree has no `lookup.py`). **DO NOT START — the family is parked (2026-09-16):**
+the external 0.29 nightlies are degenerate on the card's own matched pair, and our own bf16+bf16
+run is too (`HANDOVER-dflash2.md` §8/§9: 0.0408 / 0.0079 per-draft acceptance, all four
+suspects excluded). Kept for the mechanism description only; the port itself is off the queue
+until a non-degenerate drafter appears for this family. Touches the model too (`qwen3_dflash2.py`), and is written
 against a speculator that upstream has since refactored (~480 lines there vs 217 here), so it is
 an adaptation port. This is the mechanism Kevin remembered as "CAT-1 for DFlash": instead of a drafter forward, blocks are proposed from the
 **request's own context** (`dflash2/lookup.py` picks the block length from emitted/rejected
@@ -1695,8 +1704,20 @@ retained (`MOE_M1=0`, `MOE_NPT=4`). The tested batch arm was neutral
 because it takes the unretiled BM≥2 grouped path; that path is still
 unmeasured, not rejected. Remaining:
 
-- measure and, if useful, re-tile the BM≥2 grouped path for concurrent
-  decode (the only open axis — needs a multi-hour serving A/B session);
+- **BM≥2 grouped path — CLOSED NEUTRAL (serving gate run 2026-09-16).** The isolated
+  sweep (mclk-gated, production 35B shapes) said the shipped BM=4 mid bucket was the
+  worst of three tiles (em=64 227.3 → 193.6 us at BM=2, −14.8 %; em=128 406.2 → 347.6 at
+  BM=1, −14.4 %). The **serving** gate (in-process graph harness, 35B MoE, TP=1,
+  MTP k=3, B=4 concurrent, em=128, mclk 1000, 3 samples/arm, order A,B,C,D) says all
+  three tiles are within 0.5 %: unset (BM=4) 85.49, BM=2 85.71, BM=1 85.27, unset-repeat
+  85.69 → **no dispatch change**, fourth confirmation of the transfer rule.
+  The one transferable finding came from the *invalid* coarse pin (all em → BM=2):
+  **−10.6 %** (76.6 vs 85.6 t/s), i.e. the `em ≤ 32` bucket — the M=1 tile + fused
+  align/v2-gemm2 path — is load-bearing at B=4 MTP k=3 (partial-acceptance steps),
+  which is why the knob is now mid-bucket-scoped. Instrumentation that stays:
+  `bench_moe_bm_sweep.py`, `VLLM_GFX906_MOE_BM` (mid bucket), `VLLM_GFX906_MOE_NPT`
+  (all BM), `test_gfx906_moe_bm_select.py`. Detail: `DEVLOG-moe-c2v.md` (2026-09-16
+  entries).
 - ~~build the V1 N-split/direct-store variant (128/256/512 blocks)~~
   **CLOSED 2026-08-31**: all five V1 variants correct; every new N-split
   point is SLOWER than the existing best V1 point (v1b, 64 blocks @ 59.0 µs),
@@ -1808,7 +1829,28 @@ plumbing. Gate: the INT8 model serves and passes PPL; then DFL2-1's INT8 pairing
 
 ### VIT-2 — head_dim-96 instantiation for the ViT (cut the 72 → 128 padding waste)
 
-**Status: open, queued follow-up to VIT-1 (2026-09-15).** The ViT's real head dim
+**Status: KERNEL SHIPPED, PAD MAP OPT-IN (2026-09-16, `gfx906/fa-d96` → `main`; see
+[`DEVLOG-fa-d96.md`](DEVLOG-fa-d96.md)).** The kernel-side work is done: the launcher
+instantiates 96 (`gfx906_fa_launch_impl<96>` + the paged twin), the Python side carries
+`_INSTANTIATED_HEAD_DIMS = (64, 96, 128, 256)`, and `GFX906_FA_PAD96=1` selects the 96 pad
+map while the **default stays `(64,128,256)`** (72/80 → 128, the width FA-COVER-1 gated).
+
+**Two findings that changed the item:** (a) the inherited `(96,96)` tile-config row was
+**wrong for this Q8 kernel** (`nbatch_K=48` is not a multiple of 32, so only 64 of 96 dims
+were scored — rel err 0.24 vs the fp32 ref); it is now `nbatch_K=96` with `nbatch_fa`
+retuned to the D=128 pattern, and both kernel copies carry a `static_assert(nbatch_K % 32
+== 0)` so the next instantiation cannot repeat it. (b) The cost model over-predicted: the
+ViT attention is ~19 % of TTFT and the 96-wide kernel is only **−11.8 %** of that call
+(launch-regime, bit-identical), so the TTFT effect is ~−2 %, not −5 %. Measured serving
+A-B(‑A lost to a GPU reset burst): **5.133 → 5.073 s = −1.2 %** (A-A-B, n=3/arm).
+
+**Promotion gate (not run):** one clean boot, A-B-A with ~6 reps/arm on the dense 27B VL
+at 1024×1024, **plus** the Phi-3-mini text arm (`GFX906_FA_PAD96=1` vs `0`) — if both
+hold, default-on with the env as rollback. Also open: the `nbatch_fa` column for ncols
+2/4/8 (set by analogy with D=128) and D=80/112, which cannot be instantiated at all
+(no common solution to `nbatch_K % 32 == 0` and `DV % nbatch_K == 0`).
+
+**Original item (kept):** open, queued follow-up to VIT-1 (2026-09-15). The ViT's real head dim
 is 72 and the launcher dispatches only {64,128,256}, so it is padded to 128 and the
 kernel does 128/72 = 1.78× the arithmetic the model needs. Measured basis
 (`bench_vit_dscale.py`, launch-regime, H=16 S=2304, mclk 800 MHz, DEVLOG-vit1.md):
