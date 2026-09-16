@@ -3183,3 +3183,28 @@ succeeded**, all three compiled extensions import, the **FA suite passed
 `compileall`, ruff F821/F811 apart from one pre-existing upstream F811). The
 remaining gates — the PPL probe (blocked by #76) and the V1 serving smoke
 (blocked by #77) — need a fresh boot.
+
+
+## 2026-09-16 07:10:05 — INT8-PACKED-1 first load wedges at weight load (half-wedge, reset-recovered)
+
+**Context:** the first attempt to serve `lued/Qwen3.8-27B-INT8-W8A16-DFlash2` on this fork, after wiring
+`quant_config` + `prefix` into `Qwen3_5Model.embed_tokens` (the W8A16 pack-quantized checkpoint's
+embedding needs the quant method; see `DEVLOG-int8-packed.md`). Boot 2026-09-15 13:20 (the degraded boot that already carried wedges #93-#95 today), GPUs idle before the run.
+
+**Signature:** `vllm serve` (TP=2, `--dtype float16`, `--kv-cache-dtype float16`, 8k ctx, no spec decode)
+logged `Resolved architecture: Qwen3_5ForConditionalGeneration`, then died during weight load with
+`Error: CUDA error: unspecified launch failure` (the `hipErrorLaunchFailure` class). Kernel log:
+
+```
+07:10:05 amdgpu 0000:0e:00.0: Fence fallback timer expired on ring comp_1.0.0
+07:10:05 amdgpu 0000:0e:00.0: GPU reset(4) succeeded!
+07:10:05 amdgpu 0000:0e:00.0: [drm] device wedged, but recovered through reset
+```
+
+**Outcome:** half-wedge — the device recovered through `reset(4)` (no BACO, no `PSP resume failed`), VRAM
+returned to 0.00 GB on both GPUs, and the process exited. No `weight_packed` / loader-key error appeared,
+i.e. the failure happened at/after the weight-load boundary rather than at key matching.
+
+**Interpretation:** the same boot's load lottery as #68-#95 (this is a 5-hour-old boot with several wedges today, exactly the state where the degradation rule predicts load failures) (this INT8 checkpoint adds a new load path:
+401 packed tensors + a Triton dequant-gather embedding kernel are staged at load time). One authorized retry
+followed; a second consecutive genuine load failure would be a BURST (stop GPU work, reboot).
