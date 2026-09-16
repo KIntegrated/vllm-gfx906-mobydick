@@ -296,6 +296,44 @@ protocol note above.
 concrete stack gaps identified (`_dense_kv_rows` for quantized drafters, the drafter's attention
 backend), plus the unexplained ~100x step-time anomaly.
 
+## 2026-09-16 (later still) — `_dense_kv_rows` ported; the drafter's ROCm_ATTN fallback cannot be captured
+
+**VERDICT:** PROGRESS, with a new and sharper obstacle · **GATE:** the recommended pair (AWQ-INT4
+target + `syvai/Qwen3.8-27B-DFlash2-W4A16`, k=7) reaching per-position acceptance on our tree.
+
+1. **Ported `_dense_kv_rows`** into `qwen3_dflash.py` (from syv-ai's `dflash2-backport.patch`), the
+   missing piece for *any* quantized DFlash2 drafter: `_build_context_kv_buffers` read
+   `qkv_proj.weight`, which a pack-quantized layer does not have. The helper dequantizes
+   `weight_packed`/`weight_scale` (`unpack_from_int32`, `packed_dim=1`) and derives the dense shape
+   from `packed.shape[0]`/`qkv.input_size` because vLLM stacks q/k/v and the fused `weight_shape`
+   keeps only the last shard's shape.
+   - Math validated CPU-only against the real checkpoint before any GPU run: `q_proj` -> (4096, 5120),
+     `k_proj`/`v_proj` -> (1024, 5120), fused -> 6144 rows, `[q_size:]` -> **(2048, 5120)** = 2 x
+     `kv_size` (the shape `_fused_kv_weight` needs), bits=4, group=128, `fc` -> (5120, 25600) with
+     input width 25600 (= 5 x 5120 target hidden states, not 5120 - the trap that first made the
+     arithmetic look wrong).
+   - With the port the syvai drafter **loads** (`Application startup complete` after 430 s), i.e. the
+     `'QKVParallelLinear' object has no attribute 'weight'` failure is gone.
+   - The drafter stores **separate `q_proj`/`k_proj`/`v_proj`** (36 packed tensors: 5 x 7 layer
+     matrices + `fc`); the fusion is vLLM's.
+2. **New obstacle: the drafter's ROCm_ATTN fallback cannot be captured.** Serving the pair dies at
+   graph capture with `RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA graph
+   capture`, traceback through `vllm/v1/attention/backends/rocm_attn.py` ->
+   `vllm/v1/attention/ops/chunked_prefill_*`. With `--enforce-eager` the pair serves normally. This
+   is the *same* fallback choice that DFL2-8 flags, and it reinforces the suspicion that the
+   fallback also mishandles the drafter's `is_causal: false` / sliding-2048 semantics: an unwindowed
+   O(context) attention there would explain the 422 -> 728 ms per-step growth, and wrong masking
+   would explain acceptance ~0.
+3. **DFL2-8 step 1 done**: the per-backend rejection reasons were already computed (`reasons_str` in
+   `platforms/rocm.py`) but logged at `debug_once`; the INFO line that names the rejected backends
+   now carries them, so the next run tells us *which* predicate rejects CUSTOM for the drafter.
+
+**Next:** read the reasons from the next run; decide whether CUSTOM FA can serve the drafter
+(windowed-bidirectional, D=128) or a dedicated path is needed; then measure per-position acceptance
+with the recommended pair and compare against syv-ai's 3.1-3.6 tokens/step.
+
+**VERDICT:** `OPEN`, now blocked on the drafter's attention path rather than on loading.
+
 ## Refrigerated residue
 
 `rocm_unquantized_gemm`'s 3-D branches still pass `x` (not the flattened view) to

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 
 import io
 from collections.abc import Iterable
@@ -355,6 +356,35 @@ class DFlashQwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _dense_kv_rows(attn: nn.Module) -> torch.Tensor:
+    """Rows ``[q_size:]`` of the qkv projection as a dense matrix.
+
+    A compressed-tensors pack-quantized drafter (W4A16/W8A16, symmetric, group) has no
+    dense ``.weight``; this runs during weight loading, i.e. before any repack, so the
+    plain ``weight_packed``/``weight_scale`` layout can be dequantized here.
+    """
+    qkv = attn.qkv_proj
+    w = getattr(qkv, "weight", None)
+    if w is not None and w.dim() == 2:
+        return w[attn.q_size :]
+    packed = qkv.weight_packed
+    scale = qkv.weight_scale
+    # weight_shape keeps only the last shard of a fused qkv; use the tensors.
+    out_f, in_f = int(packed.shape[0]), int(qkv.input_size)
+    bits = 32 * packed.shape[1] // in_f
+    from compressed_tensors.compressors.pack_quantized.base import unpack_from_int32
+
+    shape = torch.Size([out_f, in_f])
+    q = unpack_from_int32(packed.data, bits, shape, packed_dim=1)
+    group = in_f // scale.shape[1]
+    dense = (
+        q.to(torch.float32).reshape(out_f, in_f // group, group)
+        * scale.to(torch.float32)[..., None]
+    ).reshape(out_f, in_f)
+    out_dtype = scale.dtype if scale.dtype.is_floating_point else torch.bfloat16
+    return dense.to(out_dtype)[attn.q_size :]
+
+
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
     decoder_layer_cls = DFlashQwen3DecoderLayer
@@ -469,7 +499,7 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+        kv_weights = [_dense_kv_rows(a) for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
