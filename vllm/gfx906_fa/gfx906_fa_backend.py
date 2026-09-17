@@ -80,6 +80,13 @@ class Gfx906FAMetadata:
     # lets forward_paged skip the per-seq int(cu[...]) D2H syncs)
     use_cascade: bool = False
     common_prefix_len: int = 0
+    # Per-batch causality, taken from CommonAttentionMetadata.causal. False means a
+    # bidirectional batch (a spec-decode drafter: DFlash assistants build their
+    # layers with causal=False), which must not get the inline causal clip. A
+    # *tensor* causal (per-token masks, hybrid models) is not expressible here and
+    # is treated as causal with a one-time warning -- fail-closed to today's
+    # behaviour, which is what such a model gets now.
+    causal: bool = True
 
 
 # Kernel head dims the launcher instantiates (see csrc/gfx906_fa/gfx906_fa_launcher.cu).
@@ -91,6 +98,29 @@ _FALLBACK_HEAD_DIMS = (64, 128, 256)
 
 
 _DEBUG_SHAPES = [0]  # GFX906_FA_DEBUG_SHAPES prints the first few calls
+_NON_CAUSAL_WARNED = [False]
+
+
+def _batch_causal(common_attn_metadata) -> bool:
+    """Per-batch causality from CommonAttentionMetadata (`causal: bool | Tensor`).
+
+    False selects the bidirectional path (spec-decode drafters with causal=False
+    layers). A tensor means per-token causality, which this kernel cannot express:
+    warn once and keep the causal behaviour rather than silently dropping the
+    clip (fail-closed; such a model works today only by accident of the tensor
+    being truthy in a boolean test).
+    """
+    causal = getattr(common_attn_metadata, "causal", True)
+    if isinstance(causal, torch.Tensor):
+        if not _NON_CAUSAL_WARNED[0]:
+            _NON_CAUSAL_WARNED[0] = True
+            logger.warning_once(
+                "GFX906_FA: per-token (tensor) causality is not supported by the "
+                "custom FA kernel; serving this batch as causal. Use another "
+                "attention backend if the model needs per-token masks."
+            )
+        return True
+    return bool(causal)
 
 
 def _pad_head_dim(head_size: int) -> int | None:
@@ -288,6 +318,7 @@ class Gfx906FAMetadataBuilder(AttentionMetadataBuilder[Gfx906FAMetadata]):
             ),
             use_cascade=(common_prefix_len > 0),
             common_prefix_len=common_prefix_len,
+            causal=_batch_causal(common_attn_metadata),
         )
 
 
@@ -414,6 +445,28 @@ class Gfx906FABackend(AttentionBackend):
         # Kernel instantiated for 64/96/128/256. Dims that pad onto one of those are
         # servable too when GFX906_FA_PAD opts in (default ON since the Phi-3 gate).
         return _padded_head_size(head_size) is not None
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        """Bidirectional batches (spec-decode drafters) are served since 2026-09-17.
+
+        The kernel's causal clip is gated on `q_abs_offset` and its sliding-window
+        mask/clips on `window`; the impl suppresses both for a non-causal batch, which
+        yields full bidirectional attention over [0, seq_len). Stage 1: the symmetric
+        +/-window of the reference (`_maybe_symmetrize_window`) is NOT implemented yet,
+        so a windowed drafter gets the *superset* mask (keys beyond its trained window
+        stay visible) -- see DEVLOG-fa-noncausal.md; the drafter's per-position
+        acceptance is the guard for that approximation.
+
+        Gate (2026-09-17): the official Muse-Glimmer DFlash assistant, TP=2, k=7, graphs
+        ON -- mean acceptance length **3.12/3.18** (the same drafter through ROCM_ATTN
+        with the real symmetric window and no graphs measured 2.95), decode **43.1 t/s**
+        vs 30.5 eager and 27.1 non-spec. So the superset mask costs this drafter nothing
+        and the 41 % is the graph capture CUSTOM buys. `GFX906_FA_NO_NONCAUSAL=1`
+        restores the old behaviour (CUSTOM rejected, ROCM_ATTN fallback) for an A/B or a
+        rollback.
+        """
+        return _os.environ.get("GFX906_FA_NO_NONCAUSAL", "0") != "1"
 
     @classmethod
     def supports_sliding_window(cls) -> bool:
@@ -1276,6 +1329,7 @@ class Gfx906FAImpl(AttentionImpl):
             k_gather_buf=k_gather_buf,
             v_gather_buf=v_gather_buf,
             window=self.sliding_window,
+            non_causal=not attn_metadata.causal,
         )  # [num_tokens, Hq*D] fp32
 
         if self._head_pad:

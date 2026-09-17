@@ -94,3 +94,75 @@ justification (or the refutation) for the kernel work.
    real backend, plus the FA suite (must stay green; the flag defaults off so behaviour is unchanged
    until the flip).
 3. Only then do DFL2-3 (lookup drafting) and DFL2-1 (chains) make sense.
+
+## 2026-09-17 — Stage 1 implemented: CUSTOM FA serves the non-causal drafter, graphs work, acceptance holds
+
+**VERDICT:** `SHIPPED` (default on; `GFX906_FA_NO_NONCAUSAL=1` is the rollback) · **GATE:**
+Muse-Glimmer-30B-AWQ-INT4 + `meta-models/Muse-Glimmer-30B-assistant` (method `dflash`, k=7),
+TP=2, util 0.90, maxlen 8192, `cudagraph_capture_sizes [8,16]`, chat-templated prompt, 3 reps
+× 128 tokens — the drafter's **mean acceptance length** (server metric) plus decode t/s, with
+the same arm run one day earlier through ROCM_ATTN + `--enforce-eager` as the control.
+
+### HYPOTHESIS
+
+If the non-causal batch is served by CUSTOM (no causal clip), the DFlash assistant's layers
+stop landing on ROCM_ATTN, CUDA-graph capture succeeds, and decode beats the eager arm while
+acceptance does not degrade (the mask changed from the trained symmetric ±window to its
+superset).
+
+### What was done (Python only — no kernel change, no rebuild)
+
+- `Gfx906FAMetadata.causal` (from `CommonAttentionMetadata.causal`, per batch); a *tensor*
+  causal (per-token masks) is not expressible in this kernel and stays causal with a
+  one-time warning (fail-closed to today's behaviour).
+- `Gfx906FAImpl.forward` passes `non_causal=not attn_metadata.causal` to `forward_paged`.
+- `forward_paged(..., non_causal=)`: when set, zeroes `window` and suppresses
+  `q_abs_offset`/`need_causal`. Both causal mechanisms in this stack are driven by exactly
+  those two variables (the kernel's inline clip by `q_abs_offset`; the window mask and the
+  Phase-C/M1 `kv_start` clips by `window` > 0), so one point turns them all off in every
+  dispatch branch (direct-paged, fused gather, persistent gather, legacy).
+- `Gfx906FABackend.supports_non_causal() -> True` (the selector's gate at
+  `v1/attention/backend.py:349`), with `GFX906_FA_NO_NONCAUSAL=1` restoring the rejection.
+- Tests: `test_non_causal_batch_is_bidirectional_vs_torch_ref` — a query *block* on top of a
+  64-token cache, both arms (causal=True/False) against their own fp32 references, plus an
+  amplified-future-keys control that proves the flag reaches the kernel (the first version of
+  that control passed spuriously on diffuse softmax).
+
+### Evidence — FOR
+
+| drafter attention | graphs | decode t/s (3 reps) | mean acceptance | TTFT |
+|---|---|---|---|---|
+| ROCM_ATTN + Triton fallback (`--enforce-eager`) | **no** | 30.46 / 30.43 / 31.17 | 2.95 | 3.87 s |
+| **CUSTOM FA (this change)** | **yes** | **43.13 / 43.10 / 44.14** | **3.12 / 3.18** | 3.71 s |
+| (non-spec reference: V2 TP=1, no drafter) | yes | 27.1 | — | 4.77 s |
+
+- The drafter's own capture line is the direct evidence the blocker is gone:
+  `Capturing dflash CUDA graphs (FULL): 100%|2/2 … Graph capturing finished in 18 secs`, and
+  `Cannot copy between CPU and CUDA tensors during CUDA graph capture` appears **zero** times
+  (it was the eager arm's failure mode).
+- **Acceptance is not degraded** (3.12/3.18 vs 2.95): the superset mask costs this drafter
+  nothing at 8k context, so Stage 2 (the symmetric ±window in the kernel) is not needed for
+  the live use case.
+- Net: **+41 %** decode over the eager arm, **+60 %** over non-spec.
+
+### Evidence — AGAINST / caveats
+
+- One launch failed first with `hipErrorLaunchFailure` during weight load (wedge #100, the
+  chronic load lottery — the retry was clean), so the arm's numbers are from the second load.
+- The superset mask has *not* been validated on a drafter with a short window at long context;
+  Muse's assistant is sliding-2048 and this arm ran at 8k. A drafter that genuinely needs the
+  ±window would show it as an acceptance drop; that is the guard to re-run if another
+  non-causal drafter appears.
+- A pre-existing capture-hygiene warning fires twice now (`2 retired capture-baked gather
+  generations (expected <= 1)`): with a target *and* a drafter capturing, two generations is
+  the expected count, so the warning's threshold is stale for the spec-decode case (cosmetic;
+  left alone).
+- k was not swept (k=7 only) and B=1 only; the histogram at the eager arm was still
+  productive at positions 3-4, so a k sweep is a cheap follow-up.
+
+### Interactions / superseded-by
+
+- This is the enabler MUSE-2 asked for; the ROADMAP's FA-NONCAUSAL item moves from "design" to
+  "Stage 1 shipped, Stage 2 refrigerated".
+- DFlash2 (the original motivation) stays parked for its own reasons — its degeneration was
+  never the mask.

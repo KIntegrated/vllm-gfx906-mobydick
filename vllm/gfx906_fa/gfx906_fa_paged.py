@@ -381,6 +381,7 @@ def forward_paged(
     k_gather_buf: torch.Tensor | None = None,  # [B,Hkv,Sk_pad,bytes_per_row] uint8
     v_gather_buf: torch.Tensor | None = None,  # [B,Hkv,Sk_pad,D]             fp16
     window: int = 0,  # sliding-window size in tokens (0 = off)
+    non_causal: bool = False,  # bidirectional batch (spec-decode drafter)
     cu_seqlens_q_host: torch.Tensor | None = None,  # [B+1] CPU int — avoids
     # the per-seq int(cu[...]) D2H syncs in the variable-Q branches (M3).
 ) -> torch.Tensor:
@@ -412,6 +413,27 @@ def forward_paged(
 
     if scale is None:
         scale = 1.0 / math.sqrt(D)
+
+    # -------- Non-causal (bidirectional) batches --------
+    # Spec-decode drafters whose layers are built with causal=False (DFlash
+    # assistants: all-sliding, bidirectional) attend in both directions. Two
+    # mechanisms implement causality here and both are driven by `window` and
+    # `q_abs_offset`: the inline causal clip in the kernel (q_abs_row) and the
+    # sliding-window mask/clips (kv_start, _gather_clip_start). Zeroing `window`
+    # and suppressing the offset below therefore turns BOTH off in every
+    # dispatch branch, which yields full bidirectional attention over
+    # [0, seq_len) for every query row.
+    #
+    # Stage 1 of DEVLOG-fa-noncausal.md: the reference semantics
+    # (_maybe_symmetrize_window: causal (w,0) window -> symmetric (w,w) when
+    # non-causal) is NOT implemented yet, so this mask is the *superset* of the
+    # drafter's windowed mask -- keys beyond the trained window are visible. The
+    # guard for that approximation is the drafter's own per-position acceptance
+    # (MUSE-2 measured 2.95 through the ROCM_ATTN fallback, which does implement
+    # the symmetric window); if acceptance drops, Stage 2 adds the symmetric
+    # window to the kernel.
+    if non_causal:
+        window = 0
 
     # -------- Sq / Sk padding --------
     # Sq_pad должен быть кратен ncols1 — размеру tile колонки в kernel.
@@ -501,8 +523,9 @@ def forward_paged(
 
         # Inline causal (same as gather path). window > 0 needs the offset on
         # decode batches too (the causal check is a no-op there; the
-        # per-row window cutoff is not).
-        need_causal = max_seqlen_q > 1 or window > 0
+        # per-row window cutoff is not). Suppressed for non-causal batches:
+        # without the offset the kernel applies no causal clip at all.
+        need_causal = (not non_causal) and (max_seqlen_q > 1 or window > 0)
         q_abs_offset_tensor = None
         if need_causal:
             sl_i64 = sl_i32.to(torch.int64)
@@ -886,7 +909,7 @@ def forward_paged(
     # `or window > 0` below.
     kv_max_tensor = seq_lens.to(torch.int32).contiguous()
 
-    need_causal = max_seqlen_q > 1 or window > 0
+    need_causal = (not non_causal) and (max_seqlen_q > 1 or window > 0)
     q_abs_offset_tensor = None
     if need_causal:
         sl_i64 = seq_lens.to(torch.int64) if seq_lens.dtype != torch.int64 else seq_lens
