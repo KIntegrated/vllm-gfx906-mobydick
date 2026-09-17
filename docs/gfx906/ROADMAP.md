@@ -73,20 +73,35 @@ int64-MRoPE-packing test); plus FN-7: FA suite **104 passed**, PPL **10.5472**
 — the config-shape plumbing is not instantiated in any test. That is QSA-FN-3's
 job, and it is why FN-1's verdict is "shipped at kernel level".
 
-### QSA-FN-2 — model-level fp16 sweep + the tester launch recipe
+### QSA-FN-2 — model-level fp16 sweep + the tester launch recipe (**SHIPPED 2026-09-17**)
 
-**Status: OPEN — small, and now mostly recipe.** What is left after QSA-FN-1: the
-launch recipe and the runtime dtype pins outside the model files (the three
-`HyperConnectionConfig` sites moved into FN-1). The CDNA launch recipe carries
-`--dtype bfloat16` / `--mamba-cache-dtype bfloat16`. Deliverable: a gfx906 launch
-recipe (fp16 dtype, no bf16 mamba cache, `--tool-call-parser qwen3_xml`,
-`--reasoning-parser qwen3`, `{"method":"mtp","num_speculative_tokens":3}`,
-`--block-size 64`, `--max-num-seqs 4`, `--max-num-batched-tokens 4096`) plus the
-list of what a tester must report back. Recipe deltas: [recon §2](RECON-qwen38-flash-qsa.md).
+**Status: SHIPPED** — [`_serve_qsa_flash_gfx906.sh`](_serve_qsa_flash_gfx906.sh)
+(`start|wait|stop|report`). Every deviation from the MI210 production launch and
+its reason:
 
-**GATE:** the recipe's flag set is exercised by whatever the tester runs; every
-removed/renamed flag is diffed against the CDNA launcher so nothing is silently
-dropped.
+| flag | why |
+|---|---|
+| `--dtype float16` | explicit; gfx906 has no native bf16 (the reported failure was the auto-fallback meeting the old bf16-only guards) |
+| `VLLM_USE_V2_MODEL_RUNNER=1` | **required** — the PLE inputs come from the V2 model states; on V1 the layer raises "PLE inputs were not prepared". Do not copy the other recipes' V1 pin here |
+| `--no-enable-prefix-caching` | **required workaround** — prefix caching forces `mamba_cache_mode='align'` and that V2 kernel IMAs (V2-MAMBA-1) |
+| (no `--mamba-cache-dtype`) | the CDNA recipe pins bf16 there; leave auto = fp16 |
+| `--max-model-len 262144` | native un-scaled RoPE; do **not** add YaRN (it degrades all positions) |
+| `--block-size 64`, `--max-num-seqs 4`, `--max-num-batched-tokens 4096` | as CDNA |
+| capture ladder `[4,8,12,16]` | = `max_num_seqs × (k+1)` for MTP k=3 (house rule) |
+| `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` | ours, not CDNA's deprecated `qwen4_exp_mtp` spelling (identical after `speculative.py:1090` normalizes it) |
+| `--enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3` | as CDNA |
+| `--enable-expert-parallel`, `--disable-custom-all-reduce` | as CDNA (TP>1 on this topology) |
+
+The three `HyperConnectionConfig(params_dtype=torch.bfloat16)` sites went in with
+FN-1. Deliberately not carried over: `--kv-cache-memory` (CDNA pinning; let vLLM
+size it) and `--trust-remote-code` (not needed).
+
+**Validated vs derived.** The *flag set* is validated end-to-end on the tiny
+harness (V2 + `--enable-expert-parallel` + `--disable-custom-all-reduce` + ladder
+`[4,8,12,16]` + MTP k=3 + parsers + no prefix caching all load, capture and
+serve); everything that depends on the real checkpoint (the 60 GB load, KV sizing
+at 256 K, quality, `content` vs `reasoning` on real outputs) is **derived and
+unvalidated** — that is what the tester's report is for.
 
 ### QSA-FN-3 — tiny `qwen4_exp` config: make the model testable on one MI50
 
@@ -250,19 +265,20 @@ t/s** (mean 58.30, mclk 1000); `test_qsa_amd.py` 16, `test_qsa_reference.py` 19,
 Any QSA-FN item that changes a *shared* file (`common/qsa_cache.py`) must show a
 bf16 QSA arm still passing before/after.
 
-### QSA-FN-8 — tester build (after QSA-FN-1 + FN-2, at most + FN-3/FN-4)
+### QSA-FN-8 — tester build (QSA-FN-1 + FN-2; FN-3 optional)
 
-**Status: OPEN — queued on QSA-FN-3 + FN-2.** The tester build is **fp16 QSA
-enablement (landed) plus the launch recipe**, and (if they land in time) the
-fp16-gated tiled indexer. Explicitly **excluded**: anything int8 (QSA-FN-5/6) —
-the capacity win is not worth a 2.5× prefill kernel on evidence we already have.
+**Status: OPEN — ready to assemble.** The tester build is **the FN-1 fp16
+enablement plus the FN-2 recipe** (and the tiny harness if they want a smoke rig
+that needs no VRAM). Explicitly **excluded**: anything int8 (QSA-FN-5/6) — the
+capacity win is not worth a 2.5× prefill kernel on evidence we already have.
 
-What the tester must report back (the reason this is a separate item): (a) does it
-load and serve at all in fp16; (b) `GPU KV cache size` and per-card VRAM; (c)
-their launch line vs the recipe in QSA-FN-2; (d) one greedy coherence check and
-one long-context needle; (e) whether TTFT/prefill or decode looks wrong first.
-Nothing here can be validated locally (§2 of the recon), so their report *is* the
-gate for FN-2.
+What the tester must send back (`_serve_qsa_flash_gfx906.sh report`): the launch
+line and card/VRAM; the `Resolved architecture` / `GPU KV cache size` lines; one
+short greedy completion and one ~2 k-token prompt with TTFT + decode t/s; one
+100 k+ request (completes? coherent? needle at start/middle/end?); and — if it
+breaks — which came first: init OOM, a dtype/`NotImplementedError`, a kernel
+fault (name + grid), or garbage-but-running output. Nothing here can be validated
+locally (the checkpoint needs ~60 GB), so their report *is* FN-2's gate.
 
 ## High priority — user-requested (2026-09-12)
 

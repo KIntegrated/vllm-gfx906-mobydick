@@ -6,6 +6,42 @@
 > bf16-only site inventory, the ISA facts and the kernel timings live there; not
 > restated per entry). Newest entry first.
 
+## 2026-09-17 (3) — QSA-FN-2: the tester serve recipe
+
+**VERDICT:** `SHIPPED` (recipe + flag-set validation on the tiny harness); the
+real-checkpoint behaviour stays `OPEN` and is the tester's report.
+
+**GATE:** the full recipe flag set loads, captures and serves on the tiny
+test rig (no real checkpoint available here).
+
+### What was done
+
+`docs/gfx906/_serve_qsa_flash_gfx906.sh` (`start|wait|stop|report`), carrying
+the MI210 production launch with two **required** gfx906 deviations and the
+dtype/parser deltas:
+
+- `--dtype float16` (explicit), **no** `--mamba-cache-dtype bfloat16`;
+- **`VLLM_USE_V2_MODEL_RUNNER=1`** — this model cannot run on V1 at all (the PLE
+  inputs come from the V2 model states); this is the one recipe in the repo that
+  must *not* pin V1 pending DFL2-2;
+- **`--no-enable-prefix-caching`** — the V2-MAMBA-1 workaround;
+- `--max-model-len 262144` native RoPE (no YaRN), `--block-size 64`,
+  `--max-num-seqs 4`, `--max-num-batched-tokens 4096`, ladder `[4,8,12,16]`
+  (= `max_seqs × (k+1)` for MTP k=3), `method:"mtp"` spelling,
+  `qwen3_xml` tool parser + `qwen3` reasoning parser, `--enable-expert-parallel`.
+
+Validated on the tiny rig (with `--load-format dummy`): V2 + expert-parallel at
+TP=1 + custom-all-reduce off + the `[4,8,12,16]` ladder (4 PIECEWISE + 4 FULL
+captured, not collapsed) + MTP k=3 (`SpeculativeConfig(method='mtp',
+num_spec_tokens=3)`, drafts being created) + no prefix caching + both parsers:
+loads, captures, serves completions / chat / 1321-token prefill / 4-way batch.
+
+**Caveat recorded in the script and the roadmap:** with random weights the chat
+message comes back with `content=None` and everything in `reasoning` — that is
+the parser behaving normally on garbage, and `content` vs `reasoning` on *real*
+output is one of the things the tester must report. Nothing about quality is
+implied by this validation.
+
 ## 2026-09-17 (2) — QSA-FN-3: the tiny-config harness (and three things it found)
 
 **VERDICT:** `SHIPPED` (the harness runs and gates the fp16 path end-to-end) —
