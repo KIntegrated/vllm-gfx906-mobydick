@@ -3837,3 +3837,143 @@ def test_head_dim_96_instantiated_gather_and_paged_vs_fp32_ref():
         ref2 = _windowed_ref(q2[0, :, t], Kf, Vf, scale, abs0 + t, None)
         rel2 = ((out2[t] - ref2).norm() / ref2.norm()).item()
         assert rel2 < 5e-2, f"D=96 gather row {t}: rel {rel2:.4f}"
+
+
+# ---------------------------------------------------------------------------
+# FA-NONCAUSAL (2026-09-17): a batch marked causal=False (spec-decode drafters
+# whose layers are built with causal=False -- DFlash assistants) must attend in
+# BOTH directions. The kernel's causal clip is gated on q_abs_offset and its
+# sliding-window mask/clips on `window`, so the impl suppresses both for a
+# non-causal batch; this pins that, and pins that the flag has an effect (the
+# same batch served as causal must differ where the two masks disagree).
+# Stage 1: the symmetric +/-window of the reference is not implemented yet, so
+# the non-causal mask is the superset (full [0, seq_len)); see
+# docs/gfx906/DEVLOG-fa-noncausal.md.
+# ---------------------------------------------------------------------------
+
+def test_non_causal_batch_is_bidirectional_vs_torch_ref():
+    from types import SimpleNamespace
+
+    from vllm.gfx906_fa.gfx906_fa_backend import (
+        Gfx906FAImpl,
+        Gfx906FAMetadata,
+    )
+
+    dev = "cuda"
+    torch.manual_seed(20260917)
+    L, sq, hq, hkv, d = 64, 8, 4, 2, 128
+    n_blocks = L // BLOCK
+
+    kv = torch.zeros(n_blocks, hkv, BLOCK, 2 * d, dtype=torch.float16, device=dev)
+    K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+
+    impl = Gfx906FAImpl(
+        num_heads=hq,
+        head_size=d,
+        scale=1.0 / math.sqrt(d),
+        num_kv_heads=hkv,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="float16",
+    )
+    layer = SimpleNamespace(_k_scale=1.0, _v_scale=1.0)
+    slots = torch.arange(L, dtype=torch.int64, device=dev)
+    impl.do_kv_cache_update(layer, K, V, kv, slots)
+
+    # A query BLOCK: sq rows appended after the L cached tokens, i.e. positions
+    # L-sq .. L-1. A drafter's block looks exactly like this (context in the
+    # cache, block queries on top).
+    q = torch.randn(sq, hq, d, device=dev, dtype=torch.float32) * 0.5
+    block_slots = torch.arange(L - sq, L, dtype=torch.int64, device=dev)
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev).view(1, n_blocks)
+    scale = 1.0 / math.sqrt(d)
+
+    def run(causal: bool):
+        m = Gfx906FAMetadata(
+            num_actual_tokens=sq,
+            max_query_len=sq,
+            max_seq_len=L,
+            query_start_loc=torch.tensor([0, sq], dtype=torch.int32, device=dev),
+            seq_lens=torch.tensor([L], dtype=torch.int32, device=dev),
+            block_table=bt,
+            slot_mapping=block_slots,
+            causal=causal,
+        )
+        out = torch.empty(sq, hq, d, dtype=torch.float16, device=dev)
+        got = impl.forward(layer, q, K, V, kv, m, output=out)
+        return (out if got is None else got).float().view(sq, hq, d)
+
+    got_bidir = run(causal=False)
+    got_causal = run(causal=True)
+
+    Kf, Vf = K.float(), V.float()
+    g = hq // hkv
+    for j in (0, sq // 2, sq - 1):
+        q_row = q[j]                       # [hq, d]
+        qg = q_row.view(hkv, g, d)
+        # Non-causal reference: EVERY row sees ALL L keys (both directions).
+        s_all = torch.einsum("gjd,lgd->gjl", qg, Kf) * scale
+        ref_bidir = torch.einsum(
+            "gjl,lgd->gjd", torch.softmax(s_all, -1), Vf
+        ).reshape(hq, d)
+        rel = ((got_bidir[j] - ref_bidir).norm() / ref_bidir.norm()).item()
+        assert rel < 5e-2, f"non-causal row {j}: rel {rel:.4f}"
+
+        # Causal reference for the same row: keys [0, L-sq+j].
+        ref_causal = _windowed_ref(q[j], Kf, Vf, scale, L - sq + j, None)
+        rel_c = ((got_causal[j] - ref_causal).norm() / ref_causal.norm()).item()
+        assert rel_c < 5e-2, f"causal row {j}: rel {rel_c:.4f}"
+
+    # The two arms must differ where the masks differ (rows 0..sq-2 have future
+    # keys inside the block). The future keys are amplified below so a diffuse
+    # softmax cannot hide the difference -- an un-amplified random batch made this
+    # control pass spuriously on this seed.
+    fut = L - sq + 1
+    V_amp = V.clone()
+    V_amp[fut:] = (V_amp[fut:] * 12.0).clamp(-8, 8)
+    impl.do_kv_cache_update(layer, K, V_amp, kv, slots)
+    b_amp = run(causal=False)
+    c_amp = run(causal=True)
+    assert not torch.allclose(b_amp[0], c_amp[0], atol=1e-2), (
+        "causal=False had no effect: the two arms agree on a batch where the "
+        "causal and bidirectional masks differ (the flag is not reaching the kernel)"
+    )
+    s_amp = torch.einsum("gjd,lgd->gjl", q[0].view(hkv, g, d), Kf) * scale
+    ref_amp = torch.einsum(
+        "gjl,lgd->gjd", torch.softmax(s_amp, -1), V_amp.float()
+    ).reshape(hq, d)
+    rel_a = ((b_amp[0] - ref_amp).norm() / ref_amp.norm()).item()
+    assert rel_a < 5e-2, f"non-causal row 0 with amplified future keys: rel {rel_a:.4f}"
+
+
+def test_non_causal_causality_contract(monkeypatch):
+    """FA-NONCAUSAL: the bool contract is honoured, the tensor form is not claimed.
+
+    A bool `causal=False` means "no causal clip" -- the same contract TRITON_ATTN and
+    ROCM_ATTN honour for that field, so this backend may serve it. A *tensor* causal
+    (per-token masks) is not expressible in this kernel: it must keep the causal
+    behaviour it had before this feature (with a warning), not silently become
+    bidirectional over the whole sequence.
+    """
+    from types import SimpleNamespace
+
+    from vllm.gfx906_fa.gfx906_fa_backend import Gfx906FABackend, _batch_causal
+
+    bidir = SimpleNamespace(causal=False)
+    causal = SimpleNamespace(causal=True)
+    per_token = SimpleNamespace(causal=torch.ones(4, dtype=torch.bool))
+    missing = SimpleNamespace()  # older metadata without the field
+
+    assert _batch_causal(bidir) is False
+    assert _batch_causal(causal) is True
+    assert _batch_causal(missing) is True
+    # Per-token causality keeps the causal path (status quo), it does not become a
+    # full-bidirectional claim.
+    assert _batch_causal(per_token) is True
+
+    # The class-level capability and its rollback.
+    monkeypatch.delenv("GFX906_FA_NO_NONCAUSAL", raising=False)
+    assert Gfx906FABackend.supports_non_causal()
+    monkeypatch.setenv("GFX906_FA_NO_NONCAUSAL", "1")
+    assert not Gfx906FABackend.supports_non_causal()

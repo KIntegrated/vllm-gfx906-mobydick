@@ -500,7 +500,21 @@ wiring win, and this is the cheapest way to find them.
 
 ### FA-NONCAUSAL — serve decoder-shaped non-causal attention from the custom FA (unlocks spec drafters)
 
-**Status: OPEN, promoted 2026-09-16 (was "only if DFlash2 is revived").** Its live use case is
+**Status: STAGE 1 SHIPPED, DEFAULT ON (2026-09-17; `GFX906_FA_NO_NONCAUSAL=1` is the
+rollback); Stage 2 (the symmetric ±window in the kernel) REFRIGERATED — Muse's assistant did
+not need it.** A non-causal batch (drafter built with `causal=False`) now runs on CUSTOM FA:
+the impl suppresses both causal mechanisms (`q_abs_offset` and `window`) for that batch, which
+yields full bidirectional attention; `supports_non_causal()` returns True so the selector stops
+rejecting the backend. Gate: Muse-Glimmer + the official DFlash assistant, TP=2, k=7, **graphs
+on** — drafter capture `dflash CUDA graphs (FULL) 2/2`, **mean acceptance 3.12/3.18** (the same
+drafter through ROCM_ATTN + eager measured 2.95) and **decode 43.1 t/s vs 30.5 eager / 27.1
+non-spec**. So the superset mask costs this drafter nothing and CUSTOM buys +41 % by making the
+drafter graph-capturable. Order-controlled: the control arms are 5/5 clean at 30.3-30.7 t/s
+(acceptance 2.95-3.02) and the graph arm read 43.5 and 39.2 t/s in its two clean runs, so quote
+**≥ +29 %** (best +41 %), acceptance at parity. Detail, the review findings and the edit list for
+Stage 2: `DEVLOG-fa-noncausal.md`.
+
+**Original status (2026-09-16, promoted from a DFlash2 conditional).** Its live use case is
 **MUSE-2**: the official Muse-Glimmer DFlash assistant is a *healthy* non-causal drafter
 (mean acceptance 2.95, pos0 0.844) but the gfx906 selector rejects CUSTOM for its attention
 class, so it runs ROCM_ATTN, which cannot be CUDA-graph captured → the arm needed
@@ -2084,16 +2098,16 @@ supports as method `dflash` — validated tonight as **MUSE-2**.
 
 ### MUSE-2 — Muse-Glimmer + the official DFlash assistant (drafter validated, graphs blocked)
 
-**Status: OPEN — drafter healthy, FA non-causal is the enabler (2026-09-16).** TP=2, k=7,
-`--enforce-eager`, chat-templated prompt, 3×128 tokens: **mean acceptance length 2.95**
-(2.98 tokens/step), per-position **0.844 / 0.508 / 0.305 / 0.180 / 0.117 / 0.023 / 0.000**,
-decode **30.5 t/s** — i.e. +11 % over non-spec *while eager*. The blocker is that the
-assistant attends **non-causally**, our CUSTOM FA rejects that class, and the ROCM_ATTN
-fallback cannot be CUDA-graph captured (`Cannot copy between CPU and CUDA tensors during CUDA
-graph capture`). So the production path needs **FA-NONCAUSAL** (see that item — this is now
-its live use case: a supported spec method for a served model, replacing deprecated ngram).
-Cheap follow-ups: k sweep (the histogram is still productive at pos3-4, so k>7 may pay),
-k=7 with graphs once FA-NONCAUSAL lands, and B=4.
+**Status: WORKING (2026-09-17) — the official assistant + FA-NONCAUSAL Stage 1, graphs on.**
+TP=2, k=7, `cudagraph_capture_sizes [8,16]`, chat-templated prompt, 3×128 tokens: the drafter
+captures (`dflash CUDA graphs (FULL) 2/2`), mean acceptance **2.82-3.18** and decode **39.2-43.5
+t/s** across the two clean runs — vs acceptance 2.95-3.02 / **30.3-30.7 t/s** for the same arm
+through ROCM_ATTN with `--enforce-eager` (where it started: CUSTOM rejected the non-causal class
+and ROCM_ATTN cannot be graph-captured), and 27.1 t/s with no drafter. Quote **≥ +29 %**. So a served model that had **no** spec method (no MTP head,
+ngram deprecated) now runs **+45 % or better** decode. **k swept** (2026-09-17): k=4 `[5,10]` gives 43.0 t/s / acceptance 2.65 vs k=7's
+43.5 / 3.12-3.18 — throughput-equivalent, so the draft depth is not the lever (the verify step
+is); k=7 stays. Remaining: B=4, and the TP=1 path if the 24 GB + 5.1 GB envelope can be made to
+fit.
 
 ### MUSE-1 (original entry) — Muse-Glimmer: V2 parity looks good, but the PPL probe is not its gate
 
