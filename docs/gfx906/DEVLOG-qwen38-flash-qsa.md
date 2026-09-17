@@ -1,4 +1,100 @@
-# QSA-FN — Qwen3.8-Flash-Next (Qwen4Exp QSA) on gfx906 — fp16 enablement
+# QSA-FN — Qwen3.8-Flash-Next (Qwen4Exp QSA) on gfx906
+
+> Branch `gfx906/qsa-fn` off `gfx906/v0.29.0` · model `Qwen/Qwen3.8-Flash-Next`
+> (`qwen4_exp`) · 2026-09-17 · roadmap [`QSA-FN-*`](ROADMAP.md) · pre-work
+> evidence: [`RECON-qwen38-flash-qsa.md`](RECON-qwen38-flash-qsa.md) (the
+> bf16-only site inventory, the ISA facts and the kernel timings live there; not
+> restated per entry). Newest entry first.
+
+## 2026-09-17 (2) — QSA-FN-3: the tiny-config harness (and three things it found)
+
+**VERDICT:** `SHIPPED` (the harness runs and gates the fp16 path end-to-end) —
+with one deliberate limitation: it cannot measure **quality** (random weights)
+and its per-kernel *shares* do not transfer to the real model, so QSA-FN-5's
+prefill-share gate stays open.
+
+**GATE:** the model serves on one MI50 and produces tokens in every path —
+prefill, B=1..4 decode, graph replay, MTP spec decode, tool parser.
+
+### What was done
+
+Two new files, both committed:
+
+- `docs/gfx906/_qsa_tiny_model.py` — writes a `config.json` that keeps the
+  **architecture identical** (all four layer types, PLE with a real ngram table,
+  hyperconnection, QSA indexer + sparse attention, MTP) and shrinks only the
+  dimensions: hidden 2560→256, 48→4 layers (so the QSA layer fraction stays
+  **1/4 = 12/48**, matching the real model), head_dim 256→64, E=512→8,
+  MoE inter 640→64, `ngram_vocab_size_base` 20 M→4096 (the table is
+  `≈ ngram_heads × base` rows), `max_position_embeddings` 262144→4096.
+  `indexer_budget/compress_ratio` **cannot** be shrunk (the config requires the
+  ratio to be 512 or 2048) and `vocab_size` must stay 248 320 (the tokenizer's
+  size).
+- `docs/gfx906/_serve_qsa_tiny_gfx906.sh` — `model|start|wait|stop`; serves it
+  with `--load-format dummy` (random weights), V2, plugins off, capture ladder
+  `[1..max_num_seqs]`.
+
+Weights are random, so this is an **execution + A/B harness**: it proves the
+fp16 QSA/PLE/HC/MoE/GDN path compiles, executes and decodes on this box, and
+lets arms be differenced. It says nothing about output quality (log its
+`prompt_sha1`s and never quote a t/s as a quality result).
+
+### Baseline, fp16, one MI50, V2, prefix caching OFF
+
+Prefill (TTFT, warmed): 1321 tokens **22 ms** (60.0 k prompt tok/s), 2641
+**42 ms** (62.4 k), 3961 **48 ms** (83.1 k). Decode (128 tok/req, median of 3
+after a per-shape warmup): **B=1 563 t/s, B=2 1023 t/s, B=4 1994 t/s**.
+
+### The three findings
+
+1. **This model cannot run on the V1 model runner.** `Qwen4ExpModel.forward`
+   takes `query_start_loc`/`ngram_context` with `None` defaults and PLE raises
+   `PLE inputs were not prepared`; the plumbing that fills them lives in
+   `v1/worker/gpu/model_states/mamba_hybrid.py` (`Qwen4ExpModelState`), i.e. the
+   **V2** runner. The house recipe pins V1 (`_serve_tp2_gfx906.sh`, pending
+   DFL2-2) — for `qwen4_exp` that pin is not an option. Recipe/FN-8 impact.
+2. **With V2 + prefix caching ON (→ `mamba_cache_mode='align'`),
+   `precopy_mamba_align_fused_kernel` faults on gfx906.** First failing case:
+   a 2015-token prefill (`Memory Fault Error … kernel:
+   precopy_mamba_align_fused_kernel`, grid `[256, 7, 16]`) → EngineDeadError;
+   1343-token prefills pass. That kernel is V2-only — SYV-13 (2026-09-08)
+   checked it and concluded it was "not live on ROCm" (true while V1 was
+   pinned). It is live now, and it is untested here: its test is CUDA-gated
+   (`tests/kernels/mamba/test_precopy_mamba_align.py` skips on ROCm; only 3 of
+   195 mamba tests ran). **Workaround for any Qwen4Exp run:
+   `--no-enable-prefix-caching`** (mamba cache mode then stays `none`; verified:
+   the same 1321/2641/3961-token prefills run clean). Filed as `V2-MAMBA-1`,
+   which also becomes a concrete blocker for DFL2-2.
+3. **The bf16 arm is independently broken** — and it is *not* this change. With
+   `--dtype bfloat16` the engine dies in `rocm_unquantized_gemm_impl` with
+   `Matrices A and B must have the same dtype (assuming fp16)`, inside the
+   hyperconnection chain during the first compiled forward. In a bf16 run my
+   `params_dtype=vllm_config.model_config.dtype` evaluates to exactly the
+   literal `torch.bfloat16` it replaced, and the relaxed guards accept bf16
+   exactly as before — so the pre-FN-1 tree must fail identically. fp16 is not
+   just preferred on gfx906, it is the only arm; the A/B that FN-1 would
+   ideally ship (whole-model fp16 vs bf16) is therefore unavailable, leaving
+   the 4.39×/1.28× kernel numbers as the evidence.
+
+### Harness hygiene (cost me a wrong first reading)
+
+- **The first request at a new shape includes a one-time Triton-autotune storm**
+  (a 20 s stall at B=1/B=2 that looked like a decode collapse). Warm up each
+  batch shape and take the median of ≥3 reps; the pre-warm numbers are
+  meaningless (B=1 measured 6.5 t/s and 563 t/s in the same process).
+- **The venv auto-loads five stale profiler plugins** (`agdn/mtp1/pfk4/syv9/t1
+  phase`, installed as `vllm.general_plugins` entry points, armed by leftover
+  files in `/local/tmp/mtp1`). vLLM loads every discovered plugin when
+  `VLLM_PLUGINS` is unset. A/B'd: with `VLLM_PLUGINS=""` the numbers are the
+  same within spread (B=1 466 vs 448, B=4 1616 vs 1600 t/s), so they are inert
+  — but the harness pins `VLLM_PLUGINS=` anyway, and any future measurement
+  here should too.
+- **Not measured: the QSA share of prefill.** It is QSA-FN-5's decision gate and
+  the harness cannot supply it (the tiny model's per-layer dims are 10–24× off
+  the real ones, so the share is not transferable). Options: measure it on a
+  tester's box, or scale a second config to the real shape ratios.
+
+## 2026-09-17 (1) — QSA-FN-1: fp16 enablement
 
 > Branch `gfx906/qsa-fn` off `gfx906/v0.29.0` · model `Qwen/Qwen3.8-Flash-Next`
 > (`qwen4_exp`) · 2026-09-17 · roadmap [`QSA-FN-1`](ROADMAP.md) ·
@@ -6,8 +102,8 @@
 > (the bf16-only site inventory, the ISA facts and the kernel timings all live
 > there; not restated here).
 
-**VERDICT:** `SHIPPED` for the code + kernel-level gates; the *end-to-end* gate
-stays `OPEN`, owned by QSA-FN-3 (no loadable checkpoint exists on this box).
+**VERDICT:** `SHIPPED` — code + kernel-level gates, and the fp16 path now
+end-to-end via the tiny harness ([entry 2026-09-17 (2)](#2026-09-17-2--qsa-fn-3-the-tiny-config-harness-and-three-things-it-found)).
 
 **GATE:** `tests/models/qwen4_exp/` (both dtype arms, per file), **plus** the
 FN-7 existing-model gates — FA suite **104 passed**, PPL probe **10.5472**

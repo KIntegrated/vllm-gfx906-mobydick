@@ -33,13 +33,13 @@ chip.
    port at all (int8-QK: faults at the dispatch profile every real prefill uses,
    and is not faster where it runs).
 
-**Critical path: QSA-FN-3 → {QSA-FN-4, QSA-FN-2, QSA-FN-8}** (QSA-FN-1 is
-SHIPPED for the code + kernel-level gates; its end-to-end gate is FN-3's); the
-int8 items (QSA-FN-5/6) are evidence-first and both currently default to "not on
-this chip". Neither workstream can be gated end-to-end yet: the model is ~120 B
-params of MoE (W4A16 ≈ 60 GB, plus a PLE ngram table the CDNA recipe offloads
-60 GB of), i.e. unloadable in 2× MI50. **QSA-FN-3 (tiny-config harness) gates
-everything else.**
+**Critical path: QSA-FN-2 → {QSA-FN-4, QSA-FN-8}** (QSA-FN-1 and QSA-FN-3 are
+SHIPPED); the int8 items (QSA-FN-5/6) are evidence-first and both currently
+default to "not on this chip", and **V2-MAMBA-1 blocks every Qwen4Exp run until
+`--no-enable-prefix-caching` (or a fix) is in the recipe**. The real model is
+~120 B params of MoE (W4A16 ≈ 60 GB, plus a PLE ngram table the CDNA recipe
+offloads 60 GB of), i.e. unloadable in 2× MI50 — so quality and the FN-5 share
+still need a tester's box.
 
 ### QSA-FN-1 — fp16 activations + fp16 QSA/indexer caches (**SHIPPED 2026-09-17**, the reported failure)
 
@@ -75,9 +75,9 @@ job, and it is why FN-1's verdict is "shipped at kernel level".
 
 ### QSA-FN-2 — model-level fp16 sweep + the tester launch recipe
 
-**Status: OPEN — small.** What is left after QSA-FN-1: the launch recipe and the
-runtime dtype pins outside the model files (the three `HyperConnectionConfig`
-sites moved into FN-1). The CDNA launch recipe carries
+**Status: OPEN — small, and now mostly recipe.** What is left after QSA-FN-1: the
+launch recipe and the runtime dtype pins outside the model files (the three
+`HyperConnectionConfig` sites moved into FN-1). The CDNA launch recipe carries
 `--dtype bfloat16` / `--mamba-cache-dtype bfloat16`. Deliverable: a gfx906 launch
 recipe (fp16 dtype, no bf16 mamba cache, `--tool-call-parser qwen3_xml`,
 `--reasoning-parser qwen3`, `{"method":"mtp","num_speculative_tokens":3}`,
@@ -105,6 +105,60 @@ half the architecture and the half that has never run on gfx906.
 **GATE:** serves on one MI50 at fp16, generates coherent text, and the existing
 `tests/models/qwen4_exp/` suite runs against it. This harness then becomes the
 regression gate for QSA-FN-1/4 and for any future Qwen4Exp work.
+
+### QSA-FN-3 — tiny `qwen4_exp` config: make the model testable on one MI50 (**SHIPPED 2026-09-17**)
+
+**Status: SHIPPED.** [`_qsa_tiny_model.py`](_qsa_tiny_model.py) +
+[`_serve_qsa_tiny_gfx906.sh`](_serve_qsa_tiny_gfx906.sh) build and serve a
+config that keeps the architecture identical (all four layer types, PLE/ngram,
+hyperconnection, QSA indexer + sparse attention, MTP; the QSA layer fraction
+stays 1/4 = 12/48) with random weights (`--load-format dummy`) on one MI50.
+Record: [`DEVLOG-qwen38-flash-qsa.md`](DEVLOG-qwen38-flash-qsa.md) (2).
+
+Baseline (fp16, V2, prefix caching off): prefill 1321/2641/3961 tokens →
+22/42/48 ms; decode **563 / 1023 / 1994 t/s** at B=1/2/4. **Corrected gate
+wording:** "generates coherent text" is impossible with random weights — the
+gate is that every path *executes* (prefill, B=1–4 decode, graph replay, MTP
+spec decode, tool parser). Quality stays with the tester.
+
+**What it cannot do:** measure the QSA share of prefill (the tiny dims are
+10–24× off the real ones, so shares do not transfer) — that is FN-5's gate and
+needs either a tester's box or a second config scaled to the real ratios.
+
+**Three findings it produced** (each has its own entry below): the V1 runner
+cannot serve this model at all (FN-2); `precopy_mamba_align_fused_kernel` faults
+on gfx906 under V2 + prefix caching (V2-MAMBA-1); the bf16 arm is independently
+broken (FN-1's limit list). Harness hygiene: warm up every shape (a 20 s
+autotune storm otherwise looks like a decode collapse) and pin `VLLM_PLUGINS=`
+— this venv auto-loads five stale profiler plugins, A/B'd inert but noisy.
+
+### V2-MAMBA-1 — `precopy_mamba_align_fused_kernel` IMA on gfx906 (V2 + prefix caching)
+
+**Status: OPEN — tester-blocking for Qwen4Exp; also a DFL2-2 prerequisite.**
+With the V2 runner (mandatory for this model, FN-2) and prefix caching on,
+`mamba_cache_mode` becomes `align` and the pre-copy kernel faults:
+
+```
+Memory Fault Error … kernel: precopy_mamba_align_fused_kernel  grid=[256, 7, 16]
+  -> EngineDeadError;  2015-token prefill fails, 1343-token passes
+```
+
+Repro: `_serve_qsa_tiny_gfx906.sh start pc` (no `--no-enable-prefix-caching`),
+then a ~2 k-token `/v1/completions`. It is V2-only, which is why SYV-13 (2026-09-08)
+could check it and correctly call it "not live on ROCm" — the V1 pin hid it. Its
+test is CUDA-gated (`tests/kernels/mamba/test_precopy_mamba_align.py` skips on
+ROCm; 3 of 195 mamba tests ran here), so there is no gfx906 coverage.
+
+**Workaround (validated): `--no-enable-prefix-caching`** — mamba cache mode then
+stays `none`, and the same 1321/2641/3961-token prefills run clean. That is the
+recipe for any Qwen4Exp run until this is fixed (conveniently also this hub's
+bench default).
+
+**GATE:** the repro above passes with prefix caching ON, plus a
+`tests/kernels/mamba/` ROCm-enabled variant of the equivalence test. Start with
+the kernel's own guards (`num_reqs=256` padded grid, `HAS_IDX_MAPPING`, the
+`src_col`/`dst_col` early-outs) and `_TEMPORAL_TILES=16` — do not start by
+assuming a QSA interaction; the kernel knows nothing about attention.
 
 ### QSA-FN-4 — backport the tiled indexer (**fp16-gated**)
 
