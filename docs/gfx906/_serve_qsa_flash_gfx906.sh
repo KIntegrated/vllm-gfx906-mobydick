@@ -28,10 +28,12 @@
 #                              "PLE inputs were not prepared". (Our other model
 #                              recipes pin V1 pending DFL2-2 — do NOT copy that
 #                              pin here.)
-#   --no-enable-prefix-caching required workaround: prefix caching forces
-#                              mamba_cache_mode='align', whose V2 pre-copy
-#                              kernel IMAs on gfx906 (roadmap V2-MAMBA-1).
-#                              Cost: no cross-request reuse; TTFT rises.
+#   (prefix caching ON)        the default. It forces mamba_cache_mode='align',
+#                              whose V2 pre-copy kernel used to IMA on any
+#                              model with a KV group finer than the mamba block
+#                              size (V2-MAMBA-1, fixed 2026-09-17). On a build
+#                              predating that fix, append
+#                              --no-enable-prefix-caching to EXTRA_ARGS.
 #   (no --mamba-cache-dtype)   the CDNA recipe pins bf16; on gfx906 leave it
 #                              auto (= model dtype = fp16).
 #   --max-model-len 262144     native, un-scaled RoPE. Do NOT add YaRN or go
@@ -105,7 +107,6 @@ start)
       --dtype float16 --gpu-memory-utilization "$GPUTIL" \
       --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" \
       --max-num-batched-tokens "$MBT" --block-size 64 \
-      --no-enable-prefix-caching \
       --compilation-config "{\"cudagraph_capture_sizes\":[$sizes]}" \
       "${spec_args[@]}" "${offload[@]}" \
       --enable-auto-tool-choice --tool-call-parser qwen3_xml \
@@ -147,7 +148,7 @@ Send back (the FN-8 gate — without these the recipe stays unvalidated):
 2. did it load: the `Resolved architecture`, `GPU KV cache size` and
    `Available KV cache memory` lines from the server log;
 3. one short greedy completion and one ~2000-token prompt: TTFT and decode
-   tok/s (state the config: pp/tg, batch size, prefix caching off);
+   tok/s (state the config: pp/tg, batch size, prefix caching on/off);
 4. one long-context (e.g. 100k+) request: does it complete, is the output
    coherent, and is a needle retrievable (start/middle/end);
 5. which of these happened FIRST if it broke: OOM at init / a dtype or

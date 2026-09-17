@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 from dataclasses import dataclass
 from typing import Any
 
@@ -118,8 +119,18 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu[req_index].fill_(1)
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
+            # The column index is in mamba-state blocks, so it must be sized by
+            # the mamba block size, not ``cache_config.block_size``: the engine
+            # narrows the latter to the finest granularity among the KV-cache
+            # groups (``EngineCore`` startup), which is smaller than the mamba
+            # block size whenever a model has a finer-grained group. A seed
+            # sized with it lands past the end of the sequence, where the align
+            # pre-copy reads a stale block-table entry and follows it to a
+            # wild address.
+            mamba_block_size = self.cache_config.mamba_block_size
+            assert mamba_block_size is not None
             self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
+                (new_req_data.num_computed_tokens - 1) // mamba_block_size
             )
 
     def _get_mamba_group_info(

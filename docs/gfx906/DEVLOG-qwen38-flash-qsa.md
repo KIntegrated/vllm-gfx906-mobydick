@@ -24,7 +24,9 @@ dtype/parser deltas:
 - **`VLLM_USE_V2_MODEL_RUNNER=1`** — this model cannot run on V1 at all (the PLE
   inputs come from the V2 model states); this is the one recipe in the repo that
   must *not* pin V1 pending DFL2-2;
-- **`--no-enable-prefix-caching`** — the V2-MAMBA-1 workaround;
+- **`--no-enable-prefix-caching`** — the V2-MAMBA-1 workaround; **retired
+  2026-09-17** when that bug was fixed ([`DEVLOG-v2-mamba-align.md`](DEVLOG-v2-mamba-align.md)),
+  now a fallback for older builds only;
 - `--max-model-len 262144` native RoPE (no YaRN), `--block-size 64`,
   `--max-num-seqs 4`, `--max-num-batched-tokens 4096`, ladder `[4,8,12,16]`
   (= `max_seqs × (k+1)` for MTP k=3), `method:"mtp"` spelling,
@@ -99,8 +101,11 @@ after a per-shape warmup): **B=1 563 t/s, B=2 1023 t/s, B=4 1994 t/s**.
    (`tests/kernels/mamba/test_precopy_mamba_align.py` skips on ROCm; only 3 of
    195 mamba tests ran). **Workaround for any Qwen4Exp run:
    `--no-enable-prefix-caching`** (mamba cache mode then stays `none`; verified:
-   the same 1321/2641/3961-token prefills run clean). Filed as `V2-MAMBA-1`,
-   which also becomes a concrete blocker for DFL2-2.
+   the same 1321/2641/3961-token prefills run clean). Filed as `V2-MAMBA-1` and
+   **fixed the same day** — it was not a kernel bug at all but a wrong divisor
+   in `add_request` ([`DEVLOG-v2-mamba-align.md`](DEVLOG-v2-mamba-align.md)), so
+   the workaround is retired; the two mamba kernel tests named above are
+   ROCm-enabled in this branch.
 3. **The bf16 arm is independently broken** — and it is *not* this change. With
    `--dtype bfloat16` the engine dies in `rocm_unquantized_gemm_impl` with
    `Matrices A and B must have the same dtype (assuming fp16)`, inside the

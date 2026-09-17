@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """Equivalence test for ``precopy_mamba_align_fused_kernel``.
 
 The fused "align" pre-copy must migrate mamba state across block boundaries
@@ -39,7 +40,7 @@ try:
     import pytest
 
     _cuda_required = pytest.mark.skipif(
-        not current_platform.is_cuda(),
+        not (current_platform.is_cuda() or current_platform.is_rocm()),
         reason="precopy_mamba_align_fused_kernel needs CUDA/Triton",
     )
     _parametrize = pytest.mark.parametrize

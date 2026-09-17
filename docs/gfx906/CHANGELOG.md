@@ -6,6 +6,34 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-17 (V2-MAMBA-1 — V2 runner + mamba `align` mode no longer faults on gfx906)
+
+- **A GPU memory fault on any hybrid model with heterogeneous KV-group block
+  sizes is fixed**, found via Qwen3.8-Flash-Next (the V2-runner + prefix-caching
+  combination its recipe needs). `MambaHybridModelState.add_request` seeded the
+  per-request running mamba block column with `cache_config.block_size` instead
+  of `cache_config.mamba_block_size`; the engine narrows the former to the
+  **finest** KV-cache group's block size (4, from Qwen4Exp's
+  `CircularBufferSpec` indexer group) while the mamba geometry stays 192, so a
+  prefix-cache hit seeded a column ~57× too far out and the align pre-copy
+  followed a stale block-table entry to a wild address. One line (+assert) now
+  uses the mamba block size — the value the V1 path already used
+  (`mamba_utils.py`: `block_size = mamba_spec.block_size`).
+- **Not gfx906-specific and not an upstream fix re-derived:** `upstream/main`
+  (fetched 2026-09-17) still has the seed line verbatim. Upstream *did* narrow
+  the trigger the same day (only `prefix_cacheable` groups contribute to the
+  min), which masks it for this model rather than fixing it.
+- **Gates:** the tiny Qwen4Exp rig with prefix caching ON runs the sequence that
+  used to fault, with greedy tokens **and** top-5 logprobs bit-identical to the
+  prefix-caching-OFF arm (worst |Δ| = 0.000000, 6 prompt/rep pairs), with and
+  without MTP k=3; 12/12 requests OK per arm. New unit test
+  (`test_add_request_seeds_running_column_with_mamba_block_size`) fails on the
+  pre-fix code with `assert 287 == 5`. The two CUDA-gated mamba kernel tests are
+  now ROCm-enabled: **195 passed** on gfx906.
+- **Supersedes** the `--no-enable-prefix-caching` workaround in the QSA-FN-2
+  tester recipe (retired; kept there as a fallback for older builds). Record:
+  [`DEVLOG-v2-mamba-align.md`](DEVLOG-v2-mamba-align.md).
+
 ## 2026-09-17 (QSA-FN-1 — Qwen3.8-Flash-Next / QSA runs in fp16 on gfx906)
 
 - **The reported `NotImplementedError: Qwen4Exp QSA currently requires BF16` is

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -94,3 +95,33 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias() -
     assert state._mamba_state_idx_gpu.tolist() == expected_state_indices
     expected_accepted = [9, 1, 9, 2, 9]
     assert state.num_accepted_tokens_gpu.tolist() == expected_accepted
+
+
+@pytest.mark.parametrize(("num_computed", "expected"), [(0, -1), (1152, 5), (4032, 20)])
+def test_add_request_seeds_running_column_with_mamba_block_size(
+    num_computed: int, expected: int
+) -> None:
+    """The align seed is a mamba-state block column, so it must be sized by
+    ``mamba_block_size``.
+
+    Regression: sizing it by ``cache_config.block_size`` lands 14x too far out
+    when the engine has narrowed that to a finer KV-cache group's block size
+    (4 vs 192 here). The align pre-copy then reads a stale block-table entry and
+    faults (gfx906: ``Memory Fault Error ... precopy_mamba_align_fused_kernel``).
+    """
+    state = object.__new__(MambaHybridModelState)
+    state.cache_config = SimpleNamespace(
+        mamba_cache_mode="align", block_size=4, mamba_block_size=192
+    )
+    state._align_mode = True
+    state.rope_state = None
+    state.prompt_embeds_state = None
+    state.num_accepted_tokens_gpu = torch.ones(3, dtype=torch.int32)
+    state._mamba_state_idx_gpu = torch.full((3,), -2, dtype=torch.int32)
+
+    state.add_request(1, SimpleNamespace(num_computed_tokens=num_computed))
+
+    assert state._mamba_state_idx_gpu[1].item() == expected
+    # Untouched slots keep their values; the accepted count is reset to neutral.
+    assert state._mamba_state_idx_gpu.tolist() == [-2, expected, -2]
+    assert state.num_accepted_tokens_gpu.tolist() == [1, 1, 1]

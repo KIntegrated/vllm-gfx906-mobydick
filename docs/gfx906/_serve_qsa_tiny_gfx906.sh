@@ -38,6 +38,15 @@
 #                         /local/tmp/mtp1); vLLM loads every discovered plugin
 #                         when VLLM_PLUGINS is unset. on => upstream behaviour.
 #   EXTRA_ARGS=           appended verbatim
+#
+# Prefix caching is ON by default here, which puts the model in mamba
+# 'align' mode -- the configuration that used to fault in
+# precopy_mamba_align_fused_kernel (V2-MAMBA-1, fixed 2026-09-17). It is
+# therefore also the regression rig for that fix: start the server, then send
+# three prompts of 1344 / 2016 / 4031 tokens that share a prefix (each one a
+# prefix-cache hit on the last):
+#   .venv/bin/python /local/tmp/v2mamba/v2mamba_repro.py 8341 qsa-tiny 1343 2015 4030
+# compare against EXTRA_ARGS="--no-enable-prefix-caching" (logprobs identical).
 set -u
 cd /local/git/vllm-gfx906-mobydick
 

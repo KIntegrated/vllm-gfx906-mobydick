@@ -33,13 +33,12 @@ chip.
    port at all (int8-QK: faults at the dispatch profile every real prefill uses,
    and is not faster where it runs).
 
-**Critical path: QSA-FN-2 → {QSA-FN-4, QSA-FN-8}** (QSA-FN-1 and QSA-FN-3 are
-SHIPPED); the int8 items (QSA-FN-5/6) are evidence-first and both currently
-default to "not on this chip", and **V2-MAMBA-1 blocks every Qwen4Exp run until
-`--no-enable-prefix-caching` (or a fix) is in the recipe**. The real model is
-~120 B params of MoE (W4A16 ≈ 60 GB, plus a PLE ngram table the CDNA recipe
-offloads 60 GB of), i.e. unloadable in 2× MI50 — so quality and the FN-5 share
-still need a tester's box.
+**Critical path: QSA-FN-8** (assemble the tester build from the shipped FN-1 +
+FN-2; QSA-FN-1/2/3 are SHIPPED); the int8 items (QSA-FN-5/6) are evidence-first
+and both currently default to "not on this chip". The real model is ~120 B
+params of MoE (W4A16 ≈ 60 GB, plus a PLE ngram table the CDNA recipe offloads
+60 GB of), i.e. unloadable in 2× MI50 — so quality and the FN-5 share still need
+a tester's box.
 
 ### QSA-FN-1 — fp16 activations + fp16 QSA/indexer caches (**SHIPPED 2026-09-17**, the reported failure)
 
@@ -83,7 +82,7 @@ its reason:
 |---|---|
 | `--dtype float16` | explicit; gfx906 has no native bf16 (the reported failure was the auto-fallback meeting the old bf16-only guards) |
 | `VLLM_USE_V2_MODEL_RUNNER=1` | **required** — the PLE inputs come from the V2 model states; on V1 the layer raises "PLE inputs were not prepared". Do not copy the other recipes' V1 pin here |
-| `--no-enable-prefix-caching` | **required workaround** — prefix caching forces `mamba_cache_mode='align'` and that V2 kernel IMAs (V2-MAMBA-1) |
+| `--no-enable-prefix-caching` | **was required** for V2-MAMBA-1 (the align-mode IMA); **retired 2026-09-17** once the seed bug was fixed — the recipe leaves prefix caching on and keeps the flag only as a documented fallback |
 | (no `--mamba-cache-dtype`) | the CDNA recipe pins bf16 there; leave auto = fp16 |
 | `--max-model-len 262144` | native un-scaled RoPE; do **not** add YaRN (it degrades all positions) |
 | `--block-size 64`, `--max-num-seqs 4`, `--max-num-batched-tokens 4096` | as CDNA |
@@ -142,38 +141,45 @@ needs either a tester's box or a second config scaled to the real ratios.
 
 **Three findings it produced** (each has its own entry below): the V1 runner
 cannot serve this model at all (FN-2); `precopy_mamba_align_fused_kernel` faults
-on gfx906 under V2 + prefix caching (V2-MAMBA-1); the bf16 arm is independently
-broken (FN-1's limit list). Harness hygiene: warm up every shape (a 20 s
-autotune storm otherwise looks like a decode collapse) and pin `VLLM_PLUGINS=`
-— this venv auto-loads five stale profiler plugins, A/B'd inert but noisy.
+on gfx906 under V2 + prefix caching (**V2-MAMBA-1, since fixed**); the bf16 arm is
+independently broken (FN-1's limit list). Harness hygiene: warm up every shape (a
+20 s autotune storm otherwise looks like a decode collapse) and pin
+`VLLM_PLUGINS=` — this venv auto-loads five stale profiler plugins, A/B'd inert
+but noisy.
 
-### V2-MAMBA-1 — `precopy_mamba_align_fused_kernel` IMA on gfx906 (V2 + prefix caching)
+### V2-MAMBA-1 — `precopy_mamba_align_fused_kernel` IMA on gfx906 (**SHIPPED 2026-09-17**)
 
-**Status: OPEN — tester-blocking for Qwen4Exp; also a DFL2-2 prerequisite.**
-With the V2 runner (mandatory for this model, FN-2) and prefix caching on,
-`mamba_cache_mode` becomes `align` and the pre-copy kernel faults:
+**Status: SHIPPED** (branch `gfx906/qsa-fn`). Record:
+[`DEVLOG-v2-mamba-align.md`](DEVLOG-v2-mamba-align.md).
 
-```
-Memory Fault Error … kernel: precopy_mamba_align_fused_kernel  grid=[256, 7, 16]
-  -> EngineDeadError;  2015-token prefill fails, 1343-token passes
-```
+Root cause was **not** in the kernel and **not** gfx906-specific:
+`MambaHybridModelState.add_request` seeded the per-request running mamba block
+column with `cache_config.block_size` instead of the mamba block size. On a
+hybrid model whose KV-cache groups have heterogeneous block sizes the engine
+narrows `cache_config.block_size` to the *finest* group (4 here, Qwen4Exp's
+`CircularBufferSpec` indexer group) while the mamba geometry stays 192, so a
+prefix-cache hit (`num_computed_tokens > 0`) seeded a column ~57× too far out and
+the align pre-copy followed a stale block-table entry to a wild address. Fixed
+by one line (+assert) using `cache_config.mamba_block_size` — the value the V1
+path already used (`mamba_utils.py`: `block_size = mamba_spec.block_size`).
 
-Repro: `_serve_qsa_tiny_gfx906.sh start pc` (no `--no-enable-prefix-caching`),
-then a ~2 k-token `/v1/completions`. It is V2-only, which is why SYV-13 (2026-09-08)
-could check it and correctly call it "not live on ROCm" — the V1 pin hid it. Its
-test is CUDA-gated (`tests/kernels/mamba/test_precopy_mamba_align.py` skips on
-ROCm; 3 of 195 mamba tests ran here), so there is no gfx906 coverage.
+**Gate (met):** the tiny Qwen4Exp rig with prefix caching ON runs the sequence
+that used to fault, and greedy tokens *and* top-5 logprobs are bit-identical to
+the prefix-caching-OFF arm (worst |Δ| = 0.000000), with and without MTP k=3;
+12/12 requests per arm. New unit test fails pre-fix (`assert 287 == 5`); the two
+CUDA-gated mamba kernel tests are ROCm-enabled here (195 passed on gfx906).
 
-**Workaround (validated): `--no-enable-prefix-caching`** — mamba cache mode then
-stays `none`, and the same 1321/2641/3961-token prefills run clean. That is the
-recipe for any Qwen4Exp run until this is fixed (conveniently also this hub's
-bench default).
+**Consequences:** the `--no-enable-prefix-caching` workaround is retired from the
+QSA-FN-2 recipe (kept only as a documented fallback for older builds), and this
+is no longer a DFL2-2 consideration (DFL2-2 itself closed 2026-09-16). Upstream
+`main` (fetched 2026-09-17) still has the seed bug but narrows the *trigger* by
+excluding non-prefix-cacheable groups — masking, not fixing; a prefix-cacheable
+group finer than the mamba block would still trip it, so an upstream PR is worth
+proposing (§1 duplicate checks not yet run).
 
-**GATE:** the repro above passes with prefix caching ON, plus a
-`tests/kernels/mamba/` ROCm-enabled variant of the equivalence test. Start with
-the kernel's own guards (`num_reqs=256` padded grid, `HAS_IDX_MAPPING`, the
-`src_col`/`dst_col` early-outs) and `_TEMPORAL_TILES=16` — do not start by
-assuming a QSA interaction; the kernel knows nothing about attention.
+**Residue (not gated, cross-linked not restated):** the RecoverSSM align kernel
+writes a column without the `-1` every other align site uses — dev log,
+Refrigerated residue; unverifiable here (no RecoverSSM model loadable).
 
 ### QSA-FN-4 — backport the tiled indexer (**fp16-gated**)
 
