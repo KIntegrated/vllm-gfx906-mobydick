@@ -10,6 +10,190 @@ E=256, topk=8, hidden=2048, W4A16 group-128 experts; B=1 decode step
 ≈ 15 ms at 66.5 t/s. Priority = expected gain × confidence ÷ effort+risk;
 tiers are do-order, sections within a tier are ordered the same way.
 
+## High priority — user-requested (2026-09-17): Qwen3.8-Flash-Next / QSA on gfx906
+
+**Kevin 2026-09-17.** A tester hit `NotImplementedError: Qwen4Exp QSA currently
+requires BF16` on gfx906 for `Qwen/Qwen3.8-Flash-Next` (the `qwen4_exp` QSA
+architecture), and pointed at the CDNA2 QSA patch set
+(`../qsa-cdna2-vllm-patches`, gfx90a) as the thing to backport. Recon (with
+measured kernel evidence) is [`RECON-qwen38-flash-qsa.md`](RECON-qwen38-flash-qsa.md);
+**read its §1 and §5.2 before touching anything** — the reported error is *not*
+what the patch set fixes, and the patch set's int8 half is a poor fit for this
+chip.
+
+**Two independent workstreams, in this order.**
+
+1. **fp16 enablement (QSA-FN-1/FN-2)** — fixes the reported failure, and is a
+   measured **3.9×** on the QSA kernel pair, because gfx906 emulates every bf16
+   `tl.dot` as scalar fp32 FMA (`v_fmac_f32`) while fp16 lowers to
+   `v_dot2_f32_f16`. No new kernels: guard edits only.
+2. **The CDNA2 patch set (QSA-FN-4/5/6)** — of its three changes, one ports
+   (tiled indexer, +39 % fp16, must be dtype-gated), one is capacity-only
+   (int8 KV: 2.5–2.7× attention prefill cost, decode-neutral), and one does not
+   port at all (int8-QK: faults at the dispatch profile every real prefill uses,
+   and is not faster where it runs).
+
+**Critical path: QSA-FN-1 → QSA-FN-3 → {QSA-FN-4, QSA-FN-2, QSA-FN-8}**; the
+int8 items (QSA-FN-5/6) are evidence-first and both currently default to "not on
+this chip". Neither workstream can be gated end-to-end yet: the model is ~120 B
+params of MoE (W4A16 ≈ 60 GB, plus a PLE ngram table the CDNA recipe offloads
+60 GB of), i.e. unloadable in 2× MI50. **QSA-FN-3 (tiny-config harness) gates
+everything else.**
+
+### QSA-FN-1 — fp16 activations + fp16 QSA/indexer caches (**HIGH PRIORITY**, the reported failure)
+
+**Status: OPEN — not started.** Every bf16-only site is enumerated in
+[recon §1](RECON-qwen38-flash-qsa.md) (7 in `amd/qsa.py`, 3 in
+`amd/indexer_qsa.py`, 3 in `common/qsa_cache.py`, 1 assert in `amd/ops/qsa.py`).
+The reported error is two of them: `amd/qsa.py:188` and `amd/indexer_qsa.py:95`,
+both tripped by the deliberate gfx906 bf16→fp16 auto-fallback
+(`platforms/rocm.py:645`, `config/model.py:2294`).
+
+**Measured value:** sparse attention 26.5 ms fp16 vs 116.5 ms bf16 (4.39×,
+rep-stable, interleaved).
+
+**Constraint — no CUDA regression.** `common/qsa_cache.py` is shared with the
+NVIDIA implementation: replace bf16 literals with `self.dtype` / the model dtype
+(generic mixed-dtype support), never with a gfx906 conditional. The AMD files can
+be changed freely (ROCm-only import path, `qwen4_exp/__init__.py`).
+`QSAKeyStateCache._BF16_PER_INT64 = 4` is already right for fp16 (4 × 2 B = 8 B)
+— do not "fix" it.
+
+**GATE:** (a) fp16 parametrization of `tests/models/qwen4_exp/test_qsa_amd.py`
+(9 pass in bf16 today, MI50) green **and** the bf16 arm still green; (b) after
+QSA-FN-3, a fp16 serve smoke with the tiny config; (c) the four existing-model
+gates (below).
+
+### QSA-FN-2 — model-level fp16 sweep + the tester launch recipe
+
+**Status: OPEN — small.** The QSA files are not the only bf16 literals on this
+model's path: `HyperConnectionConfig(params_dtype=torch.bfloat16)` is hardcoded at
+`amd/model.py:260`, `amd/model.py:436`, `amd/mtp.py:229` (the NVIDIA variant passes
+the model dtype there), and the CDNA launch recipe carries
+`--dtype bfloat16` / `--mamba-cache-dtype bfloat16`. Deliverable: a gfx906 launch
+recipe (fp16 dtype, no bf16 mamba cache, `--tool-call-parser qwen3_xml`,
+`--reasoning-parser qwen3`, `{"method":"mtp","num_speculative_tokens":3}`,
+`--block-size 64`, `--max-num-seqs 4`, `--max-num-batched-tokens 4096`) plus the
+list of what a tester must report back. Recipe deltas: [recon §2](RECON-qwen38-flash-qsa.md).
+
+**GATE:** the recipe's flag set is exercised by whatever the tester runs; every
+removed/renamed flag is diffed against the CDNA launcher so nothing is silently
+dropped.
+
+### QSA-FN-3 — tiny `qwen4_exp` config: make the model testable on one MI50
+
+**Status: OPEN — the enabler; do this second (after QSA-FN-1's guard edits, before
+any end-to-end judgement).** Nothing on this model can be gated on serving
+wall-clock without it, and the alternative (never running the code path) is how
+the int8-QK fault in §6 of the recon survived to a tester.
+
+Approach to try first (cheap): `--load-format dummy` + `--hf-overrides` shrinking
+the *real* config (few layers, E=8, small hidden, PLE present but tiny,
+`layer_types` consistent with `full_attention_interval`, MTP 1 layer). Second
+option if the overrides fight config validation: a saved tiny random checkpoint
+with the full module set. Keep the PLE/PLE-ngram and indexer paths *in* — they are
+half the architecture and the half that has never run on gfx906.
+
+**GATE:** serves on one MI50 at fp16, generates coherent text, and the existing
+`tests/models/qwen4_exp/` suite runs against it. This harness then becomes the
+regression gate for QSA-FN-1/4 and for any future Qwen4Exp work.
+
+### QSA-FN-4 — backport the tiled indexer (**fp16-gated**)
+
+**Status: OPEN — patch applies cleanly today** (`patch -p0 --dry-run` clean on
+both files; our `amd/` files are the CDNA author's exact base). Bring
+`_qsa_mqa_paged_tiled_kernel` + the uniform-request route (`q.shape[0] >= 64`) in
+verbatim, then **add the dtype gate the CDNA version lacks**: measured 1.39× in
+fp16 but **0.42× in bf16** (16648 vs 6928 µs) — as written, a bf16 run would take
+a ~2.4× indexer regression. Quality is unaffected by construction (top-2048
+membership agreement 1.00000, logits NRMSE 1.3e-7).
+
+Also note the route's uniformity check `(token_to_req == token_to_req[0]).all()`
+synchronizes the device; keep it inside the `q.shape[0] >= 64` prefill gate.
+
+**GATE:** fp16 indexer probe (`/local/tmp/qsaprobe/probe_indexer.py`) ≥ 1.3× and
+agreement 1.00000, **plus** a bf16 run showing the route is not taken, **plus**
+the QSA-FN-1 fp16 gate unchanged, **plus** the four existing-model gates.
+
+### QSA-FN-5 — int8 `per_token_head` KV for QSA: capacity-only, evidence-first
+
+**Status: OPEN — DO NOT PORT YET; the measurement says why.** The patch ports
+mechanically (host-side spec/write-path/scale-view work + dtype-generic dequant
+in the two read kernels), but on gfx906 it buys capacity and costs prefill:
+attention prefill is **2.5–2.7×** for identical shapes over T=64…1024 while
+**decode (T=1) is neutral (0.99×)** (recon §5.3). Mechanism is pinned far enough
+to say a smarter dequant will not fix it: dropping the scale multiply entirely
+still leaves 2.68× — the cost is converting a loaded int8 tile into a
+`v_dot2`-legal dot operand. Accuracy is the documented ~1 % attention-value NRMSE
+(0.0081 measured).
+
+**Decision gate (cheap, and required before any porting):** the QSA sparse
+attention kernel's **share of prefill wall-clock on this model**. If it resembles
+MI210's 57.7 %, a 2.5× kernel cost is unaffordable for the 1.67× KV gain and the
+item parks. Measure it with the QSA-FN-3 harness (rocprofv3, skill
+`gfx906-rocprofv3-kernel-trace`) — not with a standalone probe.
+
+**If it ever proceeds:** capacity-only, default OFF, decode-neutrality and the
+prefill share re-measured at the same time. Cross-link SYV-11 / the `T2` row of
+`int8-investigation-qwen.md`, which cost the same idea for the custom FA path
+(1.88× capacity, ~20 % decode cost) — same conclusion, different backend.
+
+### QSA-FN-6 — gfx906 int8-`tl.dot` fault in the QSA kernel (root-cause or drop)
+
+**Status: OPEN — blocking for int8-QK; not blocking anything else.**
+`QSA_INT8_QK=1` faults (IMA) in `_qsa_sparse_paged_gqa_splitk_kernel` at the
+dispatch profile the wrapper picks for **every prefill >512 rows**
+(`block_n=64, num_splits=1, num_warps=2`, from the "Tuned on GB300" table at
+`amd/ops/qsa.py`). Reproduced repeatedly at G=12/T=1024/TOPK=2048/L=65536
+(`/local/tmp/qsaprobe/logs/ima_repro_G12.log`); `num_warps=8` or `BLOCK_M=8`
+clears it, nothing else does. The CDNA author's own int8-QK test passes on gfx906
+(G=8 shapes), so this is a shape/profile-dependent gfx906 codegen hazard, not a
+wiring error. Not reducible to a standalone `tl.dot` repro in this session; a
+stripped loop kernel with the same shape computes correctly.
+
+**Decision rule (both branches acceptable, the cheap one is recommended):** if
+int8-QK is ever wanted on gfx906, the work is (a) a per-instruction/LDS census of
+the failing instantiation (`llvm-objdump`; skill `gfx906-isa-disassembly`) to
+find the bad `v_dot4_i32_i8` operand pack under spills, then a Triton-side report
+(relevant to TRITON-1's upstream work) **or** a gfx906 dispatch that forces
+`num_warps=8`. Otherwise **drop int8-QK for gfx906**: it is 2.4× *slower* than an
+fp16 cache at the profiles where it runs at all, so the fault costs us nothing
+we wanted. Record the drop in `DEAD-ENDS.md` when decided.
+
+**GATE (whichever branch):** `tests/test_int8qk_attn.py`-style NRMSE gate **and**
+an IMA-free run across all four dispatch profiles (T ∈ {1, 4, 64, 512+}) — a
+profile sweep, not one shape; the fault is profile-specific.
+
+### QSA-FN-7 — non-regression gate for the existing models (runs with every item above)
+
+**Status: STANDING REQUIREMENT** (Kevin 2026-09-17: "no regression in performance
+or fidelity"). None of QSA-FN-1/2/4 touches a code path any currently-served model
+uses (Qwen4Exp is the only `qwen4_exp` architecture, and the AMD import path is
+ROCm-only), but the cheap deterministic gates are not optional:
+
+- `tests/kernels/attention/test_gfx906_fa.py` (97) — the FA suite;
+- in-process PPL probe (`benchmarks/kernels/gfx906/ppl_probe.py`): dense 27B
+  **10.5516**, MoE 35B and Nemotron band 26.96–27.02, `0` top-20 misses;
+- MoE 35B `_bench_gfx906.py` pp2048/tg256 4 samples (~66.5 t/s band);
+- `tests/models/qwen4_exp/*` one file at a time.
+
+Any QSA-FN item that changes a *shared* file (`common/qsa_cache.py`) must show a
+bf16 QSA arm still passing before/after.
+
+### QSA-FN-8 — tester build (after QSA-FN-1 + FN-2, at most + FN-3/FN-4)
+
+**Status: OPEN — queued on QSA-FN-1.** The tester build is **fp16 QSA enablement
+plus the launch recipe**, and (if they land in time) the fp16-gated tiled
+indexer. Explicitly **excluded**: anything int8 (QSA-FN-5/6) — the capacity win
+is not worth a 2.5× prefill kernel on evidence we already have.
+
+What the tester must report back (the reason this is a separate item): (a) does it
+load and serve at all in fp16; (b) `GPU KV cache size` and per-card VRAM; (c)
+their launch line vs the recipe in QSA-FN-2; (d) one greedy coherence check and
+one long-context needle; (e) whether TTFT/prefill or decode looks wrong first.
+Nothing here can be validated locally (§2 of the recon), so their report *is* the
+gate for FN-2.
+
 ## High priority — user-requested (2026-09-12)
 
 ### DFL2-1 — DFlash2 n-gram chains: drafter-free verify blocks while a request copies its context (**PARKED — do not start**, Kevin 2026-09-12)
