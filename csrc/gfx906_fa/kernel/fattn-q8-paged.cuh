@@ -484,6 +484,9 @@ static __global__ void flash_attn_tile_q8_paged(
     constexpr int nwarps    = ggml_cuda_fattn_tile_q8_paged_get_nthreads (DKQ, DV, ncols1*ncols2) / warp_size;
     constexpr int nbatch_fa = ggml_cuda_fattn_tile_q8_paged_get_nbatch_fa(DKQ, DV, ncols1*ncols2);
     constexpr int nbatch_K  = ggml_cuda_fattn_tile_q8_paged_get_nbatch_K (DKQ, DV, ncols1*ncols2);
+    static_assert(nbatch_K % 32 == 0,
+        "nbatch_K must be a multiple of 32 (K is read in whole q8_0 blocks) — "
+        "fix the config table row, not the kernel");
 
     const int col_Q_0 = blockIdx.x * ncols1;
 

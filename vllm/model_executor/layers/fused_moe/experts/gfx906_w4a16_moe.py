@@ -111,6 +111,36 @@ def _moe_align_block_size_fused_m1(
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 
+def _block_size_m_for(M: int, topk: int) -> int:
+    """Grouped-GEMM M-tile for `em = M * topk` (the shipped heuristic).
+
+    `VLLM_GFX906_MOE_BM` pins the **mid bucket** (32 < em <= 512) for an A/B; the low
+    (em <= 32, BM=1 + the M=1 gemm2 tile) and high (prefill, BM=8) buckets always keep
+    their choice, so the knob is inert by default and the A/B isolates one tile. The 2026-09-16 isolated sweep measured the
+    shipped mid bucket (BM=4) as the worst of the three at every production em — see
+    benchmarks/kernels/gfx906/bench_moe_bm_sweep.py and the C2-BM>=2 note in
+    docs/gfx906/DEVLOG-moe-c2v.md. A serving A/B is the gate for changing the default.
+    """
+    em = M * topk
+    if em <= 32:
+        return 1
+    if em > 512:
+        return 8
+    # Mid bucket only: pinning the *whole* range also moved em<=32 off BM=1 (and its
+    # specialized M=1 gemm2 tile) and prefill off BM=8, so a coarse pin measured a
+    # different thing than the tile question -- the first BM=2 arm read -10.6 % in
+    # serving while winning +15 % in isolation, precisely because it disabled the
+    # M=1 path on the partial-acceptance steps.
+    env = os.environ.get("VLLM_GFX906_MOE_BM")
+    if env:
+        assert env in ("1", "2", "4", "8"), (
+            f"VLLM_GFX906_MOE_BM must be 1, 2, 4 or 8, got {env!r} "
+            "(unset or empty = the shipped heuristic; 32 < em <= 512 bucket only)"
+        )
+        return int(env)
+    return 4
+
+
 class Gfx906WNA16Experts(FusedMoEExpertsModular):
     """W4A16 MoE experts using the fused gfx906 HIP kernel."""
 
@@ -263,13 +293,17 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
         # BM=8 (NPT=2, 3 blocks/CU) beats BM=16 at prefill sizes: measured
         # M=512 w13 2917->2247us, M=128 1811->933us. BM=8 loses below em~1024
         # (padding waste), so the mid bucket stays at BM=4.
+        #
+        # `VLLM_GFX906_MOE_BM` pins the bucket (1/2/4/8) for an A/B: the 2026-09-16
+        # isolated sweep (benchmarks/kernels/gfx906/bench_moe_bm_sweep.py, mclk
+        # 1000 MHz gated) measured the shipped BM=4 as the *worst* of the three
+        # tiles at every production em — em=64 (B=8 greedy) 227.3 vs 193.6 us
+        # (BM=2, -14.8 %), em=128 (B=4 MTP k=3) 406.2 vs 347.6 (BM=1, -14.4 %),
+        # em=256 676.8 vs 604.6 (BM=2, -10.7 %). Isolated tile wins have failed to
+        # transfer before (S5-V2, S2 topk, gemm1 re-tiling), so the default is
+        # unchanged until a serving A/B at B=4 MTP k=3 pays for it.
+        block_size_m = _block_size_m_for(M, topk)
         em = M * topk
-        if em <= 32:
-            block_size_m = 1
-        elif em <= 512:
-            block_size_m = 4
-        else:
-            block_size_m = 8
 
         if _use_fused_align_m1(
             topk_ids, block_size_m, global_num_experts, expert_map

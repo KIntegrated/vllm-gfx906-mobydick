@@ -59,12 +59,26 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_q8_get_config
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 80,  80, 32, 256, 2,  32,  40)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 80,  80, 64, 256, 2,  32,  40)
 
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96,  2,  64, 2,  32,  48)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96,  4, 128, 2,  32,  48)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96,  8, 256, 2,  32,  48)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96, 16, 256, 2,  32,  48)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96, 32, 256, 2,  32,  48)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96, 64, 256, 2,  32,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96,  2, 256, 2, 128,  96)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96,  4, 128, 2,  64,  96)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96,  8, 256, 2,  64,  96)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96, 16, 256, 1,  64,  96)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96, 32, 256, 1,  64,  96)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96, 64, 256, 1,  64,  96)
+    // The inherited llama.cpp row here was (nbatch_fa 32, nbatch_K 48). Both
+    // sides of this Q8 kernel constrain that pair, and 48 satisfies neither
+    // contract:
+    //   * K is consumed in whole q8_0 blocks (blocks_per_K_row = nbatch_K/32),
+    //     so nbatch_K must be a multiple of 32 — 48 scored only 64 of 96 dims
+    //     (silently wrong numerics; the static_asserts now catch it);
+    //   * nbatch_V = nbatch_K*nbatch_fa/DV must divide nbatch_fa (the V tile
+    //     loader), which needs DV % nbatch_K == 0.
+    // For DV=96 the only pairs satisfying both are (nbatch_K 96, nbatch_fa any
+    // multiple of 32) and (32, nbatch_fa multiple of 96). nbatch_K=96 keeps
+    // num_K_tiles=1 (one 3-block K tile) and nbatch_V=nbatch_fa, so the
+    // nbatch_fa/nthreads/occupancy columns mirror the D=128 rows — a first cut
+    // measured the inherited nbatch_fa=32 at +6.7 % on the ViT shape and +277 %
+    // on a decode shape, i.e. the fa column had to be retuned, not just K.
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(112, 112,  2,  64, 2,  32,  56)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(112, 112,  4, 128, 2,  32,  56)
@@ -975,12 +989,19 @@ static __global__ void flash_attn_tile_q8(
 
     static_assert(ggml_cuda_fattn_tile_q8_get_config(DKQ, DV, ncols1*ncols2) != 0, "kernel config not defined");
     static_assert(DKQ % 32 == 0, "DKQ must be multiple of 32 for Q8_0 quantization");
+    // K is consumed in whole q8_0 blocks (blocks_per_K_row = nbatch_K/32): a tile
+    // size that is not a multiple of 32 silently scores fewer dims than DKQ, so
+    // the config table must not carry such a row for an instantiated dim. This
+    // caught the inherited (96,96) row (nbatch_K 48 -> only 64 of 96 dims).
 
     constexpr int ncols     = ncols1*ncols2;
     constexpr int warp_size = 32;
     constexpr int nwarps    = ggml_cuda_fattn_tile_q8_get_nthreads (DKQ, DV, ncols1*ncols2) / warp_size;
     constexpr int nbatch_fa = ggml_cuda_fattn_tile_q8_get_nbatch_fa(DKQ, DV, ncols1*ncols2);
     constexpr int nbatch_K  = ggml_cuda_fattn_tile_q8_get_nbatch_K (DKQ, DV, ncols1*ncols2);
+    static_assert(nbatch_K % 32 == 0,
+        "nbatch_K must be a multiple of 32 (K is read in whole q8_0 blocks) — "
+        "fix the config table row, not the kernel");
 
     const int col_Q_0 = blockIdx.x * ncols1;
 

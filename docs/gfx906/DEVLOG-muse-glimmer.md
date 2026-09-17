@@ -1418,3 +1418,138 @@ now moot *via Part A* — the repack (the B=1 fix candidate) is closed
 as a dead end for the flip; the flip stays closed unless a future
 mechanism (Part C or a write-path fix) targets the residual B=1 gap
 and survives the serving gate.
+
+## 2026-09-16 — MUSE-1: the V1 pin is lifted (V2 serving validated), and the spec method is the official DFlash assistant
+
+> NOTE: this log is ~3x the 20-25 KB budget (`AGENTS.md` merge-train rule 1) — it needs an
+> archive/staleness pass; the entry below is kept compact for that reason.
+
+**VERDICT:** `SHIPPED` (V2 pin lifted; V1 removal in 0.32.0 no longer blocks this model) ·
+**GATE:** serving A/B, Muse-Glimmer-30B-AWQ-INT4, TP=1 GPU0, util 0.90, maxlen 8192,
+greedy (spec off), **chat template** via `/v1/chat/completions`, identical prompts
+(`prompt_sha1` logged), 3 reps/point, arms A(V2)-B(V1)-A(V2) same boot, mclk 1000.
+
+### HYPOTHESIS
+
+Muse-Glimmer is the last model pinned to the V1 runner (`VLLM_USE_V2_MODEL_RUNNER=0`) and
+upstream removes V1 in 0.32.0. In-process V1/V2 generation was already byte-identical
+(2026-09-15), so if V2 serving is at parity the pin can go.
+
+### What was done
+
+- Server A/B with `VLLM_USE_V2_MODEL_RUNNER=1|0`, everything else identical; the client
+  is new (`docs/gfx906/_bench_chat_serve.py`) because Muse is instruction-tuned (chat
+  template required) **and** a reasoning model — under `--reasoning-parser muse_glimmer`
+  its tokens arrive in the `reasoning` delta field, so a client that counts only
+  `content` reads zero tokens (that cost one full session tonight: "no content received"
+  on every request).
+- Prompts are raw-filler bodies (8000 / 20800 chars ≈ 2k / 5-6k tokens); the corpus
+  `real`/`agent` files are token-id lists, not text, so they cannot be sent through a
+  chat template directly. Recorded as `prompt_form=chat-template + filler body`.
+
+### Evidence — FOR (V2 at parity → pin lifted)
+
+| arm | decode t/s @2k | decode t/s @8k | TTFT @2k | TTFT @8k | KV pool |
+|---|---|---|---|---|---|
+| V2 (load 1) | 27.12 / 27.07 / 27.05 | 26.65 / 26.60 | 4.773 / 4.764 / 4.766 s | 11.73 / 11.75 s | 53,235 tok |
+| V1 (the pin) | 27.66 / 27.59 / 27.58 | 26.97 / 26.95 | 4.784 / 4.756 / 4.780 s | 11.75 / 11.78 s | **67,722 tok** |
+| V2 (load 2, order control) | 27.23 / 27.18 / 27.14 | 26.80 / 26.72 / 26.68 | 4.778 / 4.771 / 4.780 s | 11.72 / 11.77 s | — |
+
+- **TTFT is at parity** (4.773 vs 4.773 s @2k; V2 is 0.3 % faster @8k) and the order
+  control reproduces V2 within 0.4 %, so V2 is the runner to ship.
+- **Decode is −1.8 % @2k and −1.0 % @8k** on V1. That is above this config's
+  process-to-process drift (V2-1 vs V2-2 agree to 0.4 %), so it is real — accepted
+  anyway because 0.32.0 removes V1 (keeping V1 would mean carrying it in the fork), and
+  the numbers are recorded so the cost is visible.
+- **The KV pool is 21 % smaller under V2** (53,235 vs 67,722 tokens at util 0.90,
+  maxlen 8192) — irrelevant at 8k (6.5× concurrency) but it would matter at longer
+  maxlen; recorded, not chased.
+- Both runners get `Using CUSTOM (gfx906 FA) backend for ViT attention`, i.e. VIT-1
+  covers the Muse vision tower on V2 as well.
+- These are the **first real-payload (non-ngram-filler) serving numbers** for this
+  model: ~27 t/s decode at 2k-8k greedy, TTFT 4.8 s @2k / 11.7 s @8k on one MI50.
+
+### Spec-decode decision (MUSE-1's other half)
+
+- **MTP does not exist for this checkpoint**: `cyankiwi/Muse-Glimmer-30B-AWQ-INT4` has no
+  MTP head (2654 tensors, no `mtp`/`nextn`/`draft` names; no such config keys). The
+  ROADMAP's "use MTP instead of ngram" is not available here.
+- **ngram is deprecated repo-wide** (filler-corpus acceptance ceilings).
+- **The official drafter exists and our tree already supports it**:
+  `meta-models/Muse-Glimmer-30B-assistant` (`architectures: [MuseGlimmerAssistantModel]`)
+  is mapped by `vllm/config/speculative.py` to **method `dflash`** by architecture name,
+  and `registry.py` routes `MuseGlimmerAssistantModel` → `DFlashQwen3ForCausalLM`. Its
+  config: 5 layers, hidden 6656, 32/8 GQA, head_dim 128, all-sliding 2048, block_size 16,
+  `target_layer_ids [1,13,25,37,49]`, bf16, 5.1 GB. Since `dflash` drafts are V2-only,
+  this is only reachable *because* the pin is lifted — the two halves of MUSE-1 resolve
+  together. First arm (k=7) launched tonight as MUSE-2; the DFlash2 precedent (a trained
+  drafter for this family measuring degenerate) makes the acceptance check the gate, not
+  the port.
+- A DSpark drafter also exists (`DaoCloud/Muse-Glimmer-30B-DSpark`) but is a *port*: the
+  registry maps `DSparkDraftModel` to the DeepSeek-V4 class (`dspark_target_layer_ids`,
+  `dspark_markov_rank`, MLA-shaped), while the Muse drafter is qwen3-layer shaped. Left
+  queued; the assistant above is the cheaper path.
+
+### Interactions
+
+- Supersedes the ROADMAP's "MUSE-1 = MTP" framing and the model table's ngram recipe.
+- The reasoning-delta client fix is a general lesson for Muse/Gemma-4-class models (a
+  `reasoning` parser changes the stream field, and "no content" is a client bug, not a
+  server failure).
+
+## 2026-09-16 (later) — MUSE-2: the official DFlash assistant drafts usefully; non-causal attention is the blocker to graphs
+
+**VERDICT:** `OPEN — drafter validated, graph capture blocked by FA-NONCAUSAL` (the assistant
+is worth keeping and the enabler is now a named item) · **GATE:** per-position acceptance +
+decode t/s, Muse-Glimmer-30B-AWQ-INT4 + `meta-models/Muse-Glimmer-30B-assistant`,
+**TP=2**, k=7, `--enforce-eager` (forced by the blocker below), chat-templated prompt,
+3 reps × 128 tokens.
+
+### What was done
+
+- Checkpoint: `meta-models/Muse-Glimmer-30B-assistant` (5.1 GB, bf16;
+  `MuseGlimmerAssistantModel`, 5 layers, hidden 6656, 32/8 GQA, head_dim 128,
+  all-sliding 2048, block_size 16, `target_layer_ids [1,13,25,37,49]`). Our tree maps the
+  architecture to **method `dflash`** by name (`vllm/config/speculative.py`) and routes it
+  to `DFlashQwen3ForCausalLM` (`registry.py`) — no port needed.
+- Serve: `--speculative-config {"method":"dflash","model":"<assistant>","num_speculative_tokens":7}`,
+  TP=2, maxlen 8192, max-num-seqs 2, `--kv-cache-memory-bytes 2 GiB`.
+- Two launch failures first, both mine, both cheap: TP=1 OOM (24 GB target + 5.1 GB bf16
+  drafter > 32 GB card) and TP=2 with `HIP_VISIBLE_DEVICES=0` (rank 1 out of bounds).
+
+### Evidence — the drafter works
+
+| metric | value |
+|---|---|
+| steps / draft tokens / accepted | 128 / 896 / 253 |
+| **mean acceptance length** (server metric) | **2.95** |
+| accepted per draft token | 0.282 → **2.98 tokens/step** |
+| per-position acceptance | **pos0 0.844**, pos1 0.508, pos2 0.305, pos3 0.180, pos4 0.117, pos5 0.023, pos6 0.000 |
+| decode t/s (3 reps) | 30.46 / 30.43 / 31.17 |
+| TTFT (3 reps) | 3.873 / 3.883 / 3.889 s |
+
+For reference the non-spec numbers on the same model/prompts are 27.1 t/s decode (V2, TP=1)
+and 27.6 (V1); this arm is *eager* TP=2 and still +11 % on decode, because ~3 tokens/step
+more than pays for the drafter. The position-0 rate (0.84) is the metric that separated a
+healthy drafter from the degenerate DFlash2 one (0.04) — this is a normal distribution.
+
+### Evidence — the blocker (why graphs are off)
+
+- The assistant's attention is **non-causal** (`dflash_has_any_non_causal` is true for this
+  config), so the gfx906 backend selector rejects CUSTOM:
+  `attention backend ROCM_ATTN was selected … but the custom gfx906 FA is unavailable (non-causal …)`.
+- ROCM_ATTN then cannot be CUDA-graph captured on this stack:
+  `Cannot copy between CPU and CUDA tensors during CUDA graph capture` (rocm_attn →
+  chunked_prefill), which is the same wall the DFlash2 arms hit.
+- Workaround used: `--enforce-eager` (target and drafter). Eager TP=2 costs the *target* a
+  lot on ordinary decode, so the production path needs FA non-causal support.
+
+### Consequence
+
+The kernel already computes bidirectional attention (`mask=None`, `q_abs_offset=None` — VIT-1
+proved that path), so what is missing is the *decoder-shaped* non-causal case: backend
+acceptance, window symmetry (`_maybe_symmetrize_window` in the DFlash2 handover), and the
+KV-write/read contract. That is the documented **FA-NONCAUSAL** design, which was previously
+motivated only by the parked DFlash2 family — the assistant gives it a live, measured use
+case (a supported spec method for a served model, replacing deprecated ngram). Queued in the
+ROADMAP.

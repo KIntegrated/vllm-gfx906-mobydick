@@ -475,3 +475,139 @@ needs multi-hour serving infrastructure; left open on the roadmap).
 ## Search keys
 
 `HYPOTHESIS:` `VERDICT:` `C2-V` `moe-c2v` `batch decode` `TP=2`
+
+## 2026-09-16 — C2-BM≥2: the grouped/batch-decode tile had never been swept (and the shipped BM=4 is the worst of three)
+
+**VERDICT:** `OPEN` — enabler shipped, isolated result is a **10–15 % per-call regression
+from the shipped tile** at every production `em`; the default does NOT move without a
+serving A/B. · **GATE:** serving A/B at **B=4 MTP k=3 (em=128)** on the 35B MoE, ms/step
+lead, same boot, interleaved arms — *not run* (the night's load budget was consumed by the
+FA-D96 gate: wedge #96 + GPU resets (2)/(3) in 8 min = burst).
+`VLLM_GFX906_MOE_BM` (1/2/4/8) pins the tile for that A/B; unset = the historical choice.
+
+### HYPOTHESIS
+
+The C2 work closed the M=1 tiles and characterized the BM=4 grouped path as expensive
+("BM=1→BM=4 costs +161 %/step for 2× the tokens") but never *swept* it: `select_n_per_thread`
+was BM≥8 only and `case 2`/`case 4` hard-coded NPT=4. If the grouped path is tile-limited
+rather than shape-limited, then (a) the NPT axis and (b) the BM choice itself should move
+the per-call time on the production `em` values (em = M·topk: 64 at B=8 greedy, 128 at B=4
+MTP k=3, 256 at B=16/B=4·k=7).
+
+### What was done
+
+- `csrc/rocm/moe_q_gemm_gfx906.cu`: `VLLM_GFX906_MOE_NPT` now applies to **every** BM (was
+  BM≥8), and `case 2`/`case 4` honour it. Unset = the historical choices → bit-identical
+  dispatch to the pre-change build.
+- `vllm/model_executor/layers/fused_moe/experts/gfx906_w4a16_moe.py`: the heuristic moved
+  into `_block_size_m_for(M, topk)` with the new `VLLM_GFX906_MOE_BM` pin.
+- New bench `benchmarks/kernels/gfx906/bench_moe_bm_sweep.py` (production shapes E=256,
+  topk=8, w13 1024×2048, w2 2048×512; dispatcher-faithful; deciles; cross-tile output
+  check; DVFS gate).
+- Tests: `tests/kernels/moe/test_gfx906_moe_bm_select.py` (heuristic table + pin + bad-pin
+  rejection) and the MoE GEMM suite re-run — 76 passed.
+
+### Evidence — FOR (*launch-regime*, mclk 1000 MHz gated, medians of 15×10 calls)
+
+Per-call gemm1+gemm2 totals, Qwen3.5-35B-A3B shapes, GPU0 (`c2_focus.log`):
+
+| em (M) | production bucket | bm=1 | bm=2 | **bm=4 (shipped)** | best vs shipped |
+|---|---|---|---|---|---|
+| 64 (M=8, B=8 greedy) | 4 | 198.1 | **193.6** | 227.3 | **−14.8 %** (bm=2) |
+| 128 (M=16, B=4 MTP k=3) | 4 | **347.6** | 350.7 | 406.2 | **−14.4 %** (bm=1) |
+| 256 (M=32) | 4 | 722.1 | **604.6** | 676.8 | **−10.7 %** (bm=2) |
+
+- The NPT axis is a wash in this regime: with `VLLM_GFX906_MOE_NPT=2` the same grid reads
+  199.2/195.1/225.0, 350.9/389.6/432.3, 705.7/754.2/752.1 — i.e. BM=4 is still the worst
+  and the best tile per point is the same shape (bm=2 at em 64/256, bm=1 at em 128).
+- Cross-tile agreement: `rel vs bm=1` ≤ 1.2e-4 on every point (the fp16 CAS-accumulation
+  noise band — the kernels are documented as not bit-reproducible run-to-run).
+- The two independent sweep runs (initial ungated run, then the gated focus run) agree on
+  the ordering and within 4–8 % on the magnitudes.
+
+### Evidence — AGAINST (why the default does not move)
+
+- **The gate has never been run.** This is the fourth tile/dispatch change in this area
+  whose isolated win was hoped to transfer: S5-V2 gemm2 M=1 tile, S2 top-k specialization
+  and the gemm1 re-tile all inverted or vanished in the graph-serving regime (§"Transfer
+  failures"). A 10–15 % kernel-level delta is exactly the size the M=1 history says cannot
+  be assumed.
+- The 128-token `inter` tensor is produced by a *different* block count per arm (16 blocks
+  at BM=8 vs 128 at BM=1), so the arms also differ in padding waste
+  (`num_tokens_post_padded`); the bench measures the production code path but only at one
+  activation distribution.
+- No B=1 arm is affected: at em ≤ 32 the heuristic already selects BM=1, and the M=1
+  v2/NPT tiles are gated on `size_m == output_topk`, so this item is purely the B≥4
+  concurrent-decode regime.
+
+### Why the shipped bucket may be wrong
+
+BM=4 pads every expert's token block up to 4 rows and halves the block count vs BM=2; at
+em=64–256 the extra rows are padding-only work, while the CAS K-split epilogue cost is
+per-block, so fewer, fatter blocks lose on both counts. BM=8 wins only once em is large
+enough that the padding is amortized (the prefill bucket, where the original BM=8-vs-BM=16
+measurement came from).
+
+### Interactions / superseded-by
+
+- Complements, not supersedes, the M=1 work: those tiles are selected by `em ≤ 32`, this
+  item is the `32 < em ≤ 512` bucket.
+- The `VLLM_GFX906_MOE_NPT` widening is inert by default and enables the same A/B for any
+  future BM question.
+
+### Refrigerated residue
+
+- **Queued serving gate (fresh boot, 1 pair of arms):** 35B MoE, `--max-num-seqs 4` +
+  `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`, agentic corpus,
+  `VLLM_GFX906_MOE_BM=2` vs unset (and `=1` at the 35B's em=128), ms/step lead + acceptance
+  + t/s, interleaved. If a tile wins ≥0.5 % with the fingerprint intact, change
+  `_block_size_m_for`'s middle bucket and keep the env as the rollback.
+- `BM=2` is instantiated but the heuristic can never select it today (`case 2` existed
+  unused) — the sweep is the first data on that template in the batch regime.
+- Bench-methodology note for the next reader: `rocm-smi` was unusable after the night's GPU
+  resets (python init MemoryError) and silently produced "mclk 0 MHz" windows; the sampler
+  now reads `/sys/class/drm/card*/device/pp_dpm_mclk` first (the DPM table marks the active
+  level with `*`) and takes the max across cards, because GPU0 is `card1` on this box.
+
+## 2026-09-16 (later) — C2-BM>=2 serving gate: NEUTRAL, and the low bucket is the real win
+
+**VERDICT:** `NEUTRAL` (item closed as an active fusion/tile item) · **GATE:** in-process
+graph serving A/B (`docs/gfx906/_bench_gfx906.py`), Qwen3.5-35B-A3B-AWQ, TP=1, util 0.95,
+**MTP k=3, B=4 concurrent** (em=128 -> the mid bucket), pp2048/tg192, 3 samples/arm,
+mclk 1000 MHz on every window, arms back-to-back in the order A,B,C,D.
+
+The isolated 10–15 % per-call win from the sweep above **does not transfer**: all three
+mid-bucket tiles are within 0.5 % in serving.
+
+| arm | mid-bucket BM | t/s (3 samples) | mean |
+|---|---|---|---|
+| A1 unset (shipped) | 4 | 85.741 / 85.188 / 85.547 | **85.49** |
+| B `MOE_BM=2` | 2 | 85.803 / 85.724 / 85.598 | **85.71** |
+| C `MOE_BM=1` | 1 | 85.354 / 85.215 / 85.235 | **85.27** |
+| D unset (order control) | 4 | 85.752 / 85.697 / 85.606 | **85.69** |
+
+- A vs D (order control) = **+0.2 %** — the shipped arm reproduces, so the ~0.5 % spread
+  between B/C is the noise floor, not a signal.
+- No dispatch change ships: `_block_size_m_for`'s mid bucket stays 4, and
+  `VLLM_GFX906_MOE_BM` stays as the A/B/rollback knob (mid bucket only).
+
+**The finding that did transfer — the *low* bucket.** The first BM=2 arm pinned **every**
+em value and read **76.6 / 76.5 / 76.4 t/s = −10.6 %** vs the shipped 85.6. That arm is
+invalid for the mid-bucket question (it also moved `em <= 32` off BM=1 and prefill off
+BM=8), but it is a clean measurement of something else: at B=4 MTP k=3 a large share of
+steps are partial-acceptance steps with `em = 4·k_accept·topk <= 32`, and those run the
+**M=1 tile + the fused-align/v2-gemm2 M=1 path** — moving them to BM=2 costs ~10 %. So
+the heuristic's BM=1 bucket is load-bearing in exactly the way the C2 M=1 work claimed.
+This is why the knob is now **mid-bucket-scoped** (`_block_size_m_for`): a coarse pin
+silently measures a different experiment.
+
+**Why the isolated win vanished (mechanism).** The isolated bench timed the grouped GEMM
+alone; in the step the same kernel is one of several (FA verify, GDN, routing, drafter,
+shared expert) and the mid-bucket tile swap only re-schedules the same total work
+(BM=4 pads more per expert but launches half the blocks) — with the step's other
+components unchanged, a ±15 % kernel delta that is really a *schedule* delta washes out.
+This is the fourth confirmation of the repo's transfer rule and the first on this axis.
+
+**Post-state:** `VLLM_GFX906_MOE_NPT` (all-BM) + `VLLM_GFX906_MOE_BM` (mid bucket) +
+`bench_moe_bm_sweep.py` + `test_gfx906_moe_bm_select.py` remain as the reusable
+instrumentation for any future BM question.

@@ -602,13 +602,22 @@ void launch_moe_gemm_q4_v2(
 // 2 columns/thread: ~half the accumulator/dequant register pressure,
 // doubling occupancy at BM=16 (4 -> 8 waves/CU) for a small but consistent
 // prefill speedup. VLLM_GFX906_MOE_NPT=4|2 overrides for tuning.
+//
+// The override now applies to every BM (it was BM>=8 only), because the
+// grouped/batch-decode regime (BM=4 is what em in (32, 512] selects, i.e. B=4
+// under MTP k=3) had never been swept on the NPT axis — see the C2-BM>=2 note
+// in docs/gfx906/DEVLOG-moe-c2v.md. Unset = the historical defaults, so an
+// unset env is bit-identical to the pre-change kernel choice.
 static int select_n_per_thread(int block_size_m) {
-  if (block_size_m < 8) return 4;
   static int cached = [] {
     const char* e = getenv("VLLM_GFX906_MOE_NPT");
-    return (e && e[0] == '4') ? 4 : 2;
+    if (e == nullptr) return 0;
+    if (e[0] == '2') return 2;
+    if (e[0] == '4') return 4;
+    return 0;
   }();
-  return cached;
+  if (cached != 0) return cached;
+  return block_size_m < 8 ? 4 : 2;
 }
 
 #define LAUNCH_MOE(BM, NPT)                                                \
@@ -739,10 +748,18 @@ void dispatch_moe_gemm_q4(
       }
       break;
     case 2:
-      LAUNCH_MOE(2, 4);
+      if (npt == 2) {
+        LAUNCH_MOE(2, 2);
+      } else {
+        LAUNCH_MOE(2, 4);
+      }
       break;
     case 4:
-      LAUNCH_MOE(4, 4);
+      if (npt == 2) {
+        LAUNCH_MOE(4, 2);
+      } else {
+        LAUNCH_MOE(4, 4);
+      }
       break;
     case 8:
       if (npt == 2) {

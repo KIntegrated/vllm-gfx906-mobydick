@@ -12,8 +12,13 @@ tiers are do-order, sections within a tier are ordered the same way.
 
 ## High priority — user-requested (2026-09-12)
 
-### DFL2-1 — DFlash2 n-gram chains: drafter-free verify blocks while a request copies its context (**HIGH PRIORITY**, Kevin 2026-09-12)
+### DFL2-1 — DFlash2 n-gram chains: drafter-free verify blocks while a request copies its context (**PARKED — do not start**, Kevin 2026-09-12)
 
+> **PARKED FINALLY 2026-09-16 (external result):** upstream vLLM 0.29 is degenerate on the
+> card's own matched pair, and so is our bf16+bf16 control — see `HANDOVER-dflash2.md` §8/§9
+> (`DEVLOG-dflash2.md`, "external, decisive"). No downstream patch can close that, so the whole
+> DFL2-* family is off the queue; the text below is kept as the mechanism record.
+>
 > **Work branch: `gfx906/dflash2`** (cut from `main` 2026-09-15). The DFlash2 bring-up records
 > already on `main` — the `triton_matmul` 3-D / `[K, N]` fix, `DEVLOG-dflash2.md` and the DFL2-*
 > items — are shared; the DFlash2 feature work (DFL2-3 lookup-drafting → DFL2-1 chains, DFL2-7
@@ -167,8 +172,13 @@ supporting detail that separates a cost effect from a depth effect.
 
 ### DFL2-2 — V2 runner up to speed on gfx906 (**V1 removal lands in 0.32.0**) (**HIGH PRIORITY**, Kevin 2026-09-12)
 
-**STATUS 2026-09-15 — the bring-up is DONE for every model whose gate exists; one
-pin left.** V2 is validated and default for the dense 27B, MoE 35B, Nemotron 3.5
+**STATUS 2026-09-16 — DONE; the last V1 pin is lifted and `DFL2-2` is closed as an active
+item.** Muse-Glimmer's V1/V2 serving A/B passed (TTFT parity, decode −1.8 % @2k / −1.0 % @8k,
+KV pool 53 k vs 68 k tokens; accepted because 0.32.0 removes V1) — no model here needs
+`VLLM_USE_V2_MODEL_RUNNER=0` any more. See `DEVLOG-muse-glimmer.md` (MUSE-1).
+
+**STATUS 2026-09-15 — the bring-up was DONE for every model whose gate existed; one
+pin was left.** V2 is validated and default for the dense 27B, MoE 35B, Nemotron 3.5
 Lightning, Ornith, **and Gemma-4** (gated today through its chat template — see
 GEMMA4-1); evidence and numbers in [`V2-bringup.md`](V2-bringup.md) (PPL bit-identity,
 in-process bench parity, agentic ms/step parity, MoE +0.9 %). **Muse-Glimmer is the only
@@ -258,7 +268,11 @@ appear); **risk:** low-medium (probe first, one load, no new code).
 
 **Status: open — and it is the *prerequisite* for DFL2-1** (verified 2026-09-15: the chain
 patch imports `dflash2.lookup` and refuses to enable itself without `VLLM_DFLASH2_LOOKUP=1`,
-while our tree has no `lookup.py`). Touches the model too (`qwen3_dflash2.py`), and is written
+while our tree has no `lookup.py`). **DO NOT START — the family is parked (2026-09-16):**
+the external 0.29 nightlies are degenerate on the card's own matched pair, and our own bf16+bf16
+run is too (`HANDOVER-dflash2.md` §8/§9: 0.0408 / 0.0079 per-draft acceptance, all four
+suspects excluded). Kept for the mechanism description only; the port itself is off the queue
+until a non-degenerate drafter appears for this family. Touches the model too (`qwen3_dflash2.py`), and is written
 against a speculator that upstream has since refactored (~480 lines there vs 217 here), so it is
 an adaptation port. This is the mechanism Kevin remembered as "CAT-1 for DFlash": instead of a drafter forward, blocks are proposed from the
 **request's own context** (`dflash2/lookup.py` picks the block length from emitted/rejected
@@ -470,7 +484,9 @@ text fallbacks are `attention sinks not supported` (72 synthetic rows), `head_si
 of them models we run under llama-server rather than vLLM. Next: (1) the **guard** — DONE (2026-09-16: `_guard_gfx906_fa_fallback` + `VLLM_GFX906_FA_STRICT`,
 loud once-per-engine warning, FA suite 97 passed); (2) mirror the ViT's `_pad_head_dim` in the text path to delete
 the `head_size` class (a padded text layout is ours to declare in `get_kv_cache_shape`); (3) sinks
-only if a sink model is actually wanted; (4) non-causal only if DFlash2 is revived for performance.
+only if a sink model is actually wanted; (4) non-causal — **now a live item, not a
+conditional: see FA-NONCAUSAL below** (the Muse-Glimmer DFlash assistant is a working
+non-causal drafter, MUSE-2).
 
 **Status: open (2026-09-15).** The same mechanism silently puts models on Triton-based attention
 instead of the MI50-tuned FA. Two instances found so far: **Gemma-4 → TRITON_ATTN** (noticed during
@@ -481,6 +497,47 @@ genuine kernel limitation or a declaration/dispatch gap that our FA already cove
 surface: head sizes {64,128,256}, sliding window, bidirectional, DECODER, MM-encoder/ViT) and close
 the reachable ones. Any model that silently runs Triton attention is a candidate for a VIT-1-style
 wiring win, and this is the cheapest way to find them.
+
+### FA-NONCAUSAL — serve decoder-shaped non-causal attention from the custom FA (unlocks spec drafters)
+
+**Status: OPEN, promoted 2026-09-16 (was "only if DFlash2 is revived").** Its live use case is
+**MUSE-2**: the official Muse-Glimmer DFlash assistant is a *healthy* non-causal drafter
+(mean acceptance 2.95, pos0 0.844) but the gfx906 selector rejects CUSTOM for its attention
+class, so it runs ROCM_ATTN, which cannot be CUDA-graph captured → the arm needed
+`--enforce-eager` (and still measured +11 % decode vs non-spec, eager).
+
+What is already there: the kernel computes full bidirectional attention when it gets
+`mask=None` and `q_abs_offset=None` (VIT-1 proved that path end to end for the ViT), so the
+missing part is the *decoder-shaped* non-causal case, not the arithmetic. Work items:
+(1) teach the backend/selector to accept `AttentionType.DECODER` + non-causal (today it emits
+`non-causal attention not supported`); (2) decide the mask contract for a
+windowed-bidirectional drafter (the DFlash2 handover has `_maybe_symmetrize_window`: no causal
+clip, symmetric ±window — get this from the model's own reference, not by guessing);
+(3) KV write/read for that layout, including the Q8 side-buffer path; (4) gate: the assistant
+arm with graphs enabled vs the eager numbers above (acceptance must stay 2.95, decode must
+beat eager), plus the FA suite and the ViT/text regressions. Effort: medium-high (backend +
+one kernel contract), risk: medium (a wrong mask is silent quality loss — the acceptance
+histogram is the guard).
+
+**Recon (2026-09-16, the edit list).** The plumbing is small and mirrors what TRITON_ATTN /
+ROCM_ATTN already do:
+- `vllm/v1/attention/backend.py:349` rejects a backend whose `supports_non_causal()` is False
+  when the request sets `use_non_causal` (`dflash/speculator.py:110` sets it from
+  `dflash_has_any_non_causal`), which is the string the log prints. Both triton_attn.py:350
+  and rocm_attn.py:210 simply return True, and their kernels read
+  `common_attn_metadata.causal` (bool or tensor) to pick the mask
+  (`triton_attn.py:266/834`). So: add `supports_non_causal() -> True` to
+  `Gfx906FABackend`, then honour `causal=False` in the impl/metadata builder.
+- Kernel contract already exists for the *no-window* case: `mask=None, q_abs_offset=None,
+  window=0` = full bidirectional (VIT-1's path). The only genuinely new piece is the
+  **symmetric sliding window** — today `window>0` implies the causal formula
+  (`k_pos < q_abs - window + 1` masked), which is wrong for a ±window drafter. Choose
+  between (a) first cut `window=0` (full bidirectional; cheap, but attends outside the
+  training window) and (b) a small kernel arg for the pre-window (`window_pre`) with tests —
+  measure acceptance both ways, since the drafter's own reference is the arbiter.
+- KV path: the drafter's block writes go through the same slot/block-table machinery, and the
+  Q8 side-buffer write is per-token and order-independent, so no layout change is expected —
+  but verify with the assistant arm plus a prefix/COW case.
 
 ### FD-1 — CLOSED: the MTP fused-draft path was measured (NEUTRAL, stack-confounded) and its only reader is gone
 
@@ -1695,8 +1752,20 @@ retained (`MOE_M1=0`, `MOE_NPT=4`). The tested batch arm was neutral
 because it takes the unretiled BM≥2 grouped path; that path is still
 unmeasured, not rejected. Remaining:
 
-- measure and, if useful, re-tile the BM≥2 grouped path for concurrent
-  decode (the only open axis — needs a multi-hour serving A/B session);
+- **BM≥2 grouped path — CLOSED NEUTRAL (serving gate run 2026-09-16).** The isolated
+  sweep (mclk-gated, production 35B shapes) said the shipped BM=4 mid bucket was the
+  worst of three tiles (em=64 227.3 → 193.6 us at BM=2, −14.8 %; em=128 406.2 → 347.6 at
+  BM=1, −14.4 %). The **serving** gate (in-process graph harness, 35B MoE, TP=1,
+  MTP k=3, B=4 concurrent, em=128, mclk 1000, 3 samples/arm, order A,B,C,D) says all
+  three tiles are within 0.5 %: unset (BM=4) 85.49, BM=2 85.71, BM=1 85.27, unset-repeat
+  85.69 → **no dispatch change**, fourth confirmation of the transfer rule.
+  The one transferable finding came from the *invalid* coarse pin (all em → BM=2):
+  **−10.6 %** (76.6 vs 85.6 t/s), i.e. the `em ≤ 32` bucket — the M=1 tile + fused
+  align/v2-gemm2 path — is load-bearing at B=4 MTP k=3 (partial-acceptance steps),
+  which is why the knob is now mid-bucket-scoped. Instrumentation that stays:
+  `bench_moe_bm_sweep.py`, `VLLM_GFX906_MOE_BM` (mid bucket), `VLLM_GFX906_MOE_NPT`
+  (all BM), `test_gfx906_moe_bm_select.py`. Detail: `DEVLOG-moe-c2v.md` (2026-09-16
+  entries).
 - ~~build the V1 N-split/direct-store variant (128/256/512 blocks)~~
   **CLOSED 2026-08-31**: all five V1 variants correct; every new N-split
   point is SLOWER than the existing best V1 point (v1b, 64 blocks @ 59.0 µs),
@@ -1808,7 +1877,33 @@ plumbing. Gate: the INT8 model serves and passes PPL; then DFL2-1's INT8 pairing
 
 ### VIT-2 — head_dim-96 instantiation for the ViT (cut the 72 → 128 padding waste)
 
-**Status: open, queued follow-up to VIT-1 (2026-09-15).** The ViT's real head dim
+**Status: DONE — DEFAULT ON (2026-09-16; see [`DEVLOG-fa-d96.md`](DEVLOG-fa-d96.md)).**
+The launcher instantiates 96 (`gfx906_fa_launch_impl<96>` + the paged twin), the Python
+side serves it, and the pad map is now `(64, 96, 128, 256)`: an exact 96 runs natively
+and 72/80 pad onto 96. `GFX906_FA_PAD96=0` restores `(64, 128, 256)` — the pre-FA-D96
+behaviour, and the rollback.
+
+**Gates (two same-boot A-B-A runs, mclk 1000):** image-prompt TTFT on the dense 27B VL,
+1024×1024 fresh image per rep, 6 reps/arm — pad128 **5.151** / pad96 **5.080** / pad128
+**5.155** s = **−1.46 %**, order control +0.08 %, distributions disjoint. Phi-3-mini
+(head_dim 96, pp2048/tg256, 4 samples) — 36.164 / **36.379** / 36.092 t/s = **+0.69 %**,
+order control −0.2 %. Both are far below the −5 % this item estimated: the ViT attention
+is ~19 % of TTFT and the kernel removes ~12 % of that call, so the ceiling was ~−2.3 %.
+The class also gains a 25 % narrower KV row.
+
+**Two findings that changed the item:** (a) the inherited `(96,96)` tile-config row was
+**wrong for this Q8 kernel** (`nbatch_K=48` is not a multiple of 32, so only 64 of 96
+dims were scored — rel err 0.24 vs the fp32 ref); it is now `nbatch_K=96` with
+`nbatch_fa` retuned to the D=128 pattern, and both kernel copies carry
+`static_assert(nbatch_K % 32 == 0)`. (b) The cost model over-predicted the transfer, as
+above.
+
+**Residue:** the `nbatch_fa` column for the 96 rows (set by analogy with D=128) has only
+been exercised at the ncols values the ViT and Phi-3 shapes select; a full sweep at
+ncols 2/4/8 is open. D=80/112 cannot be instantiated at all (no common solution to
+`nbatch_K % 32 == 0` and `DV % nbatch_K == 0`).
+
+**Original item (kept):** open, queued follow-up to VIT-1 (2026-09-15). The ViT's real head dim
 is 72 and the launcher dispatches only {64,128,256}, so it is padded to 128 and the
 kernel does 128/72 = 1.78× the arithmetic the model needs. Measured basis
 (`bench_vit_dscale.py`, launch-regime, H=16 S=2304, mclk 800 MHz, DEVLOG-vit1.md):
@@ -1971,7 +2066,36 @@ per-model split.
 exercises `BENCH_CHAT_TEMPLATE=1` end-to-end is in flight), and the same templated gate
 for Muse-Glimmer (MUSE-1).
 
-### MUSE-1 —### MUSE-1 — Muse-Glimmer: V2 parity looks good, but the PPL probe is not its gate
+### MUSE-1 — Muse-Glimmer: V2 pin LIFTED (2026-09-16); spec method = the official DFlash assistant
+
+**Status: RESOLVED (2026-09-16, `DEVLOG-muse-glimmer.md`).** The PPL probe was never its gate
+(VLM + chat template); the gate was a serving A/B, now run: Muse-Glimmer-30B-AWQ-INT4, TP=1,
+util 0.90, maxlen 8192, greedy, chat template, identical prompts, 3 reps/point, A-B-A same
+boot, mclk 1000. **V2 TTFT at parity** (4.773 vs 4.773 s @2k; −0.3 % @8k) with **decode
+−1.8 % @2k / −1.0 % @8k** vs V1 (order control 0.4 %), and a **21 % smaller KV pool**
+(53,235 vs 67,722 tokens). The pin is lifted because upstream removes V1 in 0.32.0; the
+decode cost is recorded rather than hidden. First real-payload numbers for this model:
+**27.1 t/s decode @2k / 26.7 @8k, TTFT 4.77 / 11.74 s** (filler body, chat template, greedy).
+
+**Spec method:** MTP does not exist for this checkpoint (no MTP tensors/keys), ngram is
+deprecated, and DSpark would be a port (its drafter arch maps to the DeepSeek-V4 class). The
+answer is the **official `meta-models/Muse-Glimmer-30B-assistant`**, which our tree already
+supports as method `dflash` — validated tonight as **MUSE-2**.
+
+### MUSE-2 — Muse-Glimmer + the official DFlash assistant (drafter validated, graphs blocked)
+
+**Status: OPEN — drafter healthy, FA non-causal is the enabler (2026-09-16).** TP=2, k=7,
+`--enforce-eager`, chat-templated prompt, 3×128 tokens: **mean acceptance length 2.95**
+(2.98 tokens/step), per-position **0.844 / 0.508 / 0.305 / 0.180 / 0.117 / 0.023 / 0.000**,
+decode **30.5 t/s** — i.e. +11 % over non-spec *while eager*. The blocker is that the
+assistant attends **non-causally**, our CUSTOM FA rejects that class, and the ROCM_ATTN
+fallback cannot be CUDA-graph captured (`Cannot copy between CPU and CUDA tensors during CUDA
+graph capture`). So the production path needs **FA-NONCAUSAL** (see that item — this is now
+its live use case: a supported spec method for a served model, replacing deprecated ngram).
+Cheap follow-ups: k sweep (the histogram is still productive at pos3-4, so k>7 may pay),
+k=7 with graphs once FA-NONCAUSAL lands, and B=4.
+
+### MUSE-1 (original entry) — Muse-Glimmer: V2 parity looks good, but the PPL probe is not its gate
 
 **Status: open (2026-09-15) — checkpoint obtained, gate run, verdict: V1/V2 parity holds
 at the token that matters; the RBLOCK workaround is obsolete.** The 24 GB AWQ

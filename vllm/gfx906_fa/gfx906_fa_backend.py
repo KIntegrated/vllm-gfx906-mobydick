@@ -83,14 +83,18 @@ class Gfx906FAMetadata:
 
 
 # Kernel head dims the launcher instantiates (see csrc/gfx906_fa/gfx906_fa_launcher.cu).
-_INSTANTIATED_HEAD_DIMS = (64, 128, 256)
+# 96 was added 2026-09-16 (FA-D96) for the ViT's 72 and the head_dim-96 text class; the
+# pad MAP stays on _FALLBACK_HEAD_DIMS until that item's real-model gates pass (see
+# _pad96_enabled), so this set is the kernel whitelist, not the default pad map.
+_INSTANTIATED_HEAD_DIMS = (64, 96, 128, 256)
+_FALLBACK_HEAD_DIMS = (64, 128, 256)
 
 
 _DEBUG_SHAPES = [0]  # GFX906_FA_DEBUG_SHAPES prints the first few calls
 
 
 def _pad_head_dim(head_size: int) -> int | None:
-    """Smallest instantiated kernel head dim that fits (None if none does).
+    """Smallest servable kernel head dim that fits (None if none does).
 
     Mirrors the ViT path (`gfx906_fa_mm_encoder.py`), which serves every head dim up to
     256 by zero-padding to the next instantiated dim. Padding is exact here: padded Q
@@ -99,29 +103,59 @@ def _pad_head_dim(head_size: int) -> int | None:
     The cost is real (QK/PV work grows) but it replaces a fallback to ROCM_ATTN or
     TRITON_ATTN, which loses the tuned kernel entirely.
 
-    NOT WIRED YET (FA-COVER-1 step 2): a padded dim needs the KV-cache layout to carry
-    it (`get_kv_cache_shape`) plus padding and slicing in the write and read paths, so
-    `supports_head_size` stays restrictive until that lands.
-    See docs/gfx906/DEVLOG-fa-coverage.md.
+    96 is in the pad map since the FA-D96 gate (2026-09-16, default on): an exact 96 is
+    served natively and 72/80 pad onto 96 instead of 128. ``GFX906_FA_PAD96=0`` restores
+    the (64, 128, 256) map. See docs/gfx906/DEVLOG-fa-d96.md.
     """
-    for head_dim in _INSTANTIATED_HEAD_DIMS:
+    dims = _INSTANTIATED_HEAD_DIMS if _pad96_enabled() else _FALLBACK_HEAD_DIMS
+    for head_dim in dims:
         if head_size <= head_dim:
             return head_dim
     return None
 
 
+def _pad96_enabled() -> bool:
+    """Whether the 96-wide kernel is used by the pad map (default ON since 2026-09-16).
+
+    Gated on two A-B-A serving runs, both same-boot and mclk-1000:
+
+    * **ViT (72 -> 96)**: image-prompt TTFT, dense 27B VL, 1024x1024 fresh image per
+      rep, encoder-cache control — pad128 **5.151** / pad96 **5.080** / pad128
+      **5.155** s (6 reps/arm; order control +0.08 %), i.e. **-1.46 %**. The 6-rep
+      distributions do not overlap (pad96 max 5.133 < pad128 min 5.127).
+    * **head_dim-96 text (Phi-3-mini, native 96)**: pp2048/tg256, 4 samples —
+      pad128 **36.164** / native96 **36.379** / pad128 **36.092** t/s, i.e. **+0.69 %**
+      (order control -0.2 %).
+
+    Both are far smaller than the -5 % the item estimated (the ViT attention is ~19 %
+    of TTFT and the kernel only removes ~12 % of that call), but they are consistent
+    and the class also gains a 25 % narrower KV row. Kernel outputs are bit-identical
+    between arms (the removed dims are the all-zero q8_0 block) and the FA suite plus
+    a dedicated D=96 test pin correctness on both entry points.
+    ``GFX906_FA_PAD96=0`` is the rollback to the (64, 128, 256) map.
+    """
+    return _os.environ.get("GFX906_FA_PAD96", "1") == "1"
+
+
 def _padded_head_size(head_size: int) -> int | None:
     """``head_size`` as a servable dim, or None when it cannot be served.
 
-    Default ON since the Phi-3-mini gate (2026-09-16, FA-COVER-1 step 2): head_dim 96 went from a
-    silent fallback to CUSTOM at 36.41 t/s vs 28.62 (+27 %), with identical top-5 tokens and PPL
-    within 0.11 % of the fallback arm (0 top-20 misses in both). The cost is KV bytes: the row
-    grows by the pad ratio (96 -> 128 is +33 % of K and V, 72 -> 128 is +78 %), and
-    ``GFX906_FA_PAD=0`` restores the old behaviour (instantiated dims only). Instantiated dims are
-    returned unchanged either way.
+    Default ON since the Phi-3-mini gate (2026-09-16, FA-COVER-1 step 2): head_dim 96 went
+    from a silent fallback to CUSTOM at 36.41 t/s vs 28.62 (+27 %), with identical top-5
+    tokens and PPL within 0.11 % of the fallback arm (0 top-20 misses in both). The cost is
+    KV bytes: the row grows by the pad ratio, and ``GFX906_FA_PAD=0`` restores the old
+    behaviour (instantiated dims only). Instantiated dims are returned unchanged either way.
+
+    FA-D96 (2026-09-16) added 96 to the map (`_pad96_enabled`, default on): 96 is served
+    natively, 72/80 pad onto 96. ``GFX906_FA_PAD96=0`` restores (64, 128, 256), which is
+    what the pre-FA-D96 builds did.
     """
     if _os.environ.get("GFX906_FA_PAD", "1") != "1":
-        return head_size if head_size in _INSTANTIATED_HEAD_DIMS else None
+        # No padding: only dims in the *active* map are servable. With the FA-D96 opt-in
+        # off that excludes 96 — the pre-FA-D96 semantics of this switch (Phi-3 falls
+        # back rather than being served by a dim the map does not carry).
+        dims = _INSTANTIATED_HEAD_DIMS if _pad96_enabled() else _FALLBACK_HEAD_DIMS
+        return head_size if head_size in dims else None
     return _pad_head_dim(head_size)
 
 
@@ -302,14 +336,13 @@ class Gfx906FABackend(AttentionBackend):
     def customize_spec(cls, spec):
         """Widen the KV spec's head dims to the padded one when padding is opted in.
 
-        NOTE: both halves are set to the same padded width, which is what the impl's split and
-        its zero-padding assume; a model with genuinely asymmetric K/V head dims would need
-        per-half padding here and in the impl.
+        NOTE: both halves are set to the same padded width, which is what the impl's split
+        and its zero-padding assume; a model with genuinely asymmetric K/V head dims would
+        need per-half padding here and in the impl.
 
-
-        vLLM sizes the KV cache from this spec while the kernels are dispatched on the padded
-        dim, so the two must agree. With the real dim in the spec the layer allocates a
-        2*real-byte fused row, and splitting that at the padded dim leaves a remainder
+        vLLM sizes the KV cache from this spec while the kernels are dispatched on the
+        padded dim, so the two must agree. With the real dim in the spec the layer allocates
+        a 2*real-byte fused row, and splitting that at the padded dim leaves a remainder
         (Phi-3-mini: a 128 chunk plus a 64 remainder, which trips the Q8 row check).
         """
         if _os.environ.get("GFX906_FA_DEBUG_SHAPES"):
@@ -321,10 +354,10 @@ class Gfx906FABackend(AttentionBackend):
         padded = _padded_head_size(spec.head_size)
         if padded is None or padded == spec.head_size:
             return spec
-        # BOTH halves: the 0.29 fused row is K||V, so its width is head_size + head_size_v,
-        # and our impl splits it into two padded_head_size halves. Widening only head_size
-        # leaves a row of padded + real (Phi-3: 128 + 96 = 224), which is what the allocator
-        # then built and what the Q8 row check rejected.
+        # BOTH halves: the 0.29 fused row is K||V, so its width is head_size +
+        # head_size_v, and our impl splits it into two padded_head_size halves. Widening
+        # only head_size leaves a row of padded + real (Phi-3: 128 + 96 = 224), which is
+        # what the allocator then built and what the Q8 row check rejected.
         out = dataclasses.replace(spec, head_size=padded, head_size_v=padded)
         if _os.environ.get("GFX906_FA_DEBUG_SHAPES"):
             print(f"[gfx906_fa-spec] out: head={out.head_size}", flush=True)
@@ -378,9 +411,8 @@ class Gfx906FABackend(AttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        # Kernel validated for 64/128; 256 (Qwen3.5/3.6) added. Dims that pad onto
-        # one of those are servable too, but only when GFX906_FA_PAD opts in
-        # (default off until the write path is validated on a real model).
+        # Kernel instantiated for 64/96/128/256. Dims that pad onto one of those are
+        # servable too when GFX906_FA_PAD opts in (default ON since the Phi-3 gate).
         return _padded_head_size(head_size) is not None
 
     @classmethod

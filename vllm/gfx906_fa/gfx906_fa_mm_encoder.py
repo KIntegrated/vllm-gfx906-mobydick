@@ -28,17 +28,17 @@ A `cu_seqlens` of `B+1` entries over a `[B, S, …]` tensor (one sequence per ba
 item, optionally padded) is also handled — per-item calls when lengths differ,
 one batched call when they do not.
 
-Why head_dim is padded: the launcher dispatches on
-`head_dim in {64, 128, 256}` and requires `head_size % 32 == 0`, so 72 is
-zero-padded to **128**. The padding is exact:
+Why head_dim is padded: the launcher serves `head_dim in {64, 96, 128, 256}` and
+requires `head_size % 32 == 0`. The pad map is `{64, 96, 128, 256}` — so 72 is
+zero-padded to **96** (`GFX906_FA_PAD96=0` restores 128). The padding is exact:
 
 * padded `Q` dims contribute 0 to the QK dot,
 * padded `K` dims quantise to zero q8_0 blocks (0 contribution),
 * padded `V` dims contribute 0 to P·V,
 * the padding is in the **head** dim, so the softmax denominator is unchanged.
 
-Padding cost is real (the QK/PV work grows with the padded head dim) and is
-tracked in the VIT-1 dev log; a 96-wide instantiation is the open follow-up.
+Padding cost is real (the QK/PV work grows with the padded head dim); the 96-wide
+instantiation makes the 96..127 all-zero q8_0 block disappear (2026-09-16).
 """
 
 from __future__ import annotations
@@ -50,15 +50,27 @@ import torch
 from vllm import _gfx906_fa_C as gfx906_fa
 
 
-_INSTANTIATED_HEAD_DIMS = (64, 128, 256)
+_INSTANTIATED_HEAD_DIMS = (64, 96, 128, 256)
+_FALLBACK_HEAD_DIMS = (64, 128, 256)
 
 
 def _pad_head_dim(head_size: int) -> int | None:
-    """Smallest instantiated kernel head dim that fits (None if none does)."""
-    for hd in _INSTANTIATED_HEAD_DIMS:
+    """Smallest servable kernel head dim that fits (None if none does).
+
+    The pad map is (64, 96, 128, 256) since the FA-D96 gate (2026-09-16, default on): the
+    ViT's 72 pads onto 96 instead of 128. ``GFX906_FA_PAD96=0`` restores the
+    (64, 128, 256) map. Mirrors `gfx906_fa_backend._pad_head_dim` (the text path).
+    """
+    dims = _INSTANTIATED_HEAD_DIMS if _pad96_enabled() else _FALLBACK_HEAD_DIMS
+    for hd in dims:
         if head_size <= hd:
             return hd
     return None
+
+
+def _pad96_enabled() -> bool:
+    """96-wide pad map (see the backend's twin for the gate evidence). Default on."""
+    return os.environ.get("GFX906_FA_PAD96", "1") == "1"
 
 
 def vit_enabled() -> bool:
