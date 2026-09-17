@@ -98,29 +98,33 @@ _FALLBACK_HEAD_DIMS = (64, 128, 256)
 
 
 _DEBUG_SHAPES = [0]  # GFX906_FA_DEBUG_SHAPES prints the first few calls
-_NON_CAUSAL_WARNED = [False]
 
 
 def _batch_causal(common_attn_metadata) -> bool:
     """Per-batch causality from CommonAttentionMetadata (`causal: bool | Tensor`).
 
-    False selects the bidirectional path (spec-decode drafters with causal=False
-    layers). A tensor means per-token causality, which this kernel cannot express:
-    warn once and keep the causal behaviour rather than silently dropping the
-    clip (fail-closed; such a model works today only by accident of the tensor
-    being truthy in a boolean test).
+    False -> a fully bidirectional batch (no causal mask). This is the same contract
+    TRITON_ATTN and ROCM_ATTN honour for the bool form -- their kernels pass it straight
+    to their mask logic and clip nothing -- so serving it here is not a weaker claim than
+    the reference backends make. (The *window* differs: they symmetrize a causal sliding
+    window via `_maybe_symmetrize_window` while stage 1 of FA-NONCAUSAL drops it, i.e. a
+    superset mask; see DEVLOG-fa-noncausal.md and the acceptance guard noted there.)
+
+    Tensor -> per-token causality, which this kernel cannot express. Warn once and keep
+    the causal behaviour: that is exactly what such a batch got before this feature
+    existed (the impl never read causality), so it preserves the status quo instead of
+    making a silent new claim.
     """
     causal = getattr(common_attn_metadata, "causal", True)
     if isinstance(causal, torch.Tensor):
-        if not _NON_CAUSAL_WARNED[0]:
-            _NON_CAUSAL_WARNED[0] = True
-            logger.warning_once(
-                "GFX906_FA: per-token (tensor) causality is not supported by the "
-                "custom FA kernel; serving this batch as causal. Use another "
-                "attention backend if the model needs per-token masks."
-            )
+        logger.warning_once(
+            "GFX906_FA: per-token (tensor) causality is not supported by the "
+            "custom FA kernel; serving this batch as causal - the same behaviour "
+            "as before FA-NONCAUSAL. Use TRITON_ATTN if the model needs per-token "
+            "masks."
+        )
         return True
-    return bool(causal)
+    return causal is not False
 
 
 def _pad_head_dim(head_size: int) -> int | None:
@@ -448,7 +452,7 @@ class Gfx906FABackend(AttentionBackend):
 
     @classmethod
     def supports_non_causal(cls) -> bool:
-        """Bidirectional batches (spec-decode drafters) are served since 2026-09-17.
+        """Bidirectional batches (`causal=False`) are served since 2026-09-17.
 
         The kernel's causal clip is gated on `q_abs_offset` and its sliding-window
         mask/clips on `window`; the impl suppresses both for a non-causal batch, which
@@ -457,6 +461,11 @@ class Gfx906FABackend(AttentionBackend):
         so a windowed drafter gets the *superset* mask (keys beyond its trained window
         stay visible) -- see DEVLOG-fa-noncausal.md; the drafter's per-position
         acceptance is the guard for that approximation.
+
+        The claim is the same one the reference backends make for this field (a bool
+        `causal=False` means "no causal clip"); what is *not* supported is its tensor form
+        (per-token causality), which `_batch_causal` warns about and serves as causal --
+        the pre-FA-NONCAUSAL behaviour.
 
         Gate (2026-09-17): the official Muse-Glimmer DFlash assistant, TP=2, k=7, graphs
         ON -- mean acceptance length **3.12/3.18** (the same drafter through ROCM_ATTN

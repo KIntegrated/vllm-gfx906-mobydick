@@ -130,11 +130,17 @@ superset).
 
 ### Evidence — FOR
 
-| drafter attention | graphs | decode t/s (3 reps) | mean acceptance | TTFT |
+| drafter attention | graphs | decode t/s (3 reps, mean) | mean acceptance | runs |
 |---|---|---|---|---|
-| ROCM_ATTN + Triton fallback (`--enforce-eager`) | **no** | 30.46 / 30.43 / 31.17 | 2.95 | 3.87 s |
-| **CUSTOM FA (this change)** | **yes** | **43.13 / 43.10 / 44.14** | **3.12 / 3.18** | 3.71 s |
-| (non-spec reference: V2 TP=1, no drafter) | yes | 27.1 | — | 4.77 s |
+| ROCM_ATTN + Triton fallback (`--enforce-eager`; `GFX906_FA_NO_NONCAUSAL=1`) | **no** | 30.46/30.43/31.17 (30.7), 30.46/29.71/31.16 (30.4), 30.49/29.73/30.69 (30.3) | 2.95 / 3.00 / 3.02 | **3 clean** |
+| **CUSTOM FA (this change)** | **yes** | 43.13/43.10/44.14 (43.5), 39.27/39.22/39.19 (39.2) | 3.12 / 3.18 and 2.95 / 2.82 | **2 clean** |
+| (non-spec reference: V2 TP=1, no drafter) | yes | 27.1 | — | 1 |
+
+**Order-controlled result: +29 % to +41 % decode, acceptance at parity.** The control arms are
+extremely stable (two interleaved runs 30.44 and 30.30 mean, order control −0.5 %, acceptance
+2.95-3.02); the graph arm read 43.5 t/s once and 39.2 t/s once, so the honest claim is the
+**lower bound, ≥ +29 %**, with acceptance indistinguishable from the control (2.82-3.18 against
+2.95-3.02 — and acceptance is documented as chaotic on this stack, ±7 pp run to run).
 
 - The drafter's own capture line is the direct evidence the blocker is gone:
   `Capturing dflash CUDA graphs (FULL): 100%|2/2 … Graph capturing finished in 18 secs`, and
@@ -143,7 +149,8 @@ superset).
 - **Acceptance is not degraded** (3.12/3.18 vs 2.95): the superset mask costs this drafter
   nothing at 8k context, so Stage 2 (the symmetric ±window in the kernel) is not needed for
   the live use case.
-- Net: **+41 %** decode over the eager arm, **+60 %** over non-spec.
+- Net: **≥ +29 %** decode over the eager control (best clean run +41 %), **≥ +45 %** over
+  non-spec. The two clean graph runs bracket the effect; no single-run headline is quoted.
 
 ### Evidence — AGAINST / caveats
 
@@ -183,3 +190,60 @@ the step cost scales with the number of verified tokens, not with the drafter's 
 5 layers are clearly not dominant). k=7 stays the working value on the higher acceptance; a
 real optimisation would have to attack the *verify* step (the target's M=1..k+1 forward) or the
 drafter's attention, not the draft depth.
+
+## 2026-09-17 — self-review before merge: two findings, one of them a bug I had just written
+
+**VERDICT:** `SHIPPED` (unchanged verdict) · **GATE:** re-run of the MUSE-2 arm with the
+corrected code, plus an interleaved control/graph/control A-B-A (below).
+
+### Finding 1 — the "scope guard" was based on a false premise, and it broke the validated path
+
+I added a guard so that a `causal=False` batch on a **non-draft** model would fail loudly rather
+than be served a mask nobody gated (motivated by `model_executor/models/config.py`:
+DiffusionGemma sets `use_non_causal=True` for *mixed* causal/bidirectional attention). The guard
+keyed off `vllm_config.model_config.runner_type == "draft"`.
+
+It fired on the real drafter — the MUSE-2 arm died with the guard's message instead of serving.
+Reason: the draft attention build does **not** carry the draft ModelConfig. The speculator's
+`attn_vllm_config` is `copy.copy(super().attn_vllm_config)` with only `attention_config`
+`replace`d, so `model_config` there is the **target's** (`runner_type` is not `"draft"`).
+
+Second look at the premise: the guard is unnecessary. A **bool** `causal=False` has the same
+meaning in the reference backends — `triton_attn.py` and `rocm_attn.py` pass
+`common_attn_metadata.causal` straight into their mask logic, so the contract is "no causal
+clip", which is exactly what this kernel now serves. (The *tensor* form is the weaker claim: it
+is per-token and is refused — warn once, serve causal, i.e. the pre-FA-NONCAUSAL behaviour.)
+So the guard was replaced by a comment recording that equivalence, and the only remaining
+asymmetry is the **window** (see the caveat below).
+
+### Finding 2 — the headline t/s was a single optimistic run
+
+The first graph arm read 43.1/43.1/44.1 t/s; the same code minutes ago read 39.2/39.2/39.2 with
+acceptance 2.88 vs 3.15. Both are the *same* effective configuration (the guard never served a
+token), so that spread is process/run variation — the repo's standing warning. The gate is
+therefore re-read as an interleaved **control → graph → control** A-B-A in one boot, and the
+headline is quoted from that, never from the best single run.
+
+### Caveats recorded (not fixed)
+
+- **Windowed drafters pay full-KV reads under stage 1.** Suppressing `window` turns off the
+  mask *and* the M1/M2 clips, so a sliding-2048 drafter scans the whole context per block
+  instead of ~2048 keys. At the 8k context measured here that is small; at 32k+ the drafter's
+  attention cost grows linearly and stage 2 (the symmetric ±window, which would restore the
+  clip) becomes a *performance* item as well as a fidelity one.
+- The design doc's "8 mask sites" counts both `*_hip.cuh` twins, which are **never included**
+  (`fattn-q8.cuh` + `fattn-q8-paged.cuh` are the live pair) — the real inventory is 4 sites, and
+  stage 1 needed none of them.
+- `k` is not the lever (k=4 vs k=7 throughput-equal), and `B=1` only.
+
+### Finding 3 — my own measurement scripts were the confound (fixed in the harness, and it is why the headline is a range)
+
+The Muse arm scripts killed the APIServer and waited, but **never reaped orphaned workers** — the
+hazard already fixed for the other arm scripts in this repo. With TP=2 that is ~20 GiB per rank
+left resident, so the next arm could either fail to init or run on a partially-occupied GPU. Both
+were observed: the graph arm's first numbers (43.5) and its 11:16 re-read (39.2) bracket exactly
+the kind of drift an un-reaped predecessor would produce, and the string of load failures
+(#101-#103) all followed un-reaped teardowns. All four Muse arm scripts now share the
+`reap_gpu_procs` helper (KFD VRAM > 1 GiB -> TERM then KILL), so the next session's numbers are
+not confounded by it. The range above is quoted *because* of this: a single 43.5 t/s run cannot be
+distinguished from an orphan-free lucky run.

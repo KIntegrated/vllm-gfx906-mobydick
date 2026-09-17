@@ -509,7 +509,10 @@ rejecting the backend. Gate: Muse-Glimmer + the official DFlash assistant, TP=2,
 on** — drafter capture `dflash CUDA graphs (FULL) 2/2`, **mean acceptance 3.12/3.18** (the same
 drafter through ROCM_ATTN + eager measured 2.95) and **decode 43.1 t/s vs 30.5 eager / 27.1
 non-spec**. So the superset mask costs this drafter nothing and CUSTOM buys +41 % by making the
-drafter graph-capturable. Detail + the edit list for Stage 2: `DEVLOG-fa-noncausal.md`.
+drafter graph-capturable. Order-controlled: the control arms are 5/5 clean at 30.3-30.7 t/s
+(acceptance 2.95-3.02) and the graph arm read 43.5 and 39.2 t/s in its two clean runs, so quote
+**≥ +29 %** (best +41 %), acceptance at parity. Detail, the review findings and the edit list for
+Stage 2: `DEVLOG-fa-noncausal.md`.
 
 **Original status (2026-09-16, promoted from a DFlash2 conditional).** Its live use case is
 **MUSE-2**: the official Muse-Glimmer DFlash assistant is a *healthy* non-causal drafter
@@ -2097,11 +2100,11 @@ supports as method `dflash` — validated tonight as **MUSE-2**.
 
 **Status: WORKING (2026-09-17) — the official assistant + FA-NONCAUSAL Stage 1, graphs on.**
 TP=2, k=7, `cudagraph_capture_sizes [8,16]`, chat-templated prompt, 3×128 tokens: the drafter
-captures (`dflash CUDA graphs (FULL) 2/2`), **mean acceptance length 3.12/3.18** and **decode
-43.1 t/s** — vs 2.95 / 30.5 t/s for the same arm through ROCM_ATTN with `--enforce-eager` (which
-is where it started: CUSTOM rejected the non-causal class, ROCM_ATTN cannot be graph-captured),
-and 27.1 t/s with no drafter at all. So a served model that had **no** spec method (no MTP head,
-ngram deprecated) now runs +60 % decode. **k swept** (2026-09-17): k=4 `[5,10]` gives 43.0 t/s / acceptance 2.65 vs k=7's
+captures (`dflash CUDA graphs (FULL) 2/2`), mean acceptance **2.82-3.18** and decode **39.2-43.5
+t/s** across the two clean runs — vs acceptance 2.95-3.02 / **30.3-30.7 t/s** for the same arm
+through ROCM_ATTN with `--enforce-eager` (where it started: CUSTOM rejected the non-causal class
+and ROCM_ATTN cannot be graph-captured), and 27.1 t/s with no drafter. Quote **≥ +29 %**. So a served model that had **no** spec method (no MTP head,
+ngram deprecated) now runs **+45 % or better** decode. **k swept** (2026-09-17): k=4 `[5,10]` gives 43.0 t/s / acceptance 2.65 vs k=7's
 43.5 / 3.12-3.18 — throughput-equivalent, so the draft depth is not the lever (the verify step
 is); k=7 stays. Remaining: B=4, and the TP=1 path if the 24 GB + 5.1 GB envelope can be made to
 fit.

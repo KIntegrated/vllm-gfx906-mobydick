@@ -3945,3 +3945,35 @@ def test_non_causal_batch_is_bidirectional_vs_torch_ref():
     ).reshape(hq, d)
     rel_a = ((b_amp[0] - ref_amp).norm() / ref_amp.norm()).item()
     assert rel_a < 5e-2, f"non-causal row 0 with amplified future keys: rel {rel_a:.4f}"
+
+
+def test_non_causal_causality_contract(monkeypatch):
+    """FA-NONCAUSAL: the bool contract is honoured, the tensor form is not claimed.
+
+    A bool `causal=False` means "no causal clip" -- the same contract TRITON_ATTN and
+    ROCM_ATTN honour for that field, so this backend may serve it. A *tensor* causal
+    (per-token masks) is not expressible in this kernel: it must keep the causal
+    behaviour it had before this feature (with a warning), not silently become
+    bidirectional over the whole sequence.
+    """
+    from types import SimpleNamespace
+
+    from vllm.gfx906_fa.gfx906_fa_backend import Gfx906FABackend, _batch_causal
+
+    bidir = SimpleNamespace(causal=False)
+    causal = SimpleNamespace(causal=True)
+    per_token = SimpleNamespace(causal=torch.ones(4, dtype=torch.bool))
+    missing = SimpleNamespace()  # older metadata without the field
+
+    assert _batch_causal(bidir) is False
+    assert _batch_causal(causal) is True
+    assert _batch_causal(missing) is True
+    # Per-token causality keeps the causal path (status quo), it does not become a
+    # full-bidirectional claim.
+    assert _batch_causal(per_token) is True
+
+    # The class-level capability and its rollback.
+    monkeypatch.delenv("GFX906_FA_NO_NONCAUSAL", raising=False)
+    assert Gfx906FABackend.supports_non_causal()
+    monkeypatch.setenv("GFX906_FA_NO_NONCAUSAL", "1")
+    assert not Gfx906FABackend.supports_non_causal()

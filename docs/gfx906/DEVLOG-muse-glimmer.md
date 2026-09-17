@@ -1563,13 +1563,15 @@ non-causal class; `DEVLOG-fa-noncausal.md`).
 
 | arm | drafter attention | graphs | decode t/s | mean acceptance |
 |---|---|---|---|---|
-| eager (2026-09-16) | ROCM_ATTN + Triton | no | 30.5 | 2.95 |
-| **this run** | **CUSTOM FA** | **yes** | **43.1 / 43.1 / 44.1** | **3.12 / 3.18** |
+| control, pre-change (`GFX906_FA_NO_NONCAUSAL=1` + eager), 3 runs | ROCM_ATTN + Triton | no | 30.3-30.7 | 2.95-3.02 |
+| **this change** | **CUSTOM FA** | **yes** | **39.2-43.5** | **2.82-3.18** |
 | no drafter (V2, TP=1) | — | yes | 27.1 | — |
 
 `Capturing dflash CUDA graphs (FULL): 100%|2/2` and zero `Cannot copy between CPU and CUDA`
 lines. Acceptance is *not* degraded by the superset (full-bidirectional) mask, so the kernel's
-symmetric ±window (FA-NONCAUSAL Stage 2) is not needed for this drafter. Net for the model:
-**+60 % decode** vs serving it with no spec method at all (its only alternatives were
-deprecated ngram and a DSpark port). Caveat: one load died first in the load lottery
+symmetric ±window (FA-NONCAUSAL Stage 2) is not needed for this drafter. Net for the model: **≥ +29 % decode** against an order-controlled control
+(≥ +45 % vs serving it with no spec method at all — its only alternatives were deprecated ngram
+and a DSpark port). The first version of this entry quoted a single 43.1 t/s run; the number is now
+the range from two clean runs, because the harness of the day did not reap orphaned TP=2 workers
+(fixed; see `DEVLOG-fa-noncausal.md` finding 3). Caveat: one load died first in the load lottery
 (wedge #100); the retry was clean. k was not swept (k=7 only), B=1 only.
