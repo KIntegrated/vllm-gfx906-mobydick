@@ -85,6 +85,28 @@ def _qsa_sparse_paged_attention_reference(
     return output
 
 
+def _qsa_mqa_paged_reference(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compress_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pages = page_table.index_select(0, token_to_req.long()).long()
+    keys = k_cache[pages, :, 0, :].flatten(1, 2)
+    scores = torch.einsum("rhd,rnd->rnh", q.float(), keys.float())
+    logits = torch.relu(scores).sum(dim=-1) / math.sqrt(q.shape[-1])
+    visible = torch.minimum(
+        (query_positions + 1) // compress_ratio,
+        sequence_lengths.index_select(0, token_to_req.long()) // compress_ratio,
+    )
+    positions = torch.arange(keys.shape[1], device=q.device).unsqueeze(0)
+    logits = logits.masked_fill(positions >= visible.unsqueeze(1), -torch.inf)
+    return logits, visible.to(torch.int32)
+
+
 def test_qsa_rope_uses_platform_dispatch() -> None:
     tensor = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4)
     positions = torch.tensor([0, 1])
@@ -197,6 +219,7 @@ def test_qsa_selection_uses_portable_topk_on_rocm(
 
 
 @requires_qsa_kernels
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize(
     ("num_rows", "num_query_heads", "num_kv_heads", "page_size"),
     [
@@ -212,6 +235,7 @@ def test_qsa_sparse_paged_attention_matches_reference(
     num_query_heads: int,
     num_kv_heads: int,
     page_size: int,
+    dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(2)
     head_dim = 256
@@ -222,16 +246,14 @@ def test_qsa_sparse_paged_attention_matches_reference(
     indexer_budget = 2048
     indexer_compress_ratio = 4
     selection_width = indexer_budget + indexer_compress_ratio - 1
-    q = torch.randn(
-        num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
+    q = torch.randn(num_rows, num_query_heads, head_dim, device="cuda", dtype=dtype)
     kv_cache = torch.randn(
         num_cache_blocks,
         page_size,
         num_kv_heads,
         2 * head_dim,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     k_cache, v_cache = kv_cache.split(head_dim, dim=-1)
     block_table = (
@@ -295,3 +317,54 @@ def test_qsa_sparse_paged_attention_matches_reference(
     )
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_qsa_mqa_paged_matches_reference(dtype: torch.dtype) -> None:
+    """The indexer's scoring kernel reads the compressed-key cache in its own dtype."""
+    torch.manual_seed(3)
+    head_dim = 128
+    num_rows, num_query_heads = 64, 4
+    page_size, num_pages, num_requests = 64, 20, 2
+    compress_ratio = 4
+    q = torch.randn(num_rows, num_query_heads, head_dim, device="cuda", dtype=dtype)
+    k_cache = torch.randn(num_pages, page_size, 1, head_dim, device="cuda", dtype=dtype)
+    page_table = torch.randperm(num_pages, device="cuda", dtype=torch.int32).reshape(
+        num_requests, num_pages // num_requests
+    )
+    token_to_req = torch.repeat_interleave(
+        torch.arange(num_requests, device="cuda", dtype=torch.int32),
+        num_rows // num_requests,
+    )
+    sequence_lengths = torch.tensor(
+        [num_pages * page_size, num_pages * page_size - 37],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    request_lengths = sequence_lengths.index_select(0, token_to_req.long())
+    query_positions = (
+        request_lengths - num_rows + torch.arange(num_rows, device="cuda")
+    ).to(torch.int32)
+
+    actual, actual_visible = qsa_ops.qsa_mqa_paged(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+    )
+    expected, expected_visible = _qsa_mqa_paged_reference(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_visible, expected_visible)

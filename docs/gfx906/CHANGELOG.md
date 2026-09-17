@@ -6,6 +6,42 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-17 (QSA-FN-1 — Qwen3.8-Flash-Next / QSA runs in fp16 on gfx906)
+
+- **The reported `NotImplementedError: Qwen4Exp QSA currently requires BF16` is
+  fixed, and the fix is a 4.4× kernel win.** Admission of fp16 was added to every
+  place the QSA path stores or reads a 2-byte float, through one shared pair of
+  constants (`QSA_ACTIVATION_DTYPES` / `QSA_KV_CACHE_DTYPES`, `common/qsa_cache.py`):
+  the attention/backend/Impl guards, `forward_qsa`'s Q/K/V check, `get_kv_cache_spec`'s
+  storage check, the indexer's activation check and its raw/compressed key caches
+  (now the model dtype), the `qsa_sparse_paged_attention` assert, and the three AMD
+  `HyperConnectionConfig(params_dtype=…)` sites. `common/qsa_cache.py` is shared with
+  the NVIDIA implementation, so its edits are dtype-*general* (`self.dtype` / model
+  dtype) and **no NVIDIA/CUDA path changes**; the NVIDIA HC sites keep their bf16
+  literal.
+- **Why it was 4.4× and not a guard fix only:** gfx906 has no bf16 instruction, so
+  every bf16 `tl.dot` lowers to scalar `v_fmac_f32` (+ converts) while fp16 lowers to
+  `v_dot2_f32_f16`. Measured on MI50, launch-regime: sparse attention **26.5 ms fp16
+  vs 116.5 ms bf16** (interleaved reps, stable to ±0.2 %); the per-row indexer kernel
+  **5426 vs 6928 µs**.
+- **Gates (all green, one boot):** `test_qsa_amd.py` **9 → 16 passed** and
+  `test_qsa_reference.py` **16 → 19 passed** — the sparse-attention reference test is
+  now parametrized `bf16|fp16`, plus a new indexer-scoring reference test
+  (`qsa_mqa_paged`, bf16+fp16) and a new int64-MRoPE-packing test for the shared
+  state caches; FA suite **104 passed**; in-process PPL (Qwen3.8-27B-AWQ-INT4, fp16,
+  359 tokens) **10.5472, 0 top-20 misses**, identical to the value recorded for this
+  build; MoE 35B `_bench_gfx906.py` pp2048/tg256 4 samples **58.31/58.35/58.29/58.23
+  t/s** (mean 58.30, mclk 1000) — parity.
+- **Not covered — the end-to-end gate is QSA-FN-3's.** No served request has exercised
+  the fp16 path (the model needs ~60 GB of W4A16 weights), so the config-shape
+  plumbing is uninstantiated and the indexer's compress/store/selection kernels are
+  untested in fp16. Record + limits:
+  [`DEVLOG-qwen38-flash-qsa.md`](DEVLOG-qwen38-flash-qsa.md); pre-work evidence:
+  [`RECON-qwen38-flash-qsa.md`](RECON-qwen38-flash-qsa.md).
+- By-product baseline, first record: Qwen3.5-27B-AWQ in-process PPL **14.3750**
+  (359 tokens, 0 top-20 misses) — a different model from the 10.55 band, so not
+  comparable to it.
+
 ## 2026-09-16 (KVLAYOUT-1 — LEGACY=0 default flip)
 
 - **`GFX906_FA_LEGACY=0` (Q8 side-buffer KV read path) is now the default.** Verified

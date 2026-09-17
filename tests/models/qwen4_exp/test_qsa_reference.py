@@ -346,12 +346,18 @@ def test_qsa_circular_buffer_survives_one_speculative_step(chunk_start: int) -> 
     assert set(slots.tolist()).isdisjoint((committed % capacity).tolist())
 
 
-def _qsa_key_cache(block_size: int, compress_ratio: int) -> qsa_cache.QSAKeyStateCache:
+def _qsa_key_cache(
+    block_size: int,
+    compress_ratio: int,
+    dtype: torch.dtype = torch.bfloat16,
+    cache_rope_positions: bool = False,
+) -> qsa_cache.QSAKeyStateCache:
     return qsa_cache.QSAKeyStateCache(
         head_size=64,
-        dtype=torch.bfloat16,
+        dtype=dtype,
+        cache_rope_positions=cache_rope_positions,
         cache_config=SimpleNamespace(block_size=block_size),
-        prefix=f"raw.{block_size}.{compress_ratio}",
+        prefix=f"raw.{block_size}.{compress_ratio}.{dtype}",
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(static_forward_context={})
         ),
@@ -359,20 +365,21 @@ def _qsa_key_cache(block_size: int, compress_ratio: int) -> qsa_cache.QSAKeyStat
     )
 
 
-def test_qsa_state_caches_adapt_the_unified_logical_layout() -> None:
-    raw_cache = _qsa_key_cache(block_size=32, compress_ratio=4)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_qsa_state_caches_adapt_the_unified_logical_layout(dtype: torch.dtype) -> None:
+    raw_cache = _qsa_key_cache(block_size=32, compress_ratio=4, dtype=dtype)
     compressed_cache = qsa_cache.QSACompressedKeyCache(
         head_size=64,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         cache_config=SimpleNamespace(block_size=32),
-        prefix="compressed.bind",
+        prefix=f"compressed.bind.{dtype}",
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(static_forward_context={})
         ),
         compress_ratio=4,
     )
-    raw_view = torch.empty(2, 1, 8, 64, dtype=torch.bfloat16)
-    compressed_view = torch.empty(2, 1, 8, 64, dtype=torch.bfloat16)
+    raw_view = torch.empty(2, 1, 8, 64, dtype=dtype)
+    compressed_view = torch.empty(2, 1, 8, 64, dtype=dtype)
 
     raw_cache.bind_kv_cache(raw_view)
     compressed_cache.bind_kv_cache(compressed_view)
@@ -381,6 +388,27 @@ def test_qsa_state_caches_adapt_the_unified_logical_layout() -> None:
     assert compressed_cache.kv_cache.shape == (2, 8, 1, 64)
     assert raw_cache.kv_cache.data_ptr() == raw_view.data_ptr()
     assert compressed_cache.kv_cache.data_ptr() == compressed_view.data_ptr()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_qsa_raw_key_cache_packs_int64_rope_positions(dtype: torch.dtype) -> None:
+    """The MRoPE position tail is int64-addressable in either 2-byte key dtype."""
+    cache = _qsa_key_cache(
+        block_size=32, compress_ratio=4, dtype=dtype, cache_rope_positions=True
+    )
+    width = cache.head_size
+    storage = (
+        torch.arange(2 * 8 * width, dtype=torch.int64).to(dtype).reshape(2, 1, 8, width)
+    )
+
+    cache.bind_kv_cache(storage)
+
+    assert cache.key_cache.shape == (2, 8, 1, 64)
+    assert cache.rope_position_cache is not None
+    assert cache.rope_position_cache.dtype == torch.int64
+    assert cache.rope_position_cache.shape == (2, 8, 1, 3)
+    packed = storage[..., cache.rope_position_offset :].view(torch.int64)
+    assert torch.equal(cache.rope_position_cache, packed.transpose(1, 2))
 
 
 @pytest.mark.parametrize(

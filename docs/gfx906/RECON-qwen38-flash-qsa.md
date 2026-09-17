@@ -58,7 +58,9 @@ from either.
 This is not a QSA bug and not a CDNA-patch issue: it is the documented gfx906
 policy (bf16 checkpoints run as fp16) meeting a subsystem that upstream only ever
 ran in bf16. **Every bf16-only site on the QSA path is a gfx906 blocker**, and they
-are all in `vllm/models/qwen4_exp/` (QSA-FN-1):
+are all in `vllm/models/qwen4_exp/`: See
+[`DEVLOG-qwen38-flash-qsa.md`](DEVLOG-qwen38-flash-qsa.md) for what was changed
+(QSA-FN-1, landed 2026-09-17) — the table below is the pre-edit inventory.
 
 | file | line | guard |
 |---|---|---|
@@ -321,9 +323,10 @@ probe cannot tell us:
 
 1. **QSA-FN-1 (fp16 enablement)** — unblocks the reported error, and is the 3.9×
    win. Editing list is §1; gate is an fp16 parametrization of
-   `test_qsa_amd.py` plus whatever the existing suite covers, with the bf16 arm
-   kept green (no CUDA/NVIDIA path may change: `common/qsa_cache.py` edits stay
-   dtype-general).
+   `test_qsa_amd.py` plus the shared-cache dtype tests, with the bf16 arm kept
+   green (no CUDA/NVIDIA path may change: `common/qsa_cache.py` edits stay
+   dtype-general). **DONE 2026-09-17** —
+   [`DEVLOG-qwen38-flash-qsa.md`](DEVLOG-qwen38-flash-qsa.md).
 2. **QSA-FN-3 (tiny-config harness)** — the enabler for every end-to-end gate
    after this point, and cheap: a `--load-format dummy` + `--hf-overrides`
    qwen4_exp config (4 layers, E=8, hidden ~512, PLE present but tiny) so the

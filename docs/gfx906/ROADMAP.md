@@ -23,9 +23,9 @@ chip.
 
 **Two independent workstreams, in this order.**
 
-1. **fp16 enablement (QSA-FN-1/FN-2)** — fixes the reported failure, and is a
-   measured **3.9×** on the QSA kernel pair, because gfx906 emulates every bf16
-   `tl.dot` as scalar fp32 FMA (`v_fmac_f32`) while fp16 lowers to
+1. **fp16 enablement (QSA-FN-1 — SHIPPED; recipe half = QSA-FN-2)** — fixes the
+   reported failure, and is a measured **3.9×** on the QSA kernel pair, because gfx906
+   emulates every bf16 `tl.dot` as scalar fp32 FMA (`v_fmac_f32`) while fp16 lowers to
    `v_dot2_f32_f16`. No new kernels: guard edits only.
 2. **The CDNA2 patch set (QSA-FN-4/5/6)** — of its three changes, one ports
    (tiled indexer, +39 % fp16, must be dtype-gated), one is capacity-only
@@ -33,43 +33,51 @@ chip.
    port at all (int8-QK: faults at the dispatch profile every real prefill uses,
    and is not faster where it runs).
 
-**Critical path: QSA-FN-1 → QSA-FN-3 → {QSA-FN-4, QSA-FN-2, QSA-FN-8}**; the
+**Critical path: QSA-FN-3 → {QSA-FN-4, QSA-FN-2, QSA-FN-8}** (QSA-FN-1 is
+SHIPPED for the code + kernel-level gates; its end-to-end gate is FN-3's); the
 int8 items (QSA-FN-5/6) are evidence-first and both currently default to "not on
 this chip". Neither workstream can be gated end-to-end yet: the model is ~120 B
 params of MoE (W4A16 ≈ 60 GB, plus a PLE ngram table the CDNA recipe offloads
 60 GB of), i.e. unloadable in 2× MI50. **QSA-FN-3 (tiny-config harness) gates
 everything else.**
 
-### QSA-FN-1 — fp16 activations + fp16 QSA/indexer caches (**HIGH PRIORITY**, the reported failure)
+### QSA-FN-1 — fp16 activations + fp16 QSA/indexer caches (**SHIPPED 2026-09-17**, the reported failure)
 
-**Status: OPEN — not started.** Every bf16-only site is enumerated in
-[recon §1](RECON-qwen38-flash-qsa.md) (7 in `amd/qsa.py`, 3 in
-`amd/indexer_qsa.py`, 3 in `common/qsa_cache.py`, 1 assert in `amd/ops/qsa.py`).
-The reported error is two of them: `amd/qsa.py:188` and `amd/indexer_qsa.py:95`,
-both tripped by the deliberate gfx906 bf16→fp16 auto-fallback
-(`platforms/rocm.py:645`, `config/model.py:2294`).
+**Status: SHIPPED** for the code and the kernel-level gates, on branch
+`gfx906/qsa-fn`; **the end-to-end gate is QSA-FN-3's** (no loadable checkpoint
+here). Record: [`DEVLOG-qwen38-flash-qsa.md`](DEVLOG-qwen38-flash-qsa.md).
+
+The reported error was two of the guards (`amd/qsa.py` activation check,
+`amd/indexer_qsa.py`'s copy), both tripped by the deliberate gfx906 bf16→fp16
+auto-fallback (`platforms/rocm.py:645`, `config/model.py:2294`). Fixed by
+admitting fp16 everywhere the QSA path stores or reads a 2-byte float, through
+one shared pair of constants (`QSA_ACTIVATION_DTYPES` / `QSA_KV_CACHE_DTYPES` in
+`common/qsa_cache.py`). `common/qsa_cache.py` is shared with the NVIDIA
+implementation, so its edits are dtype-*general* (`self.dtype`, model dtype) and
+the NVIDIA files are untouched — no CUDA-path change.
+
+The three AMD `HyperConnectionConfig(params_dtype=torch.bfloat16)` sites (listed
+under FN-2) came along: bf16 HC weights under fp16 activations are not a coherent
+fp16 path. The NVIDIA copies keep their bf16 literal.
 
 **Measured value:** sparse attention 26.5 ms fp16 vs 116.5 ms bf16 (4.39×,
-rep-stable, interleaved).
+interleaved, rep-stable); per-row indexer 5426 µs vs 6928 µs (1.28×).
 
-**Constraint — no CUDA regression.** `common/qsa_cache.py` is shared with the
-NVIDIA implementation: replace bf16 literals with `self.dtype` / the model dtype
-(generic mixed-dtype support), never with a gfx906 conditional. The AMD files can
-be changed freely (ROCm-only import path, `qwen4_exp/__init__.py`).
-`QSAKeyStateCache._BF16_PER_INT64 = 4` is already right for fp16 (4 × 2 B = 8 B)
-— do not "fix" it.
+**GATE (green):** `test_qsa_amd.py` **9 → 16 passed** and `test_qsa_reference.py`
+**16 → 19 passed**, both with a new fp16 arm (the sparse-attention reference test,
+a new indexer-scoring reference test, the shared state-cache bind test, and a new
+int64-MRoPE-packing test); plus FN-7: FA suite **104 passed**, PPL **10.5472**
+(= the recorded value for this build), MoE 35B **58.30 t/s** mean (= parity).
 
-**GATE:** (a) fp16 parametrization of `tests/models/qwen4_exp/test_qsa_amd.py`
-(9 pass in bf16 today, MI50) green **and** the bf16 arm still green; (b) after
-QSA-FN-3, a fp16 serve smoke with the tiny config; (c) the four existing-model
-gates (below).
+**Remaining risk (in the dev log):** no served request has exercised the fp16 path
+— the config-shape plumbing is not instantiated in any test. That is QSA-FN-3's
+job, and it is why FN-1's verdict is "shipped at kernel level".
 
 ### QSA-FN-2 — model-level fp16 sweep + the tester launch recipe
 
-**Status: OPEN — small.** The QSA files are not the only bf16 literals on this
-model's path: `HyperConnectionConfig(params_dtype=torch.bfloat16)` is hardcoded at
-`amd/model.py:260`, `amd/model.py:436`, `amd/mtp.py:229` (the NVIDIA variant passes
-the model dtype there), and the CDNA launch recipe carries
+**Status: OPEN — small.** What is left after QSA-FN-1: the launch recipe and the
+runtime dtype pins outside the model files (the three `HyperConnectionConfig`
+sites moved into FN-1). The CDNA launch recipe carries
 `--dtype bfloat16` / `--mamba-cache-dtype bfloat16`. Deliverable: a gfx906 launch
 recipe (fp16 dtype, no bf16 mamba cache, `--tool-call-parser qwen3_xml`,
 `--reasoning-parser qwen3`, `{"method":"mtp","num_speculative_tokens":3}`,
@@ -171,21 +179,29 @@ or fidelity"). None of QSA-FN-1/2/4 touches a code path any currently-served mod
 uses (Qwen4Exp is the only `qwen4_exp` architecture, and the AMD import path is
 ROCm-only), but the cheap deterministic gates are not optional:
 
-- `tests/kernels/attention/test_gfx906_fa.py` (97) — the FA suite;
-- in-process PPL probe (`benchmarks/kernels/gfx906/ppl_probe.py`): dense 27B
-  **10.5516**, MoE 35B and Nemotron band 26.96–27.02, `0` top-20 misses;
-- MoE 35B `_bench_gfx906.py` pp2048/tg256 4 samples (~66.5 t/s band);
+- `tests/kernels/attention/test_gfx906_fa.py` — the FA suite;
+- in-process PPL probe (`benchmarks/kernels/gfx906/ppl_probe.py`): **Qwen3.8-27B-AWQ-INT4**
+  is the reference model (recorded **10.5472** on this build; the 10.5516 figure in the
+  older records is the 3.6 fork. **Do not** use Qwen3.5-27B for this band — it reads
+  14.3750, its own baseline, first measured 2026-09-17); Nemotron band 26.96–27.02;
+- MoE 35B `_bench_gfx906.py` pp2048/tg256 4 samples (recorded 57.97 stock 3.8.0 /
+  58.36 fork at mclk 1000);
 - `tests/models/qwen4_exp/*` one file at a time.
+
+**Run for QSA-FN-1 (2026-09-17, same boot, all green):** FA suite **104 passed**;
+PPL **10.5472** (359 tokens, 0 top-20 misses); MoE 35B **58.31/58.35/58.29/58.23
+t/s** (mean 58.30, mclk 1000); `test_qsa_amd.py` 16, `test_qsa_reference.py` 19,
+`test_config.py` 7, `test_ple.py` 10.
 
 Any QSA-FN item that changes a *shared* file (`common/qsa_cache.py`) must show a
 bf16 QSA arm still passing before/after.
 
 ### QSA-FN-8 — tester build (after QSA-FN-1 + FN-2, at most + FN-3/FN-4)
 
-**Status: OPEN — queued on QSA-FN-1.** The tester build is **fp16 QSA enablement
-plus the launch recipe**, and (if they land in time) the fp16-gated tiled
-indexer. Explicitly **excluded**: anything int8 (QSA-FN-5/6) — the capacity win
-is not worth a 2.5× prefill kernel on evidence we already have.
+**Status: OPEN — queued on QSA-FN-3 + FN-2.** The tester build is **fp16 QSA
+enablement (landed) plus the launch recipe**, and (if they land in time) the
+fp16-gated tiled indexer. Explicitly **excluded**: anything int8 (QSA-FN-5/6) —
+the capacity win is not worth a 2.5× prefill kernel on evidence we already have.
 
 What the tester must report back (the reason this is a separate item): (a) does it
 load and serve at all in fp16; (b) `GPU KV cache size` and per-card VRAM; (c)
