@@ -2101,9 +2101,10 @@ captures (`dflash CUDA graphs (FULL) 2/2`), **mean acceptance length 3.12/3.18**
 43.1 t/s** — vs 2.95 / 30.5 t/s for the same arm through ROCM_ATTN with `--enforce-eager` (which
 is where it started: CUSTOM rejected the non-causal class, ROCM_ATTN cannot be graph-captured),
 and 27.1 t/s with no drafter at all. So a served model that had **no** spec method (no MTP head,
-ngram deprecated) now runs +60 % decode. Remaining cheap follow-ups: k sweep (the eager
-histogram was still productive at pos3-4, so k>7 may pay), B=4, and the same drafter on the
-TP=1 path if the 24 GB + 5.1 GB envelope can be made to fit.
+ngram deprecated) now runs +60 % decode. **k swept** (2026-09-17): k=4 `[5,10]` gives 43.0 t/s / acceptance 2.65 vs k=7's
+43.5 / 3.12-3.18 — throughput-equivalent, so the draft depth is not the lever (the verify step
+is); k=7 stays. Remaining: B=4, and the TP=1 path if the 24 GB + 5.1 GB envelope can be made to
+fit.
 
 ### MUSE-1 (original entry) — Muse-Glimmer: V2 parity looks good, but the PPL probe is not its gate
 

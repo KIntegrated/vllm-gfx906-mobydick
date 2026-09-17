@@ -166,3 +166,20 @@ superset).
   "Stage 1 shipped, Stage 2 refrigerated".
 - DFlash2 (the original motivation) stays parked for its own reasons — its degeneration was
   never the mask.
+
+## 2026-09-17 (later) — k sweep on the graph path: throughput is flat, the verify step is the cost
+
+**VERDICT:** `NEUTRAL` on the k axis (k=7 stays) · **GATE:** same arm as above with
+`num_speculative_tokens=4` (`cudagraph_capture_sizes [5,10]`, i.e. multiples of k+1), 3 reps.
+
+| k | capture ladder | decode t/s (3 reps) | mean acceptance | tokens/step |
+|---|---|---|---|---|
+| 4 | [5,10] | 44.29 / 43.30 / 41.47 (43.0) | 2.65 | 3.65 |
+| 7 | [8,16] | 43.13 / 43.10 / 44.14 (43.5) | 3.12 / 3.18 | 4.12 |
+
+Throughput-equivalent (within this box's run-to-run spread), so **k is not the lever**: with
+tokens/step 4.12 vs 3.65 at the same t/s, the extra k=7 drafts pay for themselves exactly and
+the step cost scales with the number of verified tokens, not with the drafter's own work (whose
+5 layers are clearly not dominant). k=7 stays the working value on the higher acceptance; a
+real optimisation would have to attack the *verify* step (the target's M=1..k+1 forward) or the
+drafter's attention, not the draft depth.
