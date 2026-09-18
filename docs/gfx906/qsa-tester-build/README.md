@@ -9,6 +9,9 @@ checklist in [What to report back](#what-to-report-back). Nothing in this
 bundle has been run against the real checkpoint (it does not fit on our 2×32 GB
 MI50 box), so your report *is* the end-to-end gate.
 
+**Short on time? Read [`HANDOVER.md`](HANDOVER.md)** — a one-page
+version of this file with just the steps, the gates and what to send back.
+
 ## What is included
 
 | file | what / why |

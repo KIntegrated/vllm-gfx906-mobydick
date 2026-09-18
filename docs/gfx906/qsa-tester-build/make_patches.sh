@@ -45,7 +45,7 @@ git diff "$MERGE_BASE" "$BRANCH" -- \
   docs/gfx906/_serve_qsa_flash_gfx906.sh \
   > "$OUT/patches/0004-qsa-harness.patch"
 
-cp "$SRC/README.md" "$OUT/README.md"
+cp "$SRC/README.md" "$SRC/HANDOVER.md" "$OUT/"
 
 # Offline tokenizer + the tiny config, so the smoke rig needs no HF access.
 mkdir -p "$OUT/tiny-tokenizer"
