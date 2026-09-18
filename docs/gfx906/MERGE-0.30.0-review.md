@@ -13,6 +13,16 @@
 > `^Auto-merging`; every one of the 31 has both sides changed since the merge base
 > (or is an add/add), while 116 of the "extra" paths exist on neither side.
 
+**Second correction (this one matters):** my first pass put four
+off-by-default switches in a "verify then delete" bucket as if they were parked
+experiments. Three of them are the opposite — **gated wins whose gate already
+passed and whose only open item is a default flip**: `SKINNY_M16` (measured
++14.5 % / +6.1 %), `QUANT_LAYER0_MOE` (measured +3.0 %), and the FD-1/A3 flag
+(a revived mechanism with three tests and an in-tree consumer). Table 2 now
+carries the record per switch. The lesson: *off by default ≠ dead* — on this box
+a default flip is a deliberate, documented "Kevin's call" step, so grep the dev
+logs and the roadmap for the flag before proposing a deletion.
+
 ## Method (re-runnable)
 
 ```bash
@@ -42,7 +52,7 @@ has (take theirs, drop our copy) · **D** = bindings/CI/test glue (mechanical).
 | `vllm/model_executor/layers/utils.py` | 494+/60− | 50+/27− | L+G | fp32 router-gate GEMV (NH-3), `DENSE_GEMV`/`DOWN_GEMV` default-on, triton_matmul >2-D — **plus `SKINNY_M16` (default off)**. KEEP; split out the M16 hunk (see Table 2) |
 | `vllm/model_executor/layers/fused_moe/oracle/int_wna16.py` | 513+/42− | 123+/152− | L | Nemotron-3.5 INT4/INT8 wna16 support + code-review fixes. KEEP |
 | `tests/quantization/test_moe_wna16.py` | 460+/0− | 223+/25− | L | the wna16 tests for the above. KEEP |
-| `vllm/model_executor/layers/mamba/mamba_mixer2.py` | 23+/0− | 155+/46− | **G** | **NH-4 fused grouped gated-norm, `VLLM_GFX906_MAMBA_FUSED_GROUP_NORM` default OFF** — its gate **was run** and was neutral (Table 2). ARCHIVE CANDIDATE |
+| `vllm/model_executor/layers/mamba/mamba_mixer2.py` | 23+/0− | 155+/46− | **G** | **NH-4 fused grouped gated-norm, `VLLM_GFX906_MAMBA_FUSED_GROUP_NORM` default OFF** — gate **ran, neutral** (+0.4 %, Table 2). Optional strip; the merge cost either way is these 23 lines |
 | `vllm/model_executor/layers/quantization/utils/fp8_utils.py` | 76+/21− | 58+/17− | L | dense GEMV switches (default-on). KEEP |
 | `vllm/models/minimax_m3/amd/model.py` | 128+/18− | 181+/14− | L | Minimax-M3-AWQ-INT4 gfx906 support (the train we are ON). KEEP |
 | `vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py` | 292+/79− | 373+/102− | L | Minimax-M3 sparse/indexer fixes (uses upstream's `VLLM_ROCM_MLA_SPARSE_*`). KEEP |
@@ -75,61 +85,55 @@ hand-merge; ~10 are upstream commits we carry, where 0.30.0 already has its own
 (or better) version and the right move is to **drop our copy** rather than
 re-apply it; the rest is additive glue.
 
-## Table 2 — fork-wide inventory of switches that are OFF by default
+## Table 2 — off-by-default switches: **check the record before deleting**
 
-The interesting population for "move it to a dead branch": code reachable only
-when an env flag is set, where the flag defaults off.
+Lesson from the first pass of this doc: *off by default ≠ dead*. Three of the six
+switches I first listed as deletion candidates are **gated wins whose gate already
+passed and whose only open item is a default flip** (Kevin's call). The record, per
+switch:
 
-| flag | read at | status (docs/roadmap) | recommendation |
-|---|---|---|---|
-| `VLLM_GFX906_MAMBA_FUSED_GROUP_NORM` | `mamba/mamba_mixer2.py` | NH-4: **the gate RAN 2026-08-30** (`DEVLOG-nemotron-h.md`, A–B–A, fresh boot per arm, TP=2+EP, 4 samples/arm): A 109.8 / B 110.05 / A2 109.37 t/s → **+0.4 %, inside inter-arm noise** (the A-vs-A2 *drift* of 0.43 t/s is larger than the effect), PPL 24.9034 vs 24.8944, 0 top-20 misses. Isolated win 68→55 µs/layer ≈ **0.29 ms/step over 23 layers**, invisible because the step is MoE-GEMV-bound. The in-code comment still says "default off pending the serving A/B gate" — **stale** | **archive + delete** (measured neutral in the served config; the dev log documents the one-line env flip if the step ever stops being GEMV-bound) |
-| `VLLM_GFX906_FUSED_DRAFT` | `gfx906_fa/gfx906_fa_backend.py` | FD-1 **CLOSED** (NEUTRAL, stack-confounded); "the flag's only reader in-tree was A3's opt-in, stripped 2026-09-13" (`f8a9400789`); branches `archive/a3-fused-draft`, `archive/fd1-fused-draft-meta` exist | **delete the leftover flag read** (dead code by the roadmap's own record) |
-| `VLLM_GFX906_SKINNY_M16` | `model_executor/layers/utils.py` + `csrc/rocm/dense_gemv_gfx906.cu` | W4 skinny M=5..16 GEMV variant, default off; the M=2..4 part is default ON and live | **decide**: either gate it for deletion (archive the kernel variant) or run the A/B the docstring implies; verify the M=2..4 path stays |
-| `VLLM_GFX906_QUANT_LAYER0_MOE` | `quantization/auto_awq.py`, `quantization/c4_layer0_moe.py` | not in any dev log I find; fork-only file `c4_layer0_moe.py` | **verify then delete** (looks like a parked experiment) |
-| `VLLM_GFX906_FA_STRICT` | `platforms/rocm.py` | a *policy* switch (raise instead of warn for non-CUSTOM FA) | **keep** — it is a fail-closed guard, not dead code |
-| `VLLM_GFX906_MOE_BM` / `_M1` / `_NPT`, `GEMV_RPT`, `GEMVM_RPT`, `GEMV_I8_RPT`, `W8A16_INT8*`, `QGEMM_M1_MAXILP` | MoE/GEMV/HIP kernels | null-means-on semantics (default **on**) | keep; not dead weight |
+| flag | status in our own docs | recommendation |
+|---|---|---|
+| `VLLM_GFX906_SKINNY_M16` | **SHIPPED, not parked** — `DEVLOG-fp16-skinny.md`: 35B MoE N=8 graph **+14.5 %** (191.0 vs 166.9 t/s), 27B (Qwen3.8) N=8 **+6.1 %**, 27B N=4 control flat (−0.6 %, flag inert); kernel correctness + per-shape 2–7.5× PASS; *"the A/B arms are positive on both models and the flag-on soak passed (30 reps × 2 models, flat), so `VLLM_GFX906_SKINNY_M16=1` is cleared to go default-on; flipping it is Kevin's call"* | **FLIP, do not delete.** It covers the M=5..16 spec-verify / 5–16-seq concurrent-decode regime; today we leave the win unclaimed. Caveat on record: the ksplit>1 epilogue is fp16 `atomicAdd` (same property as the shipped M≤4 rail) | 
+| `VLLM_GFX906_QUANT_LAYER0_MOE` | **GO, not parked** — `ROADMAP.md` C4 + `DEVLOG-c4-layer0-quant.md`: unquantized layer-0 experts cost ~740 µs/call vs 182 µs for the W4A16 rail ⇒ ~558 µs/step; gates all passed — unit 8/8, PPL 15.9531 → **15.9929** (Δ +0.04, gate < 0.5), greedy fingerprint bit-identical (`d2e5262183c6b92f`), serving A/B off 84.95 → **87.51 t/s = +3.0 %** (noise floor ~1.8 %); ~1.5 GiB returned to graph capture. Open item: *"default-on decision after soak"* | **FLIP (soak is a process call, the measurements are done), do not delete** — it is a quality trade-off the checkpoint author did not make, so it is Kevin's call, but the numbers are in |
+| `VLLM_GFX906_FUSED_DRAFT` | **live, not dead** — `tests/kernels/attention/test_gfx906_fa.py` "A3 (revived 2026-09-14 on the V2 bring-up branch)": the flag is the opt-in for the fused multi-step draft *metadata* protocol, whose consumer **is in-tree** (`v1/worker/gpu/spec_decode/autoregressive/speculator.py:_generate_fused_drafts`), pinned by **three tests** (flag, view contract, and an end-to-end reuse/corruption guard). `DEAD-ENDS.md`'s "has no reader in-tree now" is **stale** — the reader is the gfx906 FA builder, the attribute consumer is upstream V2 | **KEEP; fix the stale DEAD-ENDS row.** FD-1's *neutral* verdict was about the B=4/120k offline arm (stack-confounded), not about deleting the mechanism |
+| `VLLM_GFX906_MAMBA_FUSED_GROUP_NORM` | NH-4: gate **ran** 2026-08-30 (A–B–A, fresh boot/arm, TP=2+EP): A 109.8 / B 110.05 / A2 109.37 t/s = +0.4 % inside noise (the A-vs-A2 drift exceeds the effect), PPL 24.9034 vs 24.8944, 0 top-20 misses; isolated 68→55 µs/layer ≈ 0.29 ms/step, hidden by a MoE-GEMV-bound step. The dev log labels it SHIPPED with the flip documented as a one-liner for a config that stops being GEMV-bound; the in-code comment still says "pending the A/B" (stale) | strip is **behaviorally safe** (default-off, measured-neutral in the served config) and saves 23 conflict lines; keeping it costs the same 23 lines at merge. Genuinely optional — my default is keep, fix the comment |
+| `VLLM_GFX906_FA_STRICT` | a fail-closed *policy* switch (raise instead of warn when FA degrades quietly) | keep — not dead code |
+| `VLLM_GFX906_MOE_BM`/`_M1`/`_NPT`, `GEMV_RPT`, `GEMVM_RPT`, `GEMV_I8_RPT`, `W8A16_INT8*`, `QGEMM_M1_MAXILP` | null-means-on (default **on**) | keep |
 
-Defaults already in the tree (`VLLM_GFX906_ALIGN_M1`, `DENSE_GEMV`, `DOWN_GEMV`,
-`SORT_FREE_SMALL_K`, `SPEC_CG_SMALL`, `SPEC_GEMM`, `TOPK_SINGLE_GROUP` = `1`) are
-live and should not be touched in this pass.
+Switches already default-on (`ALIGN_M1`, `DENSE_GEMV`, `DOWN_GEMV`,
+`SORT_FREE_SMALL_K`, `SPEC_CG_SMALL`, `SPEC_GEMM`, `TOPK_SINGLE_GROUP`) are live.
 
-## Proposed plan (for a decision, not yet executed)
+## Proposed plan (revised after checking the records)
 
-1. **Preserve first.** Create `archive/gfx906-dead-2` from `gfx906/v0.29.0` and
-   make one commit per dead item (NH-4, FD-1 leftover, and whatever the
-   verify-then-delete items turn out to be), so each is one `git revert` away —
-   the pattern already used for `gfx906/preserve-dead-kernels` (S2 topk + C1
-   stage-2, removed 2026-09-01) and the four `archive/*` branches.
-2. **Delete from main** (and therefore from `gfx906/qsa-fn`, which is based on
-   it): NH-4 + its flag; FD-1's leftover flag read; then the verify-then-delete
-   pair. Expected merge effect: `mamba_mixer2.py` stops conflicting entirely and
-   `utils.py` shrinks to its live hunks — i.e. the *only* off-by-default conflict
-   site disappears.
-3. **Do not** drop the live trains to make the merge smaller: MoE M1/NPT, GEMV
-   switches, wna16/Nemotron, Minimax-M3, SYV-4, `SPEC_CG_SMALL`, the q_gemm
-   max-ILP build and the Minimax backports are all default-on or active model
-   support.
-4. **For the ~10 upstream carries** (class C): take 0.30.0's version, then
-   re-check the only ones that existed because a *model we serve* needed them
-   (the Zen CPU path, the Mamba prefix-cache warning, DFlash RoPE) — if 0.30.0's
-   own fix covers it, our cherry-pick retires on the spot.
-5. **Verification for each deletion** (cheap, and the reason step 1 exists):
-   `grep` for the flag in `docs/gfx906/*` for the recorded verdict; confirm no
-   model in the supported set is documented as needing it (NH-4 off ⇒ Nemotron
-   takes the generic path it already takes by default); keep the
-   `_bench_gfx906.py` MoE reference number (58.40 t/s) and the PPL probe as the
-   non-regression gate on the branch after each removal; then confirm the 0.30.0
-   merge conflict count drops (expected 31 → 30, plus smaller `utils.py`).
+1. **Flip the two gated wins** (one-line default change each, no new code):
+   `VLLM_GFX906_SKINNY_M16` (measured +14.5 % / +6.1 % at N=8, soak passed) and
+   `VLLM_GFX906_QUANT_LAYER0_MOE` (measured +3.0 % serving). Both flips should be
+   followed by the house gates (35B `_bench_gfx906.py`, PPL probe, and the
+   `tests/kernels/moe/test_c4_layer0_quant.py` / FA suites) — the measurements
+   exist, the *defaults* are what is missing.
+2. **Fix the stale records** rather than delete code: `DEAD-ENDS.md`'s FD-1 "no
+   reader" line (the A3 opt-in was revived with three tests) and the NH-4 comment
+   in `mamba_mixer2.py` ("pending the serving A/B gate" — the gate ran and was
+   neutral).
+3. **Optional hygiene:** strip NH-4 only (default-off, measured-neutral, 23 lines)
+   and preserve it on an `archive/gfx906-dead-2` branch — do it as a separate,
+   revertible commit if the tree should be lean. I would keep it: the merge costs
+   the same 23 lines either way, and the dev log kept the flip deliberately.
+4. **Do not** delete `SKINNY_M16`, `QUANT_LAYER0_MOE` or the FD-1 flag; all three
+   have measured or test-guarded reasons to exist (Table 2).
+5. **For the merge itself**, the work is: hand-merge the ~11 live-code conflicts,
+   take 0.30.0's version for the ~10 upstream carries (re-checking only the three a
+   served model needed: Zen CPU path, mamba prefix-cache warning, DFlash RoPE
+   layout), and resolve the glue. Nothing in the conflict set is worth deleting to
+   make the merge smaller — the largest single our-side conflict is 494 lines
+   (`layers/utils.py`, live code), and the off-by-default items are 23 lines or
+   live-elsewhere.
 
 ## Open questions for Kevin
 
-- NH-4: the gate is **already answered** (neutral, above) — delete the gated path
-  and the flag, or keep it as the documented one-line flip? My recommendation:
-  delete (the dev log holds the numbers and the re-enable recipe), and fix the
-  stale in-code comment either way, since it claims the A/B is still pending.
-- `SKINNY_M16` and `QUANT_LAYER0_MOE`: are these still wanted? Both are
-  off-by-default experiments whose docs I cannot find; my default assumption is
-  "archive them with the rest".
-- Do we want the *upstream carries* retired wholesale on the merge (taking
-  0.30.0's versions), or re-applied per model? That is ~10 of the 31 conflicts
-  and would shrink the hand-merge to the ~11 live-code files.
+- Flip `SKINNY_M16` and `QUANT_LAYER0_MOE` to default-on now (with the two gates
+  re-run on the same boot), or keep them opt-in? Both logs say "Kevin's call".
+- NH-4: keep the 23 lines and fix the comment, or strip-and-archive for a lean tree?
+- The ~10 upstream carries: retire them wholesale on the merge (take 0.30.0's
+  versions) or re-apply per model?
