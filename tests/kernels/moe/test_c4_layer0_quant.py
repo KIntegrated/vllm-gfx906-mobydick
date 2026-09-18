@@ -169,8 +169,10 @@ def test_repack_matches_independent_exllama_layout():
 
 
 def test_env_gate(monkeypatch):
+    # Default ON since the gate passed (DEVLOG-c4-layer0-quant.md); "0" is the
+    # kill switch.
     monkeypatch.delenv("VLLM_GFX906_QUANT_LAYER0_MOE", raising=False)
-    assert not c4_quant_layer0_enabled()
+    assert c4_quant_layer0_enabled()
     monkeypatch.setenv("VLLM_GFX906_QUANT_LAYER0_MOE", "1")
     assert c4_quant_layer0_enabled()
     monkeypatch.setenv("VLLM_GFX906_QUANT_LAYER0_MOE", "0")
