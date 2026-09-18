@@ -319,24 +319,31 @@ def test_qsa_sparse_paged_attention_matches_reference(
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-@requires_qsa_kernels
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-def test_qsa_mqa_paged_matches_reference(dtype: torch.dtype) -> None:
-    """The indexer's scoring kernel reads the compressed-key cache in its own dtype."""
+def _qsa_mqa_paged_case(
+    dtype: torch.dtype, *, num_rows: int, uniform: bool
+) -> tuple[Any, ...]:
+    """One indexer-scoring case.
+
+    ``uniform`` puts every row on request 0, which is the row-tiled route's
+    precondition; otherwise the rows are split across two requests, so the
+    per-row kernel must be used.
+    """
     torch.manual_seed(3)
     head_dim = 128
-    num_rows, num_query_heads = 64, 4
+    num_query_heads = 4
     page_size, num_pages, num_requests = 64, 20, 2
-    compress_ratio = 4
     q = torch.randn(num_rows, num_query_heads, head_dim, device="cuda", dtype=dtype)
     k_cache = torch.randn(num_pages, page_size, 1, head_dim, device="cuda", dtype=dtype)
     page_table = torch.randperm(num_pages, device="cuda", dtype=torch.int32).reshape(
         num_requests, num_pages // num_requests
     )
-    token_to_req = torch.repeat_interleave(
-        torch.arange(num_requests, device="cuda", dtype=torch.int32),
-        num_rows // num_requests,
-    )
+    if uniform:
+        token_to_req = torch.zeros(num_rows, device="cuda", dtype=torch.int32)
+    else:
+        token_to_req = torch.repeat_interleave(
+            torch.arange(num_requests, device="cuda", dtype=torch.int32),
+            num_rows // num_requests,
+        )
     sequence_lengths = torch.tensor(
         [num_pages * page_size, num_pages * page_size - 37],
         device="cuda",
@@ -346,6 +353,23 @@ def test_qsa_mqa_paged_matches_reference(dtype: torch.dtype) -> None:
     query_positions = (
         request_lengths - num_rows + torch.arange(num_rows, device="cuda")
     ).to(torch.int32)
+    return q, k_cache, page_table, token_to_req, query_positions, sequence_lengths
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("uniform", [False, True], ids=["per-row", "tiled"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_qsa_mqa_paged_matches_reference(dtype: torch.dtype, uniform: bool) -> None:
+    """The indexer's scoring kernel reads the compressed-key cache in its own dtype.
+
+    Both routes -- the per-row kernel and the row-tiled one that the uniform
+    prefill gate selects -- must reproduce the reference.
+    """
+    compress_ratio = 4
+    num_rows = 64
+    q, k_cache, page_table, token_to_req, query_positions, sequence_lengths = (
+        _qsa_mqa_paged_case(dtype, num_rows=num_rows, uniform=uniform)
+    )
 
     actual, actual_visible = qsa_ops.qsa_mqa_paged(
         q,
@@ -368,3 +392,72 @@ def test_qsa_mqa_paged_matches_reference(dtype: torch.dtype) -> None:
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(actual_visible, expected_visible)
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize(
+    ("dtype", "num_rows", "uniform", "expect_tiled"),
+    [
+        # fp16 is a native tl.dot everywhere; uniform prefill rows take the tiled route.
+        (torch.float16, 64, True, True),
+        # ... but only at prefill scale, and only when the rows share a request.
+        (torch.float16, 32, True, False),
+        (torch.float16, 64, False, False),
+        # bf16 is a hardware dot only where the platform has native bf16 (gfx906
+        # emulates it: the tiled route measured 0.42x there vs 1.39x in fp16).
+        (torch.bfloat16, 64, True, False),
+    ],
+    ids=["fp16-uniform", "fp16-small", "fp16-mixed-req", "bf16-uniform"],
+)
+def test_qsa_mqa_paged_route_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    num_rows: int,
+    uniform: bool,
+    expect_tiled: bool,
+) -> None:
+    """Pin the row-tiled gate: it must not be entered for bf16 on gfx906.
+
+    The tiled kernel's win is a hardware ``tl.dot``; where that is emulated
+    (bf16 on gfx906) it is 2.4x slower, so the gate -- not just correctness --
+    is the regression guard.
+    """
+    compress_ratio = 4
+    launched: list[str] = []
+
+    def recorder(name: str, original: Any) -> Any:
+        """Stand-in for a Triton kernel that records the launch and delegates."""
+
+        class _Recorder:
+            def __getitem__(self, grid: Any) -> Any:
+                def launch(*args: Any, **kwargs: Any) -> Any:
+                    launched.append(name)
+                    return original[grid](*args, **kwargs)
+
+                return launch
+
+        return _Recorder()
+
+    for name in ("_qsa_mqa_paged_tiled_kernel", "_qsa_mqa_paged_kernel"):
+        monkeypatch.setattr(qsa_ops, name, recorder(name, getattr(qsa_ops, name)))
+
+    q, k_cache, page_table, token_to_req, query_positions, sequence_lengths = (
+        _qsa_mqa_paged_case(dtype, num_rows=num_rows, uniform=uniform)
+    )
+    qsa_ops.qsa_mqa_paged(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+    )
+
+    if not expect_tiled and dtype == torch.bfloat16 and uniform and num_rows >= 64:
+        # bf16 is expected to take the tiled route only where the dot is native.
+        assert current_platform.supports_native_bf16 is False
+
+    assert launched == (
+        ["_qsa_mqa_paged_tiled_kernel"] if expect_tiled else ["_qsa_mqa_paged_kernel"]
+    )

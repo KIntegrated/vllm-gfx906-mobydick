@@ -116,6 +116,110 @@ def _qsa_mqa_paged_kernel(
 
 
 @triton.jit
+def _qsa_mqa_paged_tiled_kernel(
+    q_ptr,
+    k_cache_ptr,
+    page_table_ptr,
+    token_to_req_ptr,
+    query_positions_ptr,
+    sequence_lengths_ptr,
+    visible_blocks_ptr,
+    logits_ptr,
+    stride_q_row,
+    stride_q_head,
+    stride_q_dim,
+    stride_cache_block,
+    stride_cache_token,
+    stride_cache_dim,
+    stride_table_req,
+    stride_table_page,
+    stride_logits_row,
+    num_rows,
+    num_columns,
+    num_pages,
+    num_requests,
+    score_divisor,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+) -> None:
+    # Row-tiled indexer scoring. A tile of BLOCK_M query rows shares ONE load of
+    # the compressed keys (the kernel is L2-bandwidth bound on that load) and the
+    # per-head query.key reduction becomes an MFMA tl.dot. Correct only when all
+    # rows in the tile share one request (page table is per-request); the wrapper
+    # routes uniform-request (prefill) calls here and falls back otherwise.
+    rt = tl.program_id(0)
+    ct = tl.program_id(1)
+    row_ids = rt * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_ids = ct * BLOCK_N + tl.arange(0, BLOCK_N)
+    dims = tl.arange(0, BLOCK_D)
+    row_ok = row_ids < num_rows
+
+    request = tl.load(token_to_req_ptr + row_ids, mask=row_ok, other=-1)
+    safe_req = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    qpos = tl.load(query_positions_ptr + row_ids, mask=row_ok, other=0)
+    req_ok = row_ok & (request >= 0) & (request < num_requests)
+    seqlen = tl.load(sequence_lengths_ptr + safe_req, mask=req_ok, other=0)
+    visible = tl.minimum((qpos + 1) // COMPRESS_RATIO, seqlen // COMPRESS_RATIO)
+    if ct == 0:
+        tl.store(visible_blocks_ptr + row_ids, visible, mask=row_ok)
+
+    # Uniform request across the tile (guaranteed by the wrapper): one page table.
+    tile_req = tl.maximum(tl.max(tl.where(row_ok, safe_req, 0)), 0)
+    logical_page = col_ids // PAGE_SIZE
+    page_offset = col_ids % PAGE_SIZE
+    col_ok = (col_ids < num_columns) & (logical_page < PAGE_TABLE_WIDTH)
+    safe_lp = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
+    physical_page = tl.load(
+        page_table_ptr + tile_req * stride_table_req + safe_lp * stride_table_page,
+        mask=col_ok,
+        other=-1,
+    )
+    col_ok &= (physical_page >= 0) & (physical_page < num_pages)
+    safe_pp = tl.maximum(physical_page, 0).to(tl.int64)
+
+    # keys transposed to [BLOCK_D, BLOCK_N] so tl.dot contracts over the head dim.
+    keys_t = tl.load(
+        k_cache_ptr
+        + safe_pp[None, :] * stride_cache_block
+        + page_offset[None, :] * stride_cache_token
+        + dims[:, None] * stride_cache_dim,
+        mask=(dims[:, None] < HEAD_DIM) & col_ok[None, :],
+        other=0.0,
+    )
+    scores = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for head in tl.static_range(0, NUM_HEADS):
+        qh = tl.load(
+            q_ptr
+            + row_ids[:, None] * stride_q_row
+            + head * stride_q_head
+            + dims[None, :] * stride_q_dim,
+            mask=row_ok[:, None] & (dims[None, :] < HEAD_DIM),
+            other=0.0,
+        )
+        dot = tl.dot(qh, keys_t, out_dtype=tl.float32)
+        scores += tl.maximum(dot, 0.0)
+    scores /= score_divisor
+
+    valid = (
+        row_ok[:, None]
+        & col_ok[None, :]
+        & (col_ids[None, :] < visible[:, None])
+        & (request[:, None] >= 0)
+    )
+    tl.store(
+        logits_ptr + row_ids[:, None] * stride_logits_row + col_ids[None, :],
+        tl.where(valid, scores, -float("inf")),
+        mask=row_ok[:, None] & (col_ids[None, :] < num_columns),
+    )
+
+
+@triton.jit
 def _expand_qsa_indices_kernel(
     block_indices_ptr,
     query_positions_ptr,
@@ -635,6 +739,59 @@ def qsa_mqa_paged(
     if not q.shape[0] or not columns:
         return logits, visible_blocks
     block_n = 32
+    # Row-tiled path when every row belongs to the same request (uniform-request
+    # prefill): a tile of BLOCK_M rows shares one load of the compressed keys
+    # (this scoring is L2-bandwidth bound on that load) and the per-head
+    # query-key reduction becomes a single tl.dot. Worth it only where that dot
+    # is a hardware instruction -- fp16 always lowers to one (v_dot2 on gfx906,
+    # MFMA on CDNA), bf16 is emulated per-scalar on gfx906 (measured 0.42x there
+    # vs 1.39x in fp16) and native elsewhere. The uniformity check syncs the
+    # device, so it stays behind the row-count gate: decode (few rows, mixed
+    # requests) always takes the per-row kernel.
+    dot_is_native = q.dtype == torch.float16 or current_platform.supports_native_bf16
+    use_tiled = (
+        q.shape[0] >= 64
+        and dot_is_native
+        and bool((token_to_req == token_to_req[0]).all())
+    )
+    if use_tiled:
+        block_m = 16
+        _qsa_mqa_paged_tiled_kernel[
+            (triton.cdiv(q.shape[0], block_m), triton.cdiv(columns, block_n))
+        ](
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            visible_blocks,
+            logits,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(3),
+            page_table.stride(0),
+            page_table.stride(1),
+            logits.stride(0),
+            q.shape[0],
+            columns,
+            k_cache.shape[0],
+            page_table.shape[0],
+            float(score_divisor),
+            PAGE_SIZE=k_cache.shape[1],
+            PAGE_TABLE_WIDTH=page_table.shape[1],
+            NUM_HEADS=q.shape[1],
+            HEAD_DIM=q.shape[2],
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_D=triton.next_power_of_2(q.shape[2]),
+            COMPRESS_RATIO=compress_ratio,
+            num_warps=4,
+        )
+        return logits, visible_blocks
     _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
         q,
         k_cache,

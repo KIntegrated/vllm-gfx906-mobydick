@@ -27,11 +27,11 @@ chip.
    reported failure, and is a measured **3.9×** on the QSA kernel pair, because gfx906
    emulates every bf16 `tl.dot` as scalar fp32 FMA (`v_fmac_f32`) while fp16 lowers to
    `v_dot2_f32_f16`. No new kernels: guard edits only.
-2. **The CDNA2 patch set (QSA-FN-4/5/6)** — of its three changes, one ports
-   (tiled indexer, +39 % fp16, must be dtype-gated), one is capacity-only
-   (int8 KV: 2.5–2.7× attention prefill cost, decode-neutral), and one does not
-   port at all (int8-QK: faults at the dispatch profile every real prefill uses,
-   and is not faster where it runs).
+2. **The CDNA2 patch set (QSA-FN-4/5/6)** — of its three changes, **one ported
+   and shipped** (tiled indexer, **1.33×** fp16 gated on `dot_is_native`), one is
+   capacity-only (int8 KV: 2.5–2.7× attention prefill cost, decode-neutral), and
+   one does not port at all (int8-QK: faults at the dispatch profile every real
+   prefill uses, and is not faster where it runs).
 
 **Critical path: QSA-FN-8** (assemble the tester build from the shipped FN-1 +
 FN-2; QSA-FN-1/2/3 are SHIPPED); the int8 items (QSA-FN-5/6) are evidence-first
@@ -163,22 +163,35 @@ proposing (§1 duplicate checks not yet run).
 writes a column without the `-1` every other align site uses — dev log,
 Refrigerated residue; unverifiable here (no RecoverSSM model loadable).
 
-### QSA-FN-4 — backport the tiled indexer (**fp16-gated**)
+### QSA-FN-4 — backport the tiled indexer (**fp16-gated**) (**SHIPPED 2026-09-17**)
 
-**Status: OPEN — patch applies cleanly today** (`patch -p0 --dry-run` clean on
-both files; our `amd/` files are the CDNA author's exact base). Bring
-`_qsa_mqa_paged_tiled_kernel` + the uniform-request route (`q.shape[0] >= 64`) in
-verbatim, then **add the dtype gate the CDNA version lacks**: measured 1.39× in
-fp16 but **0.42× in bf16** (16648 vs 6928 µs) — as written, a bf16 run would take
-a ~2.4× indexer regression. Quality is unaffected by construction (top-2048
-membership agreement 1.00000, logits NRMSE 1.3e-7).
+**Status: SHIPPED** — both CDNA hunks in `amd/ops/qsa.py` plus the gate the CDNA
+version lacks. Record:
+[`DEVLOG-qwen38-flash-qsa.md`](DEVLOG-qwen38-flash-qsa.md) (4).
 
-Also note the route's uniformity check `(token_to_req == token_to_req[0]).all()`
-synchronizes the device; keep it inside the `q.shape[0] >= 64` prefill gate.
+```python
+dot_is_native = q.dtype == torch.float16 or current_platform.supports_native_bf16
+use_tiled = q.shape[0] >= 64 and dot_is_native and bool((token_to_req == token_to_req[0]).all())
+```
 
-**GATE:** fp16 indexer probe (`/local/tmp/qsaprobe/probe_indexer.py`) ≥ 1.3× and
-agreement 1.00000, **plus** a bf16 run showing the route is not taken, **plus**
-the QSA-FN-1 fp16 gate unchanged, **plus** the four existing-model gates.
+The win is the hardware `tl.dot`, not the tiling: fp16 gains on every target
+(gfx906 `v_dot2_f32_f16`, CDNA MFMA), bf16 is emulated per-scalar on gfx906
+(0.42× there) and native on CDNA (the author's 6.57×). The uniformity check syncs
+the device and stays inside the `q.shape[0] >= 64` prefill gate.
+
+**Gate (met, launch-regime, one MI50):** fp16 dispatch **1.33-1.35×** (4084/4061 vs
+5439/5465 µs, same inputs, interleaved ×3) with top-2048 agreement **1.00000** and
+logits NRMSE 1.28e-07; bf16 stays on the per-row route (1.00×, not 0.42×).
+`test_qsa_amd.py` **16 → 22 passed** (the scoring test now covers both routes;
+new `test_qsa_mqa_paged_route_selection` pins the gate, including
+“bf16 + uniform + 64 rows → per-row”). Non-regression in the same boot:
+`test_qsa_reference.py` 19, `test_config.py` 7, `test_ple.py` 10, FA
+`test_gfx906_fa.py` 104, PPL 10.5472 (recorded value), MoE-35B reference
+workload unchanged.
+
+**Limit:** the indexer's *serving* share (~23 % of prefill on the CDNA author's
+30 k-token measurement) is not re-measured — the tiny rig cannot transfer shares
+(FN-3), so a tester remains the only end-to-end number.
 
 ### QSA-FN-5 — int8 `per_token_head` KV for QSA: capacity-only, evidence-first
 

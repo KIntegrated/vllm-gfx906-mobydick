@@ -6,6 +6,91 @@
 > bf16-only site inventory, the ISA facts and the kernel timings live there; not
 > restated per entry). Newest entry first.
 
+## 2026-09-17 (4) — QSA-FN-4: the tiled indexer, fp16-gated
+
+**VERDICT:** `SHIPPED` · **GATE:** the in-tree dispatch probe — fp16
+**1.33×** with top-2048 agreement **1.00000**, and a bf16 run proving the route
+is **not** taken (1.00×, not the 0.42× the ungated CDNA version measured).
+
+### What was done
+
+`vllm/models/qwen4_exp/amd/ops/qsa.py`, the two CDNA hunks only (the rest of that
+patch set is int8, i.e. QSA-FN-5/6, and stays out):
+
+- `_qsa_mqa_paged_tiled_kernel` — `BLOCK_M=16` query rows per program share one
+  load of the compressed keys (the scoring is L2-bandwidth bound on it) and the
+  per-head query·key reduction becomes one `tl.dot`.
+- the dispatch in `qsa_mqa_paged`, carrying the uniform-request precondition
+  `(token_to_req == token_to_req[0]).all()` inside the `q.shape[0] >= 64` prefill
+gate (that check syncs the device — keep it off the decode path).
+
+**Plus the gate the CDNA version lacks**, because the win is the *hardware dot*,
+not the tiling:
+
+```python
+dot_is_native = q.dtype == torch.float16 or current_platform.supports_native_bf16
+use_tiled = q.shape[0] >= 64 and dot_is_native and bool((token_to_req == token_to_req[0]).all())
+```
+
+fp16 lowers to a dot on every target (`v_dot2_f32_f16` on gfx906, MFMA on CDNA);
+bf16 is emulated per-scalar on gfx906 and native on CDNA/CUDA — where the CDNA
+author measures 6.57× (4453 → 678 µs), so gating on `supports_native_bf16` keeps
+their win and drops the gfx906 regression.
+
+### Evidence FOR (launch-regime, one MI50, uniform mapping — same inputs)
+
+[`benchmarks/kernels/gfx906/probe_fn4_indexer_route.py`](../../benchmarks/kernels/gfx906/probe_fn4_indexer_route.py)
+(2048 rows, L=30720, uniform mapping, interleaved reps ×3, medians; two runs agree
+to <1 %):
+
+| dtype | dispatch (tiled) | per-row, op | per-row, kernel | speedup | top-2048 | NRMSE |
+|---|---|---|---|---|---|---|
+| fp16 | **4061 / 4084 µs** | 5424 µs | 5465 / 5439 µs | **1.35× / 1.33×** | **1.00000** | 1.28e-07 |
+| bf16 | 6961 µs | 6747 µs | 6962 µs | 1.00× | 1.00000 | 0.0 |
+
+That bf16 row *is* the gate evidence: the “tiled” arm (a uniform mapping, which
+would take the tiled route if the gate allowed it) is the per-row kernel time to
+within 0.02 %; the same shape through the ungated CDNA kernel was 16648 µs
+(0.42×, recon §5). fp16 reproduces the recon's ~1.3× at NRMSE 1.3e-7.
+
+**Tests** (`tests/models/qwen4_exp/test_qsa_amd.py`, 22 passed):
+
+- the scoring test is now parametrized over the **route** as well as the dtype
+  (uniform mapping → tiled, mixed → per-row); both must match the torch
+  reference;
+- new `test_qsa_mqa_paged_route_selection` pins the gate with recording kernel
+  stand-ins: fp16+uniform+64 rows → tiled; fp16 at 32 rows → per-row;
+  fp16+mixed requests → per-row; **bf16+uniform+64 rows → per-row** on gfx906
+  (asserted against `supports_native_bf16`).
+
+**QSA-FN-7 / FN-1 non-regression (one boot):** `test_qsa_amd.py` 16 → **22
+passed**; `test_qsa_reference.py` **19**; `test_config.py` **7**; `test_ple.py`
+**10**; `tests/kernels/attention/test_gfx906_fa.py` **104 passed**; PPL
+(Qwen3.8-27B-AWQ-INT4, fp16, 359 tokens) **10.5472 / 0 top-20 misses** = the value
+recorded for this build; MoE 35B reference workload (`_bench_gfx906.py`,
+pp2048/tg256, `BENCH_MAX_SEQS=32`, util 0.95, mclk 1000) **58.40 / 58.40 / 58.38
+/ 58.41 t/s** — mean 58.40, i.e. at the top of the recorded 57.97–58.36 band
+(that model is now only at `/data/models/QuantTrio/Qwen3.5-35B-A3B-AWQ`; the
+`/local/models/...` path in the recipe is stale and makes vLLM treat the path as
+an HF repo id).
+
+### Evidence AGAINST / limits
+
+- **Launch-regime only.** The indexer is ~23 % of prefill on the CDNA author's
+  30 k-token measurement; nothing here re-measures the *serving* share, and the
+  tiny rig cannot (dims are 10–24× off the real model — FN-3's standing limit).
+  The dispatch's own cost when the route is *not* taken is one extra device sync
+  (`(token_to_req == token_to_req[0]).all()`) on each prefill call ≥ 64 rows.
+- The gate is dtype- *and* platform-based, not measured on CDNA: gfx906 fp16 is
+  measured here, the CDNA bf16 number is the author's.
+
+### Interactions
+
+- Complements QSA-FN-1: the tiled kernel is the second (and last) CDNA change we
+  take — QSA-FN-5/6 (int8) stay out on evidence.
+- The route needs a *uniform* `token_to_req`, so any future mixed-batch indexer
+  work should measure the sync before relaxing it (FN-6's territory).
+
 ## 2026-09-17 (3) — QSA-FN-2: the tester serve recipe
 
 **VERDICT:** `SHIPPED` (recipe + flag-set validation on the tiny harness); the

@@ -6,6 +6,31 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-17 (QSA-FN-4 — the tiled QSA indexer lands, fp16-gated)
+
+- **The one CDNA2 patch that ports is in**: `_qsa_mqa_paged_tiled_kernel` plus the
+  uniform-request dispatch in `vllm/models/qwen4_exp/amd/ops/qsa.py`, with the gate
+  the CDNA version lacks — `dot_is_native = q.dtype == torch.float16 or
+  current_platform.supports_native_bf16`. The win is the *hardware* `tl.dot` (the
+  tiling only amortizes the key load), so fp16 gains everywhere (gfx906
+  `v_dot2_f32_f16`, CDNA MFMA) while bf16 must not enter on gfx906, where the dot
+  is emulated per-scalar.
+- **Gate (launch-regime, one MI50, uniform mapping, same inputs, interleaved
+  ×3, two runs):** fp16 dispatch **1.33-1.35×** (4084/4061 vs 5439/5465 µs) with top-2048 agreement
+  **1.00000** and logits NRMSE 1.28e-07; **bf16 stays on the per-row route**
+  (6958 vs 6959 µs = 1.00×, versus the ungated CDNA kernel's 0.42×/16648 µs on the
+  same shape).
+- **Tests:** `tests/models/qwen4_exp/test_qsa_amd.py` **16 → 22 passed** — the
+  scoring test now runs both routes against the torch reference, and the new
+  `test_qsa_mqa_paged_route_selection` pins the gate with recording kernel
+  stand-ins (fp16 uniform 64 rows → tiled; 32 rows or mixed requests → per-row;
+  bf16 uniform → per-row). Non-regression in the same boot: `test_qsa_reference.py`
+  19 passed, `test_config.py` 7, `test_ple.py` 10, `test_gfx906_fa.py` 104, PPL
+  10.5472 (the recorded value for this build), MoE-35B reference workload 58.40
+  t/s mean (58.38-58.41) — at the top of the recorded 57.97-58.36 band.
+- **Not measured:** the indexer's serving share of prefill (the tiny rig cannot
+  transfer shares) — the tester's report (QSA-FN-8) is the only end-to-end number.
+
 ## 2026-09-17 (V2-MAMBA-1 — V2 runner + mamba `align` mode no longer faults on gfx906)
 
 - **A GPU memory fault on any hybrid model with heterogeneous KV-group block
