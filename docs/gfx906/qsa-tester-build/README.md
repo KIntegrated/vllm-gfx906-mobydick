@@ -36,6 +36,11 @@ Equivalently, from `gfx906/v0.29.0`: `git apply patches/000{1,2,3,4}-*.patch` in
 order — that was validated here and reproduces the branch's 63 shipped files
 byte-for-byte.
 
+**On `gfx906/v0.29.0-final` (our 2026-09-18 release), patch 0002 is already in
+the tree** (the release backported it) and so is `0004`'s harness; apply only
+`0001` + `0003`, or apply all four to the pre-release base `f79ebf2d44` as the
+`BUILD-INFO.txt` records.
+
 ### B. On stock upstream (verified against `releases/v0.30.0`)
 
 ```bash
