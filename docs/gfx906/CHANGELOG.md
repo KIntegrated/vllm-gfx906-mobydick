@@ -6,6 +6,46 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-18 (two gated wins go default-on; stale-verdict sweep)
+
+Kevin's decision after the 0.30.0 review (`MERGE-0.30.0-review.md`) established
+that both were gated wins awaiting a flip, not parked code.
+
+- **`VLLM_GFX906_SKINNY_M16` is now default-on** (`=0` is the kill switch).
+  Record: `DEVLOG-fp16-skinny.md`, VERDICT SHIPPED — 35B MoE N=8 graph **191.0 vs
+  166.9 t/s (+14.5 %)**, 27B (Qwen3.8) N=8 **104.2 vs 98.2 (+6.1 %)**, 27B N=4
+  control flat (−0.6 %, flag inert), correctness + per-shape 2–7.5× PASS, and a
+  passed 30-rep × 2-model soak. Covers the M=5..16 spec-verify / 5–16-seq
+  concurrent-decode regime, which was falling back to the M-invariant Triton
+  skinny path.
+- **`VLLM_GFX906_QUANT_LAYER0_MOE` (C4) is now default-on** (`=0` is the kill
+  switch). Record: `DEVLOG-c4-layer0-quant.md` — GO 2026-09-01 with every gate
+  passed: unit 8/8; PPL 15.9531 → 15.9929 (Δ +0.04 against a 0.5 gate); greedy
+  serving fingerprint bit-identical; serving A/B 84.95 → **87.51 t/s (+3.0 %)**
+  against a ~1.8 % noise floor; ~1.5 GiB returned to graph capture.
+  **Re-measured after the flip on the house reference workload** (Qwen3.5-35B-A3B-AWQ,
+  `_bench_gfx906.py` pp2048/tg256, 4 samples, mclk 1000): **59.79 t/s**
+  (59.76–59.84) vs **58.40** before the flip = **+2.4 %** — so future 35B numbers
+  must be compared against the new baseline, not the 57.97–58.36 band.
+  **Quality, same build and prompt set (`VLLM_GFX906_QUANT_LAYER0_MOE` ON vs the
+  `=0` kill switch): PPL 15.9361 vs 16.0169** (359 tokens, 0 top-20 misses in both;
+  Δ 0.08 in the ON-better direction, while the 2026-09-01 pair differed 0.04 the
+  other way ⇒ the delta is at the probe's resolution, not a quality signal). Layer 0's
+  experts are quantized at load, which is a quality trade-off the checkpoint
+  author did not make — accepted on the measurement above.
+- **NH-4 stays** (`VLLM_GFX906_MAMBA_FUSED_GROUP_NORM`, default off) — Kevin's
+  call after the review; its neutral A/B result is unchanged, and its stale
+  "pending the serving A/B gate" comment is now accurate about what was measured.
+- **Stale-verdict sweep (first pass):** the three stale comments above
+  (NH-4, C4, SKINNY_M16 docstring) plus `DEAD-ENDS.md`'s "`VLLM_GFX906_FUSED_DRAFT`
+  has no reader in-tree" (the A3 opt-in was revived 2026-09-14 with three tests)
+  and a stale `V1`-pin recipe in `docs/gfx906/README.md` that contradicted the
+  same file's DFL2-2 closure note. Everything else in the ~60-flag gfx906
+  namespace reconciled (flag default ↔ comment claim ↔ recorded verdict). The
+  `GFX906_FA_LEGACY_ALLOW_UNVERIFIED` reference in `test_gfx906_fa.py` is a
+  deliberate guard that the removed override stays inert — kept.
+  New standing rule: [`AGENTS.md`](AGENTS.md) merge-train rule 6.
+
 ## 2026-09-17 (QSA-FN-8 — tester bundle for Qwen3.8-Flash-Next on gfx906)
 
 - **Packaged and validated the external gate.** `docs/gfx906/qsa-tester-build/`

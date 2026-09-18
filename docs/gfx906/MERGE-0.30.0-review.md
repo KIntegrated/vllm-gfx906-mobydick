@@ -104,6 +104,16 @@ switch:
 Switches already default-on (`ALIGN_M1`, `DENSE_GEMV`, `DOWN_GEMV`,
 `SORT_FREE_SMALL_K`, `SPEC_CG_SMALL`, `SPEC_GEMM`, `TOPK_SINGLE_GROUP`) are live.
 
+## Outcome (2026-09-18)
+
+Steps 1-3 executed: **both gated wins flipped to default-on** (SKINNY_M16, C4;
+`=0` kill switches, comments updated in the same commit, gate semantics verified
+and the house gates re-run), **NH-4 kept** with its comment corrected, and the
+**stale-verdict sweep** run (findings in the CHANGELOG entry for 2026-09-18; the
+standing rule is now `AGENTS.md` merge-train rule 6). Nothing was deleted, and no
+dead-code branch was created — the "off-by-default = parked" premise did not
+survive contact with the records.
+
 ## Proposed plan (revised after checking the records)
 
 1. **Flip the two gated wins** (one-line default change each, no new code):

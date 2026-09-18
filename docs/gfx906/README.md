@@ -33,7 +33,8 @@ Reference point: llama.cpp (Q4_K_XL GGUF, full offload) — **70.3 t/s decode,
 | MoE serving decode | 3.49 t/s | **67.39 t/s** | 19.3× | llama.cpp 70.3 (1.04× gap) |
 | MoE prefill (pp=2048) | ~450 t/s | **~2140 t/s** | 4.7× | llama.cpp 806.5 (2.7× ahead) |
 | Dense serving decode | 18.89 t/s | **25.60 t/s** | +35% | — |
-| MoE concurrent decode (N=8) | 166.9 t/s (W4 off) | **191.0 t/s** | +14.5% | W4 skinny fp16 M≤16 (`VLLM_GFX906_SKINNY_M16`, flag on, soak-verified; `DEVLOG-fp16-skinny.md`) |
+| MoE concurrent decode (N=8) | 166.9 t/s (W4 off) | **191.0 t/s** | +14.5% | W4 skinny fp16 M≤16 (`VLLM_GFX906_SKINNY_M16`; **default on 2026-09-18**, `=0` kill switch; soak-verified; `DEVLOG-fp16-skinny.md`) |
+| MoE serving decode, layer-0 experts quantized | 84.95 t/s | **87.51 t/s** | +3.0% | C4 (`VLLM_GFX906_QUANT_LAYER0_MOE`; **default on 2026-09-18**, `=0` kill switch; PPL 15.9531 → 15.9929, fingerprint bit-identical; `DEVLOG-c4-layer0-quant.md`). **Reference-workload effect:** the pp2048/tg256 4-sample house bench read **59.79 t/s** after the flip vs 58.40 before (+2.4 %) |
 
 Correctness gates: PPL on a fixed 442-token probe — MoE band 6.6817–6.6942,
 dense band 6.6993–6.7197; on the 0.29.0 line the in-process probe is
@@ -364,8 +365,9 @@ posix.stat`). Allowlist them away for any bench:
 
 ```bash
 export VLLM_PLUGINS=quark_online_quant
-export VLLM_USE_V2_MODEL_RUNNER=0   # 0.29.0+: pin V1 (V2 is upstream's default,
-                                    # unvalidated on gfx906 — see ROADMAP DFL2-2)
+# The V2 model runner is the default and is validated on gfx906 since 2026-09-16
+# (DFL2-2 closed; V1 was unpinned in this file's recipe above). V1 is the
+# rollback: VLLM_USE_V2_MODEL_RUNNER=0 (Qwen4Exp needs V2 — see QSA-FN-2).
 ```
 
 MoE (**`/data/models/QuantTrio/Qwen3.5-35B-A3B-AWQ`** — the `/local` copy is

@@ -168,8 +168,11 @@ class Mixer2RMSNormGated(CustomOp):
             # per-group reduction, so route the grouped case through it when
             # each rank owns at least one whole group (Nemotron-H: 8 groups
             # of 1024; TP=2 -> 4 groups/rank of 1024). Gated by
-            # VLLM_GFX906_MAMBA_FUSED_GROUP_NORM, default off pending the
-            # serving A/B gate (DEVLOG-nemotron-h.md NH-4).
+            # VLLM_GFX906_MAMBA_FUSED_GROUP_NORM, default off: its serving A/B
+            # ran (DEVLOG-nemotron-h.md NH-4, A-B-A, TP=2+EP) and was neutral
+            # (+0.4 %, inside inter-arm noise) because the decode step is
+            # MoE-GEMV-bound, so the ~0.29 ms/step of launch-tail saving does not
+            # surface here; flip it for a config that stops being GEMV-bound.
             if (
                 os.environ.get("VLLM_GFX906_MAMBA_FUSED_GROUP_NORM", "0") == "1"
                 and self.per_rank_hidden_size % self.group_size == 0

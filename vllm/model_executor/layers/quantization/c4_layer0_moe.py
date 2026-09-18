@@ -13,9 +13,13 @@ loading (group size from the checkpoint's AWQ config, asymmetric AWQ
 zero-point convention) and routes them through the same gfx906 W4A16 kernel
 as every other MoE layer.
 
-Gated by `VLLM_GFX906_QUANT_LAYER0_MOE=1` (default off): quantizing a layer
-the checkpoint author deliberately left unquantized is a quality trade-off, so
-this ships opt-in until the PPL/coherence gate passes.
+Default on since 2026-09-18; `VLLM_GFX906_QUANT_LAYER0_MOE=0` is the kill
+switch. Quantizing a layer the checkpoint author deliberately left unquantized is
+a quality trade-off, so it was opt-in until its gates passed - they all did
+(DEVLOG-c4-layer0-quant.md, 2026-09-01): unit 8/8; PPL 15.9531 -> 15.9929
+(delta +0.04 against a 0.5 gate); greedy serving fingerprint bit-identical; serving
+A/B 84.95 -> 87.51 t/s = +3.0 % against a ~1.8 % noise floor; ~1.5 GiB returned to
+graph capture.
 
 Design notes:
 - Weights load exactly as the unquantized path does (inherited create_weights
@@ -48,8 +52,8 @@ logger = init_logger(__name__)
 
 
 def c4_quant_layer0_enabled() -> bool:
-    """Env gate for C4 (opt-in)."""
-    return os.environ.get("VLLM_GFX906_QUANT_LAYER0_MOE", "0") == "1"
+    """Env gate for C4 (default on since the gate passed; see below)."""
+    return os.environ.get("VLLM_GFX906_QUANT_LAYER0_MOE", "1") != "0"
 
 
 def _on_gfx906() -> bool:
