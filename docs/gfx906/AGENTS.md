@@ -94,6 +94,8 @@ major ongoing theme, with the model/branch/date in the file header:
 - `DEVLOG-spec-decode.md` — speculative decoding (incl. the n-gram dense probe)
 - `DEVLOG-gemma4-*.md` — Gemma-4 family (kernel + onboarding/prefill-logprob incident)
 - `DEVLOG-qwen*.md` — Qwen-family onboarding / crash notes
+- `DEVLOG-v2-mamba-align.md` — V2 runner + mamba `align` state migration
+  (prefix caching on hybrid models): the V2-MAMBA-1 seed fault
 - `DEAD-ENDS.md` — one-pass index: hypothesis → gate → verdict → commit → refs
 
 A short incident/crash/anomaly goes in its model/topic log, not a fresh file —
