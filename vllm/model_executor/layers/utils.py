@@ -311,8 +311,9 @@ def _gfx906_spec_gemv_m4(
     weight: torch.Tensor, x_view: torch.Tensor
 ) -> torch.Tensor | None:
     """M=2..16 W16A16 dense GEMM via the row-parallel GEMV-family kernel
-    (spec decode L1' for M=2..4, default on; W4 skinny M=5..16 behind
-    VLLM_GFX906_SKINNY_M16, default off; see
+    (spec decode L1' for M=2..4; W4 skinny M=5..16, both default on -- the M=5..16
+    rail measured +14.5 % on 35B N=8 and +6.1 % on 27B N=8 in
+    DEVLOG-fp16-skinny.md; VLLM_GFX906_SKINNY_M16=0 is the kill switch; see
     csrc/rocm/dense_gemv_gfx906.cu).
 
     The triton_matmul skinny fallback is weight-bound and M-invariant on
@@ -347,7 +348,7 @@ def _gfx906_spec_gemv_m4(
     # ones) - crossover at M ~= 7.4, size-independent. Gate: M<=7
     # everywhere, M=8 to <=32 MB, M>=9 to <=10 MB (small-shape
     # triton-floor regime).
-    m16 = os.environ.get("VLLM_GFX906_SKINNY_M16", "0") == "1"
+    m16 = os.environ.get("VLLM_GFX906_SKINNY_M16", "1") != "0"
     if rpt == 4:
         m16 = False  # the m16 kernel is RPT=1
     if m16 and 5 <= n <= 16:
