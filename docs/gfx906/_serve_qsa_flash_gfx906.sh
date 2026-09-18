@@ -60,7 +60,9 @@
 #   PORT=8321       server port
 #   EXTRA_ARGS=     appended verbatim
 set -u
-cd /local/git/vllm-gfx906-mobydick
+# Resolve the repo root from this script's location (docs/gfx906/...), so the
+# bundle works from any checkout.
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 TP="${TP:-2}"
 GPUTIL="${GPUTIL:-0.90}"

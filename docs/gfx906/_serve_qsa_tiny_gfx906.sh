@@ -48,7 +48,9 @@
 #   .venv/bin/python /local/tmp/v2mamba/v2mamba_repro.py 8341 qsa-tiny 1343 2015 4030
 # compare against EXTRA_ARGS="--no-enable-prefix-caching" (logprobs identical).
 set -u
-cd /local/git/vllm-gfx906-mobydick
+# Resolve the repo root from this script's location (docs/gfx906/...), so the
+# bundle works from any checkout.
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 MODEL_DIR=/local/models/tiny-qwen38-flash
 NAME=qsa-tiny
