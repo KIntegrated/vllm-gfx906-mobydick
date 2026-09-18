@@ -102,24 +102,6 @@ serve); everything that depends on the real checkpoint (the 60 GB load, KV sizin
 at 256 K, quality, `content` vs `reasoning` on real outputs) is **derived and
 unvalidated** — that is what the tester's report is for.
 
-### QSA-FN-3 — tiny `qwen4_exp` config: make the model testable on one MI50
-
-**Status: OPEN — the enabler; do this second (after QSA-FN-1's guard edits, before
-any end-to-end judgement).** Nothing on this model can be gated on serving
-wall-clock without it, and the alternative (never running the code path) is how
-the int8-QK fault in §6 of the recon survived to a tester.
-
-Approach to try first (cheap): `--load-format dummy` + `--hf-overrides` shrinking
-the *real* config (few layers, E=8, small hidden, PLE present but tiny,
-`layer_types` consistent with `full_attention_interval`, MTP 1 layer). Second
-option if the overrides fight config validation: a saved tiny random checkpoint
-with the full module set. Keep the PLE/PLE-ngram and indexer paths *in* — they are
-half the architecture and the half that has never run on gfx906.
-
-**GATE:** serves on one MI50 at fp16, generates coherent text, and the existing
-`tests/models/qwen4_exp/` suite runs against it. This harness then becomes the
-regression gate for QSA-FN-1/4 and for any future Qwen4Exp work.
-
 ### QSA-FN-3 — tiny `qwen4_exp` config: make the model testable on one MI50 (**SHIPPED 2026-09-17**)
 
 **Status: SHIPPED.** [`_qsa_tiny_model.py`](_qsa_tiny_model.py) +
@@ -285,6 +267,90 @@ short greedy completion and one ~2 k-token prompt with TTFT + decode t/s; one
 breaks — which came first: init OOM, a dtype/`NotImplementedError`, a kernel
 fault (name + grid), or garbage-but-running output. Nothing here can be validated
 locally (the checkpoint needs ~60 GB), so their report *is* FN-2's gate.
+
+## High priority — user-requested (2026-09-17): upstream our fixes to vLLM
+
+Kevin, 2026-09-17: **upstream the fixes we made locally** — as PRs to
+`vllm-project/vllm`, not as fork-only patches. Everything here is checked against
+`upstream/main` and `upstream/releases/v0.30.0` (both fetched 2026-09-17) and is
+either absent there or only masked. §1 of [`AGENTS.md`](../../AGENTS.md) governs:
+duplicate-work checks first, no low-value busywork, and a **human must own and
+defend every PR** (a pure code-agent PR is not allowed — the accountable submitter
+reviews each changed line, runs the tests, and states that AI assistance was used).
+
+### UP-1 — upstream the mamba `align` seed fix (V2-MAMBA-1) — **HIGH PRIORITY**
+
+**Status: ready to propose; the human driver + duplicate checks are the only
+blockers.** One line (+assert) in
+`vllm/v1/worker/gpu/model_states/mamba_hybrid.py` (`add_request`): seed the running
+mamba block column from `cache_config.mamba_block_size`, not
+`cache_config.block_size`. The latter is the *scheduler* granularity, narrowed at
+startup to the finest KV-cache group; on a hybrid model with heterogeneous groups
+(Qwen4Exp: a `CircularBufferSpec` group at 4 vs the mamba 192) a prefix-cache hit
+seeded a column ~57× too far out and the align pre-copy followed a stale
+block-table entry to a wild address → `Memory Fault Error …
+precopy_mamba_align_fused_kernel` → dead engine. Evidence, gates and the exact
+measured mechanism: [`DEVLOG-v2-mamba-align.md`](DEVLOG-v2-mamba-align.md).
+
+Why it should be accepted and why it is not duplicate work:
+- The bug is **live in `upstream/main` and `upstream/releases/v0.30.0`** (seed line
+  verbatim, checked 2026-09-17). Upstream's same-day change narrows the *trigger*
+  (only `prefix_cacheable` groups contribute to the min, comment: “would otherwise
+  drag the global block_size below the real allocator block size and desync it
+  from mamba”) — i.e. upstream **masks** this for Qwen4Exp rather than fixing the
+  seed, and any prefix-cacheable group finer than the mamba block still trips it.
+- The fix is **model-independent and testable without a GPU model**: our
+  `tests/v1/worker/test_mamba_hybrid_model_state.py::test_add_request_seeds_running_column_with_mamba_block_size`
+  fails on the unfixed code (`assert 287 == 5`). Lead the PR with that test, not
+  with the crash (the crash needs a >60 GB checkpoint to reproduce).
+- Also worth carrying in the same PR (same file family, keeps the diff honest):
+  the ROCm un-gating of `tests/kernels/mamba/test_memcpy_u64_tiled.py` +
+  `test_precopy_mamba_align.py` (they are pure Triton/arithmetic tests and pass
+  on gfx906 — 195 passed — but are gated on `is_cuda()`).
+
+**PR checklist (Kevin, before opening):** `gh issue view`/`gh pr list --search`
+for the faulting kernel name, `add_request`, `mamba_block_size` and
+`mamba_cache_mode align`; state why not duplicate (upstream's masking change);
+test commands + results (the new unit test, the un-gated mamba suite); the
+AI-assistance statement; and the repro argument (unit test, since the crash needs
+the Qwen3.8-Flash-Next checkpoint).
+
+### UP-2 — upstream fp16 QSA for Qwen3.8-Flash-Next (QSA-FN-1) — **HIGH PRIORITY**
+
+**Status: blocked on UP-1's landing pattern (same human driver), and on a real
+model eval.** The gfx906 fork admits fp16 through every QSA/indexer site (the
+shared `QSA_ACTIVATION_DTYPES` / `QSA_KV_CACHE_DTYPES` pair + the guards), which
+is what fixes the reported `Qwen4Exp QSA currently requires BF16`; upstream
+`releases/v0.30.0` still has the bf16-only guards (`amd/qsa.py`
+`supported_dtypes = [torch.bfloat16]`), so this is a **feature**, not a bugfix —
+and on gfx906 it is also a 4.4× kernel win (bf16 has no instruction there).
+
+Extra work this PR needs that UP-1 does not:
+- The change touches `vllm/models/qwen4_exp/common/qsa_cache.py`, **shared with the
+  NVIDIA implementation** — the PR must show the edits are dtype-*general*
+  (`self.dtype` / model dtype) and that no CUDA path changes; upstream's copy of
+  that file has also moved (103/25 lines vs our base), so it needs a real port,
+  not a cherry-pick.
+- Model evals: §1 requires results for output-affecting changes. Ours are
+  kernel-level (sparse attention 26.5 ms fp16 vs 116.5 ms bf16; indexer 5426 vs
+  6928 µs) plus the whole `tests/models/qwen4_exp/` suite (16 + 19 passed) — a
+  reviewer will want a PPL/quality arm on an fp16-capable box, which we cannot run
+  (no loadable checkpoint here). Blocked on a tester (QSA-FN-8) or upstream's own
+  CI hardware.
+- `upstream/main`'s `qwen4_exp` tree may have moved further than the release
+  branch; re-check the guard sites against `main` at PR time.
+
+### UP-3 — the 0.30.0 base itself: `gfx906/v0.30.0` fork-merge train
+
+**Status: scoped, not started.** `gfx906/v0.29.0` ← `upstream/releases/v0.30.0`
+is **595 vs 767 commits and 148 conflicted files** (measured 2026-09-17 with
+`git merge-tree --write-tree`), dominated by the fork's own gfx906 patch set — the
+only mamba conflict is `mamba_mixer2.py`; the align/`mamba_hybrid.py` files merge
+clean. Our own work ports cheaply on top: of the 20 files our QSA commits touch,
+upstream churn is 0–18 lines everywhere except `common/qsa_cache.py` (103/25) and
+`tests/models/qwen4_exp/test_qsa_reference.py` (453/106) — two real adaptation
+spots. Do this as its own session with the fork validation protocol; UP-1/UP-2 can
+proceed against `main`/`releases/v0.30.0` without it.
 
 ## High priority — user-requested (2026-09-12)
 
