@@ -6,6 +6,27 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-17 (QSA-FN-8 — tester bundle for Qwen3.8-Flash-Next on gfx906)
+
+- **Packaged and validated the external gate.** `docs/gfx906/qsa-tester-build/`
+  holds the README (quick start A, our branch; B, stock upstream 0.30.0; the
+  smoke rig; what to report) and `make_patches.sh`, which derives four patches
+  from the branch commits and bundles the Qwen3.8 tokenizer + tiny config for an
+  offline smoke run. Artifact: `/local/tmp/qsa-tester-build/` + `.tgz`, with
+  `BUILD-INFO.txt` (branch/head/base/generated).
+- **Bundle self-validation:** on `gfx906/v0.29.0` the four patches apply clean and
+  reproduce the branch's **63 shipped files byte-for-byte**; on
+  `upstream/releases/v0.30.0` 0002/0003/0004 apply clean, and 0001 applies with
+  `common/qsa_cache.py` excluded (upstream moved it 103/25 — five mechanical
+  edits listed in the README; `git apply -3` does not resolve it). A scratch
+  checkout of the base + the patches then **served the tiny rig from the patched
+  tree** and ran the 1344/2016/4031-token prefix-cached sequence that used to
+  fault (3/3 OK), with `test_qsa_amd.py` + `test_mamba_hybrid_model_state.py` 26
+  passed and `test_qsa_reference.py` 19.
+- Both serve recipes hardcoded this checkout's absolute path; they now resolve the
+  repo root from their own location, so the bundle works from any tree.
+- Excluded on purpose: int8 KV / int8-QK (QSA-FN-5/6).
+
 ## 2026-09-17 (QSA-FN-4 — the tiled QSA indexer lands, fp16-gated)
 
 - **The one CDNA2 patch that ports is in**: `_qsa_mqa_paged_tiled_kernel` plus the

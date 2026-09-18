@@ -6,6 +6,71 @@
 > bf16-only site inventory, the ISA facts and the kernel timings live there; not
 > restated per entry). Newest entry first.
 
+## 2026-09-17 (5) — QSA-FN-8: the tester bundle
+
+**VERDICT:** `SHIPPED` (bundle built and self-validated); the real-model half
+stays `OPEN` by construction — it is the tester's report.
+
+**GATE:** a clean checkout of the branch base plus the four bundled patches
+serves the tiny rig and passes the sequence that used to fault, from the patched
+tree.
+
+### What was done
+
+`docs/gfx906/qsa-tester-build/` — `README.md` (what it is, quick start A: our
+branch; B: stock upstream 0.30.0 with the one manual file; the 2-minute offline
+smoke rig; how to run the real model; the report checklist; the limits) and
+`make_patches.sh`, which derives the patch set from committed state (nothing
+hand-copied) and bundles the tokenizer + tiny config so the smoke rig needs no HF
+access. Artifact: `/local/tmp/qsa-tester-build{,.tgz}` + `BUILD-INFO.txt`.
+
+Four patches: 0001 fp16 enablement (QSA-FN-1), 0002 the mamba `align` seed fix
+(V2-MAMBA-1), 0003 the tiled indexer (QSA-FN-4), 0004 the harness.
+
+### Evidence FOR
+
+- **Against the branch base** (`gfx906/v0.29.0`, f79ebf2d44): 4/4 `git apply`
+  clean; the applied tree then reproduces the branch's **63 shipped files
+  byte-for-byte** (`sha1sum` per file).
+- **Against upstream `releases/v0.30.0`** (rc captured per step, `git apply
+  --check`): 0002, 0003, 0004 clean; 0001 clean with
+  `--exclude=vllm/models/qwen4_exp/common/qsa_cache.py`; plain 0001 fails on that
+  one file, and `-3` also fails overall — so the README lists the five mechanical
+  edits (constants, backend dtype lists, `self.dtype` check, `_BF16_PER_INT64`
+  rename, docstrings). Upstream moved that shared file by 103/25 lines; every
+  other QSA file has 0 lines of churn.
+- **End-to-end from the patched tree:** scratch worktree at the base + the four
+  patches, `PYTHONPATH=<scratch>` and cwd = scratch (verified in
+  `/proc/<pid>/cwd` and `/proc/<pid>/environ`), server healthy in 3.5 min, then
+  `v2mamba_repro.py 8399 qsa-tiny 1343 2015 4030` → **3/3 OK** (1344/2016/4031
+  prompt tokens) — the prefix-chained sequence that faulted before 0002. Unit
+  tests from the same tree: `test_qsa_amd.py` + `test_mamba_hybrid_model_state.py`
+  **26 passed**, `test_qsa_reference.py` **19 passed**.
+- Both recipes resolved the repo root from a hardcoded absolute path; they now use
+  `$(dirname "${BASH_SOURCE[0]}")/../..`, which is what made the scratch-tree run
+  possible at all.
+
+### Evidence AGAINST / limits
+
+- The bundle cannot be gated on the real checkpoint here (~60 GB W4A16 + the PLE
+  ngram table), so **quality and serving numbers are the tester's** — the README
+  asks for exactly those.
+- `make_patches.sh` reflects **committed** state (`git diff` base..branch), so it
+  must be re-run after any commit that touches the four patch scopes; regenerating
+  it before committing silently shipped stale patches in this session (caught by
+  grepping the patch for a line that commit had added).
+- Harness hazards hit while validating, both already in the workspace notes:
+  `pkill -f <script>` killed the tool's own shell mid-command (the pattern matched
+  the command line), and a backgrounded `cmd & sleep; cat` chain died with the
+  tool's process group. Use the pidfile / a `[v]llm serve` pattern and run
+  detached launches and polls as separate commands.
+
+### Interactions
+
+- Supersedes nothing; it is the delivery vehicle for QSA-FN-1/2/3/4 + V2-MAMBA-1.
+- `UP-1`/`UP-2` (upstreaming) share the patch set: 0002 is the UP-1 PR, and 0001's
+  `qsa_cache.py` port described here is the same work UP-2 needs.
+
 ## 2026-09-17 (4) — QSA-FN-4: the tiled indexer, fp16-gated
 
 **VERDICT:** `SHIPPED` · **GATE:** the in-tree dispatch probe — fp16

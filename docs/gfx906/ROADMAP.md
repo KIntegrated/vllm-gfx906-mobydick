@@ -266,20 +266,41 @@ t/s** (mean 58.30, mclk 1000); `test_qsa_amd.py` 16, `test_qsa_reference.py` 19,
 Any QSA-FN item that changes a *shared* file (`common/qsa_cache.py`) must show a
 bf16 QSA arm still passing before/after.
 
-### QSA-FN-8 — tester build (QSA-FN-1 + FN-2; FN-3 optional)
+### QSA-FN-8 — tester build (**SHIPPED 2026-09-17**)
 
-**Status: OPEN — ready to assemble.** The tester build is **the FN-1 fp16
-enablement plus the FN-2 recipe** (and the tiny harness if they want a smoke rig
-that needs no VRAM). Explicitly **excluded**: anything int8 (QSA-FN-5/6) — the
-capacity win is not worth a 2.5× prefill kernel on evidence we already have.
+**Status: SHIPPED** — [`qsa-tester-build/`](qsa-tester-build/README.md):
+`README.md` (quick start A/B, what to report, limits) and `make_patches.sh`,
+which derives the four patches from the branch's commits and bundles the tiny
+tokenizer for an offline smoke rig. Bundle artifact:
+`/local/tmp/qsa-tester-build/` (+ `.tgz`), with `BUILD-INFO.txt` naming the
+branch, head and base commit.
 
-What the tester must send back (`_serve_qsa_flash_gfx906.sh report`): the launch
-line and card/VRAM; the `Resolved architecture` / `GPU KV cache size` lines; one
-short greedy completion and one ~2 k-token prompt with TTFT + decode t/s; one
-100 k+ request (completes? coherent? needle at start/middle/end?); and — if it
-breaks — which came first: init OOM, a dtype/`NotImplementedError`, a kernel
-fault (name + grid), or garbage-but-running output. Nothing here can be validated
-locally (the checkpoint needs ~60 GB), so their report *is* FN-2's gate.
+| patch | content |
+|---|---|
+| 0001 | QSA-FN-1 fp16 enablement — the reported error, 4.4× kernel win |
+| 0002 | V2-MAMBA-1 mamba `align` seed fix — required for prefix caching |
+| 0003 | QSA-FN-4 tiled indexer, fp16-gated |
+| 0004 | the harness: tiny rig + both serve recipes |
+
+**Validation of the bundle itself:** the four patches apply clean to
+`gfx906/v0.29.0` and reproduce the branch's 63 shipped files byte-for-byte; on
+`upstream/releases/v0.30.0` 0002/0003/0004 apply clean and 0001 applies with the
+shared `common/qsa_cache.py` excluded (upstream moved it 103/25 — the README lists
+the five mechanical edits, and `git apply -3` does not resolve it); a scratch
+checkout of the base + the four patches then served the tiny rig
+(`PYTHONPATH=<scratch>`, cwd = the patched tree) and ran the prefix-cached
+1344/2016/4031-token sequence that used to fault — 3/3 OK — plus
+`test_qsa_amd.py` + `test_mamba_hybrid_model_state.py` 26 passed and
+`test_qsa_reference.py` 19. Both recipes now resolve the repo root from their own
+path (they hardcoded this checkout before), so the bundle works from any tree.
+
+Explicitly **excluded**: anything int8 (QSA-FN-5/6) — the capacity win is not
+worth a 2.5× prefill kernel on evidence we already have.
+
+**Remaining gate: the tester's report.** The real checkpoint (~60 GB, plus a
+PLE ngram table the CDNA recipe offloads) does not fit here, so quality and the
+serving numbers are theirs; `_serve_qsa_flash_gfx906.sh report` prints the
+checklist (`qsa-tester-build/README.md` §What to report back).
 
 ## High priority — user-requested (2026-09-17): upstream our fixes to vLLM
 
