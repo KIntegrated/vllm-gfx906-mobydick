@@ -376,15 +376,22 @@ Extra work this PR needs that UP-1 does not:
 
 ### UP-3 — the 0.30.0 base itself: `gfx906/v0.30.0` fork-merge train
 
-**Status: scoped, not started.** `gfx906/v0.29.0` ← `upstream/releases/v0.30.0`
-is **595 vs 767 commits and 148 conflicted files** (measured 2026-09-17 with
-`git merge-tree --write-tree`), dominated by the fork's own gfx906 patch set — the
-only mamba conflict is `mamba_mixer2.py`; the align/`mamba_hybrid.py` files merge
-clean. Our own work ports cheaply on top: of the 20 files our QSA commits touch,
-upstream churn is 0–18 lines everywhere except `common/qsa_cache.py` (103/25) and
-`tests/models/qwen4_exp/test_qsa_reference.py` (453/106) — two real adaptation
-spots. Do this as its own session with the fork validation protocol; UP-1/UP-2 can
-proceed against `main`/`releases/v0.30.0` without it.
+**Status: scoped, not started — see the decision sheet
+[`MERGE-0.30.0-review.md`](MERGE-0.30.0-review.md).** `gfx906/v0.29.0` ←
+`upstream/releases/v0.30.0` is 595 vs 767 commits and **31 conflicted files**
+(measured 2026-09-17; an earlier "148" in this entry miscounted the
+`Auto-merging …` progress lines that `git merge-tree --name-only` prints on
+stdout — the review doc has the re-runnable method). Of the 31: ~11 are our live
+gfx906 code needing a hand-merge, ~10 are upstream commits we carry that 0.30.0
+already has its own version of (take theirs), one is our code that is **off by
+default** (NH-4, `mamba_mixer2.py`), and the rest is additive glue. Our own QSA
+work ports cheaply: of the 20 files our QSA commits touch, upstream churn is 0–18
+lines everywhere except `common/qsa_cache.py` (103/25) and
+`tests/models/qwen4_exp/test_qsa_reference.py` (453/106). The review doc also
+lists the fork-wide off-by-default inventory (NH-4, FD-1 leftover, `SKINNY_M16`,
+`QUANT_LAYER0_MOE`) with the "preserve on `archive/gfx906-dead-2`, then delete"
+plan; do that first, then merge. UP-1/UP-2 can proceed against
+`main`/`releases/v0.30.0` without this.
 
 ## High priority — user-requested (2026-09-12)
 
