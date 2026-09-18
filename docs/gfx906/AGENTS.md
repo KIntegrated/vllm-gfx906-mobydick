@@ -94,6 +94,8 @@ major ongoing theme, with the model/branch/date in the file header:
 - `DEVLOG-spec-decode.md` — speculative decoding (incl. the n-gram dense probe)
 - `DEVLOG-gemma4-*.md` — Gemma-4 family (kernel + onboarding/prefill-logprob incident)
 - `DEVLOG-qwen*.md` — Qwen-family onboarding / crash notes
+- `DEVLOG-v2-mamba-align.md` — V2 runner + mamba `align` state migration
+  (prefix caching on hybrid models): the V2-MAMBA-1 seed fault
 - `DEAD-ENDS.md` — one-pass index: hypothesis → gate → verdict → commit → refs
 
 A short incident/crash/anomaly goes in its model/topic log, not a fresh file —
@@ -115,3 +117,28 @@ a log that covers only one incident is a weak search target.
 5. **Roadmap vs dev-log stays strict** — roadmap says *what we might do*,
    dev log records *what we did and the outcome* — but keep the cross-links
    so each dead-end is reachable from both directions.
+6. **Merge prep includes a stale-verdict sweep of the code.** Before any
+   upstream merge train, re-read the gfx906 code comments that assert a
+   *default* or a *pending gate* against the record, and fix the ones that
+   time has overtaken. This is not optional hygiene: three times now a stale
+   comment sent a session the wrong way (NH-4 "pending the serving A/B gate"
+   when the A/B had run neutral; C4 "opt-in until the PPL/coherence gate
+   passes" when every gate had passed; `DEAD-ENDS.md` "`FUSED_DRAFT` has no
+   reader" after the reader was revived). Method that works, ~10 minutes:
+
+   - enumerate the flags and their effective defaults, e.g. for every
+     `environ.get("VLLM_GFX906_*")` / `getenv("GFX906_*")` site print the
+     default it is read with;
+   - print the comment block in front of each read and grep it for
+     `default`, `pending`, `until`, `soak`, `flip`, `opt-in`, `gate`;
+   - for each hit, look the flag up in `ROADMAP.md` / `DEVLOG-*.md` /
+     `DEAD-ENDS.md` and reconcile: a gate that already ran neutral, a win
+     cleared to flip, a file whose "no reader" note is older than the
+     revive;
+   - fix the comment **and** the index row; if a default is being flipped,
+     update the comment in the same commit and re-run the house gates
+     (`_bench_gfx906.py`, the PPL probe) plus the feature's own unit tests.
+
+   Off-by-default is **not** evidence of dead code: on this fork a flip is a
+   deliberate "Kevin's call" step, so a `default off` comment usually means
+   "gated win awaiting a decision", not "parked".
