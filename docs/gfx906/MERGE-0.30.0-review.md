@@ -42,7 +42,7 @@ has (take theirs, drop our copy) · **D** = bindings/CI/test glue (mechanical).
 | `vllm/model_executor/layers/utils.py` | 494+/60− | 50+/27− | L+G | fp32 router-gate GEMV (NH-3), `DENSE_GEMV`/`DOWN_GEMV` default-on, triton_matmul >2-D — **plus `SKINNY_M16` (default off)**. KEEP; split out the M16 hunk (see Table 2) |
 | `vllm/model_executor/layers/fused_moe/oracle/int_wna16.py` | 513+/42− | 123+/152− | L | Nemotron-3.5 INT4/INT8 wna16 support + code-review fixes. KEEP |
 | `tests/quantization/test_moe_wna16.py` | 460+/0− | 223+/25− | L | the wna16 tests for the above. KEEP |
-| `vllm/model_executor/layers/mamba/mamba_mixer2.py` | 23+/0− | 155+/46− | **G** | **NH-4 fused grouped gated-norm, `VLLM_GFX906_MAMBA_FUSED_GROUP_NORM` default OFF** ("pending the serving A/B gate"). ARCHIVE CANDIDATE |
+| `vllm/model_executor/layers/mamba/mamba_mixer2.py` | 23+/0− | 155+/46− | **G** | **NH-4 fused grouped gated-norm, `VLLM_GFX906_MAMBA_FUSED_GROUP_NORM` default OFF** — its gate **was run** and was neutral (Table 2). ARCHIVE CANDIDATE |
 | `vllm/model_executor/layers/quantization/utils/fp8_utils.py` | 76+/21− | 58+/17− | L | dense GEMV switches (default-on). KEEP |
 | `vllm/models/minimax_m3/amd/model.py` | 128+/18− | 181+/14− | L | Minimax-M3-AWQ-INT4 gfx906 support (the train we are ON). KEEP |
 | `vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py` | 292+/79− | 373+/102− | L | Minimax-M3 sparse/indexer fixes (uses upstream's `VLLM_ROCM_MLA_SPARSE_*`). KEEP |
@@ -82,7 +82,7 @@ when an env flag is set, where the flag defaults off.
 
 | flag | read at | status (docs/roadmap) | recommendation |
 |---|---|---|---|
-| `VLLM_GFX906_MAMBA_FUSED_GROUP_NORM` | `mamba/mamba_mixer2.py` | NH-4, "default off pending the serving A/B gate" (`DEVLOG-nemotron-h.md`) — **the A/B was never run** | **archive + delete** from main (also removes one 0.30.0 conflict), or run the A/B if Nemotron TP=2 perf still matters |
+| `VLLM_GFX906_MAMBA_FUSED_GROUP_NORM` | `mamba/mamba_mixer2.py` | NH-4: **the gate RAN 2026-08-30** (`DEVLOG-nemotron-h.md`, A–B–A, fresh boot per arm, TP=2+EP, 4 samples/arm): A 109.8 / B 110.05 / A2 109.37 t/s → **+0.4 %, inside inter-arm noise** (the A-vs-A2 *drift* of 0.43 t/s is larger than the effect), PPL 24.9034 vs 24.8944, 0 top-20 misses. Isolated win 68→55 µs/layer ≈ **0.29 ms/step over 23 layers**, invisible because the step is MoE-GEMV-bound. The in-code comment still says "default off pending the serving A/B gate" — **stale** | **archive + delete** (measured neutral in the served config; the dev log documents the one-line env flip if the step ever stops being GEMV-bound) |
 | `VLLM_GFX906_FUSED_DRAFT` | `gfx906_fa/gfx906_fa_backend.py` | FD-1 **CLOSED** (NEUTRAL, stack-confounded); "the flag's only reader in-tree was A3's opt-in, stripped 2026-09-13" (`f8a9400789`); branches `archive/a3-fused-draft`, `archive/fd1-fused-draft-meta` exist | **delete the leftover flag read** (dead code by the roadmap's own record) |
 | `VLLM_GFX906_SKINNY_M16` | `model_executor/layers/utils.py` + `csrc/rocm/dense_gemv_gfx906.cu` | W4 skinny M=5..16 GEMV variant, default off; the M=2..4 part is default ON and live | **decide**: either gate it for deletion (archive the kernel variant) or run the A/B the docstring implies; verify the M=2..4 path stays |
 | `VLLM_GFX906_QUANT_LAYER0_MOE` | `quantization/auto_awq.py`, `quantization/c4_layer0_moe.py` | not in any dev log I find; fork-only file `c4_layer0_moe.py` | **verify then delete** (looks like a parked experiment) |
@@ -123,8 +123,10 @@ live and should not be touched in this pass.
 
 ## Open questions for Kevin
 
-- NH-4: delete, or run the Nemotron TP=2 serving A/B it was gated on? (The code
-  is small and gated, so deletion is cheap either way.)
+- NH-4: the gate is **already answered** (neutral, above) — delete the gated path
+  and the flag, or keep it as the documented one-line flip? My recommendation:
+  delete (the dev log holds the numbers and the re-enable recipe), and fix the
+  stale in-code comment either way, since it claims the A/B is still pending.
 - `SKINNY_M16` and `QUANT_LAYER0_MOE`: are these still wanted? Both are
   off-by-default experiments whose docs I cannot find; my default assumption is
   "archive them with the rest".
