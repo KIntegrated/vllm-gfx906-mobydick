@@ -220,16 +220,27 @@ def _query_total_memory_from_amdsmi(physical_device_id: int) -> int:
 
 
 def _get_gcn_arch() -> str:
-    """
-    Get GCN arch via amdsmi (no CUDA init), fallback to torch.cuda.
-    Called once at module level; result stored in _GCN_ARCH.
-    """
     try:
-        return _query_gcn_arch_from_amdsmi()
+        arch = _query_gcn_arch_from_amdsmi()
+        if _capability_from_gcn_arch(arch) is not None:  # or a cheaper sanity check
+            return arch
+        logger.debug("amdsmi returned implausible GCN arch %r, falling back", arch)
     except Exception as e:
         logger.debug("Failed to get GCN arch via amdsmi: %s", e)
-    # Ultimate fallback: use torch.cuda (will initialize CUDA)
     return torch.cuda.get_device_properties("cuda").gcnArchName
+
+
+# def _get_gcn_arch() -> str:
+#     """
+#     Get GCN arch via amdsmi (no CUDA init), fallback to torch.cuda.
+#     Called once at module level; result stored in _GCN_ARCH.
+#     """
+#     try:
+#         return _query_gcn_arch_from_amdsmi()
+#     except Exception as e:
+#         logger.debug("Failed to get GCN arch via amdsmi: %s", e)
+#     # Ultimate fallback: use torch.cuda (will initialize CUDA)
+#     return torch.cuda.get_device_properties("cuda").gcnArchName
 
 
 # Resolve once at module load. Uses amdsmi (no CUDA init) so Ray workers

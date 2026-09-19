@@ -40,6 +40,39 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
+#include <hip/hip_fp16.h>
+#include <stdint.h>
+
+namespace {
+__device__ inline __half atomicAdd(__half* address, __half val) {
+  unsigned short* addr_ptr = reinterpret_cast<unsigned short*>(address);
+  unsigned short old = *addr_ptr;
+  unsigned short assumed;
+
+  do {
+    assumed = old;
+
+    // Create __half from raw bits - DIRECT ASSIGNMENT (no narrowing)
+    __half_raw old_raw;
+    old_raw.x = assumed;  // or old_raw.data = assumed; depending on HIP version
+    __half old_half = __half(old_raw);
+
+    __half sum = old_half + val;
+
+    // Get back raw bits
+    __half_raw sum_raw = __half_raw{sum};
+    unsigned short sum_bits = sum_raw.x;  // or sum_raw.data
+
+    old = atomicCAS(addr_ptr, assumed, sum_bits);
+  } while (assumed != old);
+
+  // Return old value
+  __half_raw old_final;
+  old_final.x = old;
+  return __half(old_final);
+}
+}  // anonymous namespace
+
 namespace vllm {
 namespace dense_gemv_gfx906 {
 
@@ -800,7 +833,7 @@ __global__ void __launch_bounds__(KC / 16)
   const int row0 = blockIdx.x * RPT;
   const int k0 = blockIdx.y * KC;
 
-  // x slices for all M rows, each 16 halfs (two uint4s). x is small
+  // x slices for all M rows, each 16 halves (two uint4s). x is small
   // (M*K*2B <= 64 KB, L2-resident); every block re-reads its k-chunk.
   const bool inb = (k0 + t * 16) < K;
   union {
