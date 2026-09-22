@@ -6,6 +6,28 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-21 (Qwen3.8-Flash-Next serves on gfx906 — tester report; PR #2 under review)
+
+- **The FN-8 gate is met.** An external tester (4× MI50 32 GB, PCIe-only, no XGMI)
+  served `Qwen3.8-Flash-Next` with our fp16 QSA patches: `TP=4`, fp16,
+  `max-model-len=147456`, `max-num-seqs=3`, MTP k=3, piecewise cudagraphs —
+  **46.8 t/s at B=1**. First end-to-end result on the real checkpoint; the fp16
+  enablement (QSA-FN-1) is confirmed on the model, not just in kernel probes.
+- Their measurements add two knobs we did not have: **drafter CUDA graphs cost
+  2.3 % of the KV cache and are worth +6 %** on MTP k=3 here, and `enforce_eager`
+  inside `--speculative-config` is a **no-op on this build** (read only by the
+  legacy `v1/spec_decode/` proposer, never propagated to the draft `ModelConfig`).
+- They also hit a **boot-time segfault under MTP + graphs** that we have never
+  reproduced: death inside `gc.collect()`'s traversal, i.e. GC as the victim of an
+  unidentified heap corruption (their suspect: a stale tvm_ffi torch-C-DLPack
+  addon keyed without a torch-version hash). `gc.freeze()`+`gc.disable()` do not
+  prevent it; shadowing the `gc.collect` attribute for the region does. Recorded as
+  **OPEN** — the guard is a mitigation.
+- Their PR #2 is reviewed in [`REVIEW-pr2-qsa-fn.md`](REVIEW-pr2-qsa-fn.md):
+  merge-worthy in parts, with three required edits (invert the drafter-graph
+  default, gate the PLE host-table replacement, trim the essay comments) and two
+  drops (their `.cu` clang-format commit, their `degradation.md` ops rows).
+
 ## 2026-09-18 (two gated wins go default-on; stale-verdict sweep)
 
 Kevin's decision after the 0.30.0 review (`MERGE-0.30.0-review.md`) established

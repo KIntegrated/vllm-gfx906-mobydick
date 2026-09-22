@@ -10,6 +10,42 @@ E=256, topk=8, hidden=2048, W4A16 group-128 experts; B=1 decode step
 ≈ 15 ms at 66.5 t/s. Priority = expected gain × confidence ÷ effort+risk;
 tiers are do-order, sections within a tier are ordered the same way.
 
+## High priority — user-requested (2026-09-22): re-test vLLM's custom all-reduce now that PCIe P2P is live
+
+### P2P-1 — custom all-reduce: remove `--disable-custom-all-reduce` and re-measure — **HIGH PRIORITY** (Kevin 2026-09-22)
+
+**Status: OPEN** — one fresh boot per arm, interleaved (A-B-A). Low effort, low
+risk; fallback is the current flag.
+
+**Why now.** The flag is inherited, not measured: `README.md` (TP=2 tables) and
+the J2G-negative note below record the custom AR as "not a gfx906 path (peer IPC
+init faults / post-prefill hangs; matches our `--disable-custom-all-reduce`)".
+That diagnosis was made when this box had **no PCIe P2P** — no full-VRAM BAR and
+host bridge `8086:6f00` absent from the kernel `pci_p2pdma_whitelist[]`. As of
+**2026-09-22 P2P is live and byte-clean** (Above-4G decoding on, MMIO high base
+at ~1 TiB so the 32 GiB BARs sit below the 44-bit mask, whitelist patch in
+`6.8.12-acso`; both GPUs register `peer-to-peer DMA memory`, `showtopoaccess`
+True/True, re-seeded bidirectional copies 0 bad). The peer-IPC premise therefore
+has to be re-tested rather than assumed.
+
+**Why it might pay / why the ceiling is low.** vLLM's custom AR is tuned for
+small messages — exactly the TP=2 decode shape. But the same-day A/B (P2P vs
+`NCCL_P2P_DISABLE=1`, MTP k=3 filler) measured only **+1 % @2k / +0.5 % @8k**
+(~0.5 ms/step): at that config the all-reduce is *not* the bottleneck. Gate on
+**B=4 and/or long context**, where AR volume per step is larger — not on 2k.
+
+**Gates.** (1) With the flag removed: init does not fault, no post-prefill hang
+(the original failure mode). (2) Interleaved same-boot A-B-A of ms/step at B=1
+and B=4 vs the RCCL arm, mclk-gated (fresh boot — the same session saw a
+**−5.6 %** drift after one BACO wedge, so a single boot cannot resolve this).
+(3) If it holds: record the winning regime in a dev log and update the
+CDNA-parity flag set (`README.md`, `_serve_qsa_flash_gfx906.sh`, the
+`docs/gfx906/README.md` TP=2 line).
+
+**Refs.** `/local/tmp/4g-handover.md` (P2P enablement + first perf A/B);
+`degradation.md` #104/#105; `DEVLOG-tp2-dense.md` S1/S4 (RCCL P2P/IPC history);
+the J2G-negative note in the tier-0 entry below.
+
 ## High priority — user-requested (2026-09-17): Qwen3.8-Flash-Next / QSA on gfx906
 
 **Kevin 2026-09-17.** A tester hit `NotImplementedError: Qwen4Exp QSA currently
@@ -162,6 +198,19 @@ proposing (§1 duplicate checks not yet run).
 **Residue (not gated, cross-linked not restated):** the RecoverSSM align kernel
 writes a column without the `-1` every other align site uses — dev log,
 Refrigerated residue; unverifiable here (no RecoverSSM model loadable).
+
+### QSA-FN-9 — tester run + PR #2 (joochung): merge the model-specific fixes
+
+**Status: OPEN — review done, merge pending three edits.** The tester served the
+real checkpoint (4× MI50, TP=4, fp16, 147 456 ctx, MTP k=3): **46.8 t/s at B=1**,
+so QSA-FN-8's gate is met. Their PR adds a PLE host-table offload, two PLE
+correctness fixes, a gated V2 boot-GC guard, an amdsmi-arch fallback and a drafter
+graph knob. Verdict and per-commit triage:
+[`REVIEW-pr2-qsa-fn.md`](REVIEW-pr2-qsa-fn.md). Required before merge: invert the
+drafter-graph default (their default disables drafter graphs, ~−6 % on our spec
+configs), gate the PLE host table behind an env flag, trim the essay comments;
+drop the `.cu` clang-format commit and their `degradation.md` ops rows; ask for the
+GC-guard and PLE test harnesses, and re-target the PR at `gfx906/qsa-fn`.
 
 ### QSA-FN-4 — backport the tiled indexer (**fp16-gated**) (**SHIPPED 2026-09-17**)
 
@@ -1831,7 +1880,10 @@ deode data is mined first; future cells at pp=4096.**
     path; reduce-scatter for c1 decode is slower than allreduce on
     gfx906. (2) vLLM's CUDA custom-allreduce substrate is not a gfx906 path
     (peer IPC init faults / post-prefill hangs; matches our
-    `--disable-custom-all-reduce`). (3) grouped/coalesced allreduces are
+    `--disable-custom-all-reduce`). **Update 2026-09-22: the premise has
+    changed — PCIe P2P is now live and byte-clean on this box, so this is no
+    longer settled; re-test it under P2P-1 (high priority).**
+    (3) grouped/coalesced allreduces are
     infeasible on the Qwen dense graph: 128/128 adjacent AR boundaries are
     blocked by true hidden-state dependencies (64 MLP + 64 attention
     producers). (4) Marlin tile autotuning is a wash end-to-end under
