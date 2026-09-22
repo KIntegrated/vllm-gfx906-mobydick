@@ -198,13 +198,51 @@ logger = init_logger(__name__)
 # themselves (29 attribute-style call sites under torch/, 0 `from gc import
 # collect` bindings in torch/ or vllm/, so attribute shadowing reaches all of
 # them).
+#
+# Shadowing then did its job, and the result is the important part of this note:
+# with the shadow in place the crash did NOT move to some third-party call site,
+# it stayed exactly where the guard itself collects. Later the same evening three
+# MTP boots (21:54/22:01/22:07, vllm.log) each logged the new banner on all four
+# workers, and `GC restored` appears ZERO times in every log this guard has ever
+# been enabled in (vllm.log, vllm.log2, vllm.log.error4: 16 region entries, 0
+# exits). All three died in the same stack, twice in a row today: builtin_next ->
+# gen_iternext -> gen_send_ex2 -> <python frame> -> gc_collect -> gc_collect_main
+# -> deduce_unreachable. builtin_next resuming a generator is precisely how
+# contextlib.contextmanager.__exit__ finishes a generator, so the frame that dies
+# is this function's own restoring gc.collect() at the END of profile_run. Five
+# guard-enabled boots today, five deaths, always at the guard's own exit
+# traversal; the AOT cache being warm (22:01, 22:07) or cold (21:54, which logged
+# "Source code has changed since the last compilation") made no difference.
+#
+# That inverts the premise this guard was written on. Freezing the way upstream
+# _freeze_gc does it (v1/worker/gpu_model_runner.py:6619) is cheap because
+# upstream wraps CUDA graph capture, a few seconds. This guard wraps profile_run,
+# five minutes of Dynamo + Inductor + xgrammar allocation churn: freeze() at
+# entry, then nothing collects for five minutes, then one full-heap walk over
+# everything that churn produced, at the single moment the heap is largest. A
+# mitigation whose cost is "the one collection that is guaranteed to be huge is
+# the one that runs" is not a mitigation, so the exit traversal is now opt-in
+# (GFX906_GC_THAW) and the default parks instead: freeze() again on the way out,
+# which moves the region's allocation churn into the permanent generation, which
+# every later collection ignores. Nothing is ever traversed. The cost is that
+# garbage produced during boot is never reclaimed either -- bounded, one-time,
+# host RAM only, and cheaper than a segfault that costs a 6-minute restart.
+# OFF by default (GFX906_GC_FREEZE unset = upstream byte-identical). See
+# mtp-cudagraph-profile-crash.md sections 14-16 and decode-launch-bound.md 6.
 _GC_FREEZE_ENV = "GFX906_GC_FREEZE"
+_GC_THAW_ENV = "GFX906_GC_THAW"
+_GC_DUMP_ENV = "GFX906_GC_DUMP"
 _GC_FROZEN_DEPTH = 0
 _GC_REAL_COLLECT = None
 
 
 def _gc_freeze_enabled() -> bool:
     return os.environ.get(_GC_FREEZE_ENV, "0") == "1"
+
+
+def _gc_thaw_enabled() -> bool:
+    """Restore upstream's unfreeze()+collect() on exit. Default off: see above."""
+    return os.environ.get(_GC_THAW_ENV, "0") == "1"
 
 
 def _gc_collect_noop(*_args, **_kwargs) -> int:
@@ -231,6 +269,18 @@ def _gc_freeze_guard(label: str):
         return
     was_enabled = gc.isenabled()
     t0 = time.perf_counter()
+    if os.environ.get(_GC_DUMP_ENV, "0") == "1":
+        # tvm_ffi installs its own SIGSEGV handler, which is why every crash dump
+        # in these logs is C frames only under a "!!!!!!! Segfault encountered
+        # !!!!!!" banner: the Python frame that held the corrupted object has
+        # never been named. Re-arming faulthandler here puts CPython's handler
+        # back, so a segfault inside the region prints the Python stack too.
+        try:
+            import faulthandler
+
+            faulthandler.enable(all_threads=True)
+        except Exception:
+            logger.exception("GFX906_GC_DUMP: faulthandler.enable() failed")
     # freeze() first: it parks the young generation in the permanent generation,
     # and it traverses young objects itself, so there is no ordering that makes
     # it immune to an already-corrupted heap. It is not the observed crash site.
@@ -248,20 +298,35 @@ def _gc_freeze_guard(label: str):
         yield
     finally:
         _GC_FROZEN_DEPTH -= 1
-        if _GC_FROZEN_DEPTH == 0 and _GC_REAL_COLLECT is not None:
+        outermost = _GC_FROZEN_DEPTH == 0
+        if outermost and _GC_REAL_COLLECT is not None:
             gc.collect, _GC_REAL_COLLECT = _GC_REAL_COLLECT, None
-        try:
-            # Real again by now, but only on the outermost exit: a nested region
-            # leaves the shadow in place so nothing collects mid-capture.
-            gc.unfreeze()
-            gc.collect()
-        finally:
-            if was_enabled:
-                gc.enable()
-            else:
-                gc.disable()
+        thawed = False
+        if outermost:
+            # Only on the outermost exit: a nested region leaves the shadow in
+            # place so nothing collects mid-capture.
+            try:
+                if _gc_thaw_enabled():
+                    # Upstream's exit path, and the exact frame that died on all
+                    # five guard-enabled boots of 2026-09-21.
+                    gc.unfreeze()
+                    thawed = True
+                    gc.collect()
+                else:
+                    # Park, do not walk. Whatever the corruptor wrote is now in
+                    # the permanent generation, which every later collection
+                    # ignores, so the traversal that dies never runs.
+                    gc.freeze()
+            except Exception:
+                logger.exception("GFX906_GC_FREEZE: exit path failed after %s", label)
+            finally:
+                if was_enabled:
+                    gc.enable()
+                else:
+                    gc.disable()
         logger.info(
-            "GFX906_GC_FREEZE: GC restored after %s (%.1f s frozen)",
+            "GFX906_GC_FREEZE: %s after %s (%.1f s frozen)",
+            "thawed and collected" if thawed else "left frozen, nothing traversed",
             label,
             time.perf_counter() - t0,
         )
