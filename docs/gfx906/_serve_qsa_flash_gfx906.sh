@@ -45,6 +45,15 @@
 # size the pool) and `--trust-remote-code` (not needed for this checkpoint).
 # Unvalidated knobs are env-overridable; see the variable block.
 #
+# Known-good config (Tester-validated, 2026-09-22, 4x MI50 32 GB, PCIe-only):
+#   TP=4 GPUTIL=0.91 MAXLEN=147456 MAXSEQS=3 MBT=4096 SPEC k=3
+#   46.8 t/s at B=1; without MTP 25.4 t/s. The PLE ngram table must live in host
+#   RAM (their mmap offload, PR #2) -- that, not the KV dtype, is what makes the
+#   model fit on 32 GB cards. Two findings from that run are in ROADMAP QSA-FN-2b:
+#   the official Qwen chat template raises on an all-tool-result tail (pass a fixed
+#   template with --chat-template), and enforce_eager is a no-op inside
+#   --speculative-config on this build.
+#
 # Environment overrides:
 #   TP=2            tensor-parallel size (needs >= ~64 GB across the cards)
 #   GPUTIL=0.90     --gpu-memory-utilization; lower it if init OOMs (the

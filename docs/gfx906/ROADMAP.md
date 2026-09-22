@@ -138,6 +138,30 @@ serve); everything that depends on the real checkpoint (the 60 GB load, KV sizin
 at 256 K, quality, `content` vs `reasoning` on real outputs) is **derived and
 unvalidated** — that is what the tester's report is for.
 
+### QSA-FN-2b — the validated serving config (tester, 2026-09-22) + two template/toolchain findings
+
+**Status: SHIPPED as a record** — this is the configuration that actually serves the
+model, so it replaces the derived defaults in the recipe. From the tester's run
+(4× MI50 32 GB, PCIe-only): `--tensor-parallel-size 4`, fp16,
+`--max-model-len 147456`, `--max-num-seqs 3`, `--max-num-batched-tokens 4096`,
+`--gpu-memory-utilization 0.91`, MTP k=3, piecewise cudagraphs
+`capture_sizes=[4,8,12,16]`, PLE ngram table mmapped to host RAM (26 GB) — the
+offload is what makes the model fit, not the KV dtype. **46.8 t/s at B=1** with
+MTP k=3; 25.4 t/s without it (PR #1's arm).
+
+Two findings to carry into the recipe/docs (both generic, not box-specific):
+
+- **The official Qwen chat template hard-raises** `jinja2 TemplateError: No user
+  query found in messages` when a conversation has no user turn (an all-tool-result
+  tail), which kills agentic chains at request time in the APIServer, not at boot.
+  Fix: a template with a `last_query_index` fallback, passed via `--chat-template`
+  (read once at startup, so a replaced file needs a restart). Worth checking whether
+  our own `qwen3` parsers/recipes hit this before blaming the model.
+- `enforce_eager` inside `--speculative-config` is a **no-op on this build**: only the
+  legacy `v1/spec_decode/` proposer reads it, and it is never propagated to the draft
+  `ModelConfig`, so a spec-decode arm that "still captured graphs despite the flag"
+  tested nothing.
+
 ### QSA-FN-3 — tiny `qwen4_exp` config: make the model testable on one MI50 (**SHIPPED 2026-09-17**)
 
 **Status: SHIPPED.** [`_qsa_tiny_model.py`](_qsa_tiny_model.py) +
@@ -242,28 +266,22 @@ workload unchanged.
 30 k-token measurement) is not re-measured — the tiny rig cannot transfer shares
 (FN-3), so a tester remains the only end-to-end number.
 
-### QSA-FN-5 — int8 `per_token_head` KV for QSA: capacity-only, evidence-first
+### QSA-FN-5 — int8 `per_token_head` KV for QSA: **re-scoped by the tester's result**
 
-**Status: OPEN — DO NOT PORT YET; the measurement says why.** The patch ports
-mechanically (host-side spec/write-path/scale-view work + dtype-generic dequant
-in the two read kernels), but on gfx906 it buys capacity and costs prefill:
-attention prefill is **2.5–2.7×** for identical shapes over T=64…1024 while
-**decode (T=1) is neutral (0.99×)** (recon §5.3). Mechanism is pinned far enough
-to say a smarter dequant will not fix it: dropping the scale multiply entirely
-still leaves 2.68× — the cost is converting a loaded int8 tile into a
-`v_dot2`-legal dot operand. Accuracy is the documented ~1 % attention-value NRMSE
-(0.0081 measured).
+**Status: OPEN but demoted — the capacity argument moved.** The item existed to buy
+KV capacity (int8 halves KV bytes) at a measured 2.5–2.7× attention-prefill cost on
+gfx906, gated on how big the attention actually is (MI210: 57.7 % of prefill).
+The tester's working config **already serves 3 × 147 456 tokens** on 4 × 32 GB with
+the PLE ngram table mmapped to host RAM — i.e. the capacity that mattered came from
+host-RAM offload (26 GB at zero attention cost), not from the KV dtype. So: keep
+int8-KV parked unless a real need appears (more concurrency at 147 k, or a smaller
+card count), and if it is revived, measure the **attention share of prefill on the
+tester's box first** — we cannot measure it here (no loadable checkpoint), and the
+tiny rig's shares do not transfer.
 
-**Decision gate (cheap, and required before any porting):** the QSA sparse
-attention kernel's **share of prefill wall-clock on this model**. If it resembles
-MI210's 57.7 %, a 2.5× kernel cost is unaffordable for the 1.67× KV gain and the
-item parks. Measure it with the QSA-FN-3 harness (rocprofv3, skill
-`gfx906-rocprofv3-kernel-trace`) — not with a standalone probe.
-
-**If it ever proceeds:** capacity-only, default OFF, decode-neutrality and the
-prefill share re-measured at the same time. Cross-link SYV-11 / the `T2` row of
-`int8-investigation-qwen.md`, which cost the same idea for the custom FA path
-(1.88× capacity, ~20 % decode cost) — same conclusion, different backend.
+**Its one still-open measurement (delegated, with QSA-FN-10):** prefill-time
+breakdown on the real model — indexer vs sparse attention vs MoE — which decides
+FN-5 *and* prices the tiled indexer (QSA-FN-4) on real payloads.
 
 ### QSA-FN-6 — gfx906 int8-`tl.dot` fault in the QSA kernel (**CLOSED: dropped 2026-09-22**)
 
@@ -280,6 +298,25 @@ or `BLOCK_M=8` clears it) and is parked with the repro in
 Residue if it is ever resurrected: force `num_warps=8` in the gfx906 dispatch, or
 census the failing instantiation with `llvm-objdump` (skill
 `gfx906-isa-disassembly`) before blaming Triton. Record: `DEAD-ENDS.md`.
+
+### QSA-FN-10 — the next tester measurement list (one session, ~30 min)
+
+**Status: OPEN — ready to send.** Everything here needs the real checkpoint, i.e. the
+tester's box. Ordered by decision value:
+
+1. **Prefill breakdown** (decides FN-5, prices FN-4): prefill tok/s at 30 k and 100 k,
+   once with the tiled indexer forced off (`dot_is_native` false is not settable by env
+   — ask for a one-line patch or measure 1 × 32 k vs 1 × 100 k and compare against the
+   fp16 kernel probe's share) and note TTFT separately from decode.
+2. **MTP depth on the real model**: k=2 / k=3 / k=4 at 32 k and 100 k, ≥3 reps, same
+   prompts, interleaved arms (A,B,A) — our house default is k=3 from dense-model data;
+   this is the first chance to check it on 120 B MoE.
+3. **Long-context quality**: one needle at 100 k+ (start/middle/end) and a coherent
+   multi-turn exchange — the report so far has throughput only.
+4. **Drafter graphs on/off** at their k: they measured +6 % / −2.3 % KV; a same-boot
+   interleaved repeat would let us adopt that finding for our own configs.
+5. **Prefix caching on/off** at 147 k: the V2 mamba-align path now works (V2-MAMBA-1),
+   but no one has exercised it on this model's PLE/GDN state at that context.
 
 ### QSA-FN-7 — non-regression gate for the existing models (runs with every item above)
 
