@@ -556,3 +556,77 @@ would silently duplicate the non-FD control. Keep the confound too: the
 verdict above compares an **offline** arm against **serving** controls, so any
 revival must re-gate same-stack. Keep/strip analysis:
 `/local/tmp/b4/fd1-keep-strip-decision.md`.
+
+## 2026-09-22 — drafter CUDA graphs cost our TP=2 MTP k=3 config ~8%; `--disable-custom-all-reduce` is a no-op
+
+**VERDICT:** `OPEN` (config-dependent sign — keep it a knob, do not flip a global
+default on one config) · **GATE:** serving wall-clock, fixed acceptance, one boot
+per arm, A-B-A order control (ON → OFF → ON).
+
+### HYPOTHESIS
+
+If the drafter's cudagraph manager inherits the target's mode (our current
+behaviour), it captures graphs for its own 3-token forward pass; if forcing it to
+`CUDAGraphMode.NONE` helps or hurts, the sign should show as a t/s delta at fixed
+acceptance. Separately: if vLLM's custom all-reduce can actually be selected on
+this topology, dropping `--disable-custom-all-reduce` should change the AR kernel.
+
+### What was done
+
+Qwen3.8-27B-AWQ-INT4, TP=2, fp16, maxlen 262144, util 0.82, MTP k=3, capture
+`[4,8,12,16]`, `--max-num-seqs 4`, 32 000-token prompt, 256 output tokens, 3 reps
+per arm. A local (uncommitted, reverted) env gate mirrored the tester's PR #2 knob
+exactly (`GFX906_DRAFTER_GRAPHS` unset → `NONE`, `=1` → inherit). Drafter-graph
+OFF is measured in the middle arm, so the two ON arms bracket any drift.
+
+### Evidence
+
+| arm | `--disable-custom-all-reduce` | drafter graphs | decode t/s | ms/step |
+|---|---|---|---|---|
+| A (house) | yes | ON (inherit) | **55.40** (55.37–55.44) | 72.2 |
+| B | **no** | ON (inherit) | **55.52** (55.49–55.55) | 72.0 |
+| C | yes | **OFF (`NONE`)** | **59.78** (59.72–59.83) | 66.9 |
+| B2 (drift control) | **no** | ON (inherit) | **55.38** (55.33–55.43) | 72.2 |
+
+Acceptance **1.000** in every arm (filler prompt; spec tokens drafted/accepted
+identical), so the delta is pure step cost, not a scheduling difference.
+
+- **Drafter graphs: OFF is +7.9 %** on this config (59.78 vs 55.40 t/s; 66.9 vs
+  72.2 ms/step), reproduced on both ON arms. This is the *opposite* sign to the
+  tester's +6 % for enabling them (PR #2, their TP=4 / 147 456-ctx /
+  max-num-seqs 3 config) — so the effect is configuration-dependent and stays an
+  env knob rather than a default flip on either measurement.
+- **Custom all-reduce: no effect.** The engine's own backend dispatch line is
+  identical in every arm — `Using ['PYNCCL'] … out of potential backends
+  ['FLASHINFER', 'NCCL_SYMM_MEM', 'QUICK_REDUCE', 'AITER_CUSTOM', 'CUSTOM',
+  'SYMM_MEM', 'PYNCCL']` — i.e. `CustomAllreduce` is constructed and then
+  self-disables, so the flag only *documents intent* here. The 3 AR-flag arms span
+  55.38–55.52 t/s (0.25 %, within noise).
+- **KV pool is NOT readable from this session:** B reported 353 856 tokens while A
+  and B2 (identical flags to B and to each other minus the AR flag) both reported
+  381 369 — a 7 % swing with no knob difference, i.e. profiling/allocator noise.
+  The tester's −2.3 %-KV figure for drafter graphs is not reproduced (nor refuted)
+  here.
+
+### By-catch
+
+`[speculator.py:120] Fused multi-step draft decode is not supported by attention
+backend(s) CUSTOM; falling back to rebuilding …` — with our CUSTOM FA backend the
+A3/FD-1 fused multi-step draft-metadata path is **inert at runtime regardless of
+`VLLM_GFX906_FUSED_DRAFT`**, which sharpens the `DEAD-ENDS.md` row corrected on
+2026-09-17 (the flag does have a reader and tests; the *backend* refuses the path).
+
+### Evidence AGAINST / limits
+
+One prompt (filler, 100 % acceptance), one context (32 k), TP=2, `max-num-seqs 4`;
+real-payload acceptance (~0.7–0.9) and other contexts/TP are unmeasured, and those
+are exactly the regimes where a drafter-graph win could reappear. Nothing here
+tests correctness: acceptance was identical in all arms.
+
+### Interactions
+
+Feeds the PR #2 review (`REVIEW-pr2-qsa-fn.md`): the required edit is *not* "invert
+their default so we keep our graphs" — our config is faster with graphs off. The
+edit stays (default = upstream behaviour, knob to disable) but the justification is
+now "one config measures +7.9 % the other way, one measures +6 %, so keep it
+switchable", not "their default costs us 6 %".

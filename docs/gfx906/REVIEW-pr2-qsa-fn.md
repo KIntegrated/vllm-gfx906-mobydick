@@ -90,6 +90,17 @@ recipes, and the missing SPDX line in `_qsa_tiny_model.py`.
 - Re-target to `gfx906/qsa-fn`, and correct the PR body's two "default-off ⇒
   byte-identical" claims (drafter graphs, PLE host table).
 
+## Correction (2026-09-22, after measuring it on our box)
+
+The claim in "Required edits 1" — that their default (drafter graphs `NONE` unless
+`GFX906_DRAFTER_GRAPHS=1`) would cost our configs ~6 % — **is wrong, and backwards on
+our config**: with TP=2, MTP k=3, 32 k context, forcing the drafter to `NONE` is
+**+7.9 %** (59.78 vs 55.40 t/s, order-controlled A-B-A; `DEVLOG-spec-decode.md`).
+Their +6 % for *enabling* graphs holds on their config (TP=4, 147 k, max-num-seqs
+3). So the edit still stands — keep it a switch with the upstream default — but for
+the opposite reason: the sign is config-dependent, so neither default should be
+imposed by either measurement.
+
 ## Verification we can and cannot do here
 
 Can: build (the `.cu` content lines), `tests/models/qwen4_exp/` +

@@ -52,6 +52,8 @@ DEVLOG) + `DEVLOG-int8-transfer.md` (the P1/P2 session record).
 
 | int8-QK for QSA on gfx906 (`QSA_INT8_QK=1`) | kernel profile + kernel bench | **DEAD-END / DROPPED** (2026-09-22, QSA-FN-6) | no code on main (env-gated, off) | IMA in `_qsa_sparse_paged_gqa_splitk_kernel` at the dispatch profile every prefill >512 rows uses, and 2.4x slower than an fp16 cache where it does run. The config that serves the real model is fp16 + tiled indexer, with no int8 anywhere, so the fault costs nothing we wanted. Mechanism parked (repro `/local/tmp/qsaprobe/logs/ima_repro_G12.log`; `num_warps=8` clears it) | QSA-FN-6, RECON §5.2 |
 
+| `--disable-custom-all-reduce` improves TP=2 decode on this box | serving A-B-A at fixed acceptance (DevLog 2026-09-22) | **NEUTRAL** (no-op) | flag kept in the recipe as intent-documentation | The engine dispatches `['PYNCCL']` with *and* without the flag: `CustomAllreduce` is constructed and self-disables on this topology, so the flag cannot change the kernel. 3 arms span 55.38-55.52 t/s (0.25 %, noise) | DEVLOG-spec-decode.md |
+
 ## OPEN / IN-FLIGHT (verdict not yet recorded)
 
 | Hyp | Gate | Status | Refs |
