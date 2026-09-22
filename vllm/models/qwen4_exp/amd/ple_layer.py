@@ -113,6 +113,21 @@ class MmapShardedNGramEmbedding(nn.Module):
         out = flat_ids.new_empty(
             (flat_ids.numel(), self.embedding_dim), dtype=self.params_dtype
         )
+        # The loop below can only write rows whose shard index is in
+        # range(num_shards). An id outside [0, num_shards * shard_row_capacity)
+        # matches no mask, so its row would keep whatever new_empty() found at
+        # that address: a silently wrong embedding instead of an error. ids are
+        # CPU by the check above, so this costs two small host-side reductions
+        # and no device sync.
+        if flat_ids.numel() > 0:
+            low, high = int(flat_ids.min()), int(flat_ids.max())
+            table_rows = self.num_shards * self.shard_row_capacity
+            if low < 0 or high >= table_rows:
+                raise ValueError(
+                    f"PLE ngram id out of range: ids span [{low}, {high}] but "
+                    f"the table holds {table_rows} rows "
+                    f"({self.num_shards} shards x {self.shard_row_capacity})"
+                )
         # Fixed-length loop over every shard, every call — no data-dependent
         # iteration count. Necessary for CUDA graph capture safety: a Python
         # loop whose length depends on which shards this specific batch
