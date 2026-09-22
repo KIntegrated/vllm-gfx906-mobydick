@@ -185,35 +185,74 @@ logger = init_logger(__name__)
 # This does NOT repair whatever writes out of bounds; it removes the frame that
 # dies. OFF by default: GFX906_GC_FREEZE=1 enables, unset leaves upstream
 # byte-identical. See mtp-cudagraph-profile-crash.md section 15.
+#
+# gc.freeze() + gc.disable() alone turned out NOT to be enough, which is why the
+# guard also shadows the gc.collect attribute. Measured 2026-09-21: two boots
+# logged "froze and disabled GC around profile_run" on all four workers and all
+# four still segfaulted inside a traversing collect (vllm.log 20:52:48,
+# vllm.log.error4 20:39:27). gc.disable() suppresses *automatic* collections
+# only -- an explicit gc.collect() from any third-party frame still runs, and
+# gc.freeze() exempts only the objects reachable at freeze time, so everything
+# the compiled drafter allocates afterwards is still walked. The two regions this
+# guard wraps are exactly where torch/inductor/xgrammar do call gc.collect()
+# themselves (29 attribute-style call sites under torch/, 0 `from gc import
+# collect` bindings in torch/ or vllm/, so attribute shadowing reaches all of
+# them).
 _GC_FREEZE_ENV = "GFX906_GC_FREEZE"
 _GC_FROZEN_DEPTH = 0
+_GC_REAL_COLLECT = None
 
 
 def _gc_freeze_enabled() -> bool:
     return os.environ.get(_GC_FREEZE_ENV, "0") == "1"
 
 
+def _gc_collect_noop(*_args, **_kwargs) -> int:
+    """Stand-in for gc.collect() while a freeze region is active.
+
+    Returns 0 ("collected nothing"), which is what every caller in the boot path
+    ignores anyway. Not reached when GFX906_GC_FREEZE is unset.
+
+    Coverage, stated honestly: callers that look the function up as an attribute
+    (every `gc.collect()` call, and any `from gc import collect` executed after
+    the region opens) get this. Aliases bound before the region opened, and C
+    code calling PyGC_Collect directly, do not -- which is why the depth counter
+    below is kept as a second, independent line of defence for vLLM's own call
+    site.
+    """
+    return 0
+
+
 @contextmanager
 def _gc_freeze_guard(label: str):
-    global _GC_FROZEN_DEPTH
+    global _GC_FROZEN_DEPTH, _GC_REAL_COLLECT
     if not _gc_freeze_enabled():
         yield
         return
     was_enabled = gc.isenabled()
     t0 = time.perf_counter()
+    # freeze() first: it parks the young generation in the permanent generation,
+    # and it traverses young objects itself, so there is no ordering that makes
+    # it immune to an already-corrupted heap. It is not the observed crash site.
     gc.freeze()
     gc.disable()
+    if _GC_FROZEN_DEPTH == 0:
+        _GC_REAL_COLLECT = gc.collect
+        gc.collect = _gc_collect_noop
     _GC_FROZEN_DEPTH += 1
     logger.info(
-        "GFX906_GC_FREEZE: froze and disabled GC around %s "
-        "(explicit gc.collect() suppressed inside)",
+        "GFX906_GC_FREEZE: froze, disabled and shadowed gc.collect() around %s",
         label,
     )
     try:
         yield
     finally:
         _GC_FROZEN_DEPTH -= 1
+        if _GC_FROZEN_DEPTH == 0 and _GC_REAL_COLLECT is not None:
+            gc.collect, _GC_REAL_COLLECT = _GC_REAL_COLLECT, None
         try:
+            # Real again by now, but only on the outermost exit: a nested region
+            # leaves the shadow in place so nothing collects mid-capture.
             gc.unfreeze()
             gc.collect()
         finally:
@@ -243,6 +282,10 @@ def _gc_maybe_collect() -> None:
     Deliberate -- the traversing collect is the frame that dies. Skipping it in
     profile_run() makes measured free memory an UNDER-estimate (unreclaimed
     garbage counts as used), i.e. a smaller KV cache: the safe direction.
+
+    Redundant with the gc.collect shadow above by design: this branch holds even
+    if the attribute swap is defeated (an alias bound before the region, a
+    reimported gc module, a future caller that caches the builtin).
     """
     if _GC_FROZEN_DEPTH == 0:
         gc.collect()
