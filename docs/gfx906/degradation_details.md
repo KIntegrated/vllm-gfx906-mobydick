@@ -3208,3 +3208,65 @@ i.e. the failure happened at/after the weight-load boundary rather than at key m
 **Interpretation:** the same boot's load lottery as #68-#95 (this is a 5-hour-old boot with several wedges today, exactly the state where the degradation rule predicts load failures) (this INT8 checkpoint adds a new load path:
 401 packed tensors + a Triton dequant-gather embedding kernel are staged at load time). One authorized retry
 followed; a second consecutive genuine load failure would be a BURST (stop GPU work, reboot).
+
+## 2026-09-22 20:23 — wedge #106 (kill-and-relaunch of the standing 27B MTP k=3 server; GPU1 left half-wedged)
+
+**Context.** A drafter-graph A/B needed the standing server restarted (two arms differing
+only in whether the drafter inherits the target's cudagraph mode, mirroring the tester's
+`GFX906_DRAFTER_GRAPHS` gate in PR #2 — a local, uncommitted patch, Python-only, no
+rebuild). The running server (pid 7181, Qwen3.8-27B-AWQ-INT4, TP=2, fp16, MTP k=3,
+maxlen 262144, util 0.82, both decks at 29.4 GiB) was SIGTERM-killed and the same config
+relaunched ~15 s later.
+
+**Event.** APIServer up 20:21:52; the weight load then died at worker init (20:23:21):
+
+```
+CUDA error: unspecified launch failure  /  hipErrorLaunchFailure
+  from c10::cuda::SetDevice  (at::native::copy_ -> HIPFunctions.cpp:334)
+Exception: WorkerProc initialization failed ... Failed core proc(s): {}
+RuntimeError: Engine core initialization failed.
+```
+
+The traceback is the chronic weight-load family (#93–#105), raised before any of the
+patched drafter code could run. The boot's pre-symptom matches the documented degradation
+signature: `[rocm.py:1063] Failed to get total memory via amdsmi, falling back to
+torch.cuda` (amdsmi broken since boot, as in #66/#67).
+
+**Post-state.** GPU0 drained back to 10.9 MB once the failed workers exited, but **GPU1
+stayed at 10.44 GB with no process in the KFD list** (only `gpuagent`) and did not clear
+across 2+ minutes of polling — zombie VRAM, i.e. a half-wedge that needs a BACO reset or a
+reboot to reclaim. Sequence observed right after the SIGTERM: GPU0 briefly held 2.1 GB
+(not yet released) while GPU1 was already at 19 MB, so the leak is specific to the crashed
+worker on GPU1.
+
+**Action.** One authorized retry, on **GPU0 only (TP=1)** — the A/B is a *relative*
+comparison of drafter graph capture, so TP=1 keeps the measurement valid while avoiding
+the wedged deck; the absolute t/s is therefore not comparable to the recorded TP=2
+numbers. A second consecutive wedge stops GPU work for the session (the "2 in a row →
+stop" rule).
+
+**Lesson for the entry protocol:** killing a long-running TP=2 server and immediately
+re-launching the same config is a load-lottery roll like any other first-load — the kill
+itself does not appear to be the trigger, but the retry budget should be assumed before
+starting an A/B that needs a restart.
+
+**Retry (20:34–20:55) — wedged again, differently, GPU work stopped.** The GPU0-only retry
+(`HIP_VISIBLE_DEVICES=0`, TP=1, util 0.90, same model/MTP k=3 config, `GFX906_DRAFTER_GRAPHS=1`)
+launched 20:34:16 and then **never reached the API server's first log line**: the process sat
+in kernel `D` state with `wchan = amddrm_sched_entity_flush` for 11+ minutes, 0.3 % CPU, no
+child processes, zero bytes of log, GPU0 back at the 10.9 MB baseline and GPU1 still holding
+the 10.44 GB zombie. `SIGKILL` cleared the process once the driver call returned; no VRAM
+came back on GPU1.
+
+That is a **second consecutive wedge** in the same session (first = #106's load-lottery
+`hipErrorLaunchFailure`, second = the retry stuck in the DRM scheduler), so per the
+"2 in a row → stop" rule **GPU work stopped for the session**. The driver state explains
+both: amdsmi has been broken since this boot (the documented pre-wedge symptom), and
+`amddrm_sched_entity_flush` cannot complete while a scheduler entity from the killed
+long-running server is still registered — the deck needs a BACO reset or a **host reboot**
+(root required for BACO), after which GPU1's zombie 10.44 GB should clear.
+
+**Consequence for the deferred work:** the drafter-graph A/B (the reason for the restart)
+did not run. Nothing about it has been measured; the PR-review claim that the tester's
+default would cost our spec configs their drafter graphs remains an argument from their own
++6 % measurement, not from our box.

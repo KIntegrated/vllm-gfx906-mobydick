@@ -265,31 +265,21 @@ prefill share re-measured at the same time. Cross-link SYV-11 / the `T2` row of
 `int8-investigation-qwen.md`, which cost the same idea for the custom FA path
 (1.88× capacity, ~20 % decode cost) — same conclusion, different backend.
 
-### QSA-FN-6 — gfx906 int8-`tl.dot` fault in the QSA kernel (root-cause or drop)
+### QSA-FN-6 — gfx906 int8-`tl.dot` fault in the QSA kernel (**CLOSED: dropped 2026-09-22**)
 
-**Status: OPEN — blocking for int8-QK; not blocking anything else.**
-`QSA_INT8_QK=1` faults (IMA) in `_qsa_sparse_paged_gqa_splitk_kernel` at the
-dispatch profile the wrapper picks for **every prefill >512 rows**
-(`block_n=64, num_splits=1, num_warps=2`, from the "Tuned on GB300" table at
-`amd/ops/qsa.py`). Reproduced repeatedly at G=12/T=1024/TOPK=2048/L=65536
-(`/local/tmp/qsaprobe/logs/ima_repro_G12.log`); `num_warps=8` or `BLOCK_M=8`
-clears it, nothing else does. The CDNA author's own int8-QK test passes on gfx906
-(G=8 shapes), so this is a shape/profile-dependent gfx906 codegen hazard, not a
-wiring error. Not reducible to a standalone `tl.dot` repro in this session; a
-stripped loop kernel with the same shape computes correctly.
+**Status: CLOSED — int8-QK is dropped for gfx906.** Decided once the tester's run
+made the point moot: the configuration that actually serves the model (fp16,
+tiled indexer, TP=4, MTP k=3 — see QSA-FN-9) contains no int8 anywhere, and
+int8-QK is 2.4× *slower* than an fp16 cache at the profiles where it runs at all
+(RECON §5.2), so the IMA in `_qsa_sparse_paged_gqa_splitk_kernel` cost us nothing
+we wanted. The fault mechanism itself stays unexplained (shape/profile-dependent
+gfx906 codegen hazard at `block_n=64, num_splits=1, num_warps=2`; `num_warps=8`
+or `BLOCK_M=8` clears it) and is parked with the repro in
+`/local/tmp/qsaprobe/logs/ima_repro_G12.log`.
 
-**Decision rule (both branches acceptable, the cheap one is recommended):** if
-int8-QK is ever wanted on gfx906, the work is (a) a per-instruction/LDS census of
-the failing instantiation (`llvm-objdump`; skill `gfx906-isa-disassembly`) to
-find the bad `v_dot4_i32_i8` operand pack under spills, then a Triton-side report
-(relevant to TRITON-1's upstream work) **or** a gfx906 dispatch that forces
-`num_warps=8`. Otherwise **drop int8-QK for gfx906**: it is 2.4× *slower* than an
-fp16 cache at the profiles where it runs at all, so the fault costs us nothing
-we wanted. Record the drop in `DEAD-ENDS.md` when decided.
-
-**GATE (whichever branch):** `tests/test_int8qk_attn.py`-style NRMSE gate **and**
-an IMA-free run across all four dispatch profiles (T ∈ {1, 4, 64, 512+}) — a
-profile sweep, not one shape; the fault is profile-specific.
+Residue if it is ever resurrected: force `num_warps=8` in the gfx906 dispatch, or
+census the failing instantiation with `llvm-objdump` (skill
+`gfx906-isa-disassembly`) before blaming Triton. Record: `DEAD-ENDS.md`.
 
 ### QSA-FN-7 — non-regression gate for the existing models (runs with every item above)
 

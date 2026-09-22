@@ -50,6 +50,8 @@ DEVLOG) + `DEVLOG-int8-transfer.md` (the P1/P2 session record).
 
 | Onboard Qwen3-30B-A3B-AWQ as the next generic AWQ MoE candidate (E=128/topk=8/hidden=2048 may fit the M=1 tile) | — (never started) | **SUPERSEDED** (2026-08-29 user decision: not an active goal — the supported Qwen3.5/3.8 line supersedes the model) | — | candidate removed from the onboarding queue during the roadmap reorg; the generic AWQ queue itself stays open for the next compatible checkpoint | ROADMAP (onboarding queue) |
 
+| int8-QK for QSA on gfx906 (`QSA_INT8_QK=1`) | kernel profile + kernel bench | **DEAD-END / DROPPED** (2026-09-22, QSA-FN-6) | no code on main (env-gated, off) | IMA in `_qsa_sparse_paged_gqa_splitk_kernel` at the dispatch profile every prefill >512 rows uses, and 2.4x slower than an fp16 cache where it does run. The config that serves the real model is fp16 + tiled indexer, with no int8 anywhere, so the fault costs nothing we wanted. Mechanism parked (repro `/local/tmp/qsaprobe/logs/ima_repro_G12.log`; `num_warps=8` clears it) | QSA-FN-6, RECON §5.2 |
+
 ## OPEN / IN-FLIGHT (verdict not yet recorded)
 
 | Hyp | Gate | Status | Refs |
