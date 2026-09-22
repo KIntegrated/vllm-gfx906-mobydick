@@ -106,13 +106,22 @@ class MmapShardedNGramEmbedding(nn.Module):
             raise ValueError("MmapShardedNGramEmbedding requires CPU ids")
         original_shape = ids.shape
         flat_ids = ids.reshape(-1).long()
-        shard_idx = torch.div(flat_ids, self.shard_row_capacity, rounding_mode="floor")
+        shard_idx = torch.div(
+            flat_ids, self.shard_row_capacity, rounding_mode="floor"
+        )
         local_idx = flat_ids - shard_idx * self.shard_row_capacity
         out = flat_ids.new_empty(
             (flat_ids.numel(), self.embedding_dim), dtype=self.params_dtype
         )
-        for shard in torch.unique(shard_idx).tolist():
+        # Fixed-length loop over every shard, every call — no data-dependent
+        # iteration count. Necessary for CUDA graph capture safety: a Python
+        # loop whose length depends on which shards this specific batch
+        # happens to touch can execute a different number of steps during
+        # warmup/capture than during replay.
+        for shard in range(self.num_shards):
             mask = shard_idx == shard
+            if not mask.any():
+                continue
             tensor = self._shards[shard]
             if tensor is None:
                 raise RuntimeError(f"PLE ngram shard {shard} was never loaded")
@@ -1138,7 +1147,17 @@ def qwen4_exp_amd_ple_ngram_embedding(
     ple_embedding = layer.ple_embedding
     n = ngram_ids.shape[0]
     pinned_ids = ple_embedding._pinned_ngram_ids[:n]
-    pinned_ids.copy_(ngram_ids, non_blocking=True)
+    # The mmap'd shard lookup below runs on the host, so the device->host copy
+    # has to have landed before the host reads the buffer.  non_blocking=True
+    # only makes the copy stream-ordered; it does not wait for it.  The host
+    # would otherwise read ids that are stale, or -- on the first step after
+    # init, since _pinned_ngram_ids is torch.empty(...).pin_memory() and is
+    # never zeroed -- outright uninitialized.  Those values then index the
+    # shard table outside its row range (see MmapShardedNGramEmbedding.forward),
+    # which is what killed the engine at 00:26 / 00:31 with 'index out of range
+    # in self'.  The H2D copy of the result at the end stays async: it is
+    # stream-ordered against whatever consumes `output` and needs no host wait.
+    pinned_ids.copy_(ngram_ids, non_blocking=False)
     result = ple_embedding.ngram_embedding(pinned_ids).flatten(-2)
     pinned_out = ple_embedding._pinned_output[:n]
     pinned_out.copy_(result.to(dtype=output.dtype))

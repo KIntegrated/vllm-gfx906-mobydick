@@ -19,8 +19,9 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -168,6 +169,83 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import use_workspace_lane
 
 logger = init_logger(__name__)
+
+
+# --- GFX906: optional V1-style GC freeze around the boot-time capture regions --
+# The V1 runner (v1/worker/gpu_model_runner.py:6617, _freeze_gc) wraps CUDA graph
+# capture in gc.freeze() + gc.disable(). This V2 runner -- the one that actually
+# loads here (boot logs "Using V2 Model Runner") -- has three bare gc.collect()
+# calls and no guard at all. Both of our boot-time SIGSEGVs die inside one of
+# them: profile_run()'s (reached from determine_available_memory(), the 20:17 and
+# 20:22 deaths) and capture_model()'s (the 19:44 death). A fault inside
+# update_refs / deduce_unreachable / _PyGCHead_NEXT means some C extension already
+# corrupted the heap -- GC is the victim, not the bug (bpo-31181). Freezing parks
+# every reachable object in the permanent generation and turns off automatic
+# collection, so the traversal that crashes does not run inside those regions.
+# This does NOT repair whatever writes out of bounds; it removes the frame that
+# dies. OFF by default: GFX906_GC_FREEZE=1 enables, unset leaves upstream
+# byte-identical. See mtp-cudagraph-profile-crash.md section 15.
+_GC_FREEZE_ENV = "GFX906_GC_FREEZE"
+_GC_FROZEN_DEPTH = 0
+
+
+def _gc_freeze_enabled() -> bool:
+    return os.environ.get(_GC_FREEZE_ENV, "0") == "1"
+
+
+@contextmanager
+def _gc_freeze_guard(label: str):
+    global _GC_FROZEN_DEPTH
+    if not _gc_freeze_enabled():
+        yield
+        return
+    was_enabled = gc.isenabled()
+    t0 = time.perf_counter()
+    gc.freeze()
+    gc.disable()
+    _GC_FROZEN_DEPTH += 1
+    logger.info(
+        "GFX906_GC_FREEZE: froze and disabled GC around %s "
+        "(explicit gc.collect() suppressed inside)",
+        label,
+    )
+    try:
+        yield
+    finally:
+        _GC_FROZEN_DEPTH -= 1
+        try:
+            gc.unfreeze()
+            gc.collect()
+        finally:
+            if was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
+        logger.info(
+            "GFX906_GC_FREEZE: GC restored after %s (%.1f s frozen)",
+            label,
+            time.perf_counter() - t0,
+        )
+
+
+def _gc_freeze_around(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _gc_freeze_guard(fn.__name__):
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _gc_maybe_collect() -> None:
+    """vLLM's pre-capture gc.collect(); suppressed while we hold GC frozen.
+
+    Deliberate -- the traversing collect is the frame that dies. Skipping it in
+    profile_run() makes measured free memory an UNDER-estimate (unreclaimed
+    garbage counts as used), i.e. a smaller KV cache: the safe direction.
+    """
+    if _GC_FROZEN_DEPTH == 0:
+        gc.collect()
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -664,7 +742,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.speculator is not None:
             # After set_attn, so the speculator can size its cudagraph mode
             # to its own attention support.
-            self.speculator.init_cudagraph_manager(cudagraph_mode)
+            # gfx906 local experiment (mtp-cudagraph-profile-crash.md §14): this
+            # file's own header asks for no new lines here, so keep it to one.
+            # GFX906_DRAFTER_GRAPHS=1 restores upstream behaviour exactly. With the
+            # default (0) the drafter gets CUDAGraphMode.NONE for both its prefill
+            # and its decode manager instead of inheriting the target's mode
+            # (autoregressive/speculator.py:129-134 takes the mode verbatim for
+            # prefill; :137-140 already gives NONE to the decode manager in
+            # PIECEWISE mode). The target model is untouched: it keeps
+            # torch.compile + its own graphs.
+            self.speculator.init_cudagraph_manager(
+                cudagraph_mode
+                if os.environ.get("GFX906_DRAFTER_GRAPHS", "0") == "1"
+                else CUDAGraphMode.NONE,
+            )
 
         self.kv_caches: list[torch.Tensor] = []
         kv_caches_dict = init_kv_cache(
@@ -848,6 +939,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner.dummy_pooler_run(hidden_states)
 
     @torch.inference_mode()
+    @_gc_freeze_around
     def profile_run(self) -> None:
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
@@ -880,7 +972,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
         self.reset_encoder_cache()
-        gc.collect()
+        _gc_maybe_collect()
 
     def reset_mm_cache(self) -> None:
         if self.encoder_cache is not None:
@@ -898,6 +990,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return _profile_cudagraph_memory(self)
 
     @torch.inference_mode()
+    @_gc_freeze_around
     def capture_model(self) -> int:
         assert self.cudagraph_manager is not None
         capture_encoder = (
@@ -916,7 +1009,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
         start_time = time.perf_counter()
-        gc.collect()
+        _gc_maybe_collect()
         torch.accelerator.empty_cache()
         start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
