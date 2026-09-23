@@ -32,7 +32,26 @@ requires_qsa_kernels = pytest.mark.skipif(
 )
 
 
-def test_ple_ngram_embedding_custom_op_uses_resident_weight(
+def _stage_host_table_buffers(ngram_embedding: torch.nn.Module) -> None:
+    """Provide the pinned staging buffers the host-table PLE path needs.
+
+    ``MmapShardedNGramEmbedding`` (the host-RAM PLE implementation) drives the
+    custom op through per-layer pinned ``_pinned_ngram_ids`` / ``_pinned_output``
+    buffers -- the device-resident implementation does not. Adding them when the
+    implementation exists lets this test exercise the op on either path; on the
+    device path it is a no-op.
+    """
+    if not hasattr(ple_layer_module, "MmapShardedNGramEmbedding"):
+        return
+    ngram_embedding._pinned_ngram_ids = torch.empty(
+        (4, 2), dtype=torch.long, device="cpu"
+    ).pin_memory()
+    ngram_embedding._pinned_output = torch.empty(
+        (4, 6), dtype=torch.float32, device="cpu"
+    ).pin_memory()
+
+
+def test_ple_ngram_embedding_custom_op_matches_reference_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     layer_name = "model.layers.0.ple"
@@ -40,6 +59,7 @@ def test_ple_ngram_embedding_custom_op_uses_resident_weight(
     torch.nn.Module.__init__(layer)
     layer.ple_embedding = torch.nn.Module()
     layer.ple_embedding.ngram_embedding = torch.nn.Embedding(8, 3)
+    _stage_host_table_buffers(layer.ple_embedding)
     context = SimpleNamespace(no_compile_layers={layer_name: layer})
     monkeypatch.setattr(ple_layer_module, "get_forward_context", lambda: context)
 
