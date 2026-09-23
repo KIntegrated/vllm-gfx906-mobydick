@@ -3270,3 +3270,28 @@ long-running server is still registered — the deck needs a BACO reset or a **h
 did not run. Nothing about it has been measured; the PR-review claim that the tester's
 default would cost our spec configs their drafter graphs remains an argument from their own
 +6 % measurement, not from our box.
+
+## 2026-09-23 06:20 — observation #107 (draft-model load stall, TP=1 arm abandoned)
+
+Boot from 2026-09-22 21:21 had served five clean TP=2 boots (the drafter-graph and
+all-reduce A/B) plus the FD arm. The sixth launch — the TP=1 arm, after two earlier
+non-GPU failures of the same arm (a KV-capacity refusal at `max-model-len 131072`,
+then a `Free memory 13.51/31.98 GiB < 0.82` race against the previous server's VRAM
+release) — loaded the target model normally (`Loading weights took 71.15 seconds`)
+and then **stalled loading the draft model**: the log held
+
+```
+Loading safetensors checkpoint shards:   0%|  | 0/5 [00:00<?, ?it/s]
+```
+
+for ~13 minutes, unchanged (0 bytes of log growth over 30 s), with the EngineCore at
+3.9 % CPU, 26 GB of VRAM held on GPU0, no error line, and `rocm-smi` showing both
+decks healthy (no reset, no zombie VRAM). This differs from the #93–#106 family,
+which dies or spins; here the load simply stopped. `SIGTERM` took the process down
+and released the VRAM.
+
+Recorded as a load-stall observation rather than a wedge (no reset, no leaked VRAM,
+and the driver stayed serviceable). Consequence: the TP=1 drafter-graph arm was
+abandoned, so the sweep's TP=1 half is unmeasured — the TP=2 half (three arms, three
+contexts, ±0.2 % ms/step) answers the question it was asked.
+

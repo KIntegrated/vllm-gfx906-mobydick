@@ -641,3 +641,41 @@ their default so we keep our graphs" — our config is faster with graphs off. T
 edit stays (default = upstream behaviour, knob to disable) but the justification is
 now "one config measures +7.9 % the other way, one measures +6 %, so keep it
 switchable", not "their default costs us 6 %".
+
+### 2026-09-23 — real-payload sweep: the knob is **neutral**; the filler +7.9 % did not transfer
+
+**Same session, one arm per boot, TP=2, MTP k=3, maxlen 262144, util 0.82, capture
+`[4,8,12,16]`; prompts are *token ids* from `corpus_mixed.json` body 0 (real
+chat/agent payload, prefix fills), identical byte-for-byte across arms; 1 warmup +
+3 reps × 256 tokens per context; ms/step is the acceptance-independent comparator.**
+
+| context | T2ON ms/step (acc) | T2OFF ms/step (acc) | T2ON2 ms/step (acc) |
+|---|---|---|---|
+| 2 k | 60.0 (0.622) | 59.9 (0.588) | 59.8 (0.622) |
+| 8 k | 62.1 (0.611) | 62.2 (0.584) | 62.2 (0.633) |
+| 64 k | 92.0 (0.525) | 92.1 (0.544) | 92.2 (0.581) |
+
+**ms/step is identical across all three arms at every context (±0.2 %)**, and the t/s
+differences track acceptance only (e.g. 8 k: 45.8/46.8 t/s at acc 0.611/0.633 with
+graphs ON vs 44.3 at 0.584 with them OFF). T2ON2 is the drift control and matches
+T2ON. So on real payloads the drafter-graph knob is **neutral on this config**, and
+the earlier +7.9 % (OFF faster) reproduced **only** in the 100 %-acceptance filler
+regime (72.2 → 66.9 ms/step). Mechanism not investigated: the two regimes differ in
+tokens per step, so the verify path's block-boundary behaviour differs, but the
+effect is single-regime and I have not isolated it.
+
+**Consequence.** Our serving never sees 100 % acceptance on real payloads, so: keep
+the upstream default (drafter inherits the target's mode) and keep the knob
+available. No default flip on either side is justified by either measurement, and
+the PR #2 edit stands as "make it switchable, do not change the default".
+
+**TP=1 pair not measured** (three attempts lost, none of them a GPU fault):
+(1) `max-model-len 131072` cannot fit TP=1/0.82 — the engine refuses with
+`9.29 GiB KV cache is needed, larger than available`; (2) the relaunch at 65 536
+raced the previous server's VRAM release (`Free memory on device cuda:0
+(13.51/31.98 GiB) < desired 0.82`) — the kill needs an explicit drain wait;
+(3) the third attempt **stalled at the drafter's shard load** (0/5, log frozen for
+13 min, 3.9 % CPU, 26 GB VRAM held, no error) — logged as degradation observation
+#107, process killed. The TP=2 answer does not depend on it; a TP=1 confirmation
+would need a fresh boot.
+
