@@ -425,6 +425,27 @@ test commands + results (the new unit test, the un-gated mamba suite); the
 AI-assistance statement; and the repro argument (unit test, since the crash needs
 the Qwen3.8-Flash-Next checkpoint).
 
+### UP-4 — upstream the small generic fixes from PR #2 (**HIGH PRIORITY, cheapest wins**)
+
+**Status: OPEN — ready to propose.** Both are generic, small, and independently
+useful; carried in the fork they cost conflict files, upstreamed they arrive through
+the merge:
+
+- **amdsmi architecture sanity fallback** (`platforms/rocm.py`): when
+  `_query_gcn_arch_from_amdsmi()` returns an implausible arch, fall back instead of
+  trusting it. Our own logs show amdsmi breaking on this stack (it was the pre-wedge
+  symptom in wedge #106: "Failed to get total memory via amdsmi, falling back to
+  torch.cuda").
+- **`enforce_eager` in `--speculative-config` is inert** (verified in `v0.30.1rc0`):
+  the field exists in `SpeculativeConfig` but only the *target's* value is propagated
+  (`config/speculative.py:1301`), so the flag silently does nothing — an issue and a
+  one-line fix.
+
+Also worth reporting upstream from the same PR (not patches): the V2-runner boot
+segfault under MTP + graphs (GC as the *victim* of an unidentified heap corruption,
+with their boot logs as the repro) and the tvm_ffi SIGSEGV-handler-overwrites-
+`faulthandler` finding.
+
 ### UP-2 — upstream fp16 QSA for Qwen3.8-Flash-Next (QSA-FN-1) — **HIGH PRIORITY**
 
 **Status: blocked on UP-1's landing pattern (same human driver), and on a real
@@ -453,7 +474,11 @@ Extra work this PR needs that UP-1 does not:
 ### UP-3 — the 0.30.0 base itself: `gfx906/v0.30.0` fork-merge train
 
 **Status: scoped, not started — see the decision sheet
-[`MERGE-0.30.0-review.md`](MERGE-0.30.0-review.md).** `gfx906/v0.29.0` ←
+[`MERGE-0.30.0-review.md`](MERGE-0.30.0-review.md).** **Target decision needed:**
+against `v0.30.1rc0` (2026-09-23) the same branch has **44** conflicts vs **32**
+against `releases/v0.30.0` — chasing the newest upstream costs +12 conflict files,
+and applying PR #2 on top adds 2 more (`platforms/rocm.py`,
+`v1/worker/gpu/model_runner.py`; measured 2026-09-23, `REVIEW-pr2-qsa-fn.md`). `gfx906/v0.29.0` ←
 `upstream/releases/v0.30.0` is 595 vs 767 commits and **31 conflicted files**
 (measured 2026-09-17; an earlier "148" in this entry miscounted the
 `Auto-merging …` progress lines that `git merge-tree --name-only` prints on

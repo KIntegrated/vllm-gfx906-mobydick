@@ -119,3 +119,69 @@ this box) — those stay the tester's evidence.
    `CHANGELOG.md` / `DEVLOG-qwen38-flash-qsa.md` as **QSA-FN-9** (tester result +
    merged fixes).
 3. Ask the tester for the two test artifacts before the merge lands.
+
+## 2026-09-23 — upstream overlap and the conflict accounting (changes the plan)
+
+**Upstream's newest is `v0.30.1rc0` (2026-09-23); there is no rc1 yet.** Checked
+file-by-file against it — **none of the PR, and none of our QSA train, is upstream**:
+
+| artifact | in `v0.30.1rc0`? |
+|---|---|
+| fp16 QSA guards (QSA-FN-1, the reported error) | **no** — `supported_dtypes = [torch.bfloat16]`, "Qwen4Exp QSA requires BF16 Q/K/V" verbatim |
+| tiled indexer (QSA-FN-4) | **no** — `_qsa_mqa_paged_tiled_kernel` absent |
+| V2-MAMBA-1 seed fix | **no** — `// self.cache_config.block_size` verbatim (line 122) |
+| SKINNY_M16 / C4 free-list flips | **no** — fork-only flags and module, no upstream counterpart |
+| PLE mmap host-table offload | **no** — upstream's `ple_layer.py` still builds the TP-sharded on-device embedding; no mmap/CPU/pin path |
+| V2 boot GC guard | **no** — the V2 runner has bare `gc.collect()` (2 sites) and no `gc.freeze` at all |
+| drafter-graph knob | **no** — `init_cudagraph_manager(cudagraph_mode)` verbatim |
+| amdsmi arch sanity fallback | **no** — upstream calls `_query_gcn_arch_from_amdsmi()` directly |
+| the `enforce_eager` finding | **still true upstream** — the field exists in `SpeculativeConfig` but only the *target's* value is propagated (`config/speculative.py:1301`), so a `--speculative-config {"enforce_eager": …}` is inert |
+
+**The one real overlap is a capability, not code.** Upstream (and our fork) already
+ship a **generic per-parameter CPU offload** — `vllm/config/offload.py`,
+`--cpu-offload-gb` / `--cpu-offload-params` — which is exactly what the CDNA recipe
+used to keep `ngram_embedding` in host RAM. The tester's
+`MmapShardedNGramEmbedding` is a *parallel implementation of the same idea* inside
+`ple_layer.py`, with a bespoke host-weight GEMV path in `dense_gemv_gfx906.cu` +
+`utils.py`. So "upstream must have PLE offloading" is half right: it has **generic**
+offloading, not a PLE-specific one.
+
+### Conflict accounting (merge-tree, `CONFLICT` lines, same method both sides)
+
+| base | ours | ours + PR | delta |
+|---|---|---|---|
+| `v0.30.1rc0` | **44** | **46** | **+2**: `vllm/platforms/rocm.py`, `vllm/v1/worker/gpu/model_runner.py` |
+| `releases/v0.30.0` | 32 | 33 | +1 |
+
+Nothing stops conflicting. So cherry-picking the PR costs **~2 extra conflict files per
+future merge train**, both in *hot* upstream files (`model_runner.py` already diverges
+403+/421−, `rocm.py` 248+/71−). The PR's other touched files are **fork-only** and cost
+nothing: `csrc/rocm/dense_gemv_gfx906.cu`, `c4_layer0_moe.py`,
+`gfx906_fa/gfx906_fa_backend.py`. `ple_layer.py` does not conflict *today* (upstream
+has not touched it since our base) but it is upstream's file.
+
+**And the merge target matters more than the PR:** 44 conflicts against rc0 vs 32
+against 0.30.0 — chasing the newest upstream costs +12 files for this branch.
+
+### Revised plan
+
+1. **Ask the tester for one comparison** before taking the PLE work: their mmap path
+   vs `--cpu-offload-params ngram_embedding` at the same config (VRAM + prefill/decode
+   t/s). If the generic mechanism is comparable, drop the bespoke class — that removes
+   the `ple_layer.py`/`dense_gemv.cu`/`utils.py` complex, one of the two new conflict
+   sites' neighbours, and the `rocm.py` hooks with it.
+2. **Take now** (small / gated / model-local): the amdsmi arch fallback, the V2 GC
+   guard (gated; report the segfault class upstream with their repro — it is an
+   unidentified heap corruption), the drafter-graph knob (gated; our real-payload
+   sweep says neutral), the PLE correctness fixes, the shellcheck/SPDX trivia.
+3. **Don't take**: the whole-file clang-format of `dense_gemv_gfx906.cu`, the ops-runbook
+   doc rows.
+4. **Upstream the generic bits instead of carrying them** (`UP-4`): the amdsmi fallback
+   and the `enforce_eager` propagation are small, generic and independently valuable —
+   and our own logs show amdsmi breaking on this stack (it was the pre-wedge symptom in
+   wedge #106). Landed upstream, they arrive through the next merge rather than becoming
+   fork-local divergence.
+5. **Pin the merge target now.** rc0 is +12 conflict files over 0.30.0; decide whether
+   the 0.30.0 train ships first (cheaper, and the QSA work is on a branch anyway) or we
+   wait for 0.30.1 final and absorb the larger set.
+
