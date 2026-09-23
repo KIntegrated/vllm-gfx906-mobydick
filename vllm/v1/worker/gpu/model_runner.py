@@ -185,6 +185,10 @@ logger = init_logger(__name__)
 # Mechanism, measurements and the open root cause: docs/gfx906/DEVLOG-spec-decode.md
 # (2026-09-23, "V2 runner boot under MTP + graphs").
 _GC_FREEZE_ENV = "GFX906_GC_FREEZE"
+_GC_THAW_ENV = "GFX906_GC_THAW"
+_GC_DUMP_ENV = "GFX906_GC_DUMP"
+_GC_FROZEN_DEPTH = 0
+_GC_REAL_COLLECT = None
 
 
 def _gc_freeze_enabled() -> bool:

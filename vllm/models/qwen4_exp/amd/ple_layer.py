@@ -78,11 +78,18 @@ class MmapShardedNGramEmbedding(nn.Module):
         num_shards: int,
         shard_row_capacity: int,
         embedding_dim: int,
+        dummy_weights: bool = False,
     ) -> None:
         super().__init__()
         self.num_shards = num_shards
         self.shard_row_capacity = shard_row_capacity
         self.embedding_dim = embedding_dim
+        # Dummy-weight loads (``--load-format dummy``) never deliver shard
+        # tensors: the shards are read straight from the checkpoint's safetensors
+        # files and are not parameters, so nothing generates them. Serving
+        # zero rows for a missing shard keeps the path exercisable without a
+        # checkpoint (the tiny-config harness); a real load still raises.
+        self._dummy_weights = dummy_weights
         self.params_dtype: torch.dtype | None = None
         self._shards: list[torch.Tensor | None] = [None] * num_shards
 
@@ -139,6 +146,9 @@ class MmapShardedNGramEmbedding(nn.Module):
                 continue
             tensor = self._shards[shard]
             if tensor is None:
+                if self._dummy_weights:
+                    out[mask] = 0.0
+                    continue
                 raise RuntimeError(f"PLE ngram shard {shard} was never loaded")
             out[mask] = tensor.index_select(0, local_idx[mask])
         return out.reshape(*original_shape, self.embedding_dim)
@@ -317,6 +327,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             padded_vocab_size + self.split_ngram_parts - 1
         ) // self.split_ngram_parts
         self.ngram_embedding = MmapShardedNGramEmbedding(
+            dummy_weights=(
+                get_current_vllm_config().load_config.load_format == "dummy"
+            ),
             num_shards=self.split_ngram_parts,
             shard_row_capacity=shard_row_capacity,
             embedding_dim=self.head_dim,
