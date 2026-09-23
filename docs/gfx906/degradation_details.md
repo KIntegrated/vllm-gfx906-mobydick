@@ -3295,3 +3295,28 @@ and the driver stayed serviceable). Consequence: the TP=1 drafter-graph arm was
 abandoned, so the sweep's TP=1 half is unmeasured — the TP=2 half (three arms, three
 contexts, ±0.2 % ms/step) answers the question it was asked.
 
+## 2026-09-23 ~15:00–16:20 — observation #108 (quiet degradation: −4.7 % on both trees, no wedge)
+
+The PR #2 integration bench looked like a regression at first: the 35B house bench on
+the PR tip read **57.21 t/s** (57.16–57.30, mclk 1000) against the **59.79** recorded on
+the 2026-09-22 boot. Three samples per arm, tight, so it was worth chasing.
+
+Control: the *pre-cherry-pick* tip (`aa6982deb4`) benched on the **same boot** read
+**57.00 t/s** (56.96–57.06) — the same number, so the ~4.7 % is the host, not the
+branch. The branch is +0.4 % (inside noise) against its own control.
+
+Boot context: rebooted 2026-09-22 21:21, ~19 h up, after ~15 GPU loads (the drafter A-B-A
+session, the FD arm, the real-payload sweep, the tiny-rig boots, suites and two benches),
+with the earlier wedge #107 (draft-model load stall) in the window. `amdsmi` is broken on
+this boot (`_query_gcn_arch_from_amdsmi` raises `RuntimeError` — the same pre-wedge
+symptom documented for #106 and for the 2026-09-16 degradation), both trees fall back to
+`torch.cuda` and `on_gfx906()` is True in both, so the amdsmi fallback we merged from
+PR #2 is behaviour-identical here. No GPU reset appears in the reachable logs; the
+spec-decode canary was not run (the failure mode is a uniform slowdown, not the
+sync-cadence-only collapse the canary detects).
+
+Consequence: **perf gates measured on this boot are not comparable to the 09-22
+numbers** (the flips' 59.79 baseline, the drafter sweep, the AR arms). Functional gates
+(suites, tiny rig) are unaffected. Reboot before any further perf work, and re-run the
+35B bench to confirm the host is back at ~59.8 before quoting branch-vs-main perf.
+
