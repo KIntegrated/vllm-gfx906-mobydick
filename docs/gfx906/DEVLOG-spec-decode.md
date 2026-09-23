@@ -610,11 +610,22 @@ identical), so the delta is pure step cost, not a scheduling difference.
 
 ### By-catch
 
+**Correction (same day, verified):** an earlier draft of this entry read
 `[speculator.py:120] Fused multi-step draft decode is not supported by attention
-backend(s) CUSTOM; falling back to rebuilding …` — with our CUSTOM FA backend the
-A3/FD-1 fused multi-step draft-metadata path is **inert at runtime regardless of
-`VLLM_GFX906_FUSED_DRAFT`**, which sharpens the `DEAD-ENDS.md` row corrected on
-2026-09-17 (the flag does have a reader and tests; the *backend* refuses the path).
+backend(s) CUSTOM; falling back to rebuilding …` as "our CUSTOM FA refuses the fused
+path". It does not. The gate is the per-backend attribute
+`supports_draft_decode_metadata_update` (`speculator.py:104-124`), which our FA
+builder sets from `VLLM_GFX906_FUSED_DRAFT` (default off) — so the message appears
+only while the flag is unset, and it names the backend although the *flag* is what
+decided. Verified with the flag on: the message is **absent** (0 occurrences) and the
+fused multi-step path is used. Throughput there: **55.29 / 55.45 t/s** vs 55.40 for
+the flag-off house arm at 32 k with acceptance 1.000 — i.e. FD-1's recorded
+**NEUTRAL** verdict holds on this config too, now on a same-config pair.
+
+Side note from that boot: `[envs.py:2308] Unknown vLLM environment variable detected:
+VLLM_GFX906_FUSED_DRAFT`. Our `VLLM_GFX906_*` switches are read via `os.environ` and
+are not declared in `vllm/envs.py`, so every one of them emits this startup warning —
+cosmetic, but it makes a real typo'd variable look identical to a working one.
 
 ### Evidence AGAINST / limits
 
