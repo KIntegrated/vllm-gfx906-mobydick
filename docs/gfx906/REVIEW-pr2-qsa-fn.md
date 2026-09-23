@@ -185,3 +185,47 @@ against 0.30.0 — chasing the newest upstream costs +12 files for this branch.
    the 0.30.0 train ships first (cheaper, and the QSA work is on a branch anyway) or we
    wait for 0.30.1 final and absorb the larger set.
 
+## 2026-09-23 (later) — upstream has an *official* PLE CPU offload; #57497 brings it to ROCm
+
+`vllm-project/vllm#57497` — "[Qwen4Exp][ROCm] PLE n-gram table CPU offload" (author
+mrodden, **OPEN**, base `main`, updated 2026-09-23) — is the official version of
+what the tester hand-built. Checked state:
+
+| piece | `v0.30.0` | `v0.30.1rc0` (released) | `upstream/main` + #57497 |
+|---|---|---|---|
+| `vllm/config/engram.py` (PLE config + gate) | present, gate `is_cuda()` | present, gate **`is_cuda_alike()`** | same, message wording only |
+| `VLLM_PLE_CPU_OFFLOAD` | present, default **on** | present, default on | same |
+| pinned-host PLE classes | — | **NVIDIA only** (`qwen4_exp/nvidia/ngram_embedding.py`, "device and pinned-host storage", `is_uva_available`) | moved to `qwen4_exp/common/ngram_embedding.py`, **AMD selects the pinned class when `engram_config.cpu_offload`** |
+| AMD PLE path | device-resident | device-resident (`PLEVocabParallelEmbedding`) | pinned-host, behind a new custom op `qwen4_exp_amd_ple_ngram_embedding_pinned` (`mutates_args=["output"]`, so inductor's autotuning cannot materialise the table) |
+| our 0.29-line tree | **none of it** — no `engram.py`, no `VLLM_PLE_CPU_OFFLOAD`, no pinned classes | | |
+
+So the mechanism is: **pinned host RAM + UVA view, default on, ROCm accepted since
+rc0 — but the ROCm *implementation* is exactly what #57497 adds** (today the AMD path
+still builds a device-resident table, so the relaxed gate alone does not offload
+anything on gfx906). Their own numbers: offload ON vs OFF is equal within noise
+(TTFT/decode/burst), i.e. the value is VRAM, not speed — the same conclusion as the
+tester's mmap path.
+
+### What this changes for us
+
+1. **The bespoke PLE path is superseded in direction, not yet in time.** Upstream's
+   mechanism is not in any release for ROCm, and our tree has none of the
+   infrastructure, so the tester's path (or the generic `--cpu-offload-params`) is the
+   only thing that works *today* on the 0.29 base. Treat theirs as an **interim
+   stopgap**: do not gate it, do not polish it, and delete it when we adopt upstream's.
+2. **The PLE measurement stays useful but retargeted**: the meaningful comparison is
+   theirs vs **upstream's pinned-host offload** — the generic `--cpu-offload-params`
+   arm is only the closest stand-in that exists on our current base.
+3. **Pinned RAM vs page cache is the real open question.** Upstream pins the table in
+   host RAM (26 GiB here; 51–102 GiB for the FP8/bf16 checkpoints they target), while
+   the tester's path reads page-cache-backed file pages and never pins. On a 128 GB box
+   that difference decides big-table practicality, so the comparison is worth running
+   even though upstream will own the mechanism.
+4. **Their D2H/stale-id bug class transfers.** Upstream's pinned path also stages ids
+   through a pinned buffer; the tester's finding (an async D2H leaves the host reading
+   stale/uninitialised ids, which then index out of range) is a hazard worth reporting
+   against #57497 — a concrete, valuable contribution rather than a fork-local patch.
+5. **Merge sequencing is unchanged, but the merge now has an added benefit**: it brings
+   `engram.py` + the pinned classes + the relaxed gate, i.e. a capability the 0.29 line
+   lacks entirely. The AMD half still needs #57497 (or a small port of it) after that.
+

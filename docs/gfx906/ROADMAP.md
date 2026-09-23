@@ -299,6 +299,24 @@ Residue if it is ever resurrected: force `num_warps=8` in the gfx906 dispatch, o
 census the failing instantiation with `llvm-objdump` (skill
 `gfx906-isa-disassembly`) before blaming Triton. Record: `DEAD-ENDS.md`.
 
+### QSA-FN-11 — adopt upstream's official PLE CPU offload on gfx906
+
+**Status: OPEN — blocked on the 0.30.x merge, not on us.** Upstream's PLE n-gram CPU
+offload (`VLLM_PLE_CPU_OFFLOAD`, default **on**; `vllm/config/engram.py`, gate already
+`is_cuda_alike()` in `v0.30.1rc0`) is the official version of the tester's hand-built
+mmap path. What is missing for ROCm is the *implementation*: `vllm-project/vllm#57497`
+(open, base `main`) moves the pinned/device classes to `qwen4_exp/common/ngram_embedding.py`
+and makes the AMD PLE layer select the pinned class, behind a custom op that keeps the
+table out of inductor's autotuning copy.
+
+Plan once we are on a 0.30.1-based line: (1) verify `VLLM_PLE_CPU_OFFLOAD=1` engages on
+gfx906 with the tiny rig (functional) — today's AMD path ignores it; (2) port or wait
+for #57497's AMD half; (3) validate on the real checkpoint via the tester; (4) **delete
+the bespoke `MmapShardedNGramEmbedding` path** from PR #2 and keep only its bug-class
+finding (stale/uninitialised pinned ids). Interim note: while we stay on the 0.29 line,
+the bespoke path or the generic `--cpu-offload-params` are the only options — treat
+them as stopgaps, not as the design.
+
 ### QSA-FN-10 — the next tester measurement list (one session, ~30 min)
 
 **Status: OPEN — ready to send.** Everything here needs the real checkpoint, i.e. the
