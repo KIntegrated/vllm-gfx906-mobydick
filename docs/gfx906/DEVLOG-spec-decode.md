@@ -695,3 +695,51 @@ switch, so their `=1` configuration stays available on the model it helps. Our
 "neutral" claim must be quoted with its model attached — it is a Qwen3.8-27B-dense
 result, not a statement about Qwen4Exp.
 
+## 2026-09-23 — V2 runner boot under MTP + graphs: the GC guard (tester's box, PR #2)
+
+**VERDICT:** `SHIPPED` as an opt-in **mitigation** (`GFX906_GC_FREEZE=1`, default off);
+root cause `OPEN` — GC is the victim of a heap corruption nobody has identified.
+· **GATE:** their boot lottery on 4× MI50 (5/5 fatal with the exit traversal, 2/2 with
+park-at-exit); nothing reproduced on our 2-card box.
+
+The tester's box (4× MI50, TP=4 + EP, Qwen3.8-Flash-Next, MTP k=3) died during engine
+init on the first boot that added MTP. Three faces of the same boot phase:
+
+1. `!!!!!!! Segfault encountered !!!!!!!` from an **explicit `gc.collect()`** —
+   `gc_collect_main` → `deduce_unreachable` → `update_refs` — after the `eagle_head`
+   AOT artifact load and around `profile_run` / `capture_model`, on all four workers.
+2. The same phase, different face: a `ProcessGroupNCCL` watchdog timeout ~1 s after
+   `Capturing model for speculator...`.
+3. Without speculation: `list index out of range` from
+   `torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding` inside the AOT piecewise graph —
+   this one was a *real* bug of theirs: the PLE custom op staged ids through a pinned
+   buffer with an async D2H, so the host read stale ids (or, on the first step,
+   `torch.empty(...).pin_memory()` garbage), which then indexed outside the table.
+   Fixed with `non_blocking=False`, plus a hardening that raises on out-of-range ids
+   instead of returning an uninitialised row.
+
+Findings that survive the runbook:
+
+- **The GC traversal is the victim, not the bug** (`bpo-31181` shape): something
+  corrupted the heap first, and the guard only removes the frame that dies.
+- **`gc.freeze()` + `gc.disable()` are not sufficient**: `disable()` stops *automatic*
+  collections, so any third-party explicit `gc.collect()` still traverses. Shadowing
+  the `gc.collect` **attribute** for the region does reach them (29 attribute-style call
+  sites under `torch/`, no `from gc import collect` bindings in `torch/` or `vllm/`).
+- **The guard's own exit was the crash site** (5/5 boots died in the restoring
+  collect) — hence the default exit *parks* (`gc.freeze()`, no traversal) and the old
+  `unfreeze()+collect()` exit is opt-in via `GFX906_GC_THAW=1`.
+- **`tvm_ffi` installs its own `SIGSEGV` handler, replacing `faulthandler`'s**
+  (`src/ffi/backtrace.cc`), which is why eleven boots produced C-only backtraces with
+  no `File "*.py"` line; `PYTHONMALLOC=debug` is the way to get a Python trace.
+- Prime (unproven) suspect: a stale tvm_ffi torch-C-DLPack addon cached by *filename*
+  without a torch-version hash, importing `THPVariable_Wrap` against a newer torch.
+
+**Not carried into the tree** (recorded only): their operational mitigations — a
+`BOOT_TRIES` retry loop gated on *measured* VRAM release rather than a clock, a reaper
+for leaked workers, and `TVMFFI=disable` (`TVM_FFI_DISABLE_TORCH_C_DLPACK=1`).
+
+Also from this PR and recorded above: the drafter-cudagraph knob (+6 % on their
+Qwen4Exp config, neutral on our dense 27B), whose default we restored to upstream
+behaviour with `GFX906_DRAFTER_GRAPHS=0` as the switch.
+

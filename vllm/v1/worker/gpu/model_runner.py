@@ -171,69 +171,20 @@ from vllm.v1.worker.workspace import use_workspace_lane
 logger = init_logger(__name__)
 
 
-# --- GFX906: optional V1-style GC freeze around the boot-time capture regions --
-# The V1 runner (v1/worker/gpu_model_runner.py:6617, _freeze_gc) wraps CUDA graph
-# capture in gc.freeze() + gc.disable(). This V2 runner -- the one that actually
-# loads here (boot logs "Using V2 Model Runner") -- has three bare gc.collect()
-# calls and no guard at all. Both of our boot-time SIGSEGVs die inside one of
-# them: profile_run()'s (reached from determine_available_memory(), the 20:17 and
-# 20:22 deaths) and capture_model()'s (the 19:44 death). A fault inside
-# update_refs / deduce_unreachable / _PyGCHead_NEXT means some C extension already
-# corrupted the heap -- GC is the victim, not the bug (bpo-31181). Freezing parks
-# every reachable object in the permanent generation and turns off automatic
-# collection, so the traversal that crashes does not run inside those regions.
-# This does NOT repair whatever writes out of bounds; it removes the frame that
-# dies. OFF by default: GFX906_GC_FREEZE=1 enables, unset leaves upstream
-# byte-identical. See mtp-cudagraph-profile-crash.md section 15.
-#
-# gc.freeze() + gc.disable() alone turned out NOT to be enough, which is why the
-# guard also shadows the gc.collect attribute. Measured 2026-09-21: two boots
-# logged "froze and disabled GC around profile_run" on all four workers and all
-# four still segfaulted inside a traversing collect (vllm.log 20:52:48,
-# vllm.log.error4 20:39:27). gc.disable() suppresses *automatic* collections
-# only -- an explicit gc.collect() from any third-party frame still runs, and
-# gc.freeze() exempts only the objects reachable at freeze time, so everything
-# the compiled drafter allocates afterwards is still walked. The two regions this
-# guard wraps are exactly where torch/inductor/xgrammar do call gc.collect()
-# themselves (29 attribute-style call sites under torch/, 0 `from gc import
-# collect` bindings in torch/ or vllm/, so attribute shadowing reaches all of
-# them).
-#
-# Shadowing then did its job, and the result is the important part of this note:
-# with the shadow in place the crash did NOT move to some third-party call site,
-# it stayed exactly where the guard itself collects. Later the same evening three
-# MTP boots (21:54/22:01/22:07, vllm.log) each logged the new banner on all four
-# workers, and `GC restored` appears ZERO times in every log this guard has ever
-# been enabled in (vllm.log, vllm.log2, vllm.log.error4: 16 region entries, 0
-# exits). All three died in the same stack, twice in a row today: builtin_next ->
-# gen_iternext -> gen_send_ex2 -> <python frame> -> gc_collect -> gc_collect_main
-# -> deduce_unreachable. builtin_next resuming a generator is precisely how
-# contextlib.contextmanager.__exit__ finishes a generator, so the frame that dies
-# is this function's own restoring gc.collect() at the END of profile_run. Five
-# guard-enabled boots today, five deaths, always at the guard's own exit
-# traversal; the AOT cache being warm (22:01, 22:07) or cold (21:54, which logged
-# "Source code has changed since the last compilation") made no difference.
-#
-# That inverts the premise this guard was written on. Freezing the way upstream
-# _freeze_gc does it (v1/worker/gpu_model_runner.py:6619) is cheap because
-# upstream wraps CUDA graph capture, a few seconds. This guard wraps profile_run,
-# five minutes of Dynamo + Inductor + xgrammar allocation churn: freeze() at
-# entry, then nothing collects for five minutes, then one full-heap walk over
-# everything that churn produced, at the single moment the heap is largest. A
-# mitigation whose cost is "the one collection that is guaranteed to be huge is
-# the one that runs" is not a mitigation, so the exit traversal is now opt-in
-# (GFX906_GC_THAW) and the default parks instead: freeze() again on the way out,
-# which moves the region's allocation churn into the permanent generation, which
-# every later collection ignores. Nothing is ever traversed. The cost is that
-# garbage produced during boot is never reclaimed either -- bounded, one-time,
-# host RAM only, and cheaper than a segfault that costs a 6-minute restart.
-# OFF by default (GFX906_GC_FREEZE unset = upstream byte-identical). See
-# mtp-cudagraph-profile-crash.md sections 14-16 and decode-launch-bound.md 6.
+# --- GFX906: optional GC guard around the boot-time capture regions ------------
+# The V1 runner wraps graph capture in gc.freeze() + gc.disable(); this V2 runner
+# had three bare gc.collect() calls and no guard, and the tester's 4-card box died
+# inside one of them under MTP + graphs (GC traversal faults on an already-
+# corrupted heap -- GC is the victim, the corruptor is unidentified). Measured:
+# freeze+disable alone is not enough (a third-party explicit gc.collect() still
+# traverses), shadowing gc.collect for the region is; and the guard's own exit
+# traversal was the crash site, so the default exit parks instead of collecting.
+# Off by default (GFX906_GC_FREEZE=1 enables, unset leaves upstream byte-identical).
+#   GFX906_GC_THAW=1  restore upstream's unfreeze()+collect() exit (fatal 5/5 there)
+#   GFX906_GC_DUMP=1  re-arm faulthandler inside the region (tvm_ffi replaces it)
+# Mechanism, measurements and the open root cause: docs/gfx906/DEVLOG-spec-decode.md
+# (2026-09-23, "V2 runner boot under MTP + graphs").
 _GC_FREEZE_ENV = "GFX906_GC_FREEZE"
-_GC_THAW_ENV = "GFX906_GC_THAW"
-_GC_DUMP_ENV = "GFX906_GC_DUMP"
-_GC_FROZEN_DEPTH = 0
-_GC_REAL_COLLECT = None
 
 
 def _gc_freeze_enabled() -> bool:
@@ -850,18 +801,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.speculator is not None:
             # After set_attn, so the speculator can size its cudagraph mode
             # to its own attention support.
-            # gfx906 local experiment (mtp-cudagraph-profile-crash.md §14): this
-            # file's own header asks for no new lines here, so keep it to one.
-            # GFX906_DRAFTER_GRAPHS=1 restores upstream behaviour exactly. With the
-            # default (0) the drafter gets CUDAGraphMode.NONE for both its prefill
-            # and its decode manager instead of inheriting the target's mode
-            # (autoregressive/speculator.py:129-134 takes the mode verbatim for
-            # prefill; :137-140 already gives NONE to the decode manager in
-            # PIECEWISE mode). The target model is untouched: it keeps
-            # torch.compile + its own graphs.
+            # GFX906_DRAFTER_GRAPHS=0 disables graph capture for the draft model.
+            # Default keeps upstream behaviour (the drafter inherits the target's
+            # mode). Measured both ways: +6 % for enabling on Qwen4Exp (tester, PR
+            # #2), neutral on real payloads for Qwen3.8-27B dense MTP k=3
+            # (docs/gfx906/DEVLOG-spec-decode.md), so it stays a knob.
             self.speculator.init_cudagraph_manager(
                 cudagraph_mode
-                if os.environ.get("GFX906_DRAFTER_GRAPHS", "0") == "1"
+                if os.environ.get("GFX906_DRAFTER_GRAPHS", "1") != "0"
                 else CUDAGraphMode.NONE,
             )
 

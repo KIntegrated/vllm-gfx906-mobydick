@@ -222,7 +222,7 @@ def _query_total_memory_from_amdsmi(physical_device_id: int) -> int:
 def _get_gcn_arch() -> str:
     try:
         arch = _query_gcn_arch_from_amdsmi()
-        if _capability_from_gcn_arch(arch) is not None:  # or a cheaper sanity check
+        if _capability_from_gcn_arch(arch) is not None:
             return arch
         logger.debug("amdsmi returned implausible GCN arch %r, falling back", arch)
     except Exception as e:
