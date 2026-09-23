@@ -474,7 +474,7 @@ Extra work this PR needs that UP-1 does not:
 ### UP-3 — the 0.30.0 base itself: `gfx906/v0.30.0` fork-merge train
 
 **Status: scoped, not started — see the decision sheet
-[`MERGE-0.30.0-review.md`](MERGE-0.30.0-review.md).** **Target decision needed:**
+[`MERGE-0.30.0-review.md`](MERGE-0.30.0-review.md).** **Sequencing (2026-09-23, `MERGE-0.30.0-review.md`): do not merge first, and not onto an rc** — target a released upstream (`v0.30.0`, 32 conflicts) or wait for `v0.30.1` final; keep `gfx906/qsa-fn` as the tested 0.29 line and start `gfx906/v0.30.0` for the merged line, cherry-picking the QSA train onto it. **Target decision needed:**
 against `v0.30.1rc0` (2026-09-23) the same branch has **44** conflicts vs **32**
 against `releases/v0.30.0` — chasing the newest upstream costs +12 conflict files,
 and applying PR #2 on top adds 2 more (`platforms/rocm.py`,

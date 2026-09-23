@@ -147,3 +147,46 @@ survive contact with the records.
 - NH-4: keep the 23 lines and fix the comment, or strip-and-archive for a lean tree?
 - The ~10 upstream carries: retire them wholesale on the merge (take 0.30.0's
   versions) or re-apply per model?
+
+## 2026-09-23 — sequencing: should the merge go first? (recommendation: no, and not onto an rc)
+
+Fork convention (from `git log --merges`): the fork merges upstream **releases**
+("Merge upstream v0.29.0 release (98dff2a81d) into the gfx906 fork", likewise
+v0.28.0), one branch family per release (`gfx906/v0.26.0`, `v0.28.0`, `v0.29.0`);
+no `gfx906/v0.30.0` exists yet, so the train has not started.
+
+**Recommendation**
+
+1. **Not onto an rc.** `v0.30.1rc0` is a release candidate: merging it means
+   re-merging the same files when final lands, at ≥44 conflicts each time.
+   Pick a released upstream: **`v0.30.0` (32 conflicts, released 2026-09-21)** if the
+   train runs soon, otherwise **`v0.30.1` final**.
+2. **Not first.** Done before PR #2 and the QSA decisions are settled, the merge
+   carries their 2 extra conflict files *into* the merge and invalidates the base the
+   tester is currently serving on (0.29 + bundle, 46.8 t/s), costing a re-test cycle.
+   And the urgent items are **upstreamable**: the fp16 QSA guards (UP-2), the amdsmi
+   fallback and the `enforce_eager` propagation (UP-4) do not need our branch at all —
+   upstreamed, they leave the carry set instead of becoming merge work.
+3. **Instead, in parallel:** settle PR #2's scope on the 0.29 line (take the
+   small/gated bits; the PLE-offload decision needs **no merge** — the generic UVA
+   offload is in *both* bases, verified: `vllm/config/offload.py` +
+   `vllm/model_executor/offloader/uva.py` are present in rc0 and in ours); open the
+   upstream PRs; then run the merge train as one focused event with the rule-6 sweep
+   and the house gates.
+4. **Structural shape that keeps testers valid:** keep `gfx906/qsa-fn` (0.29-based) as
+   the *tested* QSA line and start `gfx906/v0.30.0` as the merged line, cherry-picking
+   the QSA train onto it when we want the new base — the fork's per-release family
+   pattern. Testers then run whichever line is validated, and the merge cannot break a
+   tested configuration.
+
+**What waiting costs (bounded, measured):** PR #2 = +2 conflict files; our own QSA train
+= +0 new conflict files (the `qwen4_exp/amd` files have ~0 upstream churn: `qsa.py` 0
+lines changed upstream since our base, `indexer_qsa.py` 0), though `ops/qsa.py` does
+grow to 169+/3−. The large divergence is the fork's own feature code (q_gemm,
+torch_bindings, `utils.py`, `model_runner.py`), which is already in the conflict set and
+does not depend on this ordering.
+
+**Why merge at all:** the 0.29 line no longer receives upstream fixes, and newer upstream
+models/kernels are the fork's growth path — but nothing in the current work *blocks* on
+it, which is exactly why it should not go first.
+
