@@ -679,3 +679,19 @@ raced the previous server's VRAM release (`Free memory on device cuda:0
 #107, process killed. The TP=2 answer does not depend on it; a TP=1 confirmation
 would need a fresh boot.
 
+### 2026-09-23 — the drafter-graph sign difference may be architecture, not config
+
+The tester's reply to the sweep offers the explanation their numbers imply: the
++6 % they measured is on **Qwen3.8-Flash-Next (Qwen4Exp/QSA)**, while every number
+of ours in this entry is **Qwen3.8-27B-AWQ-INT4 (dense, Qwen3, MTP k=3)**. Different
+architectures ⇒ different drafter shapes and step structure, so a knob that is a
++6 % win there and neutral (real payloads) / +7.9 % off-favouring (100 %-acceptance
+filler) here is not necessarily contradictory — it is two model-specific answers to
+the same question.
+
+Consequence for the plan (unchanged, but better justified): restore the upstream
+default (drafter inherits the target's mode) and keep `GFX906_DRAFTER_GRAPHS` as the
+switch, so their `=1` configuration stays available on the model it helps. Our
+"neutral" claim must be quoted with its model attached — it is a Qwen3.8-27B-dense
+result, not a statement about Qwen4Exp.
+
