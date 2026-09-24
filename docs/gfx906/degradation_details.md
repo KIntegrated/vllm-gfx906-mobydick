@@ -3335,3 +3335,33 @@ chased; the PLE change in question touches only `qwen4_exp/amd/ple_layer.py` and
 test, so it cannot affect mamba kernels, and the same suite passed on the healthy
 boot minutes before. Re-run them after a reboot.
 
+## 2026-09-24 18:13–18:45 — observation #109 (KFD resume failure 22 min into a fresh boot; one GPU's suite collapses)
+
+The host was rebooted at **18:13:44** (`who -b`, uptime 33 min at the time of writing) — so this
+is a *fresh* boot, and it is not clean. There is **no** GPU reset, `HwException`, ring timeout or
+OOM anywhere in `journalctl -k` for the day; the only kernel-side anomaly is:
+
+```
+Sep 24 18:36:22 mi50-01 kernel: amdgpu: amdgpu_amdkfd_restore_userptr_worker: Failed to resume KFD
+```
+
+Timeline: at ~18:33 two GPU jobs start — `tests/kernels/mamba` on GPU1 and the tiny QSA rig on
+GPU0. The suite reaches 46 % by 18:36, then slows to ~8 % per 9 minutes; at 18:45 it stops writing
+and the process has exited **silently** — no pytest summary, no traceback, 560 bytes of log, no OOM
+in the journal. The rig on the other GPU boots and serves its 1344/2016/4031-token sequence normally
+in the same window, and `rocm-smi` still reports both GPUs (VRAM back to the ~10 MB baseline).
+
+So this is neither the quiet uniform slowdown of #108 (the 35B bench was only ~4.7 % down there) nor
+a full wedge (no reset, rocm-smi alive). It is the *sync-heavy-suite-collapse* shape on one GPU,
+three minutes after that GPU's first real load of the boot, with a KFD resume failure at exactly
+that moment. Compare #106: dense GPU work at full speed while the sync cadence is gone; the same
+asymmetry, a different boot.
+
+Consequences for the record: the mamba/FA *kernel* suites cannot be run on this boot, so their
+verdict for the cherry-picks rests on (a) the suites that did complete on the changed code (their
+PLE + GC harnesses + our QSA file: 74 passed; tiny rig boot + requests with MTP k=1/k=3), and
+(b) construction — the PLE commits touch `qwen4_exp/amd/ple_layer.py` and its test, `config/vllm.py`
+behind a `model_type == "qwen4_exp"` gate, and the drafter knob restored to upstream's default, so
+no mamba or FA kernel is in the diff. Re-run them after a reboot; do not read their absence as a
+verdict on the branch.
+
