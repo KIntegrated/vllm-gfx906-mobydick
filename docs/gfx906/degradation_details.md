@@ -3330,10 +3330,11 @@ previous boot hung at 56 % for ~10 min before it was stopped. The 35B bench on t
 boot is only ~4.7 % down, so the two do not scale together; sync-heavy / many-small-
 kernel workloads are the ones that collapse, which is the same asymmetry as the
 spec-decode-only collapse recorded for #106 (dense GPU work normal, sync cadence
-gone). `amdsmi` is broken here as well. Both suite runs were stopped rather than
-chased; the PLE change in question touches only `qwen4_exp/amd/ple_layer.py` and its
-test, so it cannot affect mamba kernels, and the same suite passed on the healthy
-boot minutes before. Re-run them after a reboot.
+gone). `amdsmi` is broken here as well. The combined run was stopped by hand; the
+individual mamba run that followed died on its own on the next boot — see #109, which
+supersedes this addendum. The PLE change in question touches only
+`qwen4_exp/amd/ple_layer.py` and its test, so it cannot affect mamba kernels, and the
+same suite passed on this branch before the cherry-picks. Re-run them after a reboot.
 
 ## 2026-09-24 18:13–18:45 — observation #109 (KFD resume failure 22 min into a fresh boot; one GPU's suite collapses)
 
