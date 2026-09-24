@@ -3320,3 +3320,18 @@ numbers** (the flips' 59.79 baseline, the drafter sweep, the AR arms). Functiona
 (suites, tiny rig) are unaffected. Reboot before any further perf work, and re-run the
 35B bench to confirm the host is back at ~59.8 before quoting branch-vs-main perf.
 
+### #108, addendum (2026-09-24 ~18:30, next boot — degradation is not just the bench delta)
+
+On the following boot the same picture shows up in the suites, and much larger than
+4.7 %: `tests/kernels/mamba` (195 tests, ~56 s on a healthy boot, and 195 passed
+earlier the same day) ran at **~8 % progress per 9 minutes** — a ~50x slowdown, i.e.
+effectively the stalled pattern — and an earlier combined FA+mamba run on the
+previous boot hung at 56 % for ~10 min before it was stopped. The 35B bench on this
+boot is only ~4.7 % down, so the two do not scale together; sync-heavy / many-small-
+kernel workloads are the ones that collapse, which is the same asymmetry as the
+spec-decode-only collapse recorded for #106 (dense GPU work normal, sync cadence
+gone). `amdsmi` is broken here as well. Both suite runs were stopped rather than
+chased; the PLE change in question touches only `qwen4_exp/amd/ple_layer.py` and its
+test, so it cannot affect mamba kernels, and the same suite passed on the healthy
+boot minutes before. Re-run them after a reboot.
+
