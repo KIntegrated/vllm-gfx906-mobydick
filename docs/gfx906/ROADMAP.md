@@ -69,9 +69,12 @@ chip.
    one does not port at all (int8-QK: faults at the dispatch profile every real
    prefill uses, and is not faster where it runs).
 
-**Critical path: QSA-FN-8** (assemble the tester build from the shipped FN-1 +
-FN-2; QSA-FN-1/2/3 are SHIPPED); the int8 items (QSA-FN-5/6) are evidence-first
-and both currently default to "not on this chip". The real model is ~120 B
+**Critical path (2026-09-24): QSA-FN-9** — their PR is integrated on
+`gfx906/qsa-fn` and now waits on the PLE measurement — with the two house-side
+decisions **QSA-FN-12** (the `qwen4_exp` cudagraph mode) and **QSA-FN-13** (report
+the pinned-id hazard upstream) both **HIGH PRIORITY**. QSA-FN-8 and FN-1/2/3 are
+SHIPPED; the int8 items (QSA-FN-5/6) are evidence-first and both currently default
+to "not on this chip". The real model is ~120 B
 params of MoE (W4A16 ≈ 60 GB, plus a PLE ngram table the CDNA recipe offloads
 60 GB of), i.e. unloadable in 2× MI50 — so quality and the FN-5 share still need
 a tester's box.
@@ -225,16 +228,64 @@ Refrigerated residue; unverifiable here (no RecoverSSM model loadable).
 
 ### QSA-FN-9 — tester run + PR #2 (joochung): merge the model-specific fixes
 
-**Status: OPEN — review done, merge pending three edits.** The tester served the
-real checkpoint (4× MI50, TP=4, fp16, 147 456 ctx, MTP k=3): **46.8 t/s at B=1**,
-so QSA-FN-8's gate is met. Their PR adds a PLE host-table offload, two PLE
-correctness fixes, a gated V2 boot-GC guard, an amdsmi-arch fallback and a drafter
-graph knob. Verdict and per-commit triage:
-[`REVIEW-pr2-qsa-fn.md`](REVIEW-pr2-qsa-fn.md). Required before merge: invert the
-drafter-graph default (their default disables drafter graphs, ~−6 % on our spec
-configs), gate the PLE host table behind an env flag, trim the essay comments;
-drop the `.cu` clang-format commit and their `degradation.md` ops rows; ask for the
-GC-guard and PLE test harnesses, and re-target the PR at `gfx906/qsa-fn`.
+**Status: OPEN — integrated on `gfx906/qsa-fn`, waiting on the tester's PLE
+measurement (Kevin 2026-09-24).** The tester served the real checkpoint (4× MI50,
+TP=4, fp16, 147 456 ctx, MTP k=3): **46.8 t/s at B=1**, so QSA-FN-8's gate is met.
+Their six functional commits are cherry-picked onto the branch under their
+authorship; the cleanups are ours (drafter-graph default restored to upstream,
+comments trimmed, their `degradation.md` rows re-homed as generic findings, the two
+harnesses shipped in-tree), so the review-phase to-do list is discharged. Two things
+ended differently from that plan: the PLE host table is **not** env-gated — it stays
+default-on as the interim path that FN-11 deletes — and two gfx906 fixes were needed
+on top of it (`--load-format dummy` support, plus the capture-mode change in FN-12).
+Their range guard also needed a *third* revision (fold-and-warn, never a boot
+refusal): see `REVIEW-pr2-qsa-fn.md` (2026-09-24) and `DEVLOG-qwen38-flash-qsa.md`.
+**Outstanding: the PLE comparison itself** (their mmap path vs upstream's
+pinned/UVA offload, or the generic `--cpu-offload-params` stand-in) — the deciding
+datum is host RAM pinned vs page cache, and nothing in this round answers it.
+
+### QSA-FN-12 — decide the `qwen4_exp` cudagraph mode (the PIECEWISE downgrade) — **HIGH PRIORITY** (Kevin 2026-09-24)
+
+**Status: OPEN — a judgement call made to unblock the model; needs one decision and one
+measurement.** The PLE host-table op does a host-side gather and a **blocking** D2H, which
+HIP refuses inside a capture: the tiny rig's engine died at capture with
+`hipErrorStreamCaptureUnsupported` ("operation not permitted when stream is capturing").
+Two changes make the model bootable, both in `vllm/config/vllm.py` behind
+`model_type == "qwen4_exp"`: the op is appended to `compilation_config.splitting_ops`, and
+`cudagraph_mode` is downgraded from `FULL`/`FULL_AND_PIECEWISE` to `PIECEWISE` with a
+warning — FULL capture wraps the whole forward, so a splitting list alone cannot keep the op
+out of the graph.
+
+**The cost, which is why it needs deciding:** the downgrade should cost this model
+full-graph decode — unmeasured, since the checkpoint does not load here (FN-3). Options:
+(a) keep it (current state: graphs stay on and the op runs in the eager regions, which is
+the configuration the tester validated); (b) warn only and let the operator pass
+`--enforce-eager`; (c) keep the downgrade but env-gate it.
+
+**Deciding evidence (tester's box, ~10 min):** MTP k=3 at 147 456 with
+`FULL_AND_PIECEWISE` + the op in the splitting list vs the current `PIECEWISE`, same
+prompts, interleaved (A,B,A) — if FULL does not boot or does not win, keep the downgrade and
+close the question. Note that their current eager-only workaround (FN-9) makes piecewise a
+*gain* for them regardless. Whichever way it lands, the FN-2 recipe states it.
+
+### QSA-FN-13 — report the stale/uninitialised pinned-id hazard on upstream #57497 — **HIGH PRIORITY** (cheap, upstream value)
+
+**Status: OPEN — ours to file; the finding is the tester's.** Two PLE id-bug classes were
+found in the tester's host-table path and both transfer to upstream's pinned mechanism
+(`#57497`, adopted by FN-11), which stages ids through a pinned buffer the same way:
+
+- **stale/uninitialised ids** — an async D2H leaves the host reading ids the producer has
+  not written, which then index out of range (their original finding);
+- **the capture-time variant** — `0xff80ff80ff80ff80` repeated, i.e. an unwritten pinned
+  buffer, arriving only on the compile/graph path, which killed three boots on their box.
+
+To post on `#57497`: the mechanism, both producers (the drafter's
+`sample_idx_mapping.fill_(-1)` padding sentinel and capture-time uninitialised buffers), and
+the recommendation that a range check on this path **fold-and-warn rather than raise** — a
+`raise` there is a boot refusal, and its legitimate producers cannot be enumerated from the
+n-gram arithmetic. Ties into FN-11 step (4) and UP-4. Deliverable: a comment (or issue)
+carrying the mechanism plus the tiny-rig evidence; ask them whether they want to file it
+themselves or co-sign ours first.
 
 ### QSA-FN-4 — backport the tiled indexer (**fp16-gated**) (**SHIPPED 2026-09-17**)
 
