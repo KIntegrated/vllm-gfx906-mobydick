@@ -126,7 +126,33 @@ Extra work this PR needs that UP-1 does not:
 
 ### UP-3 — the 0.30.0 base itself: `gfx906/v0.30.0` fork-merge train
 
-**Status: scoped, not started — see the decision sheet
+**Status: DONE 2026-09-24 — merged as `8893a50e54` (`gfx906/v0.30.0`, cut from
+`main` = `gfx906/v0.29.0` `524ac6f2d6`; upstream `v0.30.0` `ced6857afa`).** 2017
+files, **31 conflicted files** — the count scoped below. Resolution record: the
+merge commit body + `CHANGELOG.md` 2026-09-24; outcome notes appended to
+[`MERGE-0.30.0-review.md`](MERGE-0.30.0-review.md).
+
+**Open follow-ups from the merge (do not treat the base as model-validated):**
+
+- **GLM53-QGEMM-1 (HIGH):** #54809 removed GPTQ group/dynamic activation ordering
+  upstream, so the fork adopted the removal and **gfx906 GPTQ act-order
+  checkpoints no longer load/serve**. The M=1 4-bit max-ilp dispatch was re-ported
+  onto the new kernel signature (no `b_q_perm`) and the gfx906 AWQ path updated to
+  the new `gptq_gemm`/`gptq_shuffle` arity, but neither has been run on a model
+  since. Validate the Minimax-M3-AWQ / Qwen3.5-AWQ paths (PPL probe + serving
+  smoke) before promoting this base.
+- **QSA-FN-14 (HIGH):** `rocm_aiter_mla_sparse.py` adopted upstream's sink /
+  `_forward_mla` rewrite with the fork's opt-in `VLLM_ROCM_MLA_SPARSE_FP16`
+  reference-Torch early-return re-applied by hand, and `minimax_m3/amd/model.py` /
+  `amd/ops/index_topk.py` adopted upstream's selection + indexer rewrite with the
+  fork's gfx906 fp16 casts/launch kwargs re-applied. None of the three has a
+  model-level gate on this base.
+
+The scoping worked out as predicted below (classes, the ~11 hand-merges, the ~10
+upstream carries); the one item the scoping missed was #54809 above. Original
+scoping text:
+
+**Status (scoping, 2026-09-17): scoped — see the decision sheet
 [`MERGE-0.30.0-review.md`](MERGE-0.30.0-review.md).** `gfx906/v0.29.0` ←
 `upstream/releases/v0.30.0` is 595 vs 767 commits and **31 conflicted files**
 (measured 2026-09-17; an earlier "148" in this entry miscounted the

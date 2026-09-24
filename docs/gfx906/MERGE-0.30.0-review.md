@@ -137,3 +137,42 @@ Switches already default-on (`ALIGN_M1`, `DENSE_GEMV`, `DOWN_GEMV`,
 - NH-4: keep the 23 lines and fix the comment, or strip-and-archive for a lean tree?
 - The ~10 upstream carries: retire them wholesale on the merge (take 0.30.0's
   versions) or re-apply per model?
+
+## Outcome (2026-09-24) — the merge is done
+
+`gfx906/v0.30.0` was cut from `main` (`524ac6f2d6`, = `gfx906/v0.29.0`) and
+upstream `v0.30.0` (`ced6857afa`) merged in: merge commit **`8893a50e54`**, 2017
+files, **31 conflicted files** — the count this sheet scoped. A condensed
+per-resolution record is in the merge commit body; the theme log entry is
+`CHANGELOG.md` 2026-09-24.
+
+What the merge confirmed, versus this sheet's predictions:
+
+- **The conflict classes held** (L/G/C/D): the ~11 live-code files needed hand
+  work, the ~10 upstream carries went to 0.30.0's version, and the rest was
+  glue. Nothing was deleted to shrink the merge.
+- **The one change that forced the shape was not on this sheet: #54809 (GPTQ
+  group/dynamic activation ordering removed).** It rewrites `q_gemm.cu`, the
+  marlin/marlin-moe-wna16 templates, CPU WNA16, `permute_cols` and the RDNA3
+  kernels at once. Preserving the fork's `b_g_idx` API would have forked the
+  whole quant stack, so the fork adopted the removal; the max-ilp M=1 dispatch
+  and its SYNC-COPY twin were re-ported onto the new signature. This is the one
+  **functional narrowing** of the merge: gfx906 GPTQ act-order checkpoints are
+  no longer supported.
+- **A merge can leave the tree internally inconsistent without any conflict
+  marker.** The three post-merge findings (`_process_weights_gfx906`'s 14-tuple,
+  `auto_awq`'s old `gptq_gemm`/`gptq_shuffle` arity, the missing
+  `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` env registration) were all in files
+  that merged *cleanly* because upstream changed one side of an API and the
+  fork's caller was in a third file. Import-level and pytest validation caught
+  them; a marker-only audit would not have. Worth adding to the merge-train
+  checklist: after resolving, import the touched modules and run the feature's
+  unit tests, not just `grep '<<<<<<<'`.
+- **Upstream tests written against `SimpleNamespace` configs break on fork-only
+  helpers.** `use_v2_model_runner`'s feature cases now `getattr`-guard so
+  upstream's `test_models_default_to_v2_model_runner` and the DSA test pass
+  unmodified.
+
+Open follow-ups (also in `ROADMAP.md` UP-3): a model-level pass on the gfx906
+GPTQ/AWQ paths after #54809, and one on the `rocm_aiter_mla_sparse` gfx906
+fp16-sparse early-return + MiniMax-M3 `amd/ops` routing.

@@ -6,6 +6,40 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-24 (UP-3 done — upstream v0.30.0 merged onto the fork line)
+
+`gfx906/v0.30.0` started from `main`/`gfx906/v0.29.0` (`524ac6f2d6`) and merged
+upstream `v0.30.0` (`ced6857afa`) — merge commit `8893a50e54`, 2017 files,
+**31 conflicted files** exactly as scoped in `MERGE-0.30.0-review.md`. Full
+per-file resolution record: the merge commit body. Machine validation: all
+resolved modules import, `tests/quantization/test_moe_wna16.py` 47 passed,
+`tests/test_config.py` upstream suites green (only the no-CUDA-GPU engram and
+network-dependent HF cases fail, both environmental).
+
+The one non-negotiable upstream change was **#54809 (GPTQ group/dynamic
+activation ordering removed)**: it rewrites `q_gemm.cu`, `marlin*`, CPU WNA16
+and the RDNA3 kernels, so keeping the fork's `b_g_idx` API would have meant
+forking the whole quant stack. Adopted the removal; the gfx906 M=1 4-bit
+max-ilp dispatch and its twin were re-ported onto the new kernel signature (no
+`b_q_perm`) and stay default-ON. Consequence: **gfx906 GPTQ act-order
+checkpoints are no longer supported** (upstream's new supported set). The
+gfx906 AWQ path (`auto_awq.py`) was updated to the new call signatures.
+
+Post-merge consistency fixes (not conflict hunks; found by import/pytest):
+`_process_weights_gfx906` returned the old 14-tuple, `auto_awq` used the old
+`gptq_gemm`/`gptq_shuffle` arity, `envs.py` had lost
+`VLLM_PREFIX_CACHE_RETENTION_INTERVAL` (the fork's `arg_utils.py` still reads
+it), `use_v2_model_runner`'s fork cases now use defensive `getattr` for
+upstream's `SimpleNamespace` tests, and the wna16 test dropped a `desc_act=True`
+config the new validator rejects. Also noted for the next sweep:
+`tests/test_config.py` defines `test_dflash2_draft_forces_v2_model_runner` twice
+(pre-existing on `main`, F811).
+
+**VERDICT:** OPEN follow-ups in [`ROADMAP.md`](ROADMAP.md) UP-3 — a model-level
+validation pass for (a) the gfx906 GPTQ/AWQ paths and (b) the
+`rocm_aiter_mla_sparse` gfx906 fp16-sparse early-return / MiniMax-M3 amd-ops
+routing.
+
 ## 2026-09-18 (two gated wins go default-on; stale-verdict sweep)
 
 Kevin's decision after the 0.30.0 review (`MERGE-0.30.0-review.md`) established
