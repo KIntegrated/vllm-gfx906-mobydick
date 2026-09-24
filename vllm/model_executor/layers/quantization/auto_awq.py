@@ -471,7 +471,6 @@ class AutoAWQMarlinLinearMethod(LinearMethodBase):
             act_type=params_dtype if self.input_dtype is None else self.input_dtype,
             group_size=self.quant_config.group_size,
             zero_points=self.quant_config.zero_point,
-            has_g_idx=False,
         )
 
         kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
@@ -590,11 +589,6 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
             }
         )
 
-        intermediate_size_full = extra_weight_attrs.pop(
-            "intermediate_size_full", intermediate_size_per_partition
-        )
-        self.is_k_full = intermediate_size_per_partition == intermediate_size_full
-
         w13_qweight = Parameter(
             torch.empty(
                 num_experts,
@@ -704,10 +698,6 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
             w2,
             w13_scale,
             w2_scale,
-            w13_g_idx,
-            w2_g_idx,
-            w13_g_idx_sort_indices,
-            w2_g_idx_sort_indices,
             w13_qzeros,
             w2_qzeros,
             w13_input_global_scale,
@@ -728,14 +718,6 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
 
         replace_parameter(layer, "w13_scales", w13_scale)
         replace_parameter(layer, "w2_scales", w2_scale)
-        _replace_or_register_parameter(
-            layer, "w13_g_idx_sort_indices", w13_g_idx_sort_indices
-        )
-        _replace_or_register_parameter(
-            layer, "w2_g_idx_sort_indices", w2_g_idx_sort_indices
-        )
-        _replace_or_register_parameter(layer, "w13_g_idx", w13_g_idx)
-        _replace_or_register_parameter(layer, "w2_g_idx", w2_g_idx)
         _replace_or_register_parameter(layer, "w13_qzeros", w13_qzeros)
         _replace_or_register_parameter(layer, "w2_qzeros", w2_qzeros)
         _replace_or_register_parameter(
@@ -758,11 +740,6 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
             moe_config=self.moe,
             experts_cls=self.experts_cls,
             backend=self.wna16_moe_backend,
-            is_k_full=self.is_k_full,
-            w13_g_idx=getattr(layer, "w13_g_idx", None),
-            w2_g_idx=getattr(layer, "w2_g_idx", None),
-            w13_g_idx_sort_indices=getattr(layer, "w13_g_idx_sort_indices", None),
-            w2_g_idx_sort_indices=getattr(layer, "w2_g_idx_sort_indices", None),
             routing_tables=layer._expert_routing_tables(),
         )
 
@@ -944,11 +921,10 @@ class AutoAWQLinearMethod(BaseAWQLinearMethod):
 
         if current_platform.is_rocm() and on_gfx906():
             bits = self.quant_config.weight_bits
-            empty = torch.empty(0, device=layer.qzeros.device)
 
             # hints: shuffle twice is equal to unshuffle once
-            ops.gptq_shuffle(layer.qzeros, empty, bits)
-            ops.gptq_shuffle(layer.qzeros, empty, bits)
+            ops.gptq_shuffle(layer.qzeros, bits)
+            ops.gptq_shuffle(layer.qzeros, bits)
 
             ops.gptq_shuffle_awq_qweight(layer.qweight, bits)
             layer.qweight.data = layer.qweight.reshape(
@@ -983,7 +959,6 @@ class AutoAWQLinearMethod(BaseAWQLinearMethod):
                 layer.qweight,
                 layer.qzeros,
                 scales,
-                torch.empty(0, device=layer.qweight.device),
                 True,
                 True,
                 self.quant_config.weight_bits,

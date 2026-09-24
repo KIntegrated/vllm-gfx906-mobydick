@@ -39,12 +39,13 @@ from .deepseek_v2 import (
     DeepseekV2MoE,
     _try_load_fp8_indexer_wk,
 )
+from .interfaces import SupportsPP
 from .utils import (
     get_pp_missing_layer_names,
     get_spec_layer_idx_from_weight_name,
+    make_empty_intermediate_tensors_factory,
     maybe_prefix,
 )
-
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import on_gfx906
@@ -238,7 +239,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
 
 
 @support_torch_compile
-class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
+class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -251,6 +252,9 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self.is_fp4_ckpt = (
             self.quant_config is not None
             and self.quant_config.get_name() == "modelopt_fp4"
+        )
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], self.config.hidden_size
         )
 
     def set_moe_parameters(self):
@@ -278,7 +282,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
@@ -342,6 +346,15 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
+                # A tied top-level embed_tokens has no spec layer to rewrite
+                # from; the draft needs its own copy under PP.
+                param = params_dict.get(name) if "embed_tokens" in name else None
+                if param is not None:
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
                 continue
             is_fusion_moe_shared_experts_layer = (
                 self.is_fused_shared_expert_enabled and ("mlp.shared_experts" in name)

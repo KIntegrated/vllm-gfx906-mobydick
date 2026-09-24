@@ -47,7 +47,8 @@ def torch_topk(
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
+    not current_platform.is_cuda_alike(),
+    reason="This test is skipped on non-CUDA platform.",
 )
 @pytest.mark.parametrize("num_tokens", [1, 33, 56])
 @pytest.mark.parametrize("hidden_size", [1024, 2048])
@@ -91,7 +92,8 @@ def test_fused_topk(
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
+    not current_platform.is_cuda_alike(),
+    reason="This test is skipped on non-CUDA platform.",
 )
 @pytest.mark.parametrize("num_tokens", [1, 33, 56])
 @pytest.mark.parametrize("hidden_size", [1024, 2048])
@@ -140,7 +142,8 @@ def test_fused_topk_bias(
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
+    not current_platform.is_cuda_alike(),
+    reason="This test is skipped on non-CUDA platform.",
 )
 @pytest.mark.parametrize("num_experts", [6, 8, 16])
 @pytest.mark.parametrize("topk", [3, 4])
@@ -207,7 +210,8 @@ def test_fused_topk_nan_inf_clamp(
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
+    not current_platform.is_cuda_alike(),
+    reason="This test is skipped on non-CUDA platform.",
 )
 @pytest.mark.parametrize("num_experts", [6, 8, 16])
 @pytest.mark.parametrize("topk", [3, 4])

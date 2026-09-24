@@ -84,7 +84,7 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel_m1mi(
     const uint32_t* __restrict__ b_gptq_qzeros,
     const half* __restrict__ b_gptq_scales, half* __restrict__ c,
     const int size_m, const int size_n, const int size_k, const int groups,
-    const bool use_v2_format, const int* __restrict__ b_q_perm) {
+    const bool use_v2_format) {
   MatrixView_half a_(a, size_m, size_k);
   MatrixView_half_rw c_(c, size_m, size_n);
   MatrixView_q4_row b_gptq_qzeros_(b_gptq_qzeros, groups, size_n);
@@ -112,12 +112,7 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel_m1mi(
       const half* a_ptr = a_.item_ptr(offset_m + m, 0);
       half* block_a_ptr = block_a[m];
 
-      half a0;
-      if (b_q_perm)
-        a0 = a_ptr[b_q_perm[offset_k + t]];
-      else
-        a0 = a_ptr[offset_k + t];
-      block_a_ptr[t] = a0;
+      block_a_ptr[t] = a_ptr[offset_k + t];
     }
   }
 
@@ -222,9 +217,9 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel_m1mi(
 // m_count=1.
 void qgemm_m1_maxilp_launch(const half* a, const uint32_t* b_q_weight,
                             const uint32_t* b_gptq_qzeros,
-                            const half* b_gptq_scales, const int* b_q_perm,
-                            half* c, int size_m, int size_n, int size_k,
-                            int groups, bool use_v2_format) {
+                            const half* b_gptq_scales, half* c, int size_m,
+                            int size_n, int size_k, int groups,
+                            bool use_v2_format) {
   dim3 blockDim, gridDim;
   blockDim.x = BLOCK_KN_SIZE;
   blockDim.y = 1;
@@ -236,7 +231,7 @@ void qgemm_m1_maxilp_launch(const half* a, const uint32_t* b_q_weight,
   const cudaStream_t stream = get_current_cuda_stream();
   gemm_half_q_half_gptq_4bit_kernel_m1mi<1><<<gridDim, blockDim, 0, stream>>>(
       a, b_q_weight, b_gptq_qzeros, b_gptq_scales, c, size_m, size_n, size_k,
-      groups, use_v2_format, b_q_perm);
+      groups, use_v2_format);
 }
 
 }  // namespace gptq

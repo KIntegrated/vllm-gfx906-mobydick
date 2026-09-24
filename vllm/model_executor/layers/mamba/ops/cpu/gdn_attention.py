@@ -785,17 +785,6 @@ def _spec_aware_nonspec_subset(
     return torch.cat([decode_out, prefill_out], dim=0)
 
 
-def cpu_gdn_attention_core_fake(
-    mixed_qkv: torch.Tensor,
-    b: torch.Tensor,
-    a: torch.Tensor,
-    core_attn_out: torch.Tensor,
-    layer_name: LayerNameType,
-) -> None:
-    """Fake implementation for torch.compile."""
-    return
-
-
 def register_cpu_gdn_attention_ops() -> None:
     global _CPU_GDN_ATTENTION_OPS_REGISTERED
     if _CPU_GDN_ATTENTION_OPS_REGISTERED:
@@ -805,6 +794,5 @@ def register_cpu_gdn_attention_ops() -> None:
         op_name="cpu_gdn_attention_core",
         op_func=cpu_gdn_attention_core,
         mutates_args=["core_attn_out"],
-        fake_impl=cpu_gdn_attention_core_fake,
     )
     _CPU_GDN_ATTENTION_OPS_REGISTERED = True
