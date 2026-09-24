@@ -22,6 +22,11 @@ copy of it. The claims under test, in the order the reviewer asked about them:
   restored.
 * **Enabled-state restore** -- whatever `gc.isenabled()` was on entry is what
   it is on exit, including "already disabled".
+* **Coverage** -- all three phases of `determine_available_memory` are inside a
+  region, the graph-memory-profiling module contains no bare `gc.collect()`,
+  and its guard-aware shim is wired to the runner's depth counter. See section
+  8: the phase that was missing a region is the one this box's boot SIGSEGVs
+  died in, and it is the one `--enforce-eager` skips entirely.
 
 The guard mutates the *process-global* `gc` module and two module globals, by
 design (that is the whole point of it). So these tests instrument `gc` with
@@ -29,9 +34,12 @@ counting wrappers and let pytest undo the patching, and a fixture asserts the
 depth counter is back to 0 after every case and un-parks the heap.
 """
 
+import contextlib
 import gc
+import inspect
 
 import pytest
+import regex as re
 
 mr = pytest.importorskip(
     "vllm.v1.worker.gpu.model_runner",
@@ -411,3 +419,126 @@ def test_dump_env_only_arms_faulthandler(spies, monkeypatch):
         pass
     assert armed, "faulthandler.enable() must have been called"
     assert spies.count("collect") == 0
+
+
+# --------------------------------------------------------------------------
+# 8. COVERAGE: every boot phase that can collect must be inside a region
+#
+# Worker.determine_available_memory (v1/worker/gpu_worker.py:556-572) runs
+# three phases in this order:
+#
+#     profile_run()  ->  profile_cudagraph_memory()  ->  capture_model()
+#
+# Only the first and the third were wrapped. The middle phase calls gc.collect()
+# twice (cudagraph_utils.py, before the throwaway capture and again in
+# _teardown_profiling_state) at the moment the heap is largest, and it exists
+# only when cudagraph_mode != NONE -- which is the whole eager/graphs split of
+# this box's boot-time SIGSEGVs. These tests exist so that adding a fourth
+# collecting phase without a region fails loudly here instead of at 04:00 on a
+# box that has to serve.
+# --------------------------------------------------------------------------
+
+BOOT_PHASES = ("profile_run", "profile_cudagraph_memory", "capture_model")
+
+
+def test_every_boot_phase_that_collects_is_decorated():
+    """All three phases must carry a decorator that preserves the signature.
+
+    ``functools.wraps`` sets ``__wrapped__``, which is what a decorator leaves
+    behind; a phase without one is a phase whose gc.collect() runs for real.
+    """
+    runner_cls = mr.GPUModelRunner
+    for name in BOOT_PHASES:
+        fn = getattr(runner_cls, name, None)
+        assert fn is not None, f"{name} disappeared from the V2 runner"
+        assert getattr(fn, "__wrapped__", None) is not None, (
+            f"{name} is not wrapped: its gc.collect() calls run unguarded"
+        )
+
+
+def test_a_known_unguarded_method_is_not_wrapped():
+    """Negative control: the assertion above can actually fail.
+
+    Without this, a change that wrapped *everything* (or a __wrapped__
+    attribute set by some unrelated decorator) would satisfy the coverage test
+    while protecting nothing.
+    """
+    runner_cls = mr.GPUModelRunner
+    assert getattr(runner_cls.load_model, "__wrapped__", None) is None, (
+        "load_model is unexpectedly wrapped: the coverage test no longer "
+        "distinguishes guarded from unguarded methods"
+    )
+
+
+def test_graph_memory_profiling_enters_a_region_named_after_it(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The fix itself, behaviourally: calling the phase opens the guard.
+
+    Patches the guard (to record labels) and the profiling implementation (so
+    no GPU is needed) rather than reimplementing the assertion, so this fails
+    if the decorator is dropped, if it stops being a context manager, or if the
+    phase body stops running inside it.
+    """
+    labels = []
+
+    @contextlib.contextmanager
+    def recording_guard(label):
+        labels.append(label)
+        yield
+
+    monkeypatch.setattr(mr, "_gc_freeze_guard", recording_guard)
+    monkeypatch.setattr(mr, "_profile_cudagraph_memory", lambda runner: 42)
+
+    assert mr.GPUModelRunner.profile_cudagraph_memory(object()) == 42
+    assert labels == ["profile_cudagraph_memory"], (
+        "profile_cudagraph_memory must run inside a freeze region labelled "
+        f"with its own name; saw {labels}"
+    )
+
+
+def test_graph_profiling_module_has_no_bare_collect(monkeypatch: pytest.MonkeyPatch):
+    """The two collects of the graph-profiling path go through the shim.
+
+    Source-level on purpose: an alias or a reimport would defeat the gc.collect
+    swap while still looking fine at runtime, and the shim's whole reason to
+    exist is to survive that.
+    """
+    cg = pytest.importorskip(
+        "vllm.v1.worker.gpu.cudagraph_utils",
+        reason="cudagraph_utils not importable",
+    )
+    src = inspect.getsource(cg)
+    assert not re.search(r"^\s*gc\.collect\(", src, re.MULTILINE), (
+        "cudagraph_utils calls gc.collect() directly; route it through "
+        "_gc_maybe_collect so a frozen region suppresses it"
+    )
+
+
+def test_graph_profiling_shim_delegates_to_the_runner_shim(
+    spies, monkeypatch: pytest.MonkeyPatch
+):
+    """The second line of defence is wired to the first one's state.
+
+    cudagraph_utils._gc_maybe_collect imports the runner's shim lazily (the
+    runner imports that module at module scope, so the reverse import has to be
+    inside the function). This asserts the delegation, not just its presence:
+    frozen -> nothing collected, unfrozen -> the real collect runs.
+    """
+    cg = pytest.importorskip(
+        "vllm.v1.worker.gpu.cudagraph_utils",
+        reason="cudagraph_utils not importable",
+    )
+    seen = []
+    monkeypatch.setattr(
+        mr, "_gc_maybe_collect", lambda: seen.append(mr._GC_FROZEN_DEPTH)
+    )
+    monkeypatch.setenv(FREEZE, "1")
+    spies.reset()
+
+    cg._gc_maybe_collect()
+    assert seen == [0], "unfrozen, the shim must reach vLLM's own collect"
+
+    with mr._gc_freeze_guard("profile_cudagraph_memory"):
+        cg._gc_maybe_collect()
+    assert seen == [0, 1], "inside a region the shim must see depth > 0"

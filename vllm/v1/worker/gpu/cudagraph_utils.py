@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import gc
 import itertools
 from collections import defaultdict
 from collections.abc import Callable, Iterable
@@ -714,6 +713,29 @@ _FULL_GRAPH_PROFILING_SAMPLES = 2
 _MIN_PER_GRAPH_BYTES = 1 << 20
 
 
+def _gc_maybe_collect() -> None:
+    """GC's collect(), suppressed while a GFX906 freeze region is active.
+
+    Both collects in this module belong to the graph-memory profiling phase,
+    which is where this box's boot-time SIGSEGVs have always landed, so they
+    route through the same guard-aware shim as vLLM's own call site instead of
+    calling gc.collect() directly.
+
+    Normally unreachable: GPUModelRunner.profile_cudagraph_memory is decorated
+    with _gc_freeze_around, which also swaps gc.collect itself, and these two
+    calls are attribute lookups that happen inside that region -- so they
+    already get the no-op. This is the second, independent line of defence for
+    the case the swap is defeated (an alias bound before the region opened, a
+    reimported gc module), and it costs one comparison.
+
+    The import is lazy because model_runner imports this module at module scope;
+    importing back in the other direction there would be circular.
+    """
+    from vllm.v1.worker.gpu.model_runner import _gc_maybe_collect as _shim
+
+    _shim()
+
+
 @torch.inference_mode()
 def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     """Estimate the GPU memory needed for CUDA graph capture.
@@ -734,7 +756,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     if runner.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
         return 0
 
-    gc.collect()
+    _gc_maybe_collect()
     torch.accelerator.empty_cache()
 
     # Run the whole profiling phase against a throwaway CUDA graph pool by
@@ -892,5 +914,8 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
     clear_layer_kv_caches(layers)
     runner.cache_config.num_gpu_blocks = None
     runner.maybe_remove_all_loras(runner.lora_config)
-    gc.collect()
+    # GFX906: guard-aware, see _gc_maybe_collect. Skipping it leaves garbage from
+    # the throwaway capture unreclaimed, which makes the estimate of the memory
+    # the real capture needs LARGER, i.e. a smaller KV pool: the safe direction.
+    _gc_maybe_collect()
     torch.accelerator.empty_cache()

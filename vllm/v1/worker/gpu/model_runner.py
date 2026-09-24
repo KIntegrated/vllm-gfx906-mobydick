@@ -1093,8 +1093,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pooling_runner.clear()
 
     @torch.inference_mode()
+    @_gc_freeze_around
     def profile_cudagraph_memory(self) -> int:
-        """Estimate the GPU memory required to capture CUDA graphs."""
+        """Estimate the GPU memory required to capture CUDA graphs.
+
+        GFX906: this is the third boot phase, and until now the only unguarded
+        one. Worker.determine_available_memory (gpu_worker.py:556-572) runs
+        profile_run -> profile_cudagraph_memory -> capture_model, and
+        _gc_freeze_around covered the first and the third. The middle phase
+        calls gc.collect() twice (cudagraph_utils.py:737 and, via
+        _teardown_profiling_state, :895) with the heap at its largest: Dynamo +
+        Inductor + xgrammar churn from profile_run, plus the drafter's own
+        warmup. Every boot-time SIGSEGV in these logs dies in exactly one of
+        those traversals (_PyGCHead_NEXT <- update_refs <- deduce_unreachable),
+        immediately after the drafter's `Initial profiling/warmup run` line --
+        which is why GFX906_GC_FREEZE=1 "demonstrably did not prevent" the
+        crash (decode-launch-bound.md 6a): the knob was on, the region was not
+        the one that died. It is also why --enforce-eager never crashes: with
+        CUDAGraphMode.NONE, profile_cudagraph_memory returns at
+        cudagraph_utils.py:732 before reaching either collect. Nothing here
+        repairs the corruptor; it removes the frame that trips over it.
+        """
         return _profile_cudagraph_memory(self)
 
     @torch.inference_mode()
