@@ -35,10 +35,30 @@ config the new validator rejects. Also noted for the next sweep:
 `tests/test_config.py` defines `test_dflash2_draft_forces_v2_model_runner` twice
 (pre-existing on `main`, F811).
 
-**VERDICT:** OPEN follow-ups in [`ROADMAP.md`](ROADMAP.md) UP-3 — a model-level
-validation pass for (a) the gfx906 GPTQ/AWQ paths and (b) the
-`rocm_aiter_mla_sparse` gfx906 fp16-sparse early-return / MiniMax-M3 amd-ops
-routing.
+**VERDICT:** validated on the model paths the merge touched; OPEN follow-ups in
+[`ROADMAP.md`](ROADMAP.md) UP-3 for the areas without a gate (below).
+
+**Functional validation (2026-09-24, after a full gfx906 extension rebuild —
+the installed `.so` still carried the pre-merge `gptq_gemm(..., b_g_idx)` /
+`gptq_shuffle(..., q_perm)` schemas and would have failed on first use):**
+
+- **Qwen3.8-27B-AWQ-INT4 (compressed-tensors pack-quantized → `ExllamaLinearKernel`,
+  the path #54809 rewrote): PPL 10.5472** (359 tokens, **0 top-20 misses**), in the
+  recorded band (10.5516 / 10.5472). This exercises `ops.gptq_shuffle` +
+  `ops.gptq_gemm` end-to-end on the new 2-arg / 7-arg signatures.
+- **TP=2 Qwen3.8-27B-AWQ-INT4 re-measure** (MTP k=3 default, filler, prefix caching
+  OFF, bt4096, max-seqs 4, util 0.82, capture `[4,8,12,16]`, maxlen 131072):
+  **2k 79.1 · 64k 42.0 · 120k 40.7 t/s** decode; TTFT 4.2 / 185.3 / 442.2 s;
+  standard `vllm bench serve` (random, 2048→256) **52.9 t/s** @ TPOT 18.90 ms.
+  Both READMEs updated with these numbers.
+- **Operational note for re-measures:** three leftover profiling plugins
+  (`agdn`/`pfk4`/`syv9`, armed from `/local/tmp/mtp1/*_arm.cfg`) install forward
+  hooks that do `os.path.exists`/`open` inside the graph and break inductor AOT
+  compile of any server. They are not part of the merge; disarm the arm cfgs or
+  set `VLLM_PLUGINS=gfx906_fa` (the fork's own plugin) for a clean compiled boot.
+- **Open follow-ups** (no gate yet): the `rocm_aiter_mla_sparse` gfx906
+  fp16-sparse early-return and MiniMax-M3 `amd/ops` routing; the 8k/32k/96k
+  long-context points were not re-measured.
 
 ## 2026-09-18 (two gated wins go default-on; stale-verdict sweep)
 

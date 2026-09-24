@@ -132,21 +132,29 @@ files, **31 conflicted files** — the count scoped below. Resolution record: th
 merge commit body + `CHANGELOG.md` 2026-09-24; outcome notes appended to
 [`MERGE-0.30.0-review.md`](MERGE-0.30.0-review.md).
 
-**Open follow-ups from the merge (do not treat the base as model-validated):**
+**Open follow-ups from the merge (the base is validated on one model, not all):**
 
-- **GLM53-QGEMM-1 (HIGH):** #54809 removed GPTQ group/dynamic activation ordering
-  upstream, so the fork adopted the removal and **gfx906 GPTQ act-order
-  checkpoints no longer load/serve**. The M=1 4-bit max-ilp dispatch was re-ported
-  onto the new kernel signature (no `b_q_perm`) and the gfx906 AWQ path updated to
-  the new `gptq_gemm`/`gptq_shuffle` arity, but neither has been run on a model
-  since. Validate the Minimax-M3-AWQ / Qwen3.5-AWQ paths (PPL probe + serving
-  smoke) before promoting this base.
+- **GLM53-QGEMM-1 (partly closed 2026-09-24):** #54809 removed GPTQ
+  group/dynamic activation ordering upstream, so the fork adopted the removal and
+  **gfx906 GPTQ act-order checkpoints no longer load/serve**. The M=1 4-bit
+  max-ilp dispatch was re-ported onto the new kernel signature (no `b_q_perm`) and
+  the gfx906 AWQ path updated to the new `gptq_gemm`/`gptq_shuffle` arity.
+  **Validated:** Qwen3.8-27B-AWQ-INT4 (compressed-tensors pack-quantized →
+  `ExllamaLinearKernel`) loads and scores **PPL 10.5472** (359 tok, 0 top-20
+  misses, in band) and serves TP=2 (2k 79.1 / 64k 42.0 / 120k 40.7 t/s, MTP k=3).
+  **Still open:** the Minimax-M3-AWQ / Qwen3.5-AWQ checkpoints (different
+  compressed-tensors/WNA16 oracle paths) have not been run since the merge.
 - **QSA-FN-14 (HIGH):** `rocm_aiter_mla_sparse.py` adopted upstream's sink /
   `_forward_mla` rewrite with the fork's opt-in `VLLM_ROCM_MLA_SPARSE_FP16`
   reference-Torch early-return re-applied by hand, and `minimax_m3/amd/model.py` /
   `amd/ops/index_topk.py` adopted upstream's selection + indexer rewrite with the
   fork's gfx906 fp16 casts/launch kwargs re-applied. None of the three has a
   model-level gate on this base.
+- **Re-measure housekeeping:** three leftover profiling plugins
+  (`agdn`/`pfk4`/`syv9`) hook the forward (`os.path.exists`/`open`) and break
+  inductor AOT compile of any serving boot; disarm `/local/tmp/mtp1/*_arm.cfg`
+  or set `VLLM_PLUGINS=gfx906_fa`. Also rebuild the extension after any merge
+  that changes `csrc/` — the stale `.so` fails on first `gptq_gemm`.
 
 The scoping worked out as predicted below (classes, the ~11 hand-merges, the ~10
 upstream carries); the one item the scoping missed was #54809 above. Original

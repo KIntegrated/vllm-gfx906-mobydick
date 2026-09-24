@@ -138,6 +138,7 @@ backend automatically and now log a WARNING that names the reason. Full record:
 | Gemma-4-26B-A4B-it-AWQ-4bit | optimized | **67.8** |
 | Qwen3.8-27B-AWQ-INT4 (dense) | fully functional (TP=1 + TP=2) | **59.2** (MTP k=2, TP=2, 2k ctx; 2026-08-24 final) |
 | ↳ MTP k=2 context curve (TP=2) | **kv_split fix 2026-09-03 — MTP ≥ greedy at 64k+** | 8k/32k: 44.9/25.2 (2026-08-24); **64k/96k/120k: 37.95/29.88/25.70** (post-fix; greedy 18.86/14.80/12.74) |
+| ↳ **post-0.30.0 re-measure (TP=2, 2026-09-24)** | **MTP k=3 (current default depth) + `GFX906_FA_LEGACY=0` KV read** | **2k 79.1 · 64k 42.0 · 120k 40.7 t/s** (filler, prefix caching OFF, bt4096, max-seqs 4, util 0.82, capture `[4,8,12,16]`; TTFT 4.2/185.3/442.2 s; PPL 10.5472). Standard `vllm bench serve` random 2048→256: **52.9 t/s** @ TPOT 18.90 ms, acceptance 59.9 % / 2.80 |
 | ↳ N=8 concurrent decode | W4 (`VLLM_GFX906_SKINNY_M16=1`) | **104.2** (TP=1, util 0.90) |
 | ↳ 256k context | FA gather fix (2026-08-24); kv_split fix (2026-09-03) | 250k needle PASS; **37.95 t/s MTP @ 64k ctx** (was 16.6 pre-fix) |
 | Qwen3.6 fp16 checkpoints (52–67 GB) | do not fit 32 GB | — |
@@ -176,6 +177,11 @@ B=1 numbers stand (one-point re-verify pending). Re-run recipe: `docs/gfx906/_se
 | Qwen3.8-27B-AWQ-INT4 (256k) | **443.9** | **364.8** | **289.0** | 73.8 s / 179.6 s / 389.7 s |
 | Muse-Glimmer-30B-AWQ-INT4 (128k) | **500.0** | **442.1** | **379.6** | 65.5 s / 148.1 s / 296.7 s |
 
+**Post-0.30.0 note (2026-09-24, merge `8893a50e54`):** on a k=3-spec,
+`GFX906_FA_LEGACY=0` build with prefix caching OFF, 64k prefill reads **354 t/s**
+(TTFT 185.3 s) and 120k **271 t/s** (TTFT 442.2 s) — same order as the rows above;
+the sweep itself remains the spec-free 2026-08-29 record.
+
 Prefill t/s = pp / TTFT. Live-ctx tax: prefill rate falls ~12–14 % per
 doubling for Muse and ~18–21 % for Qwen3.8 (head_dim 256 makes its
 attention share scale harder). Decode (byproduct, tg=128, no spec
@@ -204,6 +210,16 @@ bt 1024, max-seqs 4, capture `[1,2,3,4]`, `disable_custom_all_reduce`).
 | 65,536 | 15.95 t/s | **37.95 t/s** | 18.86 | **2.38×** | 2.01× |
 | 98,304 | 11.19 t/s | **29.88 t/s** | 14.80 | **2.67×** | 2.02× |
 | 122,880 | 9.18 t/s | **25.70 t/s** | 12.74 | **2.80×** | 2.02× |
+
+**Re-measured on the 0.30.0 base (2026-09-24, merge `8893a50e54`), MTP k=3 +
+`GFX906_FA_LEGACY=0` (both current defaults), same filler / prefix-caching-OFF
+basis:** 64k **42.0** / 120k **40.7 t/s** (2 samples each; 8k/32k/96k not
+re-measured). Prefill on the same runs: 64k **354 t/s** (TTFT 185.3 s), 120k
+**271 t/s** (TTFT 442.2 s). The k=2 rows above remain the 2026-09-02/03 record;
+the k=3 rows are faster because depth 3 adds accepted tokens/step and the
+KV-read layout changed. PPL gate on this build: **10.5472** (359 tokens, 0
+top-20 misses). Raw logs: `/local/tmp/bench_lc_030.log` (filler),
+`/local/tmp/bench_2k_k3.log` (standard CLI).
 
 The old "MTP < greedy past ~20k ctx" live-ctx tax is gone: with the fix,
 MTP beats greedy by ~2× at 64k+ context (it still leads at short context —
