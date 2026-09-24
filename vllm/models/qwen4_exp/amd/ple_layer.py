@@ -3,6 +3,7 @@
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
 import math
+import os
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -11,6 +12,7 @@ from torch import nn
 
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -29,6 +31,8 @@ from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+logger = init_logger(__name__)
 
 # from ..common.ple import PLEVocabParallelEmbedding
 
@@ -85,13 +89,15 @@ class MmapShardedNGramEmbedding(nn.Module):
         self.shard_row_capacity = shard_row_capacity
         self.embedding_dim = embedding_dim
         # Dummy-weight loads (``--load-format dummy``) never deliver shard
-        # tensors: the shards are read straight from the checkpoint's safetensors
-        # files and are not parameters, so nothing generates them. Serving
-        # zero rows for a missing shard keeps the path exercisable without a
-        # checkpoint (the tiny-config harness); a real load still raises.
+        # tensors: the shards are read straight from the checkpoint's
+        # safetensors files and are not parameters, so nothing generates them.
+        # Serving zero rows for a missing shard keeps the path exercisable
+        # without a checkpoint (the tiny-config harness); a real load still
+        # raises.
         self._dummy_weights = dummy_weights
         self.params_dtype: torch.dtype | None = None
         self._shards: list[torch.Tensor | None] = [None] * num_shards
+        self._warned_bad_ids = False
 
     def set_shard(self, shard_index: int, tensor: torch.Tensor) -> None:
         if tensor.device.type != "cpu":
@@ -108,14 +114,66 @@ class MmapShardedNGramEmbedding(nn.Module):
             )
         self._shards[shard_index] = tensor
 
+    # Ids outside [0, num_shards * shard_row_capacity) have two known producers,
+    # both legitimate, and neither is corruption of the table:
+    #
+    #   * the MTP drafter's "no sample here" marker. `sample_idx_mapping` is
+    #     pre-filled with PADDING_SENTINEL (spec_decode/dflash/speculator.py:145)
+    #     and reaches this lookup on every drafter warmup/capture.
+    #   * a pinned host id buffer that nothing has written yet. On 2026-09-23 a
+    #     graph-capture-time call arrived holding the poison pattern
+    #     0xff80ff80ff80ff80 repeated, which killed three boots with
+    #     "PLE ngram id out of range" -- see the 2026-09-23 entry in
+    #     docs/gfx906/degradation.md.
+    #
+    # Both are folded onto row 0 rather than rejected or clamped: rejecting them
+    # refuses a boot whose inputs are fine by the time they matter (this op is a
+    # splitting op, so it runs eagerly and the captured/replayed value is read
+    # later, from a buffer the producer has filled by then), and clamping the
+    # whole tensor would send large positive garbage to the *last* row, which is
+    # a real embedding and therefore a plausible wrong answer. Row 0 costs one
+    # wrong row for slots whose result is discarded anyway.
+    PADDING_SENTINEL = -1
+
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         if ids.device.type != "cpu":
             raise ValueError("MmapShardedNGramEmbedding requires CPU ids")
         original_shape = ids.shape
         flat_ids = ids.reshape(-1).long()
-        shard_idx = torch.div(
-            flat_ids, self.shard_row_capacity, rounding_mode="floor"
-        )
+        table_rows = self.num_shards * self.shard_row_capacity
+        if flat_ids.numel() > 0:
+            # One range test over the whole tensor, host-side (ids are CPU by
+            # the check above), instead of one per shard inside the loop below.
+            low, high = int(flat_ids.min()), int(flat_ids.max())
+            if low < 0 or high >= table_rows:
+                bad = (flat_ids < 0) | (flat_ids >= table_rows)
+                if os.environ.get("VLLM_GFX906_PLE_STRICT", "0") == "1":
+                    raise ValueError(
+                        f"PLE ngram id out of range: ids span [{low}, {high}] "
+                        f"but the table holds {table_rows} rows "
+                        f"({self.num_shards} shards x {self.shard_row_capacity}), "
+                        f"{int(bad.sum())} of {flat_ids.numel()} ids affected "
+                        "(VLLM_GFX906_PLE_STRICT=1)"
+                    )
+                if not self._warned_bad_ids:
+                    self._warned_bad_ids = True
+                    logger.warning(
+                        "PLE ngram lookup: %d of %d ids were outside [0, %d) "
+                        "(span [%d, %d]); folded onto row 0. A few during boot "
+                        "or graph capture are expected -- the pinned id buffer "
+                        "is not always written first, and the drafter passes "
+                        "%d for 'no sample here' -- but a steady stream means "
+                        "the id producer is broken. Set "
+                        "VLLM_GFX906_PLE_STRICT=1 to raise instead of folding.",
+                        int(bad.sum()),
+                        flat_ids.numel(),
+                        table_rows,
+                        low,
+                        high,
+                        self.PADDING_SENTINEL,
+                    )
+                flat_ids = flat_ids.masked_fill(bad, 0)
+        shard_idx = torch.div(flat_ids, self.shard_row_capacity, rounding_mode="floor")
         local_idx = flat_ids - shard_idx * self.shard_row_capacity
         out = flat_ids.new_empty(
             (flat_ids.numel(), self.embedding_dim), dtype=self.params_dtype
@@ -123,18 +181,9 @@ class MmapShardedNGramEmbedding(nn.Module):
         # The loop below can only write rows whose shard index is in
         # range(num_shards). An id outside [0, num_shards * shard_row_capacity)
         # matches no mask, so its row would keep whatever new_empty() found at
-        # that address: a silently wrong embedding instead of an error. ids are
-        # CPU by the check above, so this costs two small host-side reductions
-        # and no device sync.
-        if flat_ids.numel() > 0:
-            low, high = int(flat_ids.min()), int(flat_ids.max())
-            table_rows = self.num_shards * self.shard_row_capacity
-            if low < 0 or high >= table_rows:
-                raise ValueError(
-                    f"PLE ngram id out of range: ids span [{low}, {high}] but "
-                    f"the table holds {table_rows} rows "
-                    f"({self.num_shards} shards x {self.shard_row_capacity})"
-                )
+        # that address: a silently wrong embedding instead of an error. That is
+        # why the range test above folds every out-of-range id onto row 0 first
+        # -- every row this function returns is a row that was actually read.
         # Fixed-length loop over every shard, every call — no data-dependent
         # iteration count. Necessary for CUDA graph capture safety: a Python
         # loop whose length depends on which shards this specific batch

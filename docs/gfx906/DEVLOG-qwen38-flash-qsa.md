@@ -6,6 +6,78 @@
 > bf16-only site inventory, the ISA facts and the kernel timings live there; not
 > restated per entry). Newest entry first.
 
+## 2026-09-24 (1) — the PLE id guard: fold, warn, never refuse a boot
+
+**VERDICT:** `SHIPPED` (fold-and-warn adopted from the tester's third revision,
+our one local delta retained); the *implementation* decision the guard came from
+— their mmap host table vs upstream's pinned/UVA offload — stays `OPEN`, see
+QSA-FN-11.
+
+**GATE:** `tests/models/qwen4_exp/test_ple_mmap_shards.py` (24) +
+`tests/v1/worker/test_gfx906_gc_freeze.py` (28) + `test_qsa_amd.py` (22) =
+**74 passed**; the tiny rig boots with MTP k=1 and k=3 and logs **no**
+out-of-range id.
+
+### What happened
+
+The guard we cherry-picked (their `6c26a8edd6`, raise on any out-of-range id)
+was itself the second boot-breaker of the day on their box, in two steps:
+
+1. **`-1` is not corruption.** `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py`
+   pre-fills `sample_idx_mapping` with `-1` for slots that hold no real sample,
+   and that tensor reaches the lookup on every MTP drafter warmup/capture. Their
+   original reasoning — "`torch.remainder(mixed, sizes) + offsets` cannot leave
+   `[0, total_vocab_size)`, therefore defensive-only" — enumerated only the ids
+   the ngram arithmetic generates, not the other producer of the same tensor.
+   Two boots died at `speculator.propose -> qwen4_exp_amd_ple_ngram_embedding`.
+2. **Unwritten pinned buffers count as producers too.** Their fix for (1) (fold
+   only the sentinel, keep the raise) then died three more times on
+   `0xff80ff80ff80ff80` repeated (`-35747867511423104`, `min == max`) arriving on
+   the compile/graph path only — which is why `--enforce-eager` hid it. Folding
+   `-1` enumerated the *drafter* but still not producers that have not run yet:
+   buffers allocated before their first write.
+
+Lesson, theirs and recorded here because it is the general one: **a guard that
+can refuse a boot has to be justified against producers it cannot enumerate**,
+which in practice means warn-and-fold by default and raise behind a flag.
+
+### The adopted shape (theirs, verbatim)
+
+One range test over the whole tensor, host-side (ids are CPU), before the shard
+loop: every out-of-range id is folded onto row 0 with a warn-once per module
+carrying the span and count, and `VLLM_GFX906_PLE_STRICT=1` restores the raise
+for development. Folding rather than clamping matters: clamping a large positive
+id would send it to the *last* row, which is a real embedding and therefore a
+plausible wrong answer, whereas row 0 costs one wrong row for slots whose result
+is discarded anyway.
+
+### Our delta, and why their failure does not reproduce here
+
+We keep one local addition on top: `dummy_weights=` (a `--load-format dummy`
+load never delivers shard tensors, so a missing shard serves zero rows instead of
+raising; a real load still raises).
+
+Their poison run happened **without** our two gfx906 PLE fixes — their tip has
+neither the splitting op in `vllm/config/vllm.py` nor the piecewise downgrade,
+so on their tree the lookup is inside the captured graph and reads capture-time
+dummy inputs. On ours the op is a splitting op and runs outside the captured
+pieces: the tiny rig boots with MTP k=1 and k=3 and never logs an out-of-range
+id. So on this tree the fold is *defensive* rather than load-bearing — but it is
+load-bearing for anyone serving this model without the splitting-op change, and a
+boot-refusing guard on a hot path is the wrong default regardless. (Single tiny
+rig, dummy weights, 4 layers — a weak proxy for the real model; the statement is
+about our configuration, not about theirs.)
+
+### Interactions
+
+- The `dummy_weights` and splitting-op/piecewise fixes are ours, made before this
+  entry; see the two `SHIPPED` commits below them in the branch.
+- Their operational notes (BOOT_TRIES, VRAM reaper, `TVMFFI=disable`) are not
+  carried; the generic part of that finding is in `DEVLOG-spec-decode.md`
+  ("the GC guard").
+- Upstream's pinned path stages ids through a pinned buffer too — the stale- and
+  uninitialised-id hazard is worth reporting on `vllm-project/vllm#57497`.
+
 ## 2026-09-17 (5) — QSA-FN-8: the tester bundle
 
 **VERDICT:** `SHIPPED` (bundle built and self-validated); the real-model half
