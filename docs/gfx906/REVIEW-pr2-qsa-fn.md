@@ -229,3 +229,38 @@ tester's mmap path.
    `engram.py` + the pinned classes + the relaxed gate, i.e. a capability the 0.29 line
    lacks entirely. The AMD half still needs #57497 (or a small port of it) after that.
 
+
+## 2026-09-24 — integration done; the guard needed a third revision (theirs)
+
+The cherry-picks are on `gfx906/qsa-fn` (their six commits as six commits, their
+authorship, plus two integration commits authored by them as well — see the dev
+log for the `dummy_weights` and splitting-op/piecewise fixes, which their tip does
+not carry). Two rounds of reviewer work happened after the first comment, and both
+are worth knowing before this is merged:
+
+1. **The range guard we took from `6c26a8edd6` was boot-breaking**, and it took
+   them two corrections to land the right shape (`04e142cfe`, then `a1c70dedb`):
+   the drafter's `-1` `sample_idx_mapping` padding sentinel, then a third producer
+   — unwritten pinned host memory (`0xff80ff80ff80ff80`) arriving on the
+   compile/graph path only. Adopted as `fe3bcc9e23` (fold onto row 0 + warn once +
+   `VLLM_GFX906_PLE_STRICT=1` to raise). The general lesson is in the dev log, and
+   it argues against accepting a `raise` on any hot path as free hardening.
+2. **Their eager-only workaround is probably unnecessary on our config**, which is
+   the one piece of leverage we gained from their report: the poison requires the
+   lookup to be *inside* the captured graph, and our splitting-op + piecewise
+   change moves it out. Our tiny rig (MTP k=1 and k=3) logs no out-of-range id at
+   all. Stated to them as a hypothesis to test on the real model, not as a result.
+
+**The PLE comparison they were asked for still has not arrived** (neither the
+numbers nor a partial), so the mmap-vs-upstream decision is still open and still
+QSA-FN-11's problem. Do not let the guard work be mistaken for that evidence: it
+is a correctness fix to the interim path, not a reason to keep it.
+
+**Cleanups are done on our side** (drafter default restored to upstream, comment
+trim, `degradation.md` rows re-homed as generic findings) and the tester was told
+no action is needed from them there.
+
+**Open, ours:** the `PIECEWISE` downgrade for qwen4_exp is a judgement call (it
+costs this model the full-graph decode path; the alternative is warn-only plus
+`--enforce-eager`); and whether to file the stale/uninitialised-id hazard against
+#57497 ourselves using their finding. Both are recorded above and await a decision.
