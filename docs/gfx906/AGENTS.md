@@ -142,3 +142,14 @@ a log that covers only one incident is a weak search target.
    Off-by-default is **not** evidence of dead code: on this fork a flip is a
    deliberate "Kevin's call" step, so a `default off` comment usually means
    "gated win awaiting a decision", not "parked".
+
+## Merge procedure (upstream release -> fork)
+
+The full procedure (scope -> branch cut -> conflict triage -> rebuild ->
+static sweep -> validation ladder -> commit/record) and the lessons from the
+v0.28/v0.29/v0.30 merges live in the **`upstream-merge` skill**:
+[`../../.agents/skills/upstream-merge/SKILL.md`](../../.agents/skills/upstream-merge/SKILL.md).
+Its re-runnable static check is
+[`post-merge-sweep.sh`](../../.agents/skills/upstream-merge/scripts/post-merge-sweep.sh)
+(conflict markers -> tree-wide ruff F821/F811 -> in-memory syntax compile ->
+duplicate-def scan -> import smoke). Rule 6 above is step 0 of that procedure.
