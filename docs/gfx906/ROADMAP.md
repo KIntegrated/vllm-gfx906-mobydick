@@ -189,6 +189,48 @@ lists the fork-wide off-by-default inventory (NH-4, FD-1 leftover, `SKINNY_M16`,
 plan; do that first, then merge. UP-1/UP-2 can proceed against
 `main`/`releases/v0.30.0` without this.
 
+## Post-0.30 base candidates (from the v0.30.0 release notes, 2026-09-26)
+
+Upstream work that landed in the 0.30.0 base and touches a fork model or the
+MI50's limits. Nothing here blocks the 0.30.0 release; each is a decision.
+
+### U30-1 — Nemotron-H: separate/quantized MTP lm_head + latent-MoE TP>1 all-reduce
+
+**Source:** #54574 (Nemotron-H MTP with a separate, possibly quantized lm_head)
+and #52301 (Nemotron latent-MoE skipping a redundant all-reduce at TP>1, ~13 %
+decode), both in the 0.30.0 base. **Why us:** the fork serves
+Nemotron-3.5-Lightning at TP=2+EP (`DEVLOG-nemotron-h.md`); #52301 is a measured
+~13 % decode win at TP>1 and #54574 changes where the MTP head's weights load
+from. **Action:** re-run the Nemotron TP=2 decode A/B on this base and confirm
+the lm_head loads (a quantized lm_head is not a checkpoint the fork has served).
+**Gate:** Nemotron TP=2 `_bench_gfx906.py` decode t/s + PPL in 26.96–27.02.
+
+### U30-2 — persistent top-k on low-shared-memory GPUs
+
+**Source:** #54110 (persistent top-k falls back on low-shared-memory GPUs).
+**Why us:** gfx906 has the smallest LDS of the fork's targets. **Action:** check
+which top-k kernel the gfx906 build selects and whether the fallback triggers;
+measure the sampler cost if it does.
+
+### U30-3 — W4A16 packed zero-points for Gemma-4 AWQ
+
+**Source:** #54965 (W4A16 packed zero-points, −26 % TPOT on Gemma-4 AWQ on
+ROCm). **Why us:** Gemma-4-AWQ-4bit is a supported fork model, but the fork
+serves it through its own **no-zero-point** symmetric expert kernel
+(`DEVLOG-gemma4-moe.md`), so this upstream rail may not apply. **Action:**
+confirm the served checkpoint's zero-point layout; evaluate the upstream rail if
+it is packed-zp.
+
+### Not queueing (recorded so it is not re-raised)
+
+- #53155 keeps GLM-5.2 on Model Runner V1 on ROCm — corroborates the fork's
+  `VLLM_USE_V2_MODEL_RUNNER=0` pin.
+- #54782 (partial CUDA graphs raise instead of garbling), #55780 (DCP must be
+  declared): already in the base; the fork uses neither.
+- #56446 (YaRN), #54579 (scale-out endpoints), #55041 (`all` Mamba cache mode),
+  #55353 (ROCm `CUDA_VISIBLE_DEVICES` fallback): do not apply (no YaRN models,
+  no scale-out, `align` cache mode, custom AR disabled on ROCm).
+
 ## High priority — user-requested (2026-09-12)
 
 ### DFL2-1 — DFlash2 n-gram chains: drafter-free verify blocks while a request copies its context (**PARKED — do not start**, Kevin 2026-09-12)
