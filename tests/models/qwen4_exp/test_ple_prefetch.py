@@ -434,3 +434,29 @@ def test_rows_are_merged_into_runs_instead_of_one_syscall_per_row():
         ]
     finally:
         ple_prefetch._libc = _REAL_LIBC
+
+
+def test_a_working_read_ahead_reports_its_real_shard_counts(tmp_path, monkeypatch):
+    """The one success log line must state counts that resolution produced.
+
+    Until boot C the *only* sign that this feature worked at all was a thread
+    named "ple-prefetch" -- and Python 3.12 does not put threading thread names
+    in /proc/<pid>/task/*/comm, so that signal did not exist (docs
+    prefill-io-wall.md sec 3e: the boot was nearly written off as inert). The
+    once-per-process log line is the on-the-record signal now, so the shard
+    counts it prints have to be the ones _resolve_shards actually found.
+    """
+    spy = _SpyLibc()
+    monkeypatch.setattr(ple_prefetch, "_libc", lambda: spy)
+    with _file_backed(tmp_path) as emb:
+        pf = _prefetcher(emb)
+        host = np.zeros((1, 8), dtype=np.int32)
+        ctx = np.full(CTX_LEN, EOS, dtype=np.int64)
+        assert pf._shards_total == 0, "counts must not be set before resolution"
+        pf.prefetch_token_chunk(host, 0, 0, 8, ctx)
+        pf.drain()
+        assert spy.calls, "no hints issued on a file-backed shard"
+        assert pf._shards_total == NUM_SHARDS
+        assert pf._shards_usable == NUM_SHARDS, "every shard here is file-backed"
+        hints, rows = pf.stats()
+        assert hints == len(spy.calls) and rows > 0

@@ -174,6 +174,11 @@ class PleRowPrefetcher:
         self._disabled_reason: str | None = None
         self._hints = 0
         self._hint_rows = 0
+        # Kept as ints so the first-hint log line below costs nothing per step
+        # (`info_once` evaluates its arguments eagerly, and it is on the hot
+        # path: it runs once per scheduled chunk per rank).
+        self._shards_usable = 0
+        self._shards_total = 0
 
     # ------------------------------------------------------------------ setup
     @property
@@ -251,6 +256,7 @@ class PleRowPrefetcher:
             ranges.append((fd, byte_off, row_bytes))
         self._ranges = ranges
         usable = sum(r is not None for r in ranges)
+        self._shards_usable, self._shards_total = usable, len(shards)
         if usable == 0:
             self.disable("no PLE shard resolves to a file-backed mapping")
             return False
@@ -376,6 +382,17 @@ class PleRowPrefetcher:
                     max_workers=1, thread_name_prefix="ple-prefetch"
                 )
             self._pool.submit(self._advise_guarded, ngram_ids)
+            # A read-ahead that works is otherwise invisible: it has no effect
+            # on output, and until now no line in the log proved it was live.
+            # (Verifying it meant a syscall tracepoint; see
+            # docs/prefill-io-wall.md sec 3e.) Once per process.
+            logger.info_once(
+                "PLE read-ahead active: hinting %d tokens' embedding rows from "
+                "%d/%d file-backed shards, one chunk ahead of the gather.",
+                n,
+                self._shards_usable,
+                self._shards_total,
+            )
         except Exception as exc:  # noqa: BLE001
             self.disable(f"prefetch worker unavailable ({exc})")
 
