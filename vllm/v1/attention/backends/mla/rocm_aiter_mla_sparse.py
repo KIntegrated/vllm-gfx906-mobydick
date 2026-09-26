@@ -663,12 +663,15 @@ class ROCMAiterMLASparseMetadataBuilder(
         # gfx906 fp16-sparse skips the persistent MLA metadata kernel; on the
         # other paths also skip it for chunked-prefill continuations, which the
         # persistent kernel handles numerically wrong and breaks long-context
-        # decode (vllm#47042).
+        # decode (vllm#47042). Upstream removed the `seq_lens_cpu` metadata
+        # property in 0.30 (#55353); use its `seq_lens_cpu_upper_bound`
+        # replacement -- a host-side upper bound on the true sequence lengths,
+        # so this guard stays conservative rather than silently inactive.
         num_reqs = common_attn_metadata.num_reqs
-        seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu", None)
+        seq_lens_upper = common_attn_metadata.seq_lens_cpu_upper_bound
         is_chunked_continuation = False
-        if seq_lens_cpu is not None:
-            total_seq_lens = seq_lens_cpu[:num_reqs].numpy()
+        if seq_lens_upper is not None:
+            total_seq_lens = np.asarray(seq_lens_upper)[:num_reqs]
             is_chunked_continuation = bool(
                 ((seg_lengths > 1) & (total_seq_lens > seg_lengths)).any()
             )

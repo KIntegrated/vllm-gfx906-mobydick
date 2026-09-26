@@ -47,6 +47,44 @@ reasons. Commit `98e96532b7`.
 `tests/kernels/attention/test_minimax_m3.py` + the routing and
 `_forward_mla`-fp16 unit tests.
 
+### Release-notes cross-check (same day)
+
+Read the v0.30.0 release notes' "Breaking Changes & Deprecations" against the
+fork. One more silent regression, now fixed, and several items that do **not**
+apply:
+
+- **`CommonAttentionMetadata.seq_lens_cpu` / `num_computed_tokens_cpu` removed
+  (#55353).** The merge had re-applied the fork's vllm#47042 chunked-continuation
+  guard with `getattr(common_attn_metadata, "seq_lens_cpu", None)` - now always
+  `None`, so the guard was **silently inactive**. Re-derived from the
+  `seq_lens_cpu_upper_bound` replacement (host upper bound; conservative).
+  `rocm_aiter_mla_sparse.py`; the MLA-sparse suites stay green.
+- The `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` removal is **deliberate upstream**;
+  the fork's `arg_utils.py` still reads it via `get_from_deprecated_env_if_set`,
+  which is why the merge's env-table loss crashed. Kept the fork's read + env
+  registration (decision recorded; the alternative is aligning with upstream's
+  removal).
+- **Not applicable** (checked): `VLLM_MM_HASHER_ALGORITHM` (unused anywhere),
+  `use_fp4_indexer_cache` (field already gone), DCP declaration (#55780; no DCP
+  used, `AttentionImpl.supports_dcp` defaults `False`), YaRN alignment (#56446;
+  no YaRN models/recipes - `--max-model-len` is explicit), scale-out endpoints
+  (#54579; unused), `all` Mamba cache mode deprecation (#55041; the fork uses
+  `align`), CUDA_VISIBLE_DEVICES-on-ROCm removal (custom all-reduce is disabled
+  on ROCm anyway), and `requirements/build/rocm.txt` still carries the fork's pin
+  (the 0.29 toolchain lesson held).
+- **Confirms earlier findings:** #54809 (GPTQ act-order) and #55353 (env
+  removals) are the listed breaking changes; the ROCm section's MiniMax-M3
+  indexer/top-k work (#54682/#52664/#55235/#56170), Kimi-K3 mixed-batch KDA
+  (#56159) and the AITER sparse-MLA sinks (#54404) are the upstream changes whose
+  merge forced the QSA-FN-14 re-ports.
+- **Fork-relevant, no action yet (post-0.30 candidates):** Nemotron-H MTP with a
+  separate/quantized lm_head (#54574) and the latent-MoE TP>1 all-reduce skip
+  (~13 % decode, #52301); persistent top-k fallback on low-shared-memory GPUs
+  (#54110, relevant to MI50's small LDS); "unavailable piecewise CUDA graphs now
+  raise instead of garbling" (#54782); W4A16 packed zero-points (-26 % TPOT on
+  Gemma-4 AWQ, #54965); and "GLM-5.2 kept on MRV1 on ROCm" (#53155), which
+  supports the fork's V1 pin.
+
 ## 2026-09-24 (UP-3 done — upstream v0.30.0 merged onto the fork line)
 
 `gfx906/v0.30.0` started from `main`/`gfx906/v0.29.0` (`524ac6f2d6`) and merged
