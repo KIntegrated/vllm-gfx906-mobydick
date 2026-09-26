@@ -10,6 +10,33 @@ E=256, topk=8, hidden=2048, W4A16 group-128 experts; B=1 decode step
 ≈ 15 ms at 66.5 t/s. Priority = expected gain × confidence ÷ effort+risk;
 tiers are do-order, sections within a tier are ordered the same way.
 
+## 0.30.0 release prep (2026-09-26) — **BLOCKED on a V2 35B-MoE capture fault**
+
+### REL30-1 — `moe_gemm_q4_kernel_gfx906<1,2>` page fault during V2 FULL-graph capture (**RELEASE BLOCKER**)
+
+**Status: OPEN — the 0.30.0 release is blocked.** The 35B house bench (the
+release's anchor gate) faults reproducibly on the merged base with the default
+**V2** runner, during the FULL-decode graph-capture phase: `Memory Fault Error …
+kernel: vllm::moe_gptq_gfx906::moe_gemm_q4_kernel_gfx906<1, 2>` (**916** journal
+`no-retry page fault` lines in one retry window), then `hipErrorIllegalAddress` /
+rc=134. Record: [`degradation_details.md`](degradation_details.md) 2026-09-26 and
+[`degradation.md`](degradation.md) #110.
+
+**Ruled out:** the kernel source is unchanged by the merge, the merge's
+`CMakeLists.txt` change does not touch gfx906 flags, the same model passes the
+**eager** PPL probe (15.9840, 0 misses), and 0.29-**V2** ran the identical bench
+at **59.86 t/s** (`/local/tmp/bench_flip.log`, 2026-09-18).
+
+**Discriminating test (next session):** reboot the host (26 wedge events this
+boot; no passwordless sudo — operator action), then re-run the V2 35B bench once.
+A repeat fault = a 0.30.0 regression in the MRV2 FULL-graph capture path
+interacting with the fork's MoE kernel; a clean pass = host state.
+
+**Workaround if it is a regression:** the fork's serve recipes already pin
+`VLLM_USE_V2_MODEL_RUNNER=0`, so shipping 0.30.0 on **V1** for the MoE is
+consistent with the shipped configuration (V2 correctness on the MoE continues in
+`DFL2-2`).
+
 ## V2 runner / mamba `align` (2026-09-17) — fix shipped
 
 > This section's content came from the Qwen3.8-Flash-Next train (`QSA-FN`, branch
