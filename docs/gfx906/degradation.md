@@ -356,3 +356,58 @@ in a lambda, `SIM115`, E501).
 **Next:** one boot with `PLE_RANDOM=1` and **without** `NCCL_PROTO=LL`, measured with
 `scripts/probe-prefill.py 8 32` against the 2.025 ms/token cold baseline. Honest expectation:
 double-digit %, not 32×.
+
+## 2026-09-26 07:00–08:35 — implementation: opt-in PLE **read-ahead** (`PLE_PREFETCH`); the gather-ahead design killed by measurement (no boot, no live change)
+
+**Class:** SW/opt-in-knob. **Trigger:** continuing the prefill I/O wall
+(`docs/prefill-io-wall.md` §3c).
+**Engine:** untouched, pid 2984526 (still `NCCL_PROTO=LL GC_FREEZE=1 DRAFTER_GRAPHS=1`,
+still the measured net loss awaiting revert), **health 200 before and after**, serving
+throughout. No file the running process has open was modified; new code lands in
+site-packages and is inert until a restart.
+
+**What landed** (`13a8075df` refactor, `67104f61b` feature, both default-off):
+
+- `ple_prefetch.py`: `PleRowPrefetcher` + `plan_lookahead_chunks()`. Computes the *next*
+  prefill chunk's ngram ids on the host with the device path's own
+  `_compute_ngram_ids` (CPU mirrors), resolves each shard's rows to
+  `(fd, file offset, row bytes)` through `/proc/self/maps`, merges them into page runs,
+  and issues `POSIX_FADV_WILLNEED` from one worker thread while the GPU works.
+- `Qwen4ExpModelState._prefetch_next_ple_chunk()`, called at the end of
+  `prepare_inputs`. All inputs are already host numpy, so it costs no device sync.
+- `run-vllm`: `PLE_PREFETCH` (default `0`), which prints which path it took and warns
+  when `PLE_PREFETCH=1` is set without `PLE_RANDOM=1` (the +17 % was measured with both).
+
+**The measurement that decided the design** (`scripts/probe-ple-prefetch.py`, cold cache,
+fresh subprocess per arm, Latin-square rotated, real shard copy, 1024 tokens × 16 ids,
+on top of `MADV_RANDOM`): serial 77.2 ms / 65.5 MiB; **gather-ahead thread 76.5 ms = no
+win** (and **0.89×, a regression, without `MADV_RANDOM`**); **fadvise-ahead 66.0 ms =
+1.17×** with no extra traffic (66.1 MiB). A gather thread does the same I/O twice and
+holds the GIL across the NVMe wait — that eliminated the memo-buffer/ring/keying design
+entirely. Issue hints, don't do work.
+
+**Process notes (mine, kept because they repeat):**
+
+- I wrote `eos_token_id=0` and inferred `ngram_size` from the context length in the first
+  draft. Wrong eos silently computes *different ids* — a read-ahead that warms pages
+  nobody will read, which is invisible in the output. Both are now explicit constructor
+  arguments. Lesson: for a *performance* feature whose failure mode is "does nothing",
+  the parameter that silently changes *what* you prefetch is a correctness parameter.
+- `model_state.py` cannot be imported by a unit test at all (it pulls the compiled model
+  modules, absent from the source tree). So the planning arithmetic moved to a pure
+  numpy function in `ple_prefetch.py`. Better structure *and* testable: the risky part
+  now has 6 tests instead of zero.
+- Three deliberate mutations (context off by one, warming the current chunk instead of
+  the next, never splitting runs at a gap) were each caught before committing. Hooks run
+  **before** the commit this time; findings were real (duplicate `except Exception` left
+  by an edit, `SIM115` on two `open()`s whose fd only needs to live until `mmap()`,
+  `SIM102`/`SIM105`, and two mypy `list = None`).
+- 84 tests green across `test_ple.py` (10), `test_ple_mmap_shards.py` (29),
+  `test_gfx906_gc_freeze.py` (33), `test_ple_prefetch.py` (12).
+
+**Not yet validated:** the +17 % is one chunk in isolation on a copy. Live, the lookahead
+overlaps real GPU work (better) but competes with the current chunk's own faults and with
+this agent's traffic (worse). First boot to judge it:
+`PLE_RANDOM=1 PLE_PREFETCH=1 ./run-vllm`, then `scripts/probe-prefill.py 8 32` against
+the 2.025 ms/token cold baseline — the same restart window that `PLE_RANDOM` and the
+`NCCL_PROTO=LL` revert are already waiting for.
