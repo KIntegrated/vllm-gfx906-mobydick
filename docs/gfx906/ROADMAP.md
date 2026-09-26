@@ -144,12 +144,19 @@ merge commit body + `CHANGELOG.md` 2026-09-24; outcome notes appended to
   misses, in band) and serves TP=2 (2k 79.1 / 64k 42.0 / 120k 40.7 t/s, MTP k=3).
   **Still open:** the Minimax-M3-AWQ / Qwen3.5-AWQ checkpoints (different
   compressed-tensors/WNA16 oracle paths) have not been run since the merge.
-- **QSA-FN-14 (HIGH):** `rocm_aiter_mla_sparse.py` adopted upstream's sink /
-  `_forward_mla` rewrite with the fork's opt-in `VLLM_ROCM_MLA_SPARSE_FP16`
-  reference-Torch early-return re-applied by hand, and `minimax_m3/amd/model.py` /
-  `amd/ops/index_topk.py` adopted upstream's selection + indexer rewrite with the
-  fork's gfx906 fp16 casts/launch kwargs re-applied. None of the three has a
-  model-level gate on this base.
+- **QSA-FN-14 (gate CLOSED 2026-09-26; full model load still untested):**
+  `rocm_aiter_mla_sparse.py` adopted upstream's sink / `_forward_mla` rewrite
+  with the fork's opt-in `VLLM_ROCM_MLA_SPARSE_FP16` reference-Torch early-return
+  re-applied by hand, and `minimax_m3/amd/model.py` / `amd/ops/index_topk.py`
+  adopted upstream's selection + indexer rewrite with the fork's gfx906 fp16
+  casts/launch kwargs re-applied. That re-application was **incomplete and
+  buggy** and is now fixed and gated without loading the model: the fp16 `q` cast
+  in the decode index-score kernels, the launch-kwarg merge, and the
+  `AttentionConfig` `fp16`/`fp32` alias canonicalization. Gates:
+  `tests/kernels/attention/test_minimax_m3.py` (122 passed/13 skipped),
+  `test_minimax_m3_gfx906_routes_to_triton_not_cdna_aiter`, and
+  `test_rocm_aiter_mla_sparse_fp16_route_uses_reference`; see `CHANGELOG.md`
+  2026-09-26. Still open: a real MiniMax-M3-AWQ weight load/serve (needs > 32 GB).
 - **Re-measure housekeeping:** three leftover profiling plugins
   (`agdn`/`pfk4`/`syv9`) hook the forward (`os.path.exists`/`open`) and break
   inductor AOT compile of any serving boot; disarm `/local/tmp/mtp1/*_arm.cfg`

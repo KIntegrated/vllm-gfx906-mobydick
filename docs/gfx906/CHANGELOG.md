@@ -6,6 +6,47 @@ still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
 the date an investigation began.
 
+## 2026-09-26 (QSA-FN-14 gate: MiniMax-M3 `amd/ops` + `rocm_aiter_mla_sparse` fp16 paths validated without the model)
+
+The 0.30.0 merge took upstream's gfx950-gated MiniMax-M3 selectors and rewrote
+the `index_topk` kernels, leaving the gfx906 paths with **no model gate** - the
+model does not fit the 32 GB MI50s. Running the suites that the merge never ran
+here turned them red, and three real defects came out:
+
+- **`AttentionConfig` never canonicalized `indexer_kv_dtype`.** The fork's
+  Literal accepts the `fp16`/`fp32` spellings, but nothing mapped them, so
+  `indexer_kv_dtype="fp16"` reached the indexer cache as `"fp16"` and missed the
+  `"float16" -> torch.float16` map. Normalized in `__post_init__`.
+- **The merged `amd/ops`/`common/ops` decode index-score kernels cast only `k`,
+  not `q`,** before `tl.dot` - the gfx906 fp32-KV path failed Triton's same-dtype
+  assertion (`Both operands must be same dtype. Got fp16 and fp32`). The `q` cast
+  is now hoisted before the block loop (Triton loop-carried types must be
+  stable), so it cannot live inside the loop.
+- **The re-applied gfx906 launch kwargs duplicated a keyword.**
+  `**score_kwargs, **_index_score_launch_kwargs()` raises `TypeError` whenever
+  `score_kwargs` already carries `num_warps` (the multi-head spec-decode path);
+  merged to `**{**score_kwargs, **_index_score_launch_kwargs()}`.
+
+Gates now in tree (all model-free): the `_forward_mla` `VLLM_ROCM_MLA_SPARSE_FP16`
+reference-Torch early-return and the gfx906 routing (`MiniMaxM3SparseBackend` +
+Triton impl, `common.ops` sparse attn rather than CDNA/AITER) are pinned by unit
+tests, and the `amd/ops` kernels are gated numerically by
+`tests/kernels/attention/test_minimax_m3.py`. A real MiniMax-M3-AWQ weight load
+remains untested here (32 GB cards).
+
+**Results:** `test_minimax_m3.py` **122 passed / 13 skipped** (was 9 failing);
+`tests/models/minimax_m3/` + `test_rocm_glm5next_sparse.py` +
+`test_rocm_aiter_mla_sparse_metadata_sync.py` **32 passed / 3 skipped**; combined
+**154 passed / 16 skipped**; `tests/test_config.py -k "attention or indexer or
+cudagraph"` 43 passed; ruff F/I/format clean. The stale
+`test_fp32_kv_config.py` (it imported a helper that never existed, so it had
+never collected) now runs - its two pre-merge-signature tests are skipped with
+reasons. Commit `98e96532b7`.
+
+**VERDICT:** SHIPPED (code + gates) / **GATE:**
+`tests/kernels/attention/test_minimax_m3.py` + the routing and
+`_forward_mla`-fp16 unit tests.
+
 ## 2026-09-24 (UP-3 done — upstream v0.30.0 merged onto the fork line)
 
 `gfx906/v0.30.0` started from `main`/`gfx906/v0.29.0` (`524ac6f2d6`) and merged
