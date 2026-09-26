@@ -558,3 +558,61 @@ lines, all knob markers present (`PLE_PREFETCH`, `PLE_RANDOM`, `GC_FREEZE`, `DRA
 `PREFLIGHT`, `NCCL_ENVELOPE`, `BOOT_TRIES`), diff against the pre-edit copy is the one block.
 `run-vllm` is the operator's launcher outside the repo, so this is a log entry, not a commit;
 pre-edit copy kept at `/tmp/run-vllm.pre-nccl-echo`.
+
+### 2026-09-26 12:01–12:40 — measurement: boot D re-measures `NCCL_PROTO=LL` on the far side of the I/O wall, and the "+5 % decode" that justified it does not replicate
+
+**Class:** measurement + one small code fix. **Trigger:** operator booted
+`NCCL_PROTO=LL GC_FREEZE=1 DRAFTER_GRAPHS=1 PLE_RANDOM=1 PLE_PREFETCH=1 BOOT_TRIES=1`
+(pid 3255359, log `vllm.log.20260926-120102`) — boot C's exact config plus one variable, which is
+the clean single-variable A/B that §5f's own caveat asked for.
+
+**Boot integrity:** KV **399,419** tokens (bit-identical to A′/B/C, so the change really was one
+variable), PIECEWISE graphs (3 sizes), 32 `froze` lines, 0 tracebacks / 0 errors / 0 segfaults,
+health 200, `NCCL_PROTO=LL` confirmed in `/proc/3255359/environ` (the `vllm serve` pid — the
+`EngineCore` and `Worker_TP*` pids are renamed by `setproctitle` and their `environ` is clobbered).
+
+**Measured** (3 reps each, min-of-reps for prefill, medians for decode, box otherwise idle):
+
+| metric | boot C | boot D (`NCCL_PROTO=LL`) | delta |
+| --- | --- | --- | --- |
+| marginal cold prefill | 0.942 ms/tok (1,061 tok/s) | 1.088 ms/tok (919 tok/s) | **+15.5 %** slower |
+| 34.9 K cold prompt | ~33.2 s | 38.0 s | +4.8 s |
+| decode B=1 | 49.46 | 50.17 | +1.4 % (inside both rep bands) |
+| decode B=2 | 76.67 | 76.10 | −0.7 % |
+| decode B=3 | 101.71 | 101.52 | −0.2 % |
+
+**Prediction accounting.** The pre-registered forecast was a *fixed absolute* penalty — LL's 3.7x
+slowdown of a 21 MB prefill all-reduce, ~96 ARs per 4096-token chunk, ≈ +520–634 ms per chunk
+whatever else is fast — which against boot C's 3.86 s chunk predicts **+16.4 %**. Measured
+**+15.5 %**. That model is also what explains 09-25's −10 %: same knob, constant ms, 2.5x faster
+chunk. It further indicts the old baseline: LL cost +127 µs/token now against +226 µs/token implied
+by the 2.025 ms/token boot, and nothing in the collective path changed between those boots.
+**The decode forecast (+5 % at B=1) was wrong: +1.4 % arrived, inside the spread.** 09-25's 52.18
+was one run; boot D's three runs spread 48.5–53.6. Consequence, and the useful part: the *exposed*
+collective share of a decode step is bounded at **≤1.5 % at B=1 and ~0 % at B≥2** by three
+independent measurements (this A/B, the size-independent AR microbench, py-spy's ~1.1 % NCCL share
+of worker CPU). So `NCCL_PROTO=LL,Simple` — the allow-list whose entire purpose was to keep the B=1
+sliver — was **retired without spending the boot**, and custom one-shot IPC all-reduce / async-TP
+stay demoted on measurement rather than on a model.
+
+**The rule this buys:** a regression whose cost is absolute in ms becomes a bigger *percentage*
+every time something else gets faster (10 % → 15.5 % for one env var across a 2.5x prefill win), and
+a win measured as a percentage shrinks the same way. **Every "retired, costs X %" verdict needs
+re-measuring after a large win, in both directions.**
+
+**Bug found in this boot's own log, fixed:** the success line added in `48c0bcd1b` used
+`logger.info_once`, which dedupes on `(message, args)`; the token count is an argument, so the
+line printed **7 times in 3 minutes** and would have printed once per distinct chunk size for the
+life of the process. Now gated by an explicit `_logged_first_hint` flag, with two tests: the line
+must not repeat across three token counts, and the one line it does print must carry the resolved
+`128/128` and not a pre-resolution `0/0`. **Process note:** the first version of that test passed a
+red control it should have failed — driving it through `prefetch_token_chunk` with chunk sizes
+64/4096 made those calls no-ops (the fixture's host row is 8 wide), so only one hint ever ran.
+Both red controls now verify the mutation applied (`cmp`) before trusting the run. 87 tests green
+(10 PLE + 29 mmap-shards + 15 prefetch + 33 GC-freeze), pre-commit clean, site-packages synced.
+No behaviour change: this is a log line and its test.
+
+**Verdict / action:** do not serve with `NCCL_PROTO`. Boot E should be boot C's command with the
+env var dropped — `GC_FREEZE=1 DRAFTER_GRAPHS=1 PLE_RANDOM=1 PLE_PREFETCH=1 BOOT_TRIES=1` — which
+is the best configuration measured on this box: **0.942 ms/token cold prefill (2.49x over A′),
+decode unchanged, 20.8 KiB NVMe per token (was ~1.03 MiB), GPU busy 87.8 % during prefill.**

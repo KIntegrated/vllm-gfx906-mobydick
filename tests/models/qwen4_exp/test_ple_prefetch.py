@@ -436,6 +436,78 @@ def test_rows_are_merged_into_runs_instead_of_one_syscall_per_row():
         ple_prefetch._libc = _REAL_LIBC
 
 
+class _SpyLogger:
+    """Capture what the prefetcher logs, without depending on vllm's logger."""
+
+    def __init__(self) -> None:
+        self.infos: list[str] = []
+        self.warns: list[str] = []
+
+    @staticmethod
+    def _fmt(msg: str, args: tuple) -> str:
+        return msg % args if args else msg
+
+    def info(self, msg, *args) -> None:
+        self.infos.append(self._fmt(msg, args))
+
+    def warning(self, msg, *args) -> None:
+        self.warns.append(self._fmt(msg, args))
+
+    def info_once(self, msg, *args) -> None:  # pragma: no cover - not used
+        self.info(msg, *args)
+
+
+def test_the_success_line_appears_once_per_process(tmp_path, monkeypatch):
+    """One line per process, not one line per distinct chunk size.
+
+    The first version used `logger.info_once`, which dedupes on
+    (message, args): because the token count is an argument, every new chunk
+    size printed another line. Boot D emitted seven in three minutes and was
+    on track for one per distinct chunk size for the life of the process. The
+    line is the only in-record signal that the read-ahead is live, so it has
+    to stay a signal and not become traffic.
+
+    The guard is exercised directly with three different token counts, because
+    driving it through `prefetch_token_chunk` would need a host row wide enough
+    for every size -- an earlier version of this test did that and quietly made
+    two of its three calls no-ops, which is how it passed a red control it
+    should have failed.
+    """
+    log = _SpyLogger()
+    monkeypatch.setattr(ple_prefetch, "logger", log)
+    with _file_backed(tmp_path) as emb:
+        pf = _prefetcher(emb)
+        for n in (8, 64, 4096):
+            pf._log_first_hint(n)
+    assert sum("read-ahead active" in m for m in log.infos) == 1, (
+        "the success line must not repeat once per distinct chunk size"
+    )
+
+
+def test_the_success_line_reports_the_resolved_shard_counts(tmp_path, monkeypatch):
+    """The line that proves the read-ahead is live must not print 0/0.
+
+    Resolution happens inside the first `prefetch_token_chunk`, so the counts
+    are only meaningful once a hint has actually been planned; printing them
+    before that would claim a working read-ahead over an empty shard table.
+    """
+    log = _SpyLogger()
+    spy = _SpyLibc()
+    monkeypatch.setattr(ple_prefetch, "logger", log)
+    monkeypatch.setattr(ple_prefetch, "_libc", lambda: spy)
+    with _file_backed(tmp_path) as emb:
+        pf = _prefetcher(emb)
+        host = np.zeros((1, 8), dtype=np.int32)
+        ctx = np.full(CTX_LEN, EOS, dtype=np.int64)
+        pf.prefetch_token_chunk(host, 0, 0, 8, ctx)
+        pf.drain()
+        assert spy.calls, "prefetch must have run for the line to mean anything"
+        active = [m for m in log.infos if "read-ahead active" in m]
+        assert len(active) == 1, f"expected one line, got {len(active)}"
+        assert "%d" not in active[0], "the line must be formatted, not a raw template"
+        assert f"{NUM_SHARDS}/{NUM_SHARDS}" in active[0], active[0]
+
+
 def test_a_working_read_ahead_reports_its_real_shard_counts(tmp_path, monkeypatch):
     """The one success log line must state counts that resolution produced.
 

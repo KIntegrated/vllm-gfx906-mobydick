@@ -174,11 +174,11 @@ class PleRowPrefetcher:
         self._disabled_reason: str | None = None
         self._hints = 0
         self._hint_rows = 0
-        # Kept as ints so the first-hint log line below costs nothing per step
-        # (`info_once` evaluates its arguments eagerly, and it is on the hot
-        # path: it runs once per scheduled chunk per rank).
+        # Kept as ints so the first-hint log line costs nothing per step (it
+        # runs once per scheduled chunk per rank); see `_log_first_hint`.
         self._shards_usable = 0
         self._shards_total = 0
+        self._logged_first_hint = False
 
     # ------------------------------------------------------------------ setup
     @property
@@ -382,19 +382,33 @@ class PleRowPrefetcher:
                     max_workers=1, thread_name_prefix="ple-prefetch"
                 )
             self._pool.submit(self._advise_guarded, ngram_ids)
-            # A read-ahead that works is otherwise invisible: it has no effect
-            # on output, and until now no line in the log proved it was live.
-            # (Verifying it meant a syscall tracepoint; see
-            # docs/prefill-io-wall.md sec 3e.) Once per process.
-            logger.info_once(
-                "PLE read-ahead active: hinting %d tokens' embedding rows from "
-                "%d/%d file-backed shards, one chunk ahead of the gather.",
-                n,
-                self._shards_usable,
-                self._shards_total,
-            )
+            self._log_first_hint(n)
         except Exception as exc:  # noqa: BLE001
             self.disable(f"prefetch worker unavailable ({exc})")
+
+    def _log_first_hint(self, n: int) -> None:
+        """Emit the one line that proves the read-ahead is live, once per process.
+
+        A read-ahead that works is otherwise invisible: it cannot change an
+        output, and verifying it meant a syscall tracepoint (see
+        docs/prefill-io-wall.md sec 3e, where boot C was nearly written off as
+        inert on a signal that did not exist).
+
+        An explicit flag, deliberately NOT `logger.info_once`: that dedupes on
+        (message, args), and the token count is one of the args, so "once" was
+        really "once per distinct chunk size" -- boot D printed it seven times
+        in three minutes.
+        """
+        if self._logged_first_hint:
+            return
+        self._logged_first_hint = True
+        logger.info(
+            "PLE read-ahead active: hinting %d tokens' embedding rows from "
+            "%d/%d file-backed shards, one chunk ahead of the gather.",
+            n,
+            self._shards_usable,
+            self._shards_total,
+        )
 
     def _advise_guarded(self, ids: torch.Tensor) -> None:
         """Worker entry point.
