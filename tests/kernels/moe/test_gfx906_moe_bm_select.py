@@ -9,11 +9,9 @@ depends on: a silent heuristic change would invalidate that A/B's control arm.
 """
 
 import pytest
-import torch
 
 from vllm.model_executor.layers.fused_moe.experts.gfx906_w4a16_moe import (
     _block_size_m_for,
-    _match_token_rows,
 )
 
 
@@ -48,22 +46,3 @@ def test_env_pin_rejects_a_non_template_bm(monkeypatch):
     monkeypatch.setenv("VLLM_GFX906_MOE_BM", "3")
     with pytest.raises(AssertionError, match="must be 1, 2, 4 or 8"):
         _block_size_m_for(16, 8)
-
-
-def test_padded_topk_ids_is_trimmed_to_hidden_states_rows():
-    """`REL30-1`: V2 capture hands the MoE a padded `topk_ids`.
-
-    `M` comes from `hidden_states.size(0)` while the align step sizes its
-    buffers from `topk_ids.numel()`. Untrimmed, the align builds blocks from
-    the unfilled rows, whose expert ids are garbage, and the GEMM indexes the
-    per-expert weight tables with them (page fault in
-    `moe_gemm_q4_kernel_gfx906`). 256 rows is the shape the 0.30.0 capture
-    actually passed to a 4-row `hidden_states`.
-    """
-    padded = torch.zeros((256, 8), dtype=torch.int32)
-    assert _match_token_rows(padded, 4).shape == (4, 8)
-
-
-def test_matching_topk_ids_is_passed_through():
-    ids = torch.zeros((4, 8), dtype=torch.int32)
-    assert _match_token_rows(ids, 4) is ids

@@ -35,25 +35,38 @@ state is ruled out; the fork's shipped config (recipes pin V1) is unaffected, an
 **eager** PPL probe under V2 (15.9840, 0 misses). The regression is in upstream's
 MRV2 FULL-graph capture path interacting with the fork's MoE kernel.
 
-**Root cause (2026-09-26, `degradation_details.md`):** the fork's `apply()`
-derives `em = M * topk` from `hidden_states.size(0)`, but sizes its alignment
-buffers from `topk_ids.numel()`. V2 capture now hands the MoE a **padded
-`topk_ids`** (256 rows to a 4-row `hidden_states`), so `moe_align_block_size`
-builds blocks from its *unfilled* rows — garbage expert ids — and the GEMM walks
-`b_q_weight + expert_id * stride` off the allocation (hence `num_token_blocks =
-2048` in the aborted `grid=[2048, 2, 8]`, `group_seg_size=528` ⇒ BM=1). Upstream's
-base `moe_problem_size` **asserts** `topk_ids.size(0) == a1.size(0)`; the fork's
-override drops the assert, so the violation passed silently.
+**Root cause, corrected (2026-09-26 late; the earlier `topk_ids`-padding theory
+was WRONG — `_match_token_rows` never fired and no Python-path launch ever had
+`ntb=2048`):** the fork's **fused M=1 align** (`_moe_align_block_size_fused_m1` →
+`torch.ops._rocm_C.moe_align_block_size_m1_gfx906`) leaves its output buffers
+**uninitialized** under the V2 compiled/captured path. Evidence: with C++-side
+instrumentation, the faulting call is shape-consistent (`bm=1 sm=1 sid=8 eid=8
+ntb=8 ntp=8`) but its buffers hold **float bit patterns** —
+`eid_vals: 1067139072 1067794432 1057521664 …` (valid range is `[0,256)`/`-1`).
+`expert_id ≈ 1e9` makes `b_q_weight + expert_id * expert_weight_stride` a wild
+pointer ⇒ `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` in
+`moe_gemm_q4_kernel_gfx906<1, N_PER_THREAD>`. M=2/M=4 calls (generic align) were
+always fine, which is why only the M=1 path died.
 
-**Fix:** `_match_token_rows()` in `gfx906_w4a16_moe.py` trims `topk_ids` to `M`
-rows before aligning (one-time warning). Unit-tested in
-`tests/kernels/moe/test_gfx906_moe_bm_select.py` (2 CPU-only cases). **End-to-end
-validation (35B V2 bench) is pending a host reboot** — both re-runs after the
-instrumented repro died ~43 s in with the boot's init-lottery
-`hipErrorLaunchFailure` (2 launch failures → house rule stop).
+**Discriminating runs (V2, same capture config):**
 
-**Interim:** the fork's serve recipes pin **V1** any case (`_serve_tp2_gfx906.sh`),
-which is clean at 60.42 t/s.
+| arm | result |
+|---|---|
+| default | fault, 4/4 |
+| `MOE_NPT=4` only | **still faults** ⇒ not the `<1,2>` tile |
+| `MOE_NPT=4 MOE_M1=0 ALIGN_M1=0` | **passes** |
+| **`ALIGN_M1=0` only** | **passes**, ids valid (`eid_vals: 1 2 2 2 …`), 43.7 t/s @tg128 |
+
+**Confirmed workaround:** `VLLM_GFX906_ALIGN_M1=0` (the documented opt-out,
++1.2–1.7 % cost when enabled).
+
+**Candidate proper fix (unvalidated — the validating run hit the load-lottery
+wedge):** the fork registers `register_fake` for its gemm op
+(`_moe_gptq_gemm_gfx906_fake`) but **not** for its align op, so the out-param
+mutation is not modelled under `torch.compile`. A `register_fake` for
+`_rocm_C::moe_align_block_size_m1_gfx906` is added in `vllm/_custom_ops.py`;
+validate with `/local/tmp/bench35b_fake.sh` after a reboot. If it does not fix
+it, ship `ALIGN_M1=0` under the V2 runner instead.
 
 ## V2 runner / mamba `align` (2026-09-17) — fix shipped
 

@@ -20,7 +20,6 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
-from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEActivationFormat,
     FusedMoEExpertsModular,
@@ -35,8 +34,6 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.platforms import current_platform
-
-logger = init_logger(__name__)
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import on_gfx906
@@ -145,26 +142,21 @@ def _block_size_m_for(M: int, topk: int) -> int:
     return 4
 
 
-def _match_token_rows(topk_ids: torch.Tensor, num_tokens: int) -> torch.Tensor:
-    """Trim `topk_ids` to the rows that `hidden_states` actually has.
-
-    The alignment step sizes its buffers from `topk_ids.numel()`, while the
-    GEMM's `em` comes from `hidden_states.size(0)`, so the two only agree when
-    `topk_ids.size(0) == num_tokens`. V2 graph capture can hand the MoE a
-    padded `topk_ids` buffer; the align would then build blocks from its
-    unfilled rows, whose expert ids are garbage, and the GEMM would index the
-    per-expert weight tables with them.
-    """
-    if topk_ids.size(0) == num_tokens:
-        return topk_ids
-    logger.warning_once(
-        "gfx906 MoE: topk_ids has %d rows but hidden_states has %d; using "
-        "the first %d rows",
-        topk_ids.size(0),
-        num_tokens,
-        num_tokens,
+def _dbg_dump(tag, M, topk, em, bm, N, K, topk_ids, sorted_token_ids, expert_ids):
+    if os.environ.get("VLLM_GFX906_MOE_DEBUG") != "1":
+        return
+    bag = globals().setdefault("_dbg_bag", {"n": 0})
+    bag["n"] += 1
+    try:
+        cap = torch.cuda.is_current_stream_capturing()
+    except Exception:
+        cap = "?"
+    print(
+        f"[moe {bag['n']} {tag} cap={cap}] M={M} topk={topk} em={em} bm={bm} "
+        f"N={N} K={K} tid={tuple(topk_ids.shape)} sid={sorted_token_ids.size(0)} "
+        f"eid={expert_ids.size(0)} ntb={sorted_token_ids.size(0) // bm}",
+        flush=True,
     )
-    return topk_ids[:num_tokens]
 
 
 class Gfx906WNA16Experts(FusedMoEExpertsModular):
@@ -330,7 +322,6 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
         # unchanged until a serving A/B at B=4 MTP k=3 pays for it.
         block_size_m = _block_size_m_for(M, topk)
         em = M * topk
-        topk_ids = _match_token_rows(topk_ids, M)
 
         if _use_fused_align_m1(
             topk_ids, block_size_m, global_num_experts, expert_map
@@ -356,6 +347,8 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
             w1_tw = empty_topk_w
             w2_tw = topk_weights.view(-1).float()
 
+        _dbg_dump("g1", M, topk, em, block_size_m, N, K, topk_ids,
+                  sorted_token_ids, expert_ids)
         # --- gemm1: [M, K] -> [M*topk, N] (atomic into zeroed workspace) ---
         w1_out = _resize_cache(workspace13, (em, N))
         w1_out.zero_()
@@ -385,6 +378,8 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
         # --- gemm2: [M*topk, N/2] -> [M, K] (fused weight + reduce) ---
         # output may alias workspace13's storage (see workspace_shapes):
         # safe because the activation above has finished reading w1_out.
+        _dbg_dump("g2", M, topk, em, block_size_m, N, K, topk_ids,
+                  sorted_token_ids, expert_ids)
         output.zero_()
         ops.moe_gptq_gemm_gfx906(
             act_out,

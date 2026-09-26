@@ -809,6 +809,22 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
         return int(torch.ops._rocm_C.take_moe_m1_dispatch_path())
 
 
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "moe_align_block_size_m1_gfx906"
+):
+
+    @register_fake("_rocm_C::moe_align_block_size_m1_gfx906")
+    def _moe_align_block_size_m1_gfx906_fake(
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        block_size: int,
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_tokens_post_pad: torch.Tensor,
+    ) -> None:
+        return
+
+
 def dense_gemv_gfx906(
     weight: torch.Tensor,
     x: torch.Tensor,
