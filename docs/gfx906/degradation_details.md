@@ -3259,3 +3259,22 @@ changes (upstream's MRV2 FULL-graph work, #51700 / #54646 / #56382 / #56312) for
 the fork-MoE interaction, and ship 0.30.0 with the V1 pin (as the recipes already
 do) plus a roadmap item. Clean pass → hypothesis (a), record the boot state and
 proceed with the release gates.
+
+**2026-09-26, fresh-boot discrimination (host reboot 08:08:39, 0 wedge events):**
+
+- **V2 retry on the fresh boot: same fault, harder error.** The 35B bench
+  aborted again during capture, this time reported as
+  `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION: The agent attempted to access
+  memory beyond the largest legal address` in the *same* kernel
+  (`moe_gemm_q4_kernel_gfx906<1, 2>`) — no journal page-fault lines, but the
+  same capture-phase abort. **This rules out hypothesis (a), host state: it is a
+  real 0.30.0 regression** in the MRV2 FULL-graph capture path for this model.
+- **V1 control on the fresh boot: clean, rc=0.** `VLLM_USE_V2_MODEL_RUNNER=0`
+  ran the identical bench to completion: **60.446 / 60.444 / 60.404 / 60.388 t/s**
+  (mean **60.42**) with no faults. (The merged worker logs
+  `Using V2 Model Runner` only for V2, so the V1 attribution is unambiguous.) So
+  the fork's shipped serving configuration — the recipes pin V1 — is unaffected,
+  and 0.30.0 is ~0.9 % faster than the 0.29 house number (59.77–59.86).
+
+**Verdict: `REL30-1` is a V2-only regression.** Ship 0.30.0 on the V1 pin (the
+shipped config); the V2 + 35B-MoE + FULL-capture fault stays a `DFL2-2` item.

@@ -7,6 +7,11 @@ measured on a single MI50 with ROCm 7.14, torch 2.13, single request,
 
 ## Release snapshots
 
+- **[`0.30.0-final`](RELEASE-0.30.0-final.md)** (2026-09-26) — the first release on
+  the merged upstream **0.30.0** base (31-conflict merge train): GPTQ act-order
+  adopted-out, the MiniMax-M3 gfx906 re-port, and the 35B house bench at
+  **60.42 t/s** on the **V1** runner. Ships on V1 — V2 + 35B MoE + FULL-graph
+  capture faults (`REL30-1`).
 - **[`0.29.0-final`](RELEASE-0.29.0-final.md)** (2026-09-18) — the last snapshot of
   the 0.29.0 line: the V2 mamba `align` fix, `SKINNY_M16` and C4 default-on, the
   0.30.0 conflict review, and the merge-prep sweep rule. The Qwen3.8-Flash-Next /
@@ -41,7 +46,7 @@ Reference point: llama.cpp (Q4_K_XL GGUF, full offload) — **70.3 t/s decode,
 | MoE prefill (pp=2048) | ~450 t/s | **~2140 t/s** | 4.7× | llama.cpp 806.5 (2.7× ahead) |
 | Dense serving decode | 18.89 t/s | **25.60 t/s** | +35% | — |
 | MoE concurrent decode (N=8) | 166.9 t/s (W4 off) | **191.0 t/s** | +14.5% | W4 skinny fp16 M≤16 (`VLLM_GFX906_SKINNY_M16`; **default on 2026-09-18**, `=0` kill switch; soak-verified; `DEVLOG-fp16-skinny.md`) |
-| MoE serving decode, layer-0 experts quantized | 84.95 t/s | **87.51 t/s** | +3.0% | C4 (`VLLM_GFX906_QUANT_LAYER0_MOE`; **default on 2026-09-18**, `=0` kill switch; PPL 15.9531 → 15.9929, fingerprint bit-identical; `DEVLOG-c4-layer0-quant.md`). **Reference-workload effect:** the pp2048/tg256 4-sample house bench read **59.79 t/s** after the flip vs 58.40 before (+2.4 %) |
+| MoE serving decode, layer-0 experts quantized | 84.95 t/s | **87.51 t/s** | +3.0% | C4 (`VLLM_GFX906_QUANT_LAYER0_MOE`; **default on 2026-09-18**, `=0` kill switch; PPL 15.9531 → 15.9929, fingerprint bit-identical; `DEVLOG-c4-layer0-quant.md`). **Reference-workload effect:** the pp2048/tg256 4-sample house bench read **59.79 t/s** after the flip vs 58.40 before (+2.4 %); **re-measured on the 0.30.0 line, V1: 60.42 t/s** (60.446/60.444/60.404/60.388) |
 
 Correctness gates: PPL on a fixed 442-token probe — MoE band 6.6817–6.6942,
 dense band 6.6993–6.7197; on the 0.29.0 line the in-process probe is
@@ -49,15 +54,14 @@ dense band 6.6993–6.7197; on the 0.29.0 line the in-process probe is
 tests** (2026-09-15, default config) and 43/43 MoE GEMM (2026-08-24, not re-run
 since).
 
-**Release basis — 0.29.0 line (2026-09-16).** The V2 model runner is the default
-for the validated models (Qwen3.8-27B dense, MoE 35B, Nemotron 3.5 Lightning,
-Ornith; parity in [`V2-bringup.md`](V2-bringup.md)); **Gemma-4 was validated for V2 on
-2026-09-15** through a *templated* V1/V2 comparison (identical answers and logprobs —
-see the prompt-format note below), and **Muse-Glimmer's V1 pin was lifted 2026-09-16**
-(serving A/B: TTFT at parity, decode −1.8 % @2k / −1.0 % @8k, KV pool 53 k vs 68 k
-tokens — accepted because upstream removes V1 in **0.32.0**). **No model is pinned to V1
-any more.** VIT-1 (ViT attention on the custom FA) is on by default. See ROADMAP
-`DFL2-2` / `GEMMA4-1` / `MUSE-1`.
+**Release basis — 0.30.0 line (2026-09-26).** The upstream base defaults to Model
+Runner **V2**; on this fork the 35B MoE faults under V2 during FULL-graph capture
+(`REL30-1`), so the release is validated and shipped on **V1**
+(`VLLM_USE_V2_MODEL_RUNNER=0`, which every serve recipe pins). V2 remains the
+default for the small models (Qwen3.8-27B dense, and the PPL probes above run V2);
+Muse-Glimmer's V1 pin was lifted 2026-09-16 and V1 is removed upstream in
+**0.32.0**. VIT-1 (ViT attention on the custom FA) is on by default. See ROADMAP
+`REL30-1` / `DFL2-2` / `GEMMA4-1` / `MUSE-1`.
 
 ## Model support status (single MI50, MI60 numbers similar)
 

@@ -1,6 +1,8 @@
 ## Mini Install Guide for GFX906
 
-**0.29.0 line.** MI50/MI60 (gfx906) cards; single-GPU is the normal mode, TP=2 is
+**0.30.0 line** — release snapshot [`RELEASE-0.30.0-final.md`](docs/gfx906/RELEASE-0.30.0-final.md)
+(the merged upstream 0.30.0 base; the 35B house bench is validated on the **V1**
+runner, see `REL30-1`). MI50/MI60 (gfx906) cards; single-GPU is the normal mode, TP=2 is
 supported for the dense models (see the TP=2 notes below).
 
 - **Stack:** ROCm **7.14** with the **official AMD DKMS `amdgpu` driver (6.19.14)**
