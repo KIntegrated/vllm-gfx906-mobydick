@@ -653,3 +653,44 @@ itself from starting a second engine while :9000 answers, and boot D was live th
 **Action this supersedes:** the boot E command in the boot D entry above. It is now
 **`OPTIMIZED=1 ./run-vllm`**, which is boot C's configuration in one word (`BOOT_TRIES` already
 defaults to 1). To get the known-good box instead: `./run-vllm`, no variables at all.
+
+### 2026-09-26 15:01 — boot E: first `OPTIMIZED=1` boot, and the first prefill measurement broken out per prompt size
+
+**Class:** SW/**improvement** (config change, no engine code change). **Trigger:** operator relaunched
+with the new switch after boot D proved `NCCL_PROTO=LL` is a net loss.
+
+Boot E is the first log written by the manifest code: `vllm.log.20260926-150144` opens with
+`OPTIMIZED=1`, the four bundle knobs each tagged `[bundle]`, `proto=<unset>` (LL gone), launcher sha
+`878cf5e2f819`. pid 3315100, graphs PIECEWISE, 32 `froze` lines, health 200.
+
+**Prefill, `scripts/probe-prefill.py`, min of 3 cold (un-cacheable random) prompts, 15:11–15:18:**
+
+| prompt | tokens | cold TTFT (min) | absolute rate | ms/token |
+| --- | --- | --- | --- | --- |
+| 4 KB | 4,370 | 6.55 s | 667 tok/s | 1.499 |
+| 8 KB | 8,724 | 12.16 s | 718 tok/s | 1.393 |
+| 16 KB | 17,458 | 18.87 s | 925 tok/s | 1.081 |
+| 32 KB | 34,873 | 36.28 s | 961 tok/s | 1.040 |
+
+Marginal (two-point, min-based): 4→8 KB **1.287 ms/token (777 tok/s)**, 8→32 KB **0.923 ms/token
+(1,084 tok/s)**, 16→32 KB 1.000 ms/token. Request floor 108–117 ms. Prefix-cache hit on the same
+text: 34,873 tokens in 2.56 s (92.9 % saved).
+
+**The marginal agrees with boot C to 2 %** (0.923 vs 0.942 ms/token), so boot C's configuration
+reproduces, and boot D's 1.088 is confirmed as the `NCCL_PROTO=LL` penalty (+18 % on this pair).
+
+**Two things this run makes visible that the single-slope number hid:**
+
+1. **Cold prefill gets faster as the prompt gets longer** — 667 tok/s at 4 KB rising to 961 tok/s at
+   32 KB, a 44 % spread. It is not the request floor (117 ms out of 12.2 s at 8 KB) and it is not
+   attention being cheaper (quadratic attention should push the other way). Two candidate mechanisms
+   are not yet separated: (a) the first chunks of a request hit **cold PLE table pages** before the
+   read-ahead is ahead of the gather, so early tokens pay faults that later tokens do not; (b) **GPU
+   clock/power ramp** — a 6.5 s request never reaches the steady-state clocks a 36 s request does.
+   The discriminator would be a 2 KB and a 64 KB point plus per-chunk timing; not run yet.
+   Practical consequence: quoting one "prefill tok/s" for this box is wrong by up to ±25 % depending
+   on prompt length — always say which size.
+2. **Warm (prefix-hit) numbers are single-shot and must be read as upper bounds only**: this run
+   measured a 4 KB warm re-send at 4.30 s and a 32 KB warm re-send at 2.56 s, which is not a physical
+   ordering for cache hits. Earlier multi-rep work put the 34,873-token hit at ~2.4 s, matching this
+   run; the 4 KB point is the outlier and was taken while this agent's own session was decoding.
