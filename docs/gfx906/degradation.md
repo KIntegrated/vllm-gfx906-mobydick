@@ -459,3 +459,41 @@ default-off per operator decision, so they never appear unless typed). Verifying
 the process rather than from intent converted a confounded ladder into an extra arm — and it is
 the same discipline that caught A′'s 32 `froze` lines and KV 399,419 as the confirmation that
 the knobs really were on.
+
+## 2026-09-26 10:08 — boot B: `VLLM_GFX906_PLE_MADV_RANDOM=1` measured at **1.63x prefill**, decode unchanged — largest prefill win on this box
+
+**Class:** SW/**improvement**. **Trigger:** the PLE ladder, boot B (one variable over A′).
+**Health:** 200 after boot; 0 tracebacks/segfaults/CUDA errors in `vllm.log.20260926-100847`;
+graphs **PIECEWISE**; 32 `froze` lines; KV **399,419** (identical to A′, confirming a
+single-variable change); PLE fold warnings limited to the 4 capture-time `span [-1,-1]` drafter
+sentinels, same as A′; smoke test OK at B=1/2/3 with distinct output.
+
+| | **A′** baseline | **B** `PLE_MADV_RANDOM=1` | factor |
+| --- | --- | --- | --- |
+| marginal cold prefill | 2.346 ms/tok (426 tok/s) | **1.439 ms/tok (695 tok/s)** | **1.63x** |
+| 8 KB cold TTFT (min of 3) | 22 011 ms | **13 676 ms** | 1.61x |
+| 32 KB cold TTFT (min of 3) | 83 326 ms | **51 471 ms** | 1.62x |
+| NVMe read per prefill token | 1.03 MiB (09-25 arm) | **36.7 KiB** | **28.7x less** |
+| decode B=1 / B=2 / B=3 | 50.32 / 76.56 / 100.30 | 50.68 / 76.46 / 103.58 | unchanged |
+
+**Both prompt sizes moved by the same factor** (1.61x / 1.62x across a 4x span of prompt length).
+That is what a genuine per-token cost change looks like; a page-cache artifact would favor one
+size. Decode is flat, which is the expected shape — decode touches 16 ids/token against a table
+that is mostly already resident.
+
+**The knob was verified by effect, because it cannot be verified by state:** this kernel's
+`/proc/<pid>/smaps` prints no `MM:` line and `VmFlags` exposes no rand bit, so `VM_RAND_READ` is
+not readable back. Measured traffic is 28.7x lower, which is read-ahead-size over page-size
+(128 KiB / 4 KiB = 32, less the useful fraction) — the exact signature of the mechanism, plus the
+per-rank log line at `ple_layer.py:194`. New instrument: `scripts/probe-ple-io.py`.
+
+**Better than the published prediction, and the prediction is left in place:** §3a of
+`docs/prefill-io-wall.md` forecast 1.29x from the isolated gather bench. Live is 1.63x. The
+delta is read-ahead *cache churn* — at 32x amplification the scan was evicting its own useful
+pages, which a one-chunk private-mapping bench cannot show. Recorded as a lesson: **an isolated
+microbenchmark that measures bytes saved will under-predict a change whose real cost is cache
+pollution.**
+
+**Standing:** still default-off (opt-in rule). It is now the strongest argument for making
+`PLE_RANDOM=1` the recommended deployment setting; that is the operator's call. Boot C
+(`PLE_PREFETCH=1`) measures on top of this arm.
