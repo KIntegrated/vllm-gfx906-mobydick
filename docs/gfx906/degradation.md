@@ -539,3 +539,22 @@ session; a single decode run is not evidence, three reps minimum.
 **Standing:** `PLE_PREFETCH` stays default-off (opt-in rule). Cumulative effect of the two
 default-off PLE knobs on cold prefill is now **2.49x** (426 to 1,061 tok/s) with decode
 unchanged. Whether to recommend them as deployment settings is the operator's call.
+
+### 2026-09-26 12:00 — launcher: `run-vllm` no longer claims "NCCL left at RCCL defaults" when the shell handed it an NCCL_* value
+
+**Class:** tooling, no behaviour change. **Why now:** boot D is planned as
+`NCCL_PROTO=LL` inherited through the shell with `NCCL_ENVELOPE=0`, and the launcher's only
+line for that path printed "NCCL left at RCCL defaults" — which would have put a false
+statement in the boot record of exactly the boot whose whole question is whether a non-default
+proto is in effect. (Inheriting `NCCL_PROTO` is legitimate here — the script only assigns
+`NCCL_PROTO` inside the `NCCL_ENVELOPE=1` branch — but it was invisible.)
+
+The `NCCL_ENVELOPE=0` branch now prints `NCCL INHERITED from the calling shell: algo=... proto=...
+max_nchannels=...` when any of the three is set in the environment, and the old sentence only
+when none is. Verified by extracting the block and running it under four arms: nothing set
+(defaults line), `NCCL_PROTO=LL` (inherited line), `NCCL_ENVELOPE=1` (envelope line unchanged),
+`NCCL_PROTO=LL,Simple` (inherited line, value preserved verbatim). `bash -n` clean, 971 → 978
+lines, all knob markers present (`PLE_PREFETCH`, `PLE_RANDOM`, `GC_FREEZE`, `DRAFTER_GRAPHS`,
+`PREFLIGHT`, `NCCL_ENVELOPE`, `BOOT_TRIES`), diff against the pre-edit copy is the one block.
+`run-vllm` is the operator's launcher outside the repo, so this is a log entry, not a commit;
+pre-edit copy kept at `/tmp/run-vllm.pre-nccl-echo`.
