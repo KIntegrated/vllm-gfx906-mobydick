@@ -497,3 +497,45 @@ pollution.**
 **Standing:** still default-off (opt-in rule). It is now the strongest argument for making
 `PLE_RANDOM=1` the recommended deployment setting; that is the operator's call. Boot C
 (`PLE_PREFETCH=1`) measures on top of this arm.
+
+### 2026-09-26 11:15-11:45 — Boot C (`PLE_PREFETCH=1`): the read-ahead is worth 1.53x on top of MADV_RANDOM, and a false alarm about an instrument
+
+**Event:** boot C (pid 3226723, `GC_FREEZE=1 DRAFTER_GRAPHS=1 PLE_RANDOM=1 PLE_PREFETCH=1`,
+no `NCCL_PROTO`), the third arm of the ladder. One variable versus boot B; KV identical at
+399,419, PIECEWISE graphs, 32 `froze` lines, 0 errors.
+
+**Measured:** marginal cold prefill **0.942 ms/token = 1,061 tok/s** (replicated three times:
+0.939 / 0.946 / 0.942, 0.7% spread) against boot B's 1.439 and boot A''s 2.346 — so
+**1.53x over B and 2.49x over the A' baseline**. NVMe traffic went *down* again, 36.7 to
+**20.8 KiB per prefill token** (min of 3 at 32 KB), and GPU busy during a cold prefill rose
+from ~60% pre-knobs to **87.8%**. Decode is flat as required: B=1 49.46 (B was 50.68), B=2
+76.58/76.67/77.30 (76.46), B=3 median 101.71 (103.58); the 400-token temp=0.7 coherence smoke
+passed 8/8 distinct lines three times.
+
+**Both pre-registered predictions were wrong, in opposite directions.** Magnitude: the isolated
+bench said +17%, live is +53% over B — the bench measures one chunk whose host thread still
+waits for its own hints, so it can only score coalescing, while live the hints for chunk N+1
+land during chunk N's ~130 ms of GPU compute and hide the next chunk's fault latency entirely.
+Direction: I predicted traffic would *rise* and made "traffic up, time flat" the tell for a
+useless hint stream; traffic fell 43% instead. The best available story is duplication — at 4 KiB
+per fault the unhinted scan is slow enough that its own useful pages are evicted before the
+gather reaches them — consistent with why boot B also beat its prediction, but *not isolated*.
+
+**False alarm, recorded because it cost 20 minutes and the trap is generic:** I concluded the
+prefetcher was inert because `/proc/<worker>/task/*/comm` contained no `ple-prefetch` thread.
+**CPython 3.12 does not propagate `threading.Thread` names to the OS thread name** — every
+Python-spawned thread reads back as `python` (proved locally; only native threads like
+`pt_gloo_runloop` name themselves). The feature was live the whole time. The instrument that
+does work is the syscall tracepoint: `perf stat -a -e 'syscalls:sys_enter_fadvise64' sleep 100`
+around one cold prefill counted **1,734,526** calls against an idle baseline of ~5 per 10 s.
+Code consequence fixed here: the read-ahead now logs once per process on the first hinted chunk,
+with the shard counts it resolved, so a working read-ahead is visible in the log instead of
+requiring `perf`. Test added asserts those counts are the real ones.
+
+**Contamination, kept in the record:** one B=2 decode run read 8.20 tok/s and its re-run 68.32
+against a clean 76.6. This box has 15 users, a co-resident `llama-server` and this agent's own
+session; a single decode run is not evidence, three reps minimum.
+
+**Standing:** `PLE_PREFETCH` stays default-off (opt-in rule). Cumulative effect of the two
+default-off PLE knobs on cold prefill is now **2.49x** (426 to 1,061 tok/s) with decode
+unchanged. Whether to recommend them as deployment settings is the operator's call.
