@@ -87,6 +87,11 @@ the installed `.so` still carried the pre-merge `gptq_gemm(..., b_g_idx)` /
   the path #54809 rewrote): PPL 10.5472** (359 tokens, **0 top-20 misses**), in the
   recorded band (10.5516 / 10.5472). This exercises `ops.gptq_shuffle` +
   `ops.gptq_gemm` end-to-end on the new 2-arg / 7-arg signatures.
+- **Qwen3.5-35B-A3B-AWQ (MoE, the flagship): PPL 15.9840** (359 tokens, **0 top-20
+  misses**), inside the recorded C4 flip pair (15.9361 ON / 16.0169 OFF). This is
+  the run that exercises the **gfx906 MoE WNA16 path** after the merge:
+  `_process_weights_gfx906`'s new 10-tuple, the `int_wna16` oracle gates, and
+  `moe_gptq_gemm_gfx906`.
 - **TP=2 Qwen3.8-27B-AWQ-INT4 re-measure** (MTP k=3 default, filler, prefix caching
   OFF, bt4096, max-seqs 4, util 0.82, capture `[4,8,12,16]`, maxlen 131072):
   **2k 79.1 · 64k 42.0 · 120k 40.7 t/s** decode; TTFT 4.2 / 185.3 / 442.2 s;

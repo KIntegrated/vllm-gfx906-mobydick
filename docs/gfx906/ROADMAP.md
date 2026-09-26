@@ -134,16 +134,21 @@ merge commit body + `CHANGELOG.md` 2026-09-24; outcome notes appended to
 
 **Open follow-ups from the merge (the base is validated on one model, not all):**
 
-- **GLM53-QGEMM-1 (partly closed 2026-09-24):** #54809 removed GPTQ
+- **GLM53-QGEMM-1 (CLOSED 2026-09-26):** #54809 removed GPTQ
   group/dynamic activation ordering upstream, so the fork adopted the removal and
-  **gfx906 GPTQ act-order checkpoints no longer load/serve**. The M=1 4-bit
-  max-ilp dispatch was re-ported onto the new kernel signature (no `b_q_perm`) and
-  the gfx906 AWQ path updated to the new `gptq_gemm`/`gptq_shuffle` arity.
-  **Validated:** Qwen3.8-27B-AWQ-INT4 (compressed-tensors pack-quantized →
-  `ExllamaLinearKernel`) loads and scores **PPL 10.5472** (359 tok, 0 top-20
-  misses, in band) and serves TP=2 (2k 79.1 / 64k 42.0 / 120k 40.7 t/s, MTP k=3).
-  **Still open:** the Minimax-M3-AWQ / Qwen3.5-AWQ checkpoints (different
-  compressed-tensors/WNA16 oracle paths) have not been run since the merge.
+  **gfx906 GPTQ act-order checkpoints no longer load/serve** (the validator now
+  fails loudly rather than mis-dequantizing). The M=1 4-bit max-ilp dispatch was
+  re-ported onto the new kernel signature (no `b_q_perm`) and the gfx906 AWQ path
+  updated to the new `gptq_gemm`/`gptq_shuffle` arity. **Validated on both fork
+  model families:** Qwen3.8-27B-AWQ-INT4 **PPL 10.5472** (dense `ExllamaLinearKernel`,
+  0 top-20 misses) and Qwen3.5-35B-A3B-AWQ **PPL 15.9840** (MoE WNA16,
+  `_process_weights_gfx906` 10-tuple + `moe_gptq_gemm_gfx906`, 0 misses); TP=2
+  serving re-measured (2k 79.1 / 64k 42.0 / 120k 40.7 t/s, MTP k=3). Residual:
+  `tests/kernels/quantization/test_gptq.py` is only an opcheck, so the `empty` +
+  in-kernel-`blockIdx.z==0` zeroing in `q_gemm.cu` (a fork design that replaced
+  upstream's `new_zeros`; the zeroing races the epilogue `atomicAdd` in
+  principle, held safe only by the K-loop between them) has no dedicated numeric
+  gate - the model PPLs above are the evidence.
 - **QSA-FN-14 (gate CLOSED 2026-09-26; full model load still untested):**
   `rocm_aiter_mla_sparse.py` adopted upstream's sink / `_forward_mla` rewrite
   with the fork's opt-in `VLLM_ROCM_MLA_SPARSE_FP16` reference-Torch early-return
