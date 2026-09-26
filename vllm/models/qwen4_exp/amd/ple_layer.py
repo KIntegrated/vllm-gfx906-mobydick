@@ -70,6 +70,60 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
         return (normalized * (1.0 + self.weight.float())).to(input_dtype)
 
 
+_PAGE_SIZE = 4096
+_MADV_RANDOM = 1
+
+
+def _advise_random(tensor: torch.Tensor) -> tuple[bool, int, str]:
+    """Tell the kernel that ``tensor``'s pages will be read in random order.
+
+    Returns ``(ok, advised_bytes, detail)``, where ``detail`` explains the
+    failure. Never raises: the caller only logs. Sizes are returned in bytes
+    and formatted at the log site, so a small test tensor cannot round to 0.
+
+    The ngram table is ~99 GiB of bf16 rows (160 columns = 320 B/row) gathered
+    at random out of an ``mmap``'d safetensors mapping, which is far larger
+    than this node's page cache: every lookup is a cold random fault. On a
+    fault the kernel reads a whole read-ahead window (128 KiB by default) and
+    the next touch is in a different shard, so the window is thrown away. On
+    2026-09-25 that cost **1.03 MB of NVMe per prefill token at ~28x
+    amplification**, and the GPUs sat at 0 % busy for ~18 of every 29 sampled
+    seconds of a cold prefill -- prefill was I/O-serialized, not compute-bound
+    (docs/prefill-io-wall.md).
+
+    ``MADV_RANDOM`` sets ``VM_RAND_READ`` on the mapping, which makes
+    ``do_sync_mmap_readahead()`` fetch the single faulted page and skips
+    fault-around. Measured on a real shard, cold cache, 300 scattered touches:
+    **32.3 MiB -> 1.0 MiB read (27.6x -> 0.9x), 43 ms -> 24 ms**, with the
+    fault count unchanged.
+
+    It is the per-file form of shrinking the read-ahead window, and it is the
+    only form that works here: ``file_ra_state.ra_pages`` is latched when the
+    file is opened, so setting ``/sys/block/*/queue/read_ahead_kb`` after the
+    engine has started does nothing to an already-mmap'd table.
+
+    This is advisory and cannot corrupt anything -- it changes only the kernel's
+    read-ahead heuristic, never the bytes returned. A failure is not fatal and
+    is reported once by the caller.
+    """
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    libc.madvise.restype = ctypes.c_int
+    ptr = tensor.data_ptr()
+    nbytes = tensor.numel() * tensor.element_size()
+    if ptr == 0 or nbytes == 0:
+        return False, 0, "tensor has no storage"
+    start = ptr & ~(_PAGE_SIZE - 1)
+    length = (ptr - start) + nbytes
+    rc = libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(length), _MADV_RANDOM)
+    if rc != 0:
+        errno = ctypes.get_errno()
+        return False, 0, f"madvise failed: errno {errno} ({os.strerror(errno)})"
+    return True, length, f"{length} bytes"
+
+
 class MmapShardedNGramEmbedding(nn.Module):
     """CPU-resident PLE ngram embedding backed directly by mmap'd safetensors
     shard tensors, with no TP sharding and no copying. Every rank maps the
@@ -90,6 +144,8 @@ class MmapShardedNGramEmbedding(nn.Module):
         self.params_dtype: torch.dtype | None = None
         self._shards: list[torch.Tensor | None] = [None] * num_shards
         self._warned_bad_ids = False
+        self._madvise_reported = False
+        self._advised_bytes = 0
 
     def set_shard(self, shard_index: int, tensor: torch.Tensor) -> None:
         if tensor.device.type != "cpu":
@@ -105,6 +161,43 @@ class MmapShardedNGramEmbedding(nn.Module):
                 f"match previously loaded shards' dtype {self.params_dtype}"
             )
         self._shards[shard_index] = tensor
+        self._advise_shard(shard_index, tensor)
+
+    def _advise_shard(self, shard_index: int, tensor: torch.Tensor) -> None:
+        """Apply ``MADV_RANDOM`` to one shard if asked to. Off by default.
+
+        ``VLLM_GFX906_PLE_MADV_RANDOM=1`` opts in; with the variable unset the
+        mapping is left exactly as the kernel configured it, which is the
+        behaviour every existing deployment expects. Opting in cannot change
+        model output -- read-ahead affects how many bytes the kernel fetches,
+        not which bytes -- so the knob exists to make the A/B reversible from
+        the launch environment rather than because the change is risky.
+        """
+        if os.environ.get("VLLM_GFX906_PLE_MADV_RANDOM", "0") != "1":
+            return
+        ok, advised, detail = _advise_random(tensor)
+        if not ok:
+            if not self._madvise_reported:
+                self._madvise_reported = True
+                logger.warning(
+                    "PLE ngram table: MADV_RANDOM could not be applied to shard "
+                    "%d (%s). The read path keeps working with the kernel's "
+                    "default read-ahead window; see docs/prefill-io-wall.md.",
+                    shard_index,
+                    detail,
+                )
+            return
+        self._advised_bytes += advised
+        if not self._madvise_reported:
+            # First shard only: 128 shards x 4 ranks would otherwise be 512 lines.
+            self._madvise_reported = True
+            logger.info(
+                "PLE ngram table: MADV_RANDOM is enabled "
+                "(VLLM_GFX906_PLE_MADV_RANDOM=1). The kernel will fetch one page "
+                "per fault instead of a read-ahead window, which on this box is "
+                "the difference between ~28x read amplification and ~1x on a "
+                "table larger than the page cache."
+            )
 
     # Ids outside [0, num_shards * shard_row_capacity) have two known producers,
     # both legitimate, and neither is corruption of the table:
