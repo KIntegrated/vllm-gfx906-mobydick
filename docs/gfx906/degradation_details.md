@@ -3278,3 +3278,52 @@ proceed with the release gates.
 
 **Verdict: `REL30-1` is a V2-only regression.** Ship 0.30.0 on the V1 pin (the
 shipped config); the V2 + 35B-MoE + FULL-capture fault stays a `DFL2-2` item.
+
+## `REL30-1` root cause (2026-09-26): padded `topk_ids` rows make the gfx906 MoE walk off the expert tables
+
+**VERDICT: a real 0.30.0 V2-only regression in the fork's `Gfx906WNA16Experts`, not
+host state and not the kernel.** Reproducible on a fresh boot; the V1 path is clean
+(60.42 t/s). Root-caused with an env-gated shape dump in
+`vllm/model_executor/layers/fused_moe/experts/gfx906_w4a16_moe.py`.
+
+**Evidence chain.**
+
+1. The aborted launch is `moe_gemm_q4_kernel_gfx906<1, 2>` with `grid=[2048, 2, 8]`,
+   `group_seg_size=528`. `528 = BLOCK_SIZE_M * (256 + 8) * 2`, so **BLOCK_SIZE_M = 1**;
+   `grid.y = cdiv(size_n, 256*2) = 2` and `grid.z = cdiv(size_k, 256) = 8` pin it to
+   **gemm1** (N=1024, K=2048). `grid.x = num_token_blocks = 2048`.
+2. `num_token_blocks = sorted_token_ids.size(0) / block_size_m` — a host-side bound
+   (`csrc/rocm/moe_q_gemm_gfx906.cu:894`). With `block_size_m = 1`, the align buffer
+   held **2048** entries.
+3. `moe_align_block_size` sizes that buffer from **`topk_ids.numel()`**, while the
+   fork's `apply()` derives `em = M * topk` from **`hidden_states.size(0)`**. The two
+   agree only when `topk_ids.size(0) == hidden_states.size(0)`.
+4. `BLOCK_SIZE_M = 1` requires `em <= 32` (`_block_size_m_for`), i.e. `M <= 4`, so
+   `topk_ids.numel() = 2048` **cannot** come from `M*topk` — it requires
+   **`topk_ids.size(0) = 256`** while `hidden_states` had <= 4 rows. The align then
+   builds blocks from the *unfilled* rows of the padded buffer, whose expert ids are
+   garbage; the kernel computes `b_q_weight + expert_id * expert_weight_stride` and
+   reads far outside the allocation → page fault / aperture violation.
+5. The shape dump confirms every non-faulting call is consistent
+   (`M=8→tid=(8,8)/ntb=64`, `M=4→ntb=32`, `M=2→ntb=16`, profiling `M=4096→ntb=4320`);
+   only the faulting capture phase has the mis-sized align.
+
+**Why 0.30 and not 0.29.** Upstream's base `FusedMoEExpertsModular.moe_problem_size`
+**asserts** `topk_ids.size(0) == a1.size(0)`; the fork **overrides** that method
+without the assert, so the contract violation passes silently. V2's new input-batch /
+capture machinery (`vllm/v1/worker/gpu/input_batch.py`, FULL capture for microbatched
+steps #51700, warm-before-capture #55341) is what now hands the MoE a topk_ids with
+more rows than `hidden_states`.
+
+**Fix (implemented, awaiting validation).** In `Gfx906WNA16Experts.apply()`, restore
+the contract before aligning:
+
+```python
+if topk_ids.size(0) != M:
+    topk_ids = topk_ids[:M]
+```
+
+so the align buffers are sized from the same token count the GEMM uses. **Validation
+is blocked**: both attempts to re-run the 35B bench after the fault died ~43 s in with
+the boot's init-lottery `hipErrorLaunchFailure` (broken-amdsmi); a host reboot is
+needed.

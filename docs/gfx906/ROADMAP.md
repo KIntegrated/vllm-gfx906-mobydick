@@ -35,8 +35,25 @@ state is ruled out; the fork's shipped config (recipes pin V1) is unaffected, an
 **eager** PPL probe under V2 (15.9840, 0 misses). The regression is in upstream's
 MRV2 FULL-graph capture path interacting with the fork's MoE kernel.
 
-**Action:** ship 0.30.0 on the V1 pin (as `_serve_tp2_gfx906.sh` and every recipe
-already do); track the V2 + MoE + capture fault under `DFL2-2`.
+**Root cause (2026-09-26, `degradation_details.md`):** the fork's `apply()`
+derives `em = M * topk` from `hidden_states.size(0)`, but sizes its alignment
+buffers from `topk_ids.numel()`. V2 capture now hands the MoE a **padded
+`topk_ids`** (256 rows to a 4-row `hidden_states`), so `moe_align_block_size`
+builds blocks from its *unfilled* rows — garbage expert ids — and the GEMM walks
+`b_q_weight + expert_id * stride` off the allocation (hence `num_token_blocks =
+2048` in the aborted `grid=[2048, 2, 8]`, `group_seg_size=528` ⇒ BM=1). Upstream's
+base `moe_problem_size` **asserts** `topk_ids.size(0) == a1.size(0)`; the fork's
+override drops the assert, so the violation passed silently.
+
+**Fix:** `_match_token_rows()` in `gfx906_w4a16_moe.py` trims `topk_ids` to `M`
+rows before aligning (one-time warning). Unit-tested in
+`tests/kernels/moe/test_gfx906_moe_bm_select.py` (2 CPU-only cases). **End-to-end
+validation (35B V2 bench) is pending a host reboot** — both re-runs after the
+instrumented repro died ~43 s in with the boot's init-lottery
+`hipErrorLaunchFailure` (2 launch failures → house rule stop).
+
+**Interim:** the fork's serve recipes pin **V1** any case (`_serve_tp2_gfx906.sh`),
+which is clean at 60.42 t/s.
 
 ## V2 runner / mamba `align` (2026-09-17) — fix shipped
 
