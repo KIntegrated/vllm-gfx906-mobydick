@@ -3208,3 +3208,54 @@ i.e. the failure happened at/after the weight-load boundary rather than at key m
 **Interpretation:** the same boot's load lottery as #68-#95 (this is a 5-hour-old boot with several wedges today, exactly the state where the degradation rule predicts load failures) (this INT8 checkpoint adds a new load path:
 401 packed tensors + a Triton dequant-gather embedding kernel are staged at load time). One authorized retry
 followed; a second consecutive genuine load failure would be a BURST (stop GPU work, reboot).
+
+## 2026-09-26 — 35B MoE graph-capture page fault on the 0.30.0 base (new signature)
+
+Boot 2026-09-24 19:00, ~36 h up, no passwordless sudo. Context: the **0.30.0
+release gate** `_bench_gfx906.py /data/models/QuantTrio/Qwen3.5-35B-A3B-AWQ`
+(`BENCH_EAGER=0 BENCH_GPU_UTIL=0.95 BENCH_SAMPLES=4 BENCH_PP=2048 BENCH_TG=256
+BENCH_MAX_SEQS=32`, V2 default, `cudagraph_mode=FULL_DECODE_ONLY`).
+
+**Signature (reproducible, 2/2 V2 runs).** During the FULL-graph capture phase
+(after `Capturing CUDA graphs (FULL) 3/4`), the ROCm runtime reports:
+
+```
+Memory Fault Error [host: mi50-01, GPU index: 0, faulting addr: 0x784758401000,
+ kernel: void vllm::moe_gptq_gfx906::moe_gemm_q4_kernel_gfx906<1, 2>(
+   __half const*, __half*, unsigned int const*, __half const*, unsigned int const*,
+   float const*, int const*, int const*, int const*, int ×11, bool, int, int)]
+```
+
+then `hipErrorIllegalAddress` and SIGABRT (rc=134). The retry window
+(07:45–08:02) logged **916** `gfxhub0 no-retry page fault` lines — a fault storm,
+all in that kernel. `moe_gemm_q4_kernel_gfx906<BLOCK_SIZE_M=1, N_PER_THREAD=2>` is
+the default M=1 decode MoE GEMM (`csrc/rocm/moe_q_gemm_gfx906.cu`).
+
+**What is ruled out.** `moe_q_gemm_gfx906.cu` is **unchanged by the merge**
+(`git diff 524ac6f2d6 8893a50e54 -- csrc/rocm/moe_q_gemm_gfx906.cu` is empty), and
+the merge's `CMakeLists.txt` change does not touch gfx906 kernel flags. The same
+model passed the **eager** PPL probe minutes earlier (PPL 15.9840, 0 misses), and
+the **dense** 27B canary captures graphs cleanly (38.2 t/s, low-normal not DEG).
+
+**Two hypotheses.**
+(a) **Host state**: this boot accumulated many wedge events; a degraded host can
+trip sync-cadence-heavy paths. Counter-evidence: the documented DEG symptom is
+*slowness*, and this log has **no page-fault precedent** — every prior event is
+`hipErrorLaunchFailure` during *weight load*.
+(b) **A real 0.30.0 regression** in the **V2 + 35B-MoE + FULL-capture** path:
+0.29-V2 ran the identical bench at **59.86 t/s** (`/local/tmp/bench_flip.log`,
+2026-09-18), and the fork's serving recipes pin **V1** (`_serve_tp2_gfx906.sh`),
+so the shipped serving path may be unaffected.
+
+**Outcome.** During the V1 control attempt the GPU hit the familiar
+`hipErrorLaunchFailure` **during weight load** and reset (`GPU reset(1) succeeded`
+08:00:53, `VRAM is lost`) — the second failure of the session, so GPU work
+**stopped per the house burst rule**. No passwordless sudo → the host reboot is
+the operator's call.
+
+**Next step (discriminating test).** Reboot, then re-run the V2 35B bench once on
+a clean boot. Healthy fail → hypothesis (b): bisect the merge's capture-path
+changes (upstream's MRV2 FULL-graph work, #51700 / #54646 / #56382 / #56312) for
+the fork-MoE interaction, and ship 0.30.0 with the V1 pin (as the recipes already
+do) plus a roadmap item. Clean pass → hypothesis (a), record the boot state and
+proceed with the release gates.
