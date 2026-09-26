@@ -8,10 +8,18 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
+from vllm.models.qwen4_exp.amd.ple_prefetch import (
+    PleRowPrefetcher,
+    plan_lookahead_chunks,
+    prefetch_enabled,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
+
+logger = init_logger(__name__)
 
 
 class Qwen4ExpModelState(MambaHybridModelState):
@@ -61,6 +69,134 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        # Opt-in read-ahead for the PLE ngram table (see ple_prefetch.py).
+        # Built on first use, not here: the model is not loaded yet at this
+        # point, and the prefetcher needs the embedding's shard pointers.
+        self._ple_prefetcher: PleRowPrefetcher | None = None
+        self._ple_prefetch_wanted = prefetch_enabled()
+        self._ple_host_tokens = None
+
+    # ------------------------------------------------------------- read-ahead
+    def _ple_prefetch_modules(self):
+        """Locate the ngram embedding module without hardcoding layer indices.
+
+        PLE lives at ``ple_layer_ids`` (layer 2 for this checkpoint), and the
+        attribute path is a model-implementation detail. Searching by type keeps
+        this correct if the model is rearranged, and returns None -- disabling
+        the prefetch -- instead of raising if it moves.
+        """
+        from vllm.models.qwen4_exp.amd.ple_layer import Qwen4ExpNGramEmbedding
+
+        for module in self.model.modules():
+            if isinstance(module, Qwen4ExpNGramEmbedding):
+                return module
+        return None
+
+    def _build_ple_prefetcher(self) -> PleRowPrefetcher | None:
+        ngram = self._ple_prefetch_modules()
+        if ngram is None:
+            logger.info_once(
+                "PLE read-ahead requested but no ngram embedding module was "
+                "found; running without it."
+            )
+            self._ple_prefetch_wanted = False
+            return None
+        # A lookahead larger than one scheduled chunk is pure waste: the next
+        # chunk cannot be bigger than the batch token budget.
+        max_tokens = int(
+            getattr(
+                self.vllm_config.scheduler_config,
+                "max_num_batched_tokens",
+                8192,
+            )
+        )
+        return PleRowPrefetcher(
+            ngram.ngram_embedding,
+            (
+                ngram.layer_multipliers,
+                ngram.ngram_heads_vocab_sizes,
+                ngram.ngram_heads_offsets,
+            ),
+            type(ngram)._compute_ngram_ids,
+            ngram_size=int(ngram.ngram_size),
+            heads_per_ngram=int(ngram.heads_per_ngram),
+            eos_token_id=int(ngram.eos_token_id),
+            max_tokens=max_tokens,
+        )
+
+    def _prefetch_next_ple_chunk(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+    ) -> None:
+        """Ask the kernel to prefetch the next prefill chunk's embedding rows.
+
+        Every input is already on the host as numpy, so this costs no device
+        synchronisation: ``num_computed_tokens_np`` is the optimistic CPU mirror
+        and ``prefill_len_np`` the scheduled prompt length. A stale mirror only
+        warms pages the chunk does not need, which is wasted bandwidth, never a
+        wrong number -- that asymmetry is why an upper-bound mirror is safe here.
+        """
+        pf = self._ple_prefetcher
+        if pf is not None and pf.disabled_reason is not None:
+            # Permanently off: stop planning too, this runs on every step and
+            # the whole point is to spend no host CPU on the critical path.
+            self._ple_prefetcher = None
+            self._ple_prefetch_wanted = False
+            return
+        if pf is None and not self._ple_prefetch_wanted:
+            return
+        # CUDA graph capture replays this hook with dummy batches, once per
+        # capture size. Hinting those pages would stream garbage off NVMe
+        # during boot, which is when the box can least afford it. Checked every
+        # call: capture happens long after the first real step.
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return
+        except Exception:
+            pass
+        if pf is None:
+            try:
+                self._ple_prefetcher = self._build_ple_prefetcher()
+            except Exception as exc:  # noqa: BLE001 - a knob must not kill a boot
+                logger.warning(
+                    "PLE read-ahead could not be set up (%s: %s); running "
+                    "without it. Outputs are unaffected.",
+                    type(exc).__name__,
+                    exc,
+                )
+                self._ple_prefetch_wanted = False
+                return
+        pf = self._ple_prefetcher
+        if pf is None:
+            # The builder declined (no ngram module): nothing to plan against.
+            return
+        try:
+            if self._ple_host_tokens is None:
+                buf = getattr(
+                    getattr(req_states, "all_token_ids", None), "_uva_buf", None
+                )
+                host = getattr(buf, "np", None)
+                if host is None or host.ndim != 2:
+                    # all_token_ids is normally a UVA-backed host array; on a
+                    # platform where it is real GPU memory there is no cheap
+                    # host view, and a D2H copy per step would defeat the point.
+                    pf.disable("req_states.all_token_ids has no host view")
+                    return
+                self._ple_host_tokens = host
+            n = input_batch.num_reqs
+            for req, start, end, ctx in plan_lookahead_chunks(
+                host_tokens=self._ple_host_tokens,
+                idx_mapping=input_batch.idx_mapping_np[:n],
+                scheduled=input_batch.num_scheduled_tokens[:n],
+                computed=input_batch.num_computed_tokens_np[:n],
+                prefill_len=input_batch.prefill_len_np[:n],
+                context_len=self.ngram_context_len,
+                eos_token_id=self.ngram_eos_token_id,
+            ):
+                pf.prefetch_token_chunk(self._ple_host_tokens, req, start, end, ctx)
+        except Exception as exc:  # noqa: BLE001 - never reach the model path
+            pf.disable(f"lookahead planning failed ({type(exc).__name__}: {exc})")
 
     def _prepare_ngram_context(
         self,
@@ -107,6 +243,9 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=self._prepare_ngram_context(input_batch, req_states),
         )
+        # Issued last: the current chunk's inputs are already prepared, so the
+        # hints overlap the GPU work that follows instead of delaying it.
+        self._prefetch_next_ple_chunk(input_batch, req_states)
         return model_inputs
 
     def prepare_dummy_inputs(
