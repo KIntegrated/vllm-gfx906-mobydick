@@ -616,3 +616,40 @@ No behaviour change: this is a log line and its test.
 env var dropped — `GC_FREEZE=1 DRAFTER_GRAPHS=1 PLE_RANDOM=1 PLE_PREFETCH=1 BOOT_TRIES=1` — which
 is the best configuration measured on this box: **0.942 ms/token cold prefill (2.49x over A′),
 decode unchanged, 20.8 KiB NVMe per token (was ~1.03 MiB), GPU busy 87.8 % during prefill.**
+
+### 2026-09-26 14:55 — launcher: `OPTIMIZED=1` (one word for the fast box) and a boot manifest in every log
+
+**Class:** SW/launcher. **Trigger:** the operator's rule after boot D — keep the defaults at
+whatever has survived many reboots, and put everything else behind a switch. **No engine code
+changed, no default changed, no boot taken.**
+
+Two changes to `run-vllm` (978 → 1114 lines):
+
+1. **`OPTIMIZED=1 ./run-vllm`** turns on the measured-best set — `PLE_RANDOM=1` (1.63×),
+   `PLE_PREFETCH=1` (1.53× on top), `GC_FREEZE=1`, `DRAFTER_GRAPHS=1`. It is the first thing the
+   script resolves, it **exports** (the engine is a child, not a subshell), and an explicit variable
+   still beats it: `OPTIMIZED=1 PLE_PREFETCH=0` is the bundle minus one knob, which keeps
+   single-variable A/B expressible. Set-but-empty (`PLE_PREFETCH= ./run-vllm`) means *off*, not 1.
+   `OPTIMIZED=<garbage>` falls back to the known-good defaults **and says so**, rather than silently
+   booting something the operator did not ask for. The bundle deliberately excludes `NCCL_PROTO`
+   (+15.5 % prefill, see the boot D entry above) and `NCCL_ENVELOPE` (99 dead boots).
+   Plain `./run-vllm` is byte-for-byte the same boot as before this change.
+2. **Every boot writes a manifest to its own log file** before the engine starts — launcher sha,
+   `OPTIMIZED`, all four bundle knobs with *provenance* (`bundle` / `explicit(0)` / `default-off`),
+   engine shape, `SPEC`, the `NCCL_*` values **including the ones that are unset**, and the argv
+   actually executed. This is the fix for two losses this week: the 2026-09-22 boot whose 494 tok/s
+   prefill could not be reproduced because nobody can say which knobs it had, and boot D, where an
+   inherited `NCCL_PROTO=LL` reached all four workers while the launcher printed "NCCL left at RCCL
+   defaults". `boot_once` now builds its command in an array so the argv can be logged *and* exec'd
+   from the same value — no second copy that can drift.
+
+**Verification:** `scripts/test-optimized-bundle.sh`, 20 arms, all passing — the bundle's six
+precedence arms, an argv golden test that pins the whole engine command line token by token, a
+**red control** (a copy with `--no-async-scheduling` renamed must FAIL, and the harness refuses to
+claim anything if the mutation did not apply), and byte-identical argv against the pre-refactor
+launcher (`/tmp/run-vllm.pre-optimized`). Nothing here was tested by booting: the launcher blocks
+itself from starting a second engine while :9000 answers, and boot D was live throughout.
+
+**Action this supersedes:** the boot E command in the boot D entry above. It is now
+**`OPTIMIZED=1 ./run-vllm`**, which is boot C's configuration in one word (`BOOT_TRIES` already
+defaults to 1). To get the known-good box instead: `./run-vllm`, no variables at all.
