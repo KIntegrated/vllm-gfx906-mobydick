@@ -694,3 +694,46 @@ reproduces, and boot D's 1.088 is confirmed as the `NCCL_PROTO=LL` penalty (+18 
    measured a 4 KB warm re-send at 4.30 s and a 32 KB warm re-send at 2.56 s, which is not a physical
    ordering for cache hits. Earlier multi-rep work put the 34,873-token hit at ~2.4 s, matching this
    run; the 4 KB point is the outlier and was taken while this agent's own session was decoding.
+
+### 2026-09-26 15:28–15:42 — prefill extended to 64 K and 128 K: the rate is flat, the thing that was scaling was a fixed ~3 s
+
+**Class:** measurement, no live change. **Trigger:** the 4 K→32 K spread looked like "cold prefill
+gets faster on longer prompts"; 60 KB and 120 KB filler points (65,455 and 131,052 tokens) settle it.
+
+Boot E, min of 3 cold, same instrument, plus a 2 s sampler (`/sys/class/hwmon` sclk + power,
+`gpu_busy_percent`, `/sys/block/nvme0n1/stat`) kept alongside:
+
+| prompt | tokens | cold TTFT | absolute rate |
+| --- | --- | --- | --- |
+| 4 KB | 4,370 | 6.55 s | 667 tok/s |
+| 8 KB | 8,724 | 12.16 s | 718 tok/s |
+| 16 KB | 17,458 | 18.87 s | 925 tok/s |
+| 32 KB | 34,873 | 36.28 s | 961 tok/s |
+| 60 KB | 65,455 | 64.08 s | 1,022 tok/s |
+| 120 KB | 131,052 | 126.64 s | 1,035 tok/s |
+
+Least squares over all six: **t = 2.96 s + n / 1,061 tok/s**, i.e. **0.942 ms/token marginal, flat
+from 8 K to 128 K**, with a **fixed ~3 s per request**. Residuals: +8.0 %, −8.1 %, +2.9 %, −1.3 %,
++0.9 %, −0.1 % — the two small points carry the cross-window noise, the big ones fit to ~1 %.
+
+So the previous entry's "cold prefill speeds up 44 % with prompt length" is **not a rate effect at
+all**: it is one fixed cost amortised over more tokens. Absolute rate at 128 K (1,035) is within
+1.4 % of the asymptote; at 4 K it is 36 % below it. The fixed cost is ~3,136 tokens of work —
+**0.76 of one `max-num-batched-tokens=4096` chunk**, which is the sharpest hint at what it is.
+
+**The clock-ramp explanation is measured and dismissed as a major cause:** under sustained prefill
+the four MI50s sit at **1,595 → 1,710 → 1,720 MHz** (boost ceiling ~1,725) and **742 → 1,005 W**
+pack total — so the ramp is real but only ~8 % and it completes in ~10 s, while the deficit it would
+have to explain is 55 % at 4 K. It cannot carry the effect. Remaining candidate for the fixed 3 s is
+the first chunks hitting **cold PLE table pages before the read-ahead is ahead of the gather**; the
+sampler cannot separate that from first-chunk host setup because co-resident load kept
+`gpu_busy_percent` above the episode threshold for the whole 20-minute window, so the I/O series has
+no per-request resolution. The decisive instrument is per-chunk timing in the engine, or a 2 K point
+(`probe-prefill.py 2`) to confirm the cost is constant rather than size-proportional.
+
+**Long-context prefix cache (the number that actually matters for RAG-style traffic):** the same
+text re-sent costs **4.46 s at 65,455 tokens (93.0 % saved)** and **4.17 s at 131,052 tokens
+(96.7 % saved)** — the warm path is roughly *constant*, so a cached 128 K prompt is ~30× cheaper
+than a cold one. Raw series kept: `logs/gpu-samples-20260926-1528.tsv`, `logs/prefill-64-128-20260926.log`.
+NVMe read across the window: 21.9 GiB = **29.3 KiB per prefill token** (upper bound: the window also
+carried this agent's own decode and other users' traffic; boot C's cleaner measurement was 20.8).
