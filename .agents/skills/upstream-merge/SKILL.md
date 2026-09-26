@@ -76,8 +76,22 @@ Only do that when the whole file is a carry.
 ```
 
 It runs: no conflict markers · tree-wide `ruff --select F821,F811` ·
-`compileall` · a duplicate top-level `def` scan · "resolved modules import".
-This is what caught the 0.29 merge's undefined names.
+in-memory syntax compile · a duplicate top-level `def` scan · "resolved modules
+import". This is what caught the 0.29 merge's undefined names.
+
+### 2b. Cross-check the release notes' breaking-changes list against the fork
+
+```bash
+gh release view vX.Y.Z --repo vllm-project/vllm | sed -n '/Breaking Changes/,/New Contributors/p'
+```
+
+For every removed symbol/env var/behavior, grep the fork for it. A removal the
+merge took **without a conflict** can leave a fork guard or call site silently
+dead — e.g. `CommonAttentionMetadata.seq_lens_cpu` removed in v0.30.0 (#55353)
+left the fork's `#47042` chunked-continuation guard running through
+`getattr(..., "seq_lens_cpu", None)`, which is now always `None`. Re-derive from
+the replacement field (`seq_lens_cpu_upper_bound`) or delete the dead branch.
+Also classify each item as *applies* / *not applicable* and record why.
 
 ### 3. Rebuild the C++/HIP extensions — mandatory, in-tree `.so` is tracked-out
 
@@ -178,6 +192,13 @@ Then verify the schemas actually changed:
     changes as a commented note, not as a silent toolchain swap.
 12. **The merge must not be the first thing tested.** Land urgent upstreamable
     fixes first; a merge invalidates the base a tester is serving on.
+13. **Read the release notes' breaking-changes list, then grep for each removal.**
+    An upstream removal with no conflict marker leaves fork code that still
+    *references* it — often behind a `getattr(..., None)`/`is_set(name)` guard that
+    turns a real check into a no-op or an exception. v0.30.0: `seq_lens_cpu`
+    removed killed the fork's `#47042` guard (fixed 2026-09-26); the
+    `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` env removal crashed `arg_utils.py`'s
+    deprecated-env read. Both were in the notes under "Breaking Changes".
 
 ## Repo hazards that bite during a merge session
 
