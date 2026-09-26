@@ -411,3 +411,51 @@ this agent's traffic (worse). First boot to judge it:
 `PLE_RANDOM=1 PLE_PREFETCH=1 ./run-vllm`, then `scripts/probe-prefill.py 8 32` against
 the 2.025 ms/token cold baseline — the same restart window that `PLE_RANDOM` and the
 `NCCL_PROTO=LL` revert are already waiting for.
+
+## 2026-09-26 08:43 and 09:29 — two clean measurement boots (A: knobs off, A′: deployment knobs) — no regression; one historic win retired
+
+**Class:** SW/measurement. **Trigger:** the PLE-knob ladder needs a baseline in the deployment
+regime; boot A turned out not to have the deployment knobs set, so it became an extra arm.
+**Engine:** restarted twice by the operator (`./run-vllm` with `GC_FREEZE`/`PLE_*` unset, then
+with `GC_FREEZE=1 DRAFTER_GRAPHS=1`). Health **200** after each boot; no crash, no segfault,
+no traceback in either log, graphs **PIECEWISE** both times.
+
+| | **A** `GC_FREEZE=0` drafter off (pid 3188178) | **A′** `GC_FREEZE=1 DRAFTER=1` (pid 3203315) | Δ |
+| --- | --- | --- | --- |
+| B=1 | 48.41 t/s | 50.32 t/s | +3.9 % |
+| B=2 agg | 74.24 | 76.56 | +3.1 % |
+| B=3 agg | 102.37 | 100.30 | −2.0 % |
+| marginal cold prefill | 2.347 ms/tok (426 tok/s) | **2.346 ms/tok (426 tok/s)** | **0.04 %** |
+| KV tokens | 408,725 | 399,419 | −2.3 % (the known drafter-graph cost) |
+| `froze` lines | 0 (guard off, as expected) | 32 (guard live) | — |
+| smoke test | OK ×3 | OK ×3 | — |
+
+**Two results, both nulls, both retire something:**
+
+1. **`GC_FREEZE` is not a throughput knob.** The "+11 t/s at B=1 / +27 %" carried in
+   `docs/decode-launch-bound.md` §14 was **clean-vs-contended**: the `GC_FREEZE=0` arm of that
+   comparison had B=1 spread 34.7–36.9 and a B=3 *below* B=2 with one session starved at
+   18 t/s — a condition §1.3 of the same file had already declared unpublishable, but nobody
+   applied it to the headline B=1 number. Clean-vs-clean is +3.9 % on decode with the sign
+   flipping at B=3, inside my own rep spread (42.4–53.2), and A→A′ is **two** knobs, so the
+   residual is plausibly all drafter graphs (§14: +5.8 % for drafter alone). **Its prefill
+   mechanism is falsified outright** — 0.04 %: the PLE gather thread is blocked in the kernel
+   on NVMe page faults, not executing Python, so there is no GIL for a gen-2 collection to
+   steal. Keep `GC_FREEZE=1` for the boot-reliability history, which it has never been
+   measured against either; do not keep it for speed.
+2. **The 2.025 ms/token (494 tok/s) prefill baseline does not reproduce.** A and A′ give
+   426 tok/s, **0.04 % apart from each other**, 15.9 % slower than the 2026-09-22 boot that
+   every prefill A/B in `docs/` is quoted against — including the `NCCL_PROTO=LL` "−10 %"
+   verdict. First suspect was our own PLE range guard (landed 09-25/26, on the hot path since);
+   **cleared by mechanism** — it runs on CPU ids (`flat_ids.min()`/`.max()`, no `.item()`, no
+   device sync, `masked_fill` only on the rare bad-id path), microseconds, not 16 %. Remainder
+   unexplained: the 09-22 boot's `max-num-batched-tokens` (a compile key) and spec-dec config
+   are not recorded in a diffable form. **New rule: prefill A/B is quoted only against a
+   same-day boot.** B and C compare to A′ = 2.346 ms/token.
+
+**Process note:** the ladder's baseline arm was assumed to be the deployment config until I
+read `/proc/<apiserver>/environ` and found `GC_FREEZE`/`DRAFTER_GRAPHS` absent (they are
+default-off per operator decision, so they never appear unless typed). Verifying the env from
+the process rather than from intent converted a confounded ladder into an extra arm — and it is
+the same discipline that caught A′'s 32 `froze` lines and KV 399,419 as the confirmation that
+the knobs really were on.
