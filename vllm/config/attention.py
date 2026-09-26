@@ -146,6 +146,14 @@ class AttentionConfig:
             # layers still use the platform's normal automatic backend.
             self.backend = None
 
+        # gfx906 (MiniMax M3): the Literal accepts the fp16/fp32 spellings;
+        # canonicalize them so downstream dtype resolution never has to know
+        # about the aliases (the indexer maps "float16" -> torch.float16).
+        if self.indexer_kv_dtype == "fp16":
+            self.indexer_kv_dtype = "float16"
+        elif self.indexer_kv_dtype == "fp32":
+            self.indexer_kv_dtype = "float32"
+
     def resolve_indexer_kv_dtype(self, default: IndexerKVDType) -> IndexerKVDType:
         """Resolve `indexer_kv_dtype`, substituting `default` for "auto"."""
         if self.indexer_kv_dtype == "auto":

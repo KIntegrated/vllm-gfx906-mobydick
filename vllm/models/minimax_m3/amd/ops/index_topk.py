@@ -498,6 +498,10 @@ def _decode_index_score_kernel(
         mask=q_mask[None, :],
         other=0.0,
     )  # [D,HQ]
+    # gfx906: Triton MMA lacks fp32, and loop-carried types must stay stable,
+    # so cast q here instead of inside the loop.
+    if BLOCK_SIZE_HQ != 1 and q.dtype == tl.float32:
+        q = q.to(tl.float16)
     for blk in tl.range(chunk_start_block, chunk_end_block):
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = blk * BLOCK_SIZE_K + off_k
@@ -521,7 +525,8 @@ def _decode_index_score_kernel(
             # are loaded in their stored dtype (bf16 or e4m3) and the MMA
             # accumulates in fp32 so the per-block max score is exact for the
             # fp8 indexer too.
-            # On gfx906, cast to fp16 (Triton MMA lacks fp32 there).
+            # On gfx906, cast to fp16 (Triton MMA lacks fp32 there); q was cast
+            # before the loop, so only k needs it here.
             if k.dtype == tl.float32:
                 k = k.to(tl.float16)
             kq = tl.dot(k, q, out_dtype=tl.float32)  # [N,HQ]
@@ -601,6 +606,9 @@ def _decode_index_score_mapped_range(
             mask=q_mask[None, :],
             other=0.0,
         )
+        # gfx906: cast q before the loop (loop-carried types must stay stable).
+        if BLOCK_SIZE_HQ != 1 and q.dtype == tl.float32:
+            q = q.to(tl.float16)
         for blk in tl.range(chunk_start_block, chunk_end_block):
             page = tl.load(bt_row + blk).to(tl.int64)
             pos = blk * BLOCK_SIZE_K + off_k
@@ -618,6 +626,10 @@ def _decode_index_score_mapped_range(
                     axis=1,
                 )[:, None]
             else:
+                # gfx906: Triton MMA lacks fp32; q was cast before the loop,
+                # so only k needs it here.
+                if k.dtype == tl.float32:
+                    k = k.to(tl.float16)
                 kq = tl.dot(k, q, out_dtype=tl.float32)
             kq = tl.where(
                 pos_mask & q_mask[None, :],
@@ -1555,9 +1567,10 @@ def minimax_m3_index_decode(
             BLOCK_SIZE_Q=BLOCK_SIZE_Q,
             num_kv_chunks=num_kv_chunks,
             USE_PDL=use_pdl,
-            **score_kwargs,
-            # gfx906 index-score dot kernels need these launch params.
-            **_index_score_launch_kwargs(),
+            # gfx906 index-score dot kernels need these launch params; merge so
+            # a gfx906 key already in score_kwargs (num_warps) is overridden
+            # instead of duplicating the keyword.
+            **{**score_kwargs, **_index_score_launch_kwargs()},
         )
 
     if out is not None:

@@ -180,3 +180,49 @@ def test_sparse_prefill_kv_row_offset_does_not_overflow_int32():
     _store_sparse_kv_row_offset_kernel[(1,)](slot, output, stride=512)
 
     assert output.item() == 6554 * 640 * 512
+
+
+def test_rocm_aiter_mla_sparse_fp16_route_uses_reference(monkeypatch):
+    """gfx906 `VLLM_ROCM_MLA_SPARSE_FP16=1` must bypass AITER and use the
+    reference chunked Torch MLA path (the fork's MI50 fp16-sparse early-return).
+
+    Tiny CPU tensors + a monkeypatched reference, mirroring the sink test: this
+    is the model-level gate for the fp16-sparse early-return re-applied by hand
+    after the 0.30.0 merge (no MiniMax-M3/DeepSeek weights needed).
+    """
+    captured = {}
+
+    def fake_reference(q, kv, indices, sm_scale, d_v):
+        captured["q_shape"] = tuple(q.shape)
+        captured["kv_shape"] = tuple(kv.shape)
+        captured["indices_shape"] = tuple(indices.shape)
+        captured["sm_scale"] = sm_scale
+        captured["d_v"] = d_v
+        return torch.zeros(q.shape[0], q.shape[1], d_v, dtype=q.dtype)
+
+    monkeypatch.setattr(sparse_mod, "reference_mla_sparse_prefill", fake_reference)
+    monkeypatch.setattr(
+        sparse_mod.envs, "VLLM_ROCM_MLA_SPARSE_FP16", True, raising=False
+    )
+
+    impl = object.__new__(sparse_mod.ROCMAiterMLASparseImpl)
+    impl.num_heads = 8
+    impl.kv_lora_rank = 512
+    impl.softmax_scale = 512**-0.5
+    impl.kv_cache_dtype = "float16"
+
+    q = torch.zeros(2, 8, 512, dtype=torch.float16)
+    kv = torch.zeros(4, 1, 512, dtype=torch.float16)
+    topk_indices = torch.zeros(2, 16, dtype=torch.int32)
+
+    output, lse = impl._forward_mla(
+        SimpleNamespace(), q, kv, SimpleNamespace(), topk_indices
+    )
+
+    assert captured["q_shape"] == (2, 8, 512)
+    assert captured["kv_shape"] == (4, 1, 512)
+    assert captured["indices_shape"] == (2, 1, 16)
+    assert captured["sm_scale"] == impl.softmax_scale
+    assert captured["d_v"] == 512
+    assert output.shape[0] == 2 and output.shape[-1] == 512
+    assert lse is None
