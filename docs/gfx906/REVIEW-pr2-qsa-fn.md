@@ -289,3 +289,24 @@ Still open for the merge, unchanged: the 8 doc conflicts (a real union, not a si
 pick), the house gates on a healthy boot (mamba kernels, FA, PPL, 35B), and the PLE
 implementation comparison, which only the tester's box can answer.
 
+### The doc conflicts, itemised (for whoever lands the merge)
+
+The merge had 8 doc conflicts. `ROADMAP.md` is **done** (the 0.30 roadmap plus the
+branch's P2P and whole Qwen3.8-Flash-Next/QSA sections — they had diverged into two
+different documents: 0.30 carries the release-prep/upstream queue, the branch carries the
+QSA-FN journey). The other seven still hold the 0.30 side, and each needs a genuine
+editorial union rather than a side pick:
+
+| file | what the branch adds |
+|---|---|
+| `CHANGELOG.md` | the QSA-FN entries (172 lines) — land them when the work lands |
+| `MERGE-0.30.0-review.md` | the branch's copy of the 0.30 merge review (conflict accounting, off-by-default inventory); the 0.30 line's copy is the canonical one for the release, so port only the QSA-relevant rows |
+| `degradation.md`, `degradation_details.md` | observations #108/#109 and the #108 addendum (small, additive rows) |
+| `DEAD-ENDS.md` | the allreduce no-op (NEUTRAL) and int8-QK (CLOSED) rows |
+| `README.md` | the release-snapshot / stale V1-pin recipe corrections |
+| `AGENTS.md` | 11 lines the 0.30 line added (rule 6 is already in both) |
+
+Mechanical recipe that works for additive cases: `git diff <merge-base> gfx906/qsa-fn -- <file>`
+then `git apply --3way` in the merge tree (the 3-way apply reports conflicts for
+overlapping rows — `--reject` cannot be combined with it).
+
