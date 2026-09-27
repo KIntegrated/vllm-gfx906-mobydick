@@ -48,9 +48,15 @@ keep pinning V1 for the ~2 % edge.
   (59.77–59.86).
 - **PPL probe, dense** Qwen3.8-27B-AWQ-INT4: **10.5472** (359 tokens, 0 top-20
   misses; band 10.5516 / 10.5472) — V2, eager.
-- **PPL probe, MoE** Qwen3.5-35B-A3B-AWQ: **15.9840** (359 tokens, 0 top-20
-  misses; C4 band 15.9361–16.0169) — V2, eager. Exercises the gfx906 MoE WNA16
-  path (`_process_weights_gfx906` 10-tuple, `moe_gptq_gemm_gfx906`).
+- **PPL probe, MoE** Qwen3.5-35B-A3B-AWQ: **15.9407** (359 tokens, 0 top-20
+  misses; C4 band 15.9361–16.0169) on the final build — V2, eager, and with the
+  `REL30-1` gate active it exercises the **generic** align (15.9840 was measured
+  pre-gate with the fused align; the two are documented bit-equal for these
+  shapes). Exercises the gfx906 MoE WNA16 path (`_process_weights_gfx906`
+  10-tuple, `moe_gptq_gemm_gfx906`).
+- **35B house bench on V2** (default env, gate active): **58.90 t/s**
+  (58.904 / 58.976 / 58.800 / 58.880), `rc=0`, 0 faults, `Using V2 Model
+  Runner` — so V2 is correct as well; V1 stays the recommended serving config.
 - **TP=2 Qwen3.8-27B-AWQ-INT4**, MTP k=3, filler, prefix caching OFF, bt4096,
   util 0.82, capture `[4,8,12,16]`, maxlen 131072 (V1): 2k **79.1** · 64k
   **42.0** · 120k **40.7** t/s decode; TTFT 4.2 / 185.3 / 442.2 s. Standard
