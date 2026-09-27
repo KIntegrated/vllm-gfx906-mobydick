@@ -20,6 +20,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEActivationFormat,
     FusedMoEExpertsModular,
@@ -76,10 +77,17 @@ def _use_fused_align_m1(
     block_size=1 (see docs/gfx906/DEVLOG-moe-c1-routing-fusion.md and
     DEVLOG-nemotron-h.md NH-5). Serving A/B (Qwen3.5-35B): +1.18% to
     +1.73% MoE decode t/s (207-301 us/step), so it is the default;
-    VLLM_GFX906_ALIGN_M1=0 to opt out.
+    VLLM_GFX906_ALIGN_M1=0 to opt out. V1 only -- see the REL30-1 note in the
+    return below.
     """
     return (
         os.environ.get("VLLM_GFX906_ALIGN_M1", "1") == "1"
+        # REL30-1: under the V2 runner the align op's out-params come back
+        # uninitialized (the fused kernel's writes are not honoured on that
+        # compiled/captured path), so the M=1 GEMM indexes the expert tables
+        # with garbage ids. Only V1 -- which every serve recipe pins with
+        # VLLM_USE_V2_MODEL_RUNNER=0 -- may use it.
+        and envs.VLLM_USE_V2_MODEL_RUNNER is False
         and _has_gfx906_align_m1_op()
         and expert_map is None
         and topk_ids.size(0) == 1
@@ -140,23 +148,6 @@ def _block_size_m_for(M: int, topk: int) -> int:
         )
         return int(env)
     return 4
-
-
-def _dbg_dump(tag, M, topk, em, bm, N, K, topk_ids, sorted_token_ids, expert_ids):
-    if os.environ.get("VLLM_GFX906_MOE_DEBUG") != "1":
-        return
-    bag = globals().setdefault("_dbg_bag", {"n": 0})
-    bag["n"] += 1
-    try:
-        cap = torch.cuda.is_current_stream_capturing()
-    except Exception:
-        cap = "?"
-    print(
-        f"[moe {bag['n']} {tag} cap={cap}] M={M} topk={topk} em={em} bm={bm} "
-        f"N={N} K={K} tid={tuple(topk_ids.shape)} sid={sorted_token_ids.size(0)} "
-        f"eid={expert_ids.size(0)} ntb={sorted_token_ids.size(0) // bm}",
-        flush=True,
-    )
 
 
 class Gfx906WNA16Experts(FusedMoEExpertsModular):
@@ -347,8 +338,6 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
             w1_tw = empty_topk_w
             w2_tw = topk_weights.view(-1).float()
 
-        _dbg_dump("g1", M, topk, em, block_size_m, N, K, topk_ids,
-                  sorted_token_ids, expert_ids)
         # --- gemm1: [M, K] -> [M*topk, N] (atomic into zeroed workspace) ---
         w1_out = _resize_cache(workspace13, (em, N))
         w1_out.zero_()
@@ -378,8 +367,6 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
         # --- gemm2: [M*topk, N/2] -> [M, K] (fused weight + reduce) ---
         # output may alias workspace13's storage (see workspace_shapes):
         # safe because the activation above has finished reading w1_out.
-        _dbg_dump("g2", M, topk, em, block_size_m, N, K, topk_ids,
-                  sorted_token_ids, expert_ids)
         output.zero_()
         ops.moe_gptq_gemm_gfx906(
             act_out,

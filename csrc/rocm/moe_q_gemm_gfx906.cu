@@ -27,8 +27,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -895,41 +893,6 @@ void moe_gptq_gemm_gfx906(torch::Tensor a, torch::Tensor c,
 
   int num_token_blocks = (int)(sorted_token_ids.size(0) / block_size_m);
 
-  if (getenv("VLLM_GFX906_MOE_DEBUG") != nullptr) {
-    static std::atomic<long> _cgfx_n{0};
-    int ntp_host = -1;
-    try {
-      ntp_host = num_tokens_post_padded.cpu().item<int>();
-    } catch (...) {
-      ntp_host = -2;
-    }
-    fprintf(stderr,
-            "[cgfx %ld] bm=%d topk=%d otopk=%d sm=%d sn=%d sk=%d sid=%ld "
-            "eid=%ld ntb=%d ntp=%d a=%p c=%p bqw=%p sid_p=%p eid_p=%p\n",
-            _cgfx_n.fetch_add(1) + 1, (int)block_size_m, (int)top_k,
-            (int)output_topk, size_m, size_n, size_k,
-            (long)sorted_token_ids.size(0), (long)expert_ids.size(0),
-            num_token_blocks, ntp_host, (void*)a.data_ptr(),
-            (void*)c.data_ptr(), (void*)b_q_weight.data_ptr(),
-            (void*)sorted_token_ids.data_ptr(),
-            (void*)expert_ids.data_ptr());
-    try {
-      auto e_cpu = expert_ids.to(torch::kCPU).contiguous();
-      auto s_cpu = sorted_token_ids.to(torch::kCPU).contiguous();
-      const int en = (int)e_cpu.numel();
-      const int snn = (int)s_cpu.numel();
-      fprintf(stderr, "[cgfx %ld] eid_vals:", _cgfx_n.load());
-      for (int i = 0; i < en && i < 12; ++i)
-        fprintf(stderr, " %d", e_cpu.data_ptr<int32_t>()[i]);
-      fprintf(stderr, " | sid_vals:");
-      for (int i = 0; i < snn && i < 12; ++i)
-        fprintf(stderr, " %d", s_cpu.data_ptr<int32_t>()[i]);
-      fprintf(stderr, "\n");
-    } catch (...) {
-      fprintf(stderr, "[cgfx %ld] ids read failed\n", _cgfx_n.load());
-    }
-    fflush(stderr);
-  }
 
   const float* topk_w_ptr =
       (topk_weights.numel() > 0) ? topk_weights.data_ptr<float>() : nullptr;

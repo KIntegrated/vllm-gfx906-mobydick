@@ -60,13 +60,22 @@ always fine, which is why only the M=1 path died.
 **Confirmed workaround:** `VLLM_GFX906_ALIGN_M1=0` (the documented opt-out,
 +1.2–1.7 % cost when enabled).
 
-**Candidate proper fix (unvalidated — the validating run hit the load-lottery
-wedge):** the fork registers `register_fake` for its gemm op
-(`_moe_gptq_gemm_gfx906_fake`) but **not** for its align op, so the out-param
-mutation is not modelled under `torch.compile`. A `register_fake` for
-`_rocm_C::moe_align_block_size_m1_gfx906` is added in `vllm/_custom_ops.py`;
-validate with `/local/tmp/bench35b_fake.sh` after a reboot. If it does not fix
-it, ship `ALIGN_M1=0` under the V2 runner instead.
+**Negative result (recorded):** a `register_fake` for the align op — mirroring the
+fork's own `_moe_gptq_gemm_gfx906_fake`, on the theory that the out-param mutation
+was not modelled under `torch.compile` — does **NOT** fix it (still
+`eid_vals: 1067139072 …` and the same fault). Reverted.
+
+**Fix (SHIPPED):** `_use_fused_align_m1()` now also requires
+`envs.VLLM_USE_V2_MODEL_RUNNER is False`, i.e. the fused align is used only when
+**V1 is explicitly selected** — which every fork serve recipe already pins — and is
+skipped on V2 (including the `None`/auto case, so it is fail-safe).
+
+**Measured (house config, V2 default env, gate active):** `rc=0`, 0 faults,
+**58.90 t/s** (58.904 / 58.976 / 58.800 / 58.880) with `Using V2 Model Runner`.
+**V1 is unchanged at 60.42 t/s** (fused align still on). V2 therefore costs
+~2.5 % on this workload — the fused align's documented 1.2–1.7 % plus V2 overhead.
+Recommended serving config for perf stays V1; V2 is now *correct* rather than
+fatal.
 
 ## V2 runner / mamba `align` (2026-09-17) — fix shipped
 

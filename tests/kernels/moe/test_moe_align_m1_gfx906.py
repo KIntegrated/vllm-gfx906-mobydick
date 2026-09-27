@@ -105,8 +105,10 @@ def test_m1_fused_align_bit_equal_to_production(seed, shape):
 def test_m1_fused_align_dispatch_gate(monkeypatch):
     """The gate must fire only for the exact decode shapes (M=1, bsm=1,
     no expert_map, int32, flag on) AND (E, topk) in the supported pair
-    set: (256, 8) and (128, 6)."""
+    set: (256, 8) and (128, 6), AND the V1 runner (REL30-1: on V2 the op's
+    out-params come back uninitialized)."""
     monkeypatch.setenv("VLLM_GFX906_ALIGN_M1", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     dev = "cuda"
     em = torch.zeros(4, device=dev, dtype=torch.int32)
     cases = [
@@ -145,6 +147,17 @@ def test_m1_fused_align_dispatch_gate(monkeypatch):
         torch.zeros(1, 8, device=dev, dtype=torch.int32), 1, 256, None)
     assert not _use_fused_align_m1(
         torch.zeros(1, 6, device=dev, dtype=torch.int32), 1, 128, None)
+
+    # REL30-1: the fused align is V1-only. V2 (explicit) and the auto/None
+    # default (which resolves to V2) must both skip it -- an uninitialized
+    # align made the M=1 GEMM index the expert tables with garbage ids.
+    monkeypatch.delenv("VLLM_GFX906_ALIGN_M1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    assert not _use_fused_align_m1(
+        torch.zeros(1, 8, device=dev, dtype=torch.int32), 1, 256, None)
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER")
+    assert not _use_fused_align_m1(
+        torch.zeros(1, 8, device=dev, dtype=torch.int32), 1, 256, None)
 
 
 @pytest.mark.skipif(
