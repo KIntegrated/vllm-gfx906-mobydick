@@ -240,7 +240,7 @@ default-on as the interim path that FN-11 deletes — and two gfx906 fixes were 
 on top of it (`--load-format dummy` support, plus the capture-mode change in FN-12).
 Their range guard also needed a *third* revision (fold-and-warn, never a boot
 refusal): see `REVIEW-pr2-qsa-fn.md` (2026-09-24) and `DEVLOG-qwen38-flash-qsa.md`.
-**Outstanding: the PLE comparison itself** (their mmap path vs upstream's
+**Outstanding: the PLE comparison itself (tracked as QSA-FN-15)** (their mmap path vs upstream's
 pinned/UVA offload, or the generic `--cpu-offload-params` stand-in) — the deciding
 datum is host RAM pinned vs page cache, and nothing in this round answers it.
 
@@ -369,6 +369,31 @@ the bespoke `MmapShardedNGramEmbedding` path** from PR #2 and keep only its bug-
 finding (stale/uninitialised pinned ids). Interim note: while we stay on the 0.29 line,
 the bespoke path or the generic `--cpu-offload-params` are the only options — treat
 them as stopgaps, not as the design.
+
+### QSA-FN-15 — the PLE implementation comparison (mmap host table vs upstream's pinned/UVA offload) — **HIGH PRIORITY, tracked** (Kevin 2026-09-27)
+
+**Status: OPEN — explicitly *not* a gate on the 0.30 merge.** The QSA work lands on the
+0.30 line with the tester's `MmapShardedNGramEmbedding` as the **interim** AMD path
+(upstream's `VLLM_PLE_CPU_OFFLOAD` covers NVIDIA on 0.30.0; the AMD half is
+`vllm-project/vllm#57497`, which FN-11 adopts). This item is the measurement that decides
+whether the bespoke path survives that adoption.
+
+- **Arm A (upstream/generic)** — the branch *without* the PLE commits, using the generic
+  per-parameter UVA offload: `--cpu-offload-gb <at least the table> --cpu-offload-params
+  ngram_embedding.weight` (the matcher compares exact dot-separated segments, so
+  `ngram_embedding` alone does **not** match). After the merge, the equivalent arm is
+  `VLLM_PLE_CPU_OFFLOAD=1` once the AMD pinned class from #57497 is in.
+- **Arm B (the tester's mmap table)** — the path that ships today.
+- **Report:** boot, VRAM per GPU, **pinned host RAM**, prefill TTFT, decode t/s (and
+  acceptance if MTP), at their 147 456 / `max-num-seqs 3` config and at a smaller one.
+- **Deciding datum:** pinned host RAM (26 GiB now, 51–102 GiB for the checkpoints upstream
+  targets) against the page-cache approach on their 128 GB box. If pinning that much is
+  impractical or slow there, the bespoke path is justified **even after** #57497 lands and
+  we say so in the docs; if the arms are comparable, delete the bespoke path (FN-11 step
+  (4)) and keep only its bug-class finding (FN-13).
+
+Needs the tester's box: no loadable checkpoint here (FN-3), so this cannot be measured
+locally. Reference: `REVIEW-pr2-qsa-fn.md` (2026-09-24/27 sections).
 
 ### QSA-FN-10 — the next tester measurement list (one session, ~30 min)
 
