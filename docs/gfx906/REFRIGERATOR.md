@@ -202,6 +202,68 @@ rails. **Reopen gate:** a checkpoint exists locally AND a target model
 AND an acceptance gate AND a memory budget. Do not add implementation
 work before all four.
 
+## Parked at the 2026-09-27 roadmap migration
+
+Items that were carried in `ROADMAP.md` but are not active work. They are kept
+here with their reopen gates; no GitHub issues are opened for them.
+
+### DFlash2 family (DFL2-1, DFL2-3, DFL2-4, DFL2-5, DFL2-6, DFL2-7, DFL2-8)
+
+**Parked finally 2026-09-16 (external result), confirmed by the arm-C
+measurement.** Upstream vLLM 0.29 is degenerate on the card's own matched pair,
+and so is our bf16+bf16 control (`HANDOVER-dflash2.md` §8/§9; per-draft
+acceptance 0.0408 / 0.0079). Arm C (DFlash2 without the chain patch) measured
+**2.48/2.52 t/s at 64k** (acceptance 0.045/0.063) and **1.37 t/s at 120k**
+(acceptance 0.0) against the MTP k=3 + CAT-1 band (35.97/35.44 at 64k,
+24.58/24.82 at 120k, reproduced within +0.8 %/+0.4 % in the same boot). The
+gap is ~14×, so no downstream patch closes it; `DFL2-8` (the drafter's attention
+backend) was the gate for the whole family. **Reopen gate:** a non-degenerate
+drafter appears for this family (a fresh matched bf16 pair that is not
+degenerate on a stock vLLM). Work branch: `gfx906/dflash2`. Record:
+`DEVLOG-dflash2.md`, `HANDOVER-dflash2.md`.
+
+### QSA-FN-5 — int8 `per_token_head` KV for QSA
+
+**Parked: the capacity argument moved.** The item existed to buy KV capacity at a
+measured 2.5–2.7× attention-prefill cost, but the tester's working config already
+serves 3 × 147 456 tokens on 4 × 32 GB via the PLE ngram table mmapped to host
+RAM (26 GB at zero attention cost). **Reopen gate:** a real need appears (more
+concurrency at 147k, or fewer cards); then measure the attention share of prefill
+on the tester's box first. Record: `RECON-qwen38-flash-qsa.md` §5.2.
+
+### S2 — shard loading time
+
+**Parked: deprioritized by Kevin 2026-09-04** ("not high priority, do not spend
+too much time"); fastsafetensors, the main lever, reserves more VRAM than the
+usual loaders. **Reopen gate:** load > 3 min cold, or NFS-backed serving becomes
+a target.
+
+### SMLA-1 — fp16 sparse-MLA on 0.29's ROCm path
+
+**Parked: inert, half-ported.** The fork's fp16 variant (`VLLM_ROCM_MLA_SPARSE_FP16`,
+default off) is split across the backend/hook files while 0.29's restructured ops
+file took upstream's implementation, so the path is not expected to work if
+enabled. **Reopen gate:** we serve a DeepSeek/GLM sparse-attention model on
+gfx906 (needs AITER + gfx942/950 upstream). Preserved in git history.
+
+### FA-NONCAUSAL Stage 2 — symmetric ±window in the kernel
+
+**Parked: not needed.** Stage 1 (full bidirectional for a non-causal batch) shipped
+default ON and gave the Muse-Glimmer assistant **≥ +29 %**; the symmetric-window
+mask was only a refinement. **Reopen gate:** a windowed-bidirectional drafter whose
+acceptance moves when the pre-window is honoured. Record:
+`DEVLOG-fa-noncausal.md`.
+
+### SYV-6 — int8 activations (W4A8 Marlin) + negative-scale bug fix
+
+**Parked: batch-mode only.** We run B=1; park until multi-request resumes. The
+bug fix is model-portable if the negative-scale issue is ever hit.
+
+### SYV-8 — DFlash2 block drafter
+
+**Parked: covered by the DFlash2 family park above** (big effort, needs V2,
+conflicts with the FULLGRAPH path).
+
 ## Cross-references (dev-log refrigerated levers, not restated)
 
 - LEGACY=0 Q8-write fusion into `triton_reshape_and_cache_flash` —

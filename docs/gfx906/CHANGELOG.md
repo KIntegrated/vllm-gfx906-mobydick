@@ -4,7 +4,182 @@ This file records roadmap items that are complete, rejected, superseded, or
 otherwise closed. Active work, deferred work, and changes that are local but
 still need upstream merging remain in the roadmap files. Dates are landing or
 merge dates where the repository history provides one; they are not necessarily
-the date an investigation began.
+the date an investigation began. Since 2026-09-27 open work is tracked as
+GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
+index, and closing an item means recording it here and deleting its roadmap line.
+
+## 2026-09-27 (roadmap migration — closed items retired from ROADMAP.md)
+
+The roadmap was pruned to open work only. This section banks the closed items
+that had no changelog record yet (the rest were already recorded by date above)
+and moves parked work to `REFRIGERATOR.md`. Open items now live as issues #3–#33.
+
+### 0.30.0 release prep
+
+- **REL30-1 — `moe_gemm_q4_kernel_gfx906<1,2>` page fault during V2 FULL-graph
+  capture (FIXED; the release ships on the V1 pin).** The merged 0.30 base faulted
+  reproducibly under the default V2 runner during FULL-decode capture
+  (`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`; 916 journal `no-retry page
+  fault` lines in one window). Root cause: the fork's **fused M=1 align**
+  (`torch.ops._rocm_C.moe_align_block_size_m1_gfx906`) leaves its output buffers
+  **uninitialised** under the V2 compiled/captured path — instrumented ids held
+  float bit patterns (e.g. `1067139072`) instead of `[0,256)`/`-1`, so
+  `b_q_weight + expert_id * stride` became a wild pointer. Ruled out: kernel
+  source, the merge's CMake change, and eager PPL under V2 (15.9840, 0 misses). A
+  `register_fake` for the align op did **not** fix it (reverted). Fix:
+  `_use_fused_align_m1()` now also requires V1 to be explicitly selected, so the
+  fused align is skipped on V2 (fail-safe, including the auto case). **Measured:**
+  V2 default `rc=0`, 0 faults, **58.90 t/s** (58.904/58.976/58.800/58.880); V1
+  unchanged at **60.42 t/s**. V2 therefore costs ~2.5 % on this workload and the
+  recommended serving config stays V1. Older-build workaround:
+  `VLLM_GFX906_ALIGN_M1=0` (validated). Record: `degradation.md` #110,
+  `degradation_details.md` 2026-09-26.
+- **GLM53-QGEMM-1** and **QSA-FN-14** closed in the 2026-09-24 and 2026-09-26
+  entries above.
+
+### Attention / FA
+
+- **VIT-2 — head_dim-96 instantiation for the ViT (DONE, DEFAULT ON).** The
+  launcher instantiates 96 and the pad map is now `(64, 96, 128, 256)`; 72/80 pad
+  onto 96, an exact 96 runs natively. Gates (same-boot A-B-A, mclk 1000): image
+  TTFT @1024² pad128 **5.151** / pad96 **5.080** / pad128 **5.155** s =
+  **−1.46 %** (order control +0.08 %, distributions disjoint); Phi-3-mini
+  (head_dim 96) **+0.69 %**. Two findings: the inherited `(96,96)` tile row was
+  wrong for this Q8 kernel (`nbatch_K=48` not a multiple of 32 scored only 64 of
+  96 dims; now `nbatch_K=96` + `static_assert`), and the −5 % estimate was a cost
+  model over-prediction (ViT attention is ~19 % of TTFT). `GFX906_FA_PAD96=0`
+  rolls back. Record: `DEVLOG-fa-d96.md`.
+- **FA-COVER-1 — CUSTOM-FA coverage census + fallback guard (RESOLVED).**
+  `tools/fa_coverage.py` + `DEVLOG-fa-coverage.md` mapped every rejection class —
+  text fallbacks were sinks (72 rows), `head_size` (61), encoder (36), non-causal
+  (18). The guard (`_guard_gfx906_fa_fallback`, `VLLM_GFX906_FA_STRICT`) emits a
+  loud once-per-engine warning. Head-size padding became the default: Phi-3-mini
+  (D=96) went from silent ROCM_ATTN to CUSTOM — identical top-5, PPL within
+  0.11 %, **+27 % decode** (36.41 vs 28.62 t/s, A-B-A), FA suite 101 passed.
+  Fixes: the full-attention KV-spec branch routes through `customize_spec`, and
+  the backend widens both halves of the fused row (`get_kv_cache_shape` vs spec).
+  `GFX906_FA_PAD=0` is the kill switch. Remaining classes → roadmap FA-COVER-2.
+- **FA-NONCAUSAL Stage 1 (SHIPPED, DEFAULT ON).** A non-causal decoder-shaped
+  batch now runs on CUSTOM FA (`supports_non_causal()` True; the impl suppresses
+  `q_abs_offset` and `window` for that batch → full bidirectional).
+  `GFX906_FA_NO_NONCAUSAL=1` rolls back. Gate: Muse-Glimmer + the official DFlash
+  assistant, TP=2, k=7, graphs on — drafter capture `dflash CUDA graphs (FULL)
+  2/2`, mean acceptance 3.12/3.18 (ROCM_ATTN+eager 2.95), decode **43.1 t/s vs
+  30.5 eager / 27.1 non-spec**; order-controlled ≥ **+29 %** (best +41 %).
+  Stage 2 (symmetric ±window in the kernel) is refrigerated — the assistant did
+  not need it. Record: `DEVLOG-fa-noncausal.md`.
+- **MBT-1 / FIX-H2 — multi-batch prefill O(live-context) tax root-caused and
+  fixed.** E1 was chunk-invariant (refuting the per-step-repeated model); the
+  owner was the **kv_max pad-tile expansion** (per-prefill-token × live-context
+  work). The clamp was validated on boot Y9: **120k×B4 wall 75.3 → 44.8 min
+  (−41 %), prefill agg 108.6 → 182.9 t/s (+68 %)**, outputs fingerprint-identical,
+  decode/spec unaffected (`ttft-prefill-stall.md` §13.16/§13.16.1). Residual
+  own-context streaming → roadmap MBT-1r.
+- **G1 — decode-graph per-node replay-cost probe (DONE, hypothesis killed).**
+  ~**1.2 µs/node TP=1, ~1.1 µs/node TP=2**, linear over N ∈ {0,16,32,64} — an
+  order of magnitude below the ~10 µs needed to own the 1.55 ms/step. 16–32
+  extra nodes ≈ 0.02–0.04 ms/step (~2 %). Future adds-nodes-per-step proposals
+  now carry a citable budget of ~1 µs/node. Record:
+  `DEVLOG-fa-legacy0-b1-decode.md` (G1 addendum).
+
+### MoE / kernels
+
+- **C3 — fold the two MoE zeroings: NO-GO (measured, not merged).** Phase A
+  folded `w1_out.zero_()` into the M=1 align kernel, bit-correct (78/78 + 67/67)
+  and firing (~37 layers/step), but the FULL_DECODE_ONLY serving A/B was a wash
+  (median 85.42 on vs 85.62 off t/s): `w1_out` is only 8 KB here, so ~40 tiny
+  memsets save ~tens of µs/step. Record: `DEVLOG-moe-c3-zeroing-fold.md`.
+- **C8 — expert-weight residency measurement (DONE).** Combined active W4 set =
+  12.47 MB > 8 MB L2/TCC (not fully resident), but the production gemm1 `<1,4>`
+  M=1 kernel reaches only ~195 GB/s ≈ **24 % of the HBM floor** — the binding
+  constraint at M=1 is **latency/occupancy, not bandwidth**, which set C2's
+  target. Record: `DEVLOG-moe-residency.md`.
+- **N3 — GDN state-bookkeeping copies (CLOSED, no code change).** Copy-class op
+  invocations per decode step drop **~214 → ~57 (−73 %)** under graph serving;
+  the eager ~180 µs/step was CPU **launch overhead** on 192-B `[3,1,32]` copies,
+  absorbed by CUDA-graph capture. Residual is well under 60 µs/step. Record:
+  `DEVLOG-gdn-n3-state-copies.md`.
+- **N1 — quiet the expected AutoAWQMoEMarlin fallback (SHIPPED).** On gfx906 the
+  fallback to the custom WNA16 path is intentional; `get_quant_method` now emits
+  one `info_once` line per process instead of a per-layer warning. Gate:
+  `tests/quantization/test_auto_awq_gfx906_fallback.py` (fails if reverted).
+- **DE-1 — dead-end register-spill / compiler-structural audit (DONE).** **Zero**
+  dead-ends failed from register spills or measurable pressure —
+  `vgpr_spill_count = 0` on every in-tree HIP-kernel dead-end (VGPRs 12–93).
+  FA V2 = 16 VGPR vs shipped V1's 12 (both spill-free → the 7× serving loss is
+  grid-shape/scheduler); gemm1 V1 single-wave was structural by construction.
+  13 rows annotated `FULLY DEAD` in `DEAD-ENDS.md`; no branch opened. Record:
+  `DEAD-ENDS-AUDIT.md`.
+
+### Spec decode
+
+- **MTP-1a (DONE) and MTP-1b-0 (CLOSED).** Crossover pinned at 32k–64k pp (n=3,
+  cold prefill), and the FA `kv_split` clamp for k>1 replaced with a byte budget
+  (`GFX906_FA_KVSPLIT_MAX_BYTES`, default 512 MiB). With the clamp fixed, k=2
+  beats both the clamped baseline and k=1 at every long-context point — 65 536
+  **37.95** (vs 15.95 clamped / 31.6 k=1), 98 304 **29.88**, 122 880 **25.70**
+  (vs 9.18 / 22.1) — so the "crossover" was clamp-specific. Regression test
+  `test_forward_sq_multi_kv_split_vs_fp32_ref` (7 cases). Record:
+  `DEVLOG-mtp1.md`.
+- **SYV-4 — sort-free small-k top-k/top-p sampler (MERGED).** One `torch.topk(k)`
+  replaces the full-vocab sort when all rows' k ≤ 64 and B < 8; opt-out
+  `VLLM_GFX906_SORT_FREE_SMALL_K=0`. GPU bench 1.17× @B=1 k=64, **6.55× @B=4
+  mixed**; e2e B=1 +1.4 %, **B=4 +3.4 %** on a sampling workload.
+- **SYV-7 — hybrid-model prefix caching (DONE, nothing to port).** The flag is
+  already ON by default and the model config auto-promotes mamba cache mode to
+  `align`; verified working with MTP. (`SYV-7b` mamba block size → roadmap.)
+- **SYV-10 — GDN spec-decode bounds checks (PORTED).** Upstream #50021 applied
+  verbatim; the fork carried the pre-PR unmasked `i_t = num_accepted − 1` load in
+  all four kernels. No runnable GPU test on ROCm (upstream is CUDA-gated) →
+  **GDN-1 test debt** in the roadmap.
+- **SYV-13 — mamba/GDN chunked-prefill align fixes (CLOSED N/A).** Both patch
+  parts diffed: the V1 `src_col` path already implements the same guards
+  CPU-side; `chunk_o.py` is the faithful pre-patch upstream state and no NaN has
+  been observed here.
+- **J2G-1 — persistent all-reduce env knobs (DONE, default ON).**
+  `NCCL_ALGO=Tree` + `NCCL_PROTO=LL` measured **+2.77 % @120k / +4.27 % @64k**
+  greedy TP=2 (n=5/point, no wedges); channel pinning adds nothing. Applied
+  default-on in `run_server.sh` (standard env vars, no code port).
+- **FD-1 — MTP fused-draft path (EXECUTED: NEUTRAL, stack-confounded).** FIX arm
+  2377.6 s vs non-FD serving 2447.8/2464.9 s at 4×122 880 (offline vs serving
+  control). The flag's only reader (A3's opt-in) was stripped 2026-09-13, so the
+  arm must not be re-queued as-is; revival needs the archive branch and a
+  same-stack re-gate.
+
+### Onboarding
+
+- **NH-5 — Nemotron topk chain (SHIPPED).** Single-group degenerate fast path in
+  `grouped_topk` + the (128,6) fused align: 3 kernels/layer removed. Serving
+  A–B–A (boot O) **106.8 → 114.6 → 107.8 t/s = +7.3–7.8 %**; fast path bit-equal
+  (19/19, incl. ties), align bit-equal (51/51), PPL 27.05 vs 27.00.
+  `VLLM_GFX906_TOPK_SINGLE_GROUP` default ON. Record: `DEVLOG-nemotron-h.md`.
+
+### Infra / startup
+
+- **S1 — startup graph/inductor speed (COMPLETE).** The 234 s warm engine-init
+  bottleneck was **not** compile/capture: the 27B checkpoint is multimodal and
+  every startup pushed a max-feature-size dummy image through the ViT in
+  `profile_run()` (~213 s). Fix = stock `--language-model-only` (now the arm
+  default). **Warm engine init 233.85 s → 14.54 s (16×)**; dev boot is now
+  weights-load-bound. Record: `DEVLOG-s1-startup.md`.
+- **HK-1 — drop the legacy `~/env-rocm-7.14-gfx906.sh` sourcing (recipes DONE).**
+  Single ROCm toolchain now; confirmed on boot N (TP=2 boots, 74/74 suite, FA
+  micro-bench) and re-verified under `env -u ROCM_PATH -u LD_LIBRARY_PATH`.
+  Removed from `running.md`, `docs/gfx906/README.md` and the mem-attribution
+  skill; the `/local/git/AGENTS.md` + `canary.sh` lines remain → roadmap HK-1.
+- **QSA-FN-3 — tiny `qwen4_exp` rig (SHIPPED).** `_qsa_tiny_model.py` +
+  `_serve_qsa_tiny_gfx906.sh` keep the architecture identical (all four layer
+  types, PLE/ngram, hyperconnection, QSA + sparse attention, MTP; QSA fraction
+  1/4) with random weights on one MI50. Baseline fp16/V2: prefill
+  1321/2641/3961 → 22/42/48 ms; decode 563/1023/1994 t/s at B=1/2/4. Corrected
+  gate: every path *executes*; quality stays with the tester. Produced the
+  V1-cannot-serve, V2-MAMBA-1 and bf16-broken findings.
+- **QSA-FN-6 — gfx906 int8-`tl.dot` fault in the QSA kernel (CLOSED, dropped).**
+  The serving config contains no int8, and int8-QK is 2.4× *slower* than fp16 at
+  the profiles where it runs, so the IMA cost nothing. Mechanism remains
+  unexplained (profile-dependent codegen at `block_n=64, num_splits=1,
+  num_warps=2`; `num_warps=8` clears it); repro at
+  `/local/tmp/qsaprobe/logs/ima_repro_G12.log`.
 
 ## 2026-09-26 (QSA-FN-14 gate: MiniMax-M3 `amd/ops` + `rocm_aiter_mla_sparse` fp16 paths validated without the model)
 
