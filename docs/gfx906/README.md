@@ -10,8 +10,8 @@ measured on a single MI50 with ROCm 7.14, torch 2.13, single request,
 - **[`0.30.0-final`](RELEASE-0.30.0-final.md)** (2026-09-26) — the first release on
   the merged upstream **0.30.0** base (31-conflict merge train): GPTQ act-order
   adopted-out, the MiniMax-M3 gfx906 re-port, and the 35B house bench at
-  **60.42 t/s** on the **V1** runner. Ships on V1 — V2 + 35B MoE + FULL-graph
-  capture faults (`REL30-1`).
+  **60.07 t/s** on the **V1** runner (V2 also works now — `REL30-1` fixed: the
+  fork's fused M=1 MoE align is V1-only, ~2 % slower on V2).
 - **[`0.29.0-final`](RELEASE-0.29.0-final.md)** (2026-09-18) — the last snapshot of
   the 0.29.0 line: the V2 mamba `align` fix, `SKINNY_M16` and C4 default-on, the
   0.30.0 conflict review, and the merge-prep sweep rule. The Qwen3.8-Flash-Next /
@@ -55,9 +55,9 @@ tests** (2026-09-15, default config) and 43/43 MoE GEMM (2026-08-24, not re-run
 since).
 
 **Release basis — 0.30.0 line (2026-09-26).** The upstream base defaults to Model
-Runner **V2**; on this fork the 35B MoE faults under V2 during FULL-graph capture
-(`REL30-1`), so the release is validated and shipped on **V1**
-(`VLLM_USE_V2_MODEL_RUNNER=0`, which every serve recipe pins). V2 remains the
+Runner **V2**; the fork's fused M=1 MoE align is now **V1-only** (`REL30-1`
+fixed), so V2 is correct but ~2 % slower on the 35B (58.90 vs 60.07 t/s) and the
+serve recipes keep pinning **V1** (`VLLM_USE_V2_MODEL_RUNNER=0`). V2 remains the
 default for the small models (Qwen3.8-27B dense, and the PPL probes above run V2);
 Muse-Glimmer's V1 pin was lifted 2026-09-16 and V1 is removed upstream in
 **0.32.0**. VIT-1 (ViT attention on the custom FA) is on by default. See ROADMAP

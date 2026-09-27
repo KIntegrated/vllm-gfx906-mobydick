@@ -6,12 +6,12 @@ merged with upstream `v0.30.0` (`ced6857afa`) as merge commit **`8893a50e54`**
 — 2017 files, **31 conflicted files**. Per-file resolution record: the merge
 commit body; theme log: `CHANGELOG.md` 2026-09-24/26.
 
-**Release basis — V1 model runner.** The merged base defaults to Model Runner
-**V2**. The 35B MoE **faults under V2 during FULL-graph capture** (`REL30-1`,
-below), so this release is validated and shipped on the fork's existing
-**V1** configuration (`VLLM_USE_V2_MODEL_RUNNER=0`, which every serve recipe
-already pins). V2 remains the base default for the small models and is tracked
-under `DFL2-2`.
+**Release basis — V1 model runner for peak throughput; V2 now works too.**
+`REL30-1` (the fork's fused M=1 MoE align left its out-params uninitialized under
+V2) is **fixed** — the fused align is now used only when V1 is explicitly selected.
+Measured, house config: **V1 60.07 t/s** (fused align on) vs **V2 58.90 t/s**
+(fused align skipped, `rc=0`, 0 faults). Both are correct; the fork's serve recipes
+keep pinning V1 for the ~2 % edge.
 
 ## What this snapshot adds over 0.29.0-final
 
@@ -63,16 +63,21 @@ under `DFL2-2`.
   passed / 3 skipped; `test_config.py` (attention/indexer/cudagraph) 43 passed;
   `test_gptq.py` 2 passed; `post-merge-sweep.sh` PASS.
 
-## Known issue: `REL30-1` (V2 + 35B MoE + FULL-graph capture)
+## `REL30-1` — fixed in this snapshot (was: V2 + 35B MoE graph capture)
 
-The 35B MoE faults under the default **V2** runner during FULL-decode graph
-capture, in the fork's own `moe_gemm_q4_kernel_gfx906<1, 2>`
-(`Memory Fault Error` → `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`). It is
-**reproducible on a fresh boot** (host state ruled out) and **V2-only**: the V1
-control ran the identical bench clean at 60.42 t/s. The kernel source is
-unchanged by the merge, and the same model passes the **eager** PPL probe under
-V2 (15.9840). Tracked as `REL30-1` / `DFL2-2`; record:
-`degradation_details.md` 2026-09-26 and `degradation.md` #110.
+Under the default **V2** runner the 35B MoE faulted during capture with
+`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` in the fork's
+`moe_gemm_q4_kernel_gfx906`. Root cause: the fork's **fused M=1 align**
+(`_moe_align_block_size_fused_m1` -> `_rocm_C.moe_align_block_size_m1_gfx906`)
+left its out-params **uninitialized** on V2's compiled/captured path, so the M=1
+GEMM indexed the expert tables with garbage ids (~1e9). M>=2 used the generic
+align and were always fine.
+
+Fixed by gating the fused align to an explicit V1 selection
+(`envs.VLLM_USE_V2_MODEL_RUNNER is False`; the auto/`None` default also skips it,
+so it is fail-safe). A `register_fake` for the align op was tried first and does
+**not** fix it (recorded). Details and the bisect: `ROADMAP.md` `REL30-1`,
+`degradation_details.md` 2026-09-26.
 
 ## What is *not* in this snapshot
 

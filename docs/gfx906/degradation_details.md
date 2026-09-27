@@ -3327,3 +3327,12 @@ so the align buffers are sized from the same token count the GEMM uses. **Valida
 is blocked**: both attempts to re-run the 35B bench after the fault died ~43 s in with
 the boot's init-lottery `hipErrorLaunchFailure` (broken-amdsmi); a host reboot is
 needed.
+
+**Resolution of `REL30-1` (2026-09-27).** Fixed by gating the fork's fused M=1
+align to an explicit V1 selection. Measured on the house config, both `rc=0` with
+0 faults: **V1 60.07 t/s** (60.094/60.056/60.028/60.083, fused align on) and
+**V2 58.90 t/s** (58.904/58.976/58.800/58.880, fused align skipped,
+`Using V2 Model Runner`). A `register_fake` for the align op was tried and does
+**not** fix the uninitialized out-params — recorded so it is not retried. The
+diagnostic instrumentation used to find this (C++ out-param/ids dump, Python
+shape dump) has been removed and the extension rebuilt.
