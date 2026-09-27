@@ -264,3 +264,28 @@ no action is needed from them there.
 costs this model the full-graph decode path; the alternative is warn-only plus
 `--enforce-eager`); and whether to file the stale/uninitialised-id hazard against
 #57497 ourselves using their finding. Both are recorded above and await a decision.
+
+## 2026-09-27 — settling the merge: the `.cu` hunk is out, the GC guard is upstream's job
+
+Two open items from the merge report are closed, both against the cherry-pick rather
+than against the merge resolution:
+
+1. **The PLE commit's `csrc/rocm/dense_gemv_gfx906.cu` hunk is dropped** — it does not
+   compile on this toolchain (`error: call to 'atomicAdd' is ambiguous` at the
+   ksplit>1 epilogue, reproduced through the real ninja build), it is unrelated to the
+   PLE path, and the base's comment documents why that call site uses the
+   compiler-lowered fp16 atomicAdd. So the merge no longer needs a rebuild to be
+   trustworthy on the GEMV rail: the file is the base's.
+2. **The GC guard needs no consolidation** — upstream #54646 (`c28feab989`) added both
+   `freeze_gc_for_cudagraph_capture` and the `if gc.isenabled():` skip in
+   `breakable_cudagraph.py::_capture`, i.e. exactly the protection the tester's
+   shadowing was written to provide on 0.29 (where neither exists). Keep their guard on
+   the 0.29 line as the off-by-default diagnostic it already is; carry it into 0.30
+   unchanged, and record #54646 as its supersession rather than re-implementing anything
+   in `gc_utils.py`. Their 28-case harness tests the guard, not the upstream helper, so
+   it stays with the guard.
+
+Still open for the merge, unchanged: the 8 doc conflicts (a real union, not a side
+pick), the house gates on a healthy boot (mamba kernels, FA, PPL, 35B), and the PLE
+implementation comparison, which only the tester's box can answer.
+

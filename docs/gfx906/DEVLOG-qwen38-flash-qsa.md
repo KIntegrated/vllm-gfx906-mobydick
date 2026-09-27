@@ -6,6 +6,66 @@
 > bf16-only site inventory, the ISA facts and the kernel timings live there; not
 > restated per entry). Newest entry first.
 
+## 2026-09-27 (1) — the 0.30 merge check: one build break, one supersession
+
+**VERDICT:** `SHIPPED` for the merge prep (both findings acted on); nothing about
+FN-1/FN-4/FN-12 changed except the fixes below.
+
+**GATE:** the merge of `gfx906/qsa-fn` onto the `gfx906/v0.30.0-final` release
+resolves to 10 conflicts (8 docs, 2 code), builds, boots the tiny rig with MTP
+k=3 + the PLE host table, and serves 3/3 requests; `test_qsa_amd.py` 22,
+`test_qsa_reference.py` 19 (+52 skipped), the PR #2 harnesses 52.
+
+### The PLE commit's `.cu` hunk is a build break, not a perf tweak
+
+`csrc/rocm/dense_gemv_gfx906.cu` came with the mmap-PLE commit: a file-scope
+`atomicAdd(__half*, __half)` in an anonymous namespace, a duplicate
+`#include <hip/hip_fp16.h>`, `#include <stdint.h>` and a comment typo. Nothing in
+the PLE path uses it, and on this toolchain it **does not compile** — HIP already
+provides that overload, so the anonymous-namespace definition is a second
+exact-match candidate and the ksplit>1 epilogue's call becomes ambiguous:
+
+```
+FAILED: CMakeFiles/_rocm_C.dir/csrc/rocm/dense_gemv_gfx906.hip.o
+.../dense_gemv_gfx906.hip:621:7: error: call to 'atomicAdd' is ambiguous
+```
+
+Reproduced through the real build (ninja -> hipify -> clang++ with the build's
+flags), then reverted and re-compiled clean. That call site is deliberate in the
+base: the kernel comment records that ksplit>1 uses "the compiler-lowered fp16
+atomicAdd (the pk2 CAS would be misaligned for odd rows ... the HSA aperture
+violation on an odd 32-bit CAS was observed, 2026-08-23)". Dropped (commit on
+this branch) rather than fixed: unrelated, never compiled in our builds, and it
+would have swapped the M<=4 GEMV rail's accumulation for a hand CAS loop
+unmeasured. If a toolchain ever needs a half-atomicAdd substitute it belongs in
+its own change with its own numerics/perf gate.
+
+### The GC guard is superseded by upstream #54646 — no consolidation needed
+
+The remaining item from the merge report ("fold the tester's shadowing into
+`vllm/utils/gc_utils.py`, or keep two mechanisms") resolves to *neither*: on the
+0.30 line upstream already does the job.
+
+- `vllm/utils/gc_utils.py::freeze_gc_for_cudagraph_capture` (added by
+  `c28feab989`, "[Core][MRV2] Freeze gc during V2 CG capture; skip per-descriptor
+  cleanup (#54646)") freezes + disables GC around capture.
+- `vllm/compilation/breakable_cudagraph.py::_capture` then **skips** its
+  per-descriptor `gc.collect()` while GC is disabled (`if gc.isenabled():`),
+  with the comment that bulk capture already ran that cleanup.
+
+That `if gc.isenabled()` is the same insurance the tester's shadowing provides —
+implemented by upstream, at the one call site that matters, in the PR that
+introduced the hole they were working around. The 0.29 base (this branch) has
+neither the helper nor the skip: `breakable_cudagraph.py` collects
+unconditionally there, which is why the guard was needed at all, and why it stays
+here. On 0.30 it is off by default anyway (`GFX906_GC_FREEZE=1` enables; unset is
+byte-identical to upstream), so the merge carries no stacked behaviour — the
+"two mechanisms" concern in the merge report was wrong on that point.
+
+Residual, not acted on: the guard's own exit traversal (upstream's `finally` does
+`gc.unfreeze(); gc.collect()`) was the tester's crash site on 0.29; 0.30's release
+gates ran that path without incident, so there is nothing to fix here now.
+
 ## 2026-09-24 (1) — the PLE id guard: fold, warn, never refuse a boot
 
 **VERDICT:** `SHIPPED` (fold-and-warn adopted from the tester's third revision,
