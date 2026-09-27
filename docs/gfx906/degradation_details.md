@@ -3336,3 +3336,25 @@ align to an explicit V1 selection. Measured on the house config, both `rc=0` wit
 **not** fix the uninitialized out-params — recorded so it is not retried. The
 diagnostic instrumentation used to find this (C++ out-param/ids dump, Python
 shape dump) has been removed and the extension rebuilt.
+
+## 2026-09-27 08:29–09:40 — observation #110 (bench and PPL normal, sync-heavy mamba suite ~10-20x down and stalling; amdsmi broken)
+
+Fresh boot at 08:29 (the reboot after #109). Within the first hour:
+
+- **Steady-state gates are fine**: the 35B house bench reads **59.14 t/s** (59.077 / 59.13 / 59.142 / 59.203; the release record is 59.79 and
+  the release notes' V2 number 58.90), and the *merged tree's* PPL probe reads **10.5472 with 0 top-20 misses** — the exact reference value.
+- **The sync-heavy suite is not**: `tests/kernels/mamba` (195 tests, ~56 s on a healthy boot, and 195 passed on this code family earlier in
+  the week) ran **8 minutes to 57 %** on the release line at 100 % CPU (progressing, just ~15x slow) and **stalled at 54 % with 0.0 % CPU** on
+  the merged tree — twice, the second time as the *only* GPU job on the box. Same 54 % position as the pre-reboot run of #109.
+- **amdsmi is broken again**: `_query_gcn_arch_from_amdsmi()` raises `RuntimeError: amdsmi did not return valid GCN arch` on both trees, and both
+  fall back to `torch.cuda` with `on_gfx906()` True. This is the same pre-wedge symptom recorded for #106 and #108.
+- The journal has no GPU reset, no `Failed to resume KFD`, no OOM; `rocm-smi` reports both GPUs and VRAM returns to the ~10 MB baseline after each
+  run stopped.
+
+Interpretation: this is #108's asymmetry (dense GPU work at speed, sync-cadence workloads collapse) with the added end state of a stall rather than a
+uniform slowdown, and it is **not** a property of either tree — both show the slow suite, and the trees differ only in AMD-side/`qwen4_exp` code that no
+mamba test touches (verified: arch detection identical, `on_gfx906()` True in both, the merged tree's added `platforms/rocm.py` plausibility check is
+unreachable because the amdsmi call raises before it). Consequence: **do not gate the suite on this boot**; the merge's suite verdict rests on the
+healthy-boot runs of the same code (195 passed on this code family) plus the completed gates here (PPL 10.5472, QSA 22 + 19, PR #2 harnesses 52,
+tiny rig boot + 3/3 requests).
+
