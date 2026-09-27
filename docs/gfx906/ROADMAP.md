@@ -252,9 +252,11 @@ HIP refuses inside a capture: the tiny rig's engine died at capture with
 `hipErrorStreamCaptureUnsupported` ("operation not permitted when stream is capturing").
 Two changes make the model bootable, both in `vllm/config/vllm.py` behind
 `model_type == "qwen4_exp"`: the op is appended to `compilation_config.splitting_ops`, and
-`cudagraph_mode` is downgraded from `FULL`/`FULL_AND_PIECEWISE` to `PIECEWISE` with a
-warning — FULL capture wraps the whole forward, so a splitting list alone cannot keep the op
-out of the graph.
+`cudagraph_mode` is downgraded to `PIECEWISE` with a warning whenever the mode
+`has_full_cudagraphs()` — FULL capture wraps the whole forward, so a splitting list alone
+cannot keep the op out of the graph. (The first version compared members against
+`FULL`/`FULL_AND_PIECEWISE` and so missed `FULL_DECODE_ONLY`, whose value is the tuple
+`(FULL, NONE)`; found while checking the 0.30 merge, fixed 2026-09-27.)
 
 **The cost, which is why it needs deciding:** the downgrade should cost this model
 full-graph decode — unmeasured, since the checkpoint does not load here (FN-3). Options:

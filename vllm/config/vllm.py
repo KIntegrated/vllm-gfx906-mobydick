@@ -1714,10 +1714,12 @@ class VllmConfig:
             # keep that op out of the graph; PIECEWISE runs it in the eager
             # regions between the captured pieces. Downgrade loudly rather than
             # let the engine die with hipErrorStreamCaptureUnsupported.
-            if self.compilation_config.cudagraph_mode in (
-                CUDAGraphMode.FULL,
-                CUDAGraphMode.FULL_AND_PIECEWISE,
-            ):
+            # `has_full_cudagraphs()` rather than a member comparison: the
+            # full-capture modes are a tuple (FULL_AND_PIECEWISE, and
+            # FULL_DECODE_ONLY whose value is (FULL, NONE)), so an `in (...)`
+            # test silently misses FULL_DECODE_ONLY -- exactly the mode an
+            # explicit --compilation-config can ask for.
+            if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
                 logger.warning_once(
                     "Qwen4Exp's host-resident PLE n-gram lookup cannot run "
                     "inside a full cudagraph (blocking D2H mid-graph); "
