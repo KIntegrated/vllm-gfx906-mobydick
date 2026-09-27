@@ -118,6 +118,470 @@ proposing (§1 duplicate checks not yet run).
 writes a column without the `-1` every other align site uses — dev log,
 Refrigerated residue; unverifiable here (no RecoverSSM model loadable).
 
+## High priority — user-requested (2026-09-22): re-test vLLM's custom all-reduce now that PCIe P2P is live
+
+### P2P-1 — custom all-reduce: remove `--disable-custom-all-reduce` and re-measure — **HIGH PRIORITY** (Kevin 2026-09-22)
+
+**Status: OPEN** — one fresh boot per arm, interleaved (A-B-A). Low effort, low
+risk; fallback is the current flag.
+
+**Why now.** The flag is inherited, not measured: `README.md` (TP=2 tables) and
+the J2G-negative note below record the custom AR as "not a gfx906 path (peer IPC
+init faults / post-prefill hangs; matches our `--disable-custom-all-reduce`)".
+That diagnosis was made when this box had **no PCIe P2P** — no full-VRAM BAR and
+host bridge `8086:6f00` absent from the kernel `pci_p2pdma_whitelist[]`. As of
+**2026-09-22 P2P is live and byte-clean** (Above-4G decoding on, MMIO high base
+at ~1 TiB so the 32 GiB BARs sit below the 44-bit mask, whitelist patch in
+`6.8.12-acso`; both GPUs register `peer-to-peer DMA memory`, `showtopoaccess`
+True/True, re-seeded bidirectional copies 0 bad). The peer-IPC premise therefore
+has to be re-tested rather than assumed.
+
+**Why it might pay / why the ceiling is low.** vLLM's custom AR is tuned for
+small messages — exactly the TP=2 decode shape. But the same-day A/B (P2P vs
+`NCCL_P2P_DISABLE=1`, MTP k=3 filler) measured only **+1 % @2k / +0.5 % @8k**
+(~0.5 ms/step): at that config the all-reduce is *not* the bottleneck. Gate on
+**B=4 and/or long context**, where AR volume per step is larger — not on 2k.
+
+**Gates.** (1) With the flag removed: init does not fault, no post-prefill hang
+(the original failure mode). (2) Interleaved same-boot A-B-A of ms/step at B=1
+and B=4 vs the RCCL arm, mclk-gated (fresh boot — the same session saw a
+**−5.6 %** drift after one BACO wedge, so a single boot cannot resolve this).
+(3) If it holds: record the winning regime in a dev log and update the
+CDNA-parity flag set (`README.md`, `_serve_qsa_flash_gfx906.sh`, the
+`docs/gfx906/README.md` TP=2 line).
+
+**Refs.** `/local/tmp/4g-handover.md` (P2P enablement + first perf A/B);
+`degradation.md` #104/#105; `DEVLOG-tp2-dense.md` S1/S4 (RCCL P2P/IPC history);
+the J2G-negative note in the tier-0 entry below.
+
+## High priority — user-requested (2026-09-17): Qwen3.8-Flash-Next / QSA on gfx906
+
+**Kevin 2026-09-17.** A tester hit `NotImplementedError: Qwen4Exp QSA currently
+requires BF16` on gfx906 for `Qwen/Qwen3.8-Flash-Next` (the `qwen4_exp` QSA
+architecture), and pointed at the CDNA2 QSA patch set
+(`../qsa-cdna2-vllm-patches`, gfx90a) as the thing to backport. Recon (with
+measured kernel evidence) is [`RECON-qwen38-flash-qsa.md`](RECON-qwen38-flash-qsa.md);
+**read its §1 and §5.2 before touching anything** — the reported error is *not*
+what the patch set fixes, and the patch set's int8 half is a poor fit for this
+chip.
+
+**Two independent workstreams, in this order.**
+
+1. **fp16 enablement (QSA-FN-1 — SHIPPED; recipe half = QSA-FN-2)** — fixes the
+   reported failure, and is a measured **3.9×** on the QSA kernel pair, because gfx906
+   emulates every bf16 `tl.dot` as scalar fp32 FMA (`v_fmac_f32`) while fp16 lowers to
+   `v_dot2_f32_f16`. No new kernels: guard edits only.
+2. **The CDNA2 patch set (QSA-FN-4/5/6)** — of its three changes, **one ported
+   and shipped** (tiled indexer, **1.33×** fp16 gated on `dot_is_native`), one is
+   capacity-only (int8 KV: 2.5–2.7× attention prefill cost, decode-neutral), and
+   one does not port at all (int8-QK: faults at the dispatch profile every real
+   prefill uses, and is not faster where it runs).
+
+**Critical path (2026-09-24): QSA-FN-9** — their PR is integrated on
+`gfx906/qsa-fn` and now waits on the PLE measurement — with the two house-side
+decisions **QSA-FN-12** (the `qwen4_exp` cudagraph mode) and **QSA-FN-13** (report
+the pinned-id hazard upstream) both **HIGH PRIORITY**. QSA-FN-8 and FN-1/2/3 are
+SHIPPED; the int8 items (QSA-FN-5/6) are evidence-first and both currently default
+to "not on this chip". The real model is ~120 B
+params of MoE (W4A16 ≈ 60 GB, plus a PLE ngram table the CDNA recipe offloads
+60 GB of), i.e. unloadable in 2× MI50 — so quality and the FN-5 share still need
+a tester's box.
+
+### QSA-FN-1 — fp16 activations + fp16 QSA/indexer caches (**SHIPPED 2026-09-17**, the reported failure)
+
+**Status: SHIPPED** for the code and the kernel-level gates, on branch
+`gfx906/qsa-fn`; **the end-to-end gate is QSA-FN-3's** (no loadable checkpoint
+here). Record: [`DEVLOG-qwen38-flash-qsa.md`](DEVLOG-qwen38-flash-qsa.md).
+
+The reported error was two of the guards (`amd/qsa.py` activation check,
+`amd/indexer_qsa.py`'s copy), both tripped by the deliberate gfx906 bf16→fp16
+auto-fallback (`platforms/rocm.py:645`, `config/model.py:2294`). Fixed by
+admitting fp16 everywhere the QSA path stores or reads a 2-byte float, through
+one shared pair of constants (`QSA_ACTIVATION_DTYPES` / `QSA_KV_CACHE_DTYPES` in
+`common/qsa_cache.py`). `common/qsa_cache.py` is shared with the NVIDIA
+implementation, so its edits are dtype-*general* (`self.dtype`, model dtype) and
+the NVIDIA files are untouched — no CUDA-path change.
+
+The three AMD `HyperConnectionConfig(params_dtype=torch.bfloat16)` sites (listed
+under FN-2) came along: bf16 HC weights under fp16 activations are not a coherent
+fp16 path. The NVIDIA copies keep their bf16 literal.
+
+**Measured value:** sparse attention 26.5 ms fp16 vs 116.5 ms bf16 (4.39×,
+interleaved, rep-stable); per-row indexer 5426 µs vs 6928 µs (1.28×).
+
+**GATE (green):** `test_qsa_amd.py` **9 → 16 passed** and `test_qsa_reference.py`
+**16 → 19 passed**, both with a new fp16 arm (the sparse-attention reference test,
+a new indexer-scoring reference test, the shared state-cache bind test, and a new
+int64-MRoPE-packing test); plus FN-7: FA suite **104 passed**, PPL **10.5472**
+(= the recorded value for this build), MoE 35B **58.30 t/s** mean (= parity).
+
+**Remaining risk (in the dev log):** no served request has exercised the fp16 path
+— the config-shape plumbing is not instantiated in any test. That is QSA-FN-3's
+job, and it is why FN-1's verdict is "shipped at kernel level".
+
+### QSA-FN-2 — model-level fp16 sweep + the tester launch recipe (**SHIPPED 2026-09-17**)
+
+**Status: SHIPPED** — [`_serve_qsa_flash_gfx906.sh`](_serve_qsa_flash_gfx906.sh)
+(`start|wait|stop|report`). Every deviation from the MI210 production launch and
+its reason:
+
+| flag | why |
+|---|---|
+| `--dtype float16` | explicit; gfx906 has no native bf16 (the reported failure was the auto-fallback meeting the old bf16-only guards) |
+| `VLLM_USE_V2_MODEL_RUNNER=1` | **required** — the PLE inputs come from the V2 model states; on V1 the layer raises "PLE inputs were not prepared". Do not copy the other recipes' V1 pin here |
+| `--no-enable-prefix-caching` | **was required** for V2-MAMBA-1 (the align-mode IMA); **retired 2026-09-17** once the seed bug was fixed — the recipe leaves prefix caching on and keeps the flag only as a documented fallback |
+| (no `--mamba-cache-dtype`) | the CDNA recipe pins bf16 there; leave auto = fp16 |
+| `--max-model-len 262144` | native un-scaled RoPE; do **not** add YaRN (it degrades all positions) |
+| `--block-size 64`, `--max-num-seqs 4`, `--max-num-batched-tokens 4096` | as CDNA |
+| capture ladder `[4,8,12,16]` | = `max_num_seqs × (k+1)` for MTP k=3 (house rule) |
+| `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` | ours, not CDNA's deprecated `qwen4_exp_mtp` spelling (identical after `speculative.py:1090` normalizes it) |
+| `--enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3` | as CDNA |
+| `--enable-expert-parallel`, `--disable-custom-all-reduce` | as CDNA (TP>1 on this topology) |
+
+The three `HyperConnectionConfig(params_dtype=torch.bfloat16)` sites went in with
+FN-1. Deliberately not carried over: `--kv-cache-memory` (CDNA pinning; let vLLM
+size it) and `--trust-remote-code` (not needed).
+
+**Validated vs derived.** The *flag set* is validated end-to-end on the tiny
+harness (V2 + `--enable-expert-parallel` + `--disable-custom-all-reduce` + ladder
+`[4,8,12,16]` + MTP k=3 + parsers + no prefix caching all load, capture and
+serve); everything that depends on the real checkpoint (the 60 GB load, KV sizing
+at 256 K, quality, `content` vs `reasoning` on real outputs) is **derived and
+unvalidated** — that is what the tester's report is for.
+
+### QSA-FN-2b — the validated serving config (tester, 2026-09-22) + two template/toolchain findings
+
+**Status: SHIPPED as a record** — this is the configuration that actually serves the
+model, so it replaces the derived defaults in the recipe. From the tester's run
+(4× MI50 32 GB, PCIe-only): `--tensor-parallel-size 4`, fp16,
+`--max-model-len 147456`, `--max-num-seqs 3`, `--max-num-batched-tokens 4096`,
+`--gpu-memory-utilization 0.91`, MTP k=3, piecewise cudagraphs
+`capture_sizes=[4,8,12,16]`, PLE ngram table mmapped to host RAM (26 GB) — the
+offload is what makes the model fit, not the KV dtype. **46.8 t/s at B=1** with
+MTP k=3; 25.4 t/s without it (PR #1's arm).
+
+Two findings to carry into the recipe/docs (both generic, not box-specific):
+
+- **The official Qwen chat template hard-raises** `jinja2 TemplateError: No user
+  query found in messages` when a conversation has no user turn (an all-tool-result
+  tail), which kills agentic chains at request time in the APIServer, not at boot.
+  Fix: a template with a `last_query_index` fallback, passed via `--chat-template`
+  (read once at startup, so a replaced file needs a restart). Worth checking whether
+  our own `qwen3` parsers/recipes hit this before blaming the model.
+- `enforce_eager` inside `--speculative-config` is a **no-op on this build**: only the
+  legacy `v1/spec_decode/` proposer reads it, and it is never propagated to the draft
+  `ModelConfig`, so a spec-decode arm that "still captured graphs despite the flag"
+  tested nothing.
+
+### QSA-FN-3 — tiny `qwen4_exp` config: make the model testable on one MI50 (**SHIPPED 2026-09-17**)
+
+**Status: SHIPPED.** [`_qsa_tiny_model.py`](_qsa_tiny_model.py) +
+[`_serve_qsa_tiny_gfx906.sh`](_serve_qsa_tiny_gfx906.sh) build and serve a
+config that keeps the architecture identical (all four layer types, PLE/ngram,
+hyperconnection, QSA indexer + sparse attention, MTP; the QSA layer fraction
+stays 1/4 = 12/48) with random weights (`--load-format dummy`) on one MI50.
+Record: [`DEVLOG-qwen38-flash-qsa.md`](DEVLOG-qwen38-flash-qsa.md) (2).
+
+Baseline (fp16, V2, prefix caching off): prefill 1321/2641/3961 tokens →
+22/42/48 ms; decode **563 / 1023 / 1994 t/s** at B=1/2/4. **Corrected gate
+wording:** "generates coherent text" is impossible with random weights — the
+gate is that every path *executes* (prefill, B=1–4 decode, graph replay, MTP
+spec decode, tool parser). Quality stays with the tester.
+
+**What it cannot do:** measure the QSA share of prefill (the tiny dims are
+10–24× off the real ones, so shares do not transfer) — that is FN-5's gate and
+needs either a tester's box or a second config scaled to the real ratios.
+
+**Three findings it produced** (each has its own entry below): the V1 runner
+cannot serve this model at all (FN-2); `precopy_mamba_align_fused_kernel` faults
+on gfx906 under V2 + prefix caching (**V2-MAMBA-1, since fixed**); the bf16 arm is
+independently broken (FN-1's limit list). Harness hygiene: warm up every shape (a
+20 s autotune storm otherwise looks like a decode collapse) and pin
+`VLLM_PLUGINS=` — this venv auto-loads five stale profiler plugins, A/B'd inert
+but noisy.
+
+### V2-MAMBA-1 — `precopy_mamba_align_fused_kernel` IMA on gfx906 (**SHIPPED 2026-09-17**)
+
+**Status: SHIPPED** (branch `gfx906/qsa-fn`). Record:
+[`DEVLOG-v2-mamba-align.md`](DEVLOG-v2-mamba-align.md).
+
+Root cause was **not** in the kernel and **not** gfx906-specific:
+`MambaHybridModelState.add_request` seeded the per-request running mamba block
+column with `cache_config.block_size` instead of the mamba block size. On a
+hybrid model whose KV-cache groups have heterogeneous block sizes the engine
+narrows `cache_config.block_size` to the *finest* group (4 here, Qwen4Exp's
+`CircularBufferSpec` indexer group) while the mamba geometry stays 192, so a
+prefix-cache hit (`num_computed_tokens > 0`) seeded a column ~57× too far out and
+the align pre-copy followed a stale block-table entry to a wild address. Fixed
+by one line (+assert) using `cache_config.mamba_block_size` — the value the V1
+path already used (`mamba_utils.py`: `block_size = mamba_spec.block_size`).
+
+**Gate (met):** the tiny Qwen4Exp rig with prefix caching ON runs the sequence
+that used to fault, and greedy tokens *and* top-5 logprobs are bit-identical to
+the prefix-caching-OFF arm (worst |Δ| = 0.000000), with and without MTP k=3;
+12/12 requests per arm. New unit test fails pre-fix (`assert 287 == 5`); the two
+CUDA-gated mamba kernel tests are ROCm-enabled here (195 passed on gfx906).
+
+**Consequences:** the `--no-enable-prefix-caching` workaround is retired from the
+QSA-FN-2 recipe (kept only as a documented fallback for older builds), and this
+is no longer a DFL2-2 consideration (DFL2-2 itself closed 2026-09-16). Upstream
+`main` (fetched 2026-09-17) still has the seed bug but narrows the *trigger* by
+excluding non-prefix-cacheable groups — masking, not fixing; a prefix-cacheable
+group finer than the mamba block would still trip it, so an upstream PR is worth
+proposing (§1 duplicate checks not yet run).
+
+**Residue (not gated, cross-linked not restated):** the RecoverSSM align kernel
+writes a column without the `-1` every other align site uses — dev log,
+Refrigerated residue; unverifiable here (no RecoverSSM model loadable).
+
+### QSA-FN-9 — tester run + PR #2 (joochung): merge the model-specific fixes
+
+**Status: OPEN — integrated on `gfx906/qsa-fn`, waiting on the tester's PLE
+measurement (Kevin 2026-09-24).** The tester served the real checkpoint (4× MI50,
+TP=4, fp16, 147 456 ctx, MTP k=3): **46.8 t/s at B=1**, so QSA-FN-8's gate is met.
+Their six functional commits are cherry-picked onto the branch under their
+authorship; the cleanups are ours (drafter-graph default restored to upstream,
+comments trimmed, their `degradation.md` rows re-homed as generic findings, the two
+harnesses shipped in-tree), so the review-phase to-do list is discharged. Two things
+ended differently from that plan: the PLE host table is **not** env-gated — it stays
+default-on as the interim path that FN-11 deletes — and two gfx906 fixes were needed
+on top of it (`--load-format dummy` support, plus the capture-mode change in FN-12).
+Their range guard also needed a *third* revision (fold-and-warn, never a boot
+refusal): see `REVIEW-pr2-qsa-fn.md` (2026-09-24) and `DEVLOG-qwen38-flash-qsa.md`.
+**Outstanding: the PLE comparison itself (tracked as QSA-FN-15)** (their mmap path vs upstream's
+pinned/UVA offload, or the generic `--cpu-offload-params` stand-in) — the deciding
+datum is host RAM pinned vs page cache, and nothing in this round answers it.
+
+### QSA-FN-12 — decide the `qwen4_exp` cudagraph mode (the PIECEWISE downgrade) — **HIGH PRIORITY** (Kevin 2026-09-24)
+
+**Status: OPEN — a judgement call made to unblock the model; needs one decision and one
+measurement.** The PLE host-table op does a host-side gather and a **blocking** D2H, which
+HIP refuses inside a capture: the tiny rig's engine died at capture with
+`hipErrorStreamCaptureUnsupported` ("operation not permitted when stream is capturing").
+Two changes make the model bootable, both in `vllm/config/vllm.py` behind
+`model_type == "qwen4_exp"`: the op is appended to `compilation_config.splitting_ops`, and
+`cudagraph_mode` is downgraded to `PIECEWISE` with a warning whenever the mode
+`has_full_cudagraphs()` — FULL capture wraps the whole forward, so a splitting list alone
+cannot keep the op out of the graph. (The first version compared members against
+`FULL`/`FULL_AND_PIECEWISE` and so missed `FULL_DECODE_ONLY`, whose value is the tuple
+`(FULL, NONE)`; found while checking the 0.30 merge, fixed 2026-09-27.)
+
+**The cost, which is why it needs deciding:** the downgrade should cost this model
+full-graph decode — unmeasured, since the checkpoint does not load here (FN-3). Options:
+(a) keep it (current state: graphs stay on and the op runs in the eager regions, which is
+the configuration the tester validated); (b) warn only and let the operator pass
+`--enforce-eager`; (c) keep the downgrade but env-gate it.
+
+**Deciding evidence (tester's box, ~10 min):** MTP k=3 at 147 456 with
+`FULL_AND_PIECEWISE` + the op in the splitting list vs the current `PIECEWISE`, same
+prompts, interleaved (A,B,A) — if FULL does not boot or does not win, keep the downgrade and
+close the question. Note that their current eager-only workaround (FN-9) makes piecewise a
+*gain* for them regardless. Whichever way it lands, the FN-2 recipe states it.
+
+### QSA-FN-13 — report the stale/uninitialised pinned-id hazard on upstream #57497 — **HIGH PRIORITY** (cheap, upstream value)
+
+**Status: OPEN — ours to file; the finding is the tester's.** Two PLE id-bug classes were
+found in the tester's host-table path and both transfer to upstream's pinned mechanism
+(`#57497`, adopted by FN-11), which stages ids through a pinned buffer the same way:
+
+- **stale/uninitialised ids** — an async D2H leaves the host reading ids the producer has
+  not written, which then index out of range (their original finding);
+- **the capture-time variant** — `0xff80ff80ff80ff80` repeated, i.e. an unwritten pinned
+  buffer, arriving only on the compile/graph path, which killed three boots on their box.
+
+To post on `#57497`: the mechanism, both producers (the drafter's
+`sample_idx_mapping.fill_(-1)` padding sentinel and capture-time uninitialised buffers), and
+the recommendation that a range check on this path **fold-and-warn rather than raise** — a
+`raise` there is a boot refusal, and its legitimate producers cannot be enumerated from the
+n-gram arithmetic. Ties into FN-11 step (4) and UP-4. Deliverable: a comment (or issue)
+carrying the mechanism plus the tiny-rig evidence; ask them whether they want to file it
+themselves or co-sign ours first.
+
+### QSA-FN-4 — backport the tiled indexer (**fp16-gated**) (**SHIPPED 2026-09-17**)
+
+**Status: SHIPPED** — both CDNA hunks in `amd/ops/qsa.py` plus the gate the CDNA
+version lacks. Record:
+[`DEVLOG-qwen38-flash-qsa.md`](DEVLOG-qwen38-flash-qsa.md) (4).
+
+```python
+dot_is_native = q.dtype == torch.float16 or current_platform.supports_native_bf16
+use_tiled = q.shape[0] >= 64 and dot_is_native and bool((token_to_req == token_to_req[0]).all())
+```
+
+The win is the hardware `tl.dot`, not the tiling: fp16 gains on every target
+(gfx906 `v_dot2_f32_f16`, CDNA MFMA), bf16 is emulated per-scalar on gfx906
+(0.42× there) and native on CDNA (the author's 6.57×). The uniformity check syncs
+the device and stays inside the `q.shape[0] >= 64` prefill gate.
+
+**Gate (met, launch-regime, one MI50):** fp16 dispatch **1.33-1.35×** (4084/4061 vs
+5439/5465 µs, same inputs, interleaved ×3) with top-2048 agreement **1.00000** and
+logits NRMSE 1.28e-07; bf16 stays on the per-row route (1.00×, not 0.42×).
+`test_qsa_amd.py` **16 → 22 passed** (the scoring test now covers both routes;
+new `test_qsa_mqa_paged_route_selection` pins the gate, including
+“bf16 + uniform + 64 rows → per-row”). Non-regression in the same boot:
+`test_qsa_reference.py` 19, `test_config.py` 7, `test_ple.py` 10, FA
+`test_gfx906_fa.py` 104, PPL 10.5472 (recorded value), MoE-35B reference
+workload unchanged.
+
+**Limit:** the indexer's *serving* share (~23 % of prefill on the CDNA author's
+30 k-token measurement) is not re-measured — the tiny rig cannot transfer shares
+(FN-3), so a tester remains the only end-to-end number.
+
+### QSA-FN-5 — int8 `per_token_head` KV for QSA: **re-scoped by the tester's result**
+
+**Status: OPEN but demoted — the capacity argument moved.** The item existed to buy
+KV capacity (int8 halves KV bytes) at a measured 2.5–2.7× attention-prefill cost on
+gfx906, gated on how big the attention actually is (MI210: 57.7 % of prefill).
+The tester's working config **already serves 3 × 147 456 tokens** on 4 × 32 GB with
+the PLE ngram table mmapped to host RAM — i.e. the capacity that mattered came from
+host-RAM offload (26 GB at zero attention cost), not from the KV dtype. So: keep
+int8-KV parked unless a real need appears (more concurrency at 147 k, or a smaller
+card count), and if it is revived, measure the **attention share of prefill on the
+tester's box first** — we cannot measure it here (no loadable checkpoint), and the
+tiny rig's shares do not transfer.
+
+**Its one still-open measurement (delegated, with QSA-FN-10):** prefill-time
+breakdown on the real model — indexer vs sparse attention vs MoE — which decides
+FN-5 *and* prices the tiled indexer (QSA-FN-4) on real payloads.
+
+### QSA-FN-6 — gfx906 int8-`tl.dot` fault in the QSA kernel (**CLOSED: dropped 2026-09-22**)
+
+**Status: CLOSED — int8-QK is dropped for gfx906.** Decided once the tester's run
+made the point moot: the configuration that actually serves the model (fp16,
+tiled indexer, TP=4, MTP k=3 — see QSA-FN-9) contains no int8 anywhere, and
+int8-QK is 2.4× *slower* than an fp16 cache at the profiles where it runs at all
+(RECON §5.2), so the IMA in `_qsa_sparse_paged_gqa_splitk_kernel` cost us nothing
+we wanted. The fault mechanism itself stays unexplained (shape/profile-dependent
+gfx906 codegen hazard at `block_n=64, num_splits=1, num_warps=2`; `num_warps=8`
+or `BLOCK_M=8` clears it) and is parked with the repro in
+`/local/tmp/qsaprobe/logs/ima_repro_G12.log`.
+
+Residue if it is ever resurrected: force `num_warps=8` in the gfx906 dispatch, or
+census the failing instantiation with `llvm-objdump` (skill
+`gfx906-isa-disassembly`) before blaming Triton. Record: `DEAD-ENDS.md`.
+
+### QSA-FN-11 — adopt upstream's official PLE CPU offload on gfx906
+
+**Status: OPEN — blocked on the 0.30.x merge, not on us.** Upstream's PLE n-gram CPU
+offload (`VLLM_PLE_CPU_OFFLOAD`, default **on**; `vllm/config/engram.py`, gate already
+`is_cuda_alike()` in `v0.30.1rc0`) is the official version of the tester's hand-built
+mmap path. What is missing for ROCm is the *implementation*: `vllm-project/vllm#57497`
+(open, base `main`) moves the pinned/device classes to `qwen4_exp/common/ngram_embedding.py`
+and makes the AMD PLE layer select the pinned class, behind a custom op that keeps the
+table out of inductor's autotuning copy.
+
+Plan once we are on a 0.30.1-based line: (1) verify `VLLM_PLE_CPU_OFFLOAD=1` engages on
+gfx906 with the tiny rig (functional) — today's AMD path ignores it; (2) port or wait
+for #57497's AMD half; (3) validate on the real checkpoint via the tester; (4) **delete
+the bespoke `MmapShardedNGramEmbedding` path** from PR #2 and keep only its bug-class
+finding (stale/uninitialised pinned ids). Interim note: while we stay on the 0.29 line,
+the bespoke path or the generic `--cpu-offload-params` are the only options — treat
+them as stopgaps, not as the design.
+
+### QSA-FN-15 — the PLE implementation comparison (mmap host table vs upstream's pinned/UVA offload) — **HIGH PRIORITY, tracked** (Kevin 2026-09-27)
+
+**Status: OPEN — explicitly *not* a gate on the 0.30 merge.** The QSA work lands on the
+0.30 line with the tester's `MmapShardedNGramEmbedding` as the **interim** AMD path
+(upstream's `VLLM_PLE_CPU_OFFLOAD` covers NVIDIA on 0.30.0; the AMD half is
+`vllm-project/vllm#57497`, which FN-11 adopts). This item is the measurement that decides
+whether the bespoke path survives that adoption.
+
+- **Arm A (upstream/generic)** — the branch *without* the PLE commits, using the generic
+  per-parameter UVA offload: `--cpu-offload-gb <at least the table> --cpu-offload-params
+  ngram_embedding.weight` (the matcher compares exact dot-separated segments, so
+  `ngram_embedding` alone does **not** match). After the merge, the equivalent arm is
+  `VLLM_PLE_CPU_OFFLOAD=1` once the AMD pinned class from #57497 is in.
+- **Arm B (the tester's mmap table)** — the path that ships today.
+- **Report:** boot, VRAM per GPU, **pinned host RAM**, prefill TTFT, decode t/s (and
+  acceptance if MTP), at their 147 456 / `max-num-seqs 3` config and at a smaller one.
+- **Deciding datum:** pinned host RAM (26 GiB now, 51–102 GiB for the checkpoints upstream
+  targets) against the page-cache approach on their 128 GB box. If pinning that much is
+  impractical or slow there, the bespoke path is justified **even after** #57497 lands and
+  we say so in the docs; if the arms are comparable, delete the bespoke path (FN-11 step
+  (4)) and keep only its bug-class finding (FN-13).
+
+Needs the tester's box: no loadable checkpoint here (FN-3), so this cannot be measured
+locally. Reference: `REVIEW-pr2-qsa-fn.md` (2026-09-24/27 sections).
+
+### QSA-FN-10 — the next tester measurement list (one session, ~30 min)
+
+**Status: OPEN — ready to send.** Everything here needs the real checkpoint, i.e. the
+tester's box. Ordered by decision value:
+
+1. **Prefill breakdown** (decides FN-5, prices FN-4): prefill tok/s at 30 k and 100 k,
+   once with the tiled indexer forced off (`dot_is_native` false is not settable by env
+   — ask for a one-line patch or measure 1 × 32 k vs 1 × 100 k and compare against the
+   fp16 kernel probe's share) and note TTFT separately from decode.
+2. **MTP depth on the real model**: k=2 / k=3 / k=4 at 32 k and 100 k, ≥3 reps, same
+   prompts, interleaved arms (A,B,A) — our house default is k=3 from dense-model data;
+   this is the first chance to check it on 120 B MoE.
+3. **Long-context quality**: one needle at 100 k+ (start/middle/end) and a coherent
+   multi-turn exchange — the report so far has throughput only.
+4. **Drafter graphs on/off** at their k: they measured +6 % / −2.3 % KV; a same-boot
+   interleaved repeat would let us adopt that finding for our own configs.
+5. **Prefix caching on/off** at 147 k: the V2 mamba-align path now works (V2-MAMBA-1),
+   but no one has exercised it on this model's PLE/GDN state at that context.
+
+### QSA-FN-7 — non-regression gate for the existing models (runs with every item above)
+
+**Status: STANDING REQUIREMENT** (Kevin 2026-09-17: "no regression in performance
+or fidelity"). None of QSA-FN-1/2/4 touches a code path any currently-served model
+uses (Qwen4Exp is the only `qwen4_exp` architecture, and the AMD import path is
+ROCm-only), but the cheap deterministic gates are not optional:
+
+- `tests/kernels/attention/test_gfx906_fa.py` — the FA suite;
+- in-process PPL probe (`benchmarks/kernels/gfx906/ppl_probe.py`): **Qwen3.8-27B-AWQ-INT4**
+  is the reference model (recorded **10.5472** on this build; the 10.5516 figure in the
+  older records is the 3.6 fork. **Do not** use Qwen3.5-27B for this band — it reads
+  14.3750, its own baseline, first measured 2026-09-17); Nemotron band 26.96–27.02;
+- MoE 35B `_bench_gfx906.py` pp2048/tg256 4 samples (recorded 57.97 stock 3.8.0 /
+  58.36 fork at mclk 1000);
+- `tests/models/qwen4_exp/*` one file at a time.
+
+**Run for QSA-FN-1 (2026-09-17, same boot, all green):** FA suite **104 passed**;
+PPL **10.5472** (359 tokens, 0 top-20 misses); MoE 35B **58.31/58.35/58.29/58.23
+t/s** (mean 58.30, mclk 1000); `test_qsa_amd.py` 16, `test_qsa_reference.py` 19,
+`test_config.py` 7, `test_ple.py` 10.
+
+Any QSA-FN item that changes a *shared* file (`common/qsa_cache.py`) must show a
+bf16 QSA arm still passing before/after.
+
+### QSA-FN-8 — tester build (**SHIPPED 2026-09-17**)
+
+**Status: SHIPPED** — [`qsa-tester-build/`](qsa-tester-build/README.md):
+`README.md` (quick start A/B, what to report, limits) and `make_patches.sh`,
+which derives the four patches from the branch's commits and bundles the tiny
+tokenizer for an offline smoke rig. Bundle artifact:
+`/local/tmp/qsa-tester-build/` (+ `.tgz`), with `BUILD-INFO.txt` naming the
+branch, head and base commit.
+
+| patch | content |
+|---|---|
+| 0001 | QSA-FN-1 fp16 enablement — the reported error, 4.4× kernel win |
+| 0002 | V2-MAMBA-1 mamba `align` seed fix — required for prefix caching |
+| 0003 | QSA-FN-4 tiled indexer, fp16-gated |
+| 0004 | the harness: tiny rig + both serve recipes |
+
+**Validation of the bundle itself:** the four patches apply clean to
+`gfx906/v0.29.0` and reproduce the branch's 63 shipped files byte-for-byte; on
+`upstream/releases/v0.30.0` 0002/0003/0004 apply clean and 0001 applies with the
+shared `common/qsa_cache.py` excluded (upstream moved it 103/25 — the README lists
+the five mechanical edits, and `git apply -3` does not resolve it); a scratch
+checkout of the base + the four patches then served the tiny rig
+(`PYTHONPATH=<scratch>`, cwd = the patched tree) and ran the prefix-cached
+1344/2016/4031-token sequence that used to fault — 3/3 OK — plus
+`test_qsa_amd.py` + `test_mamba_hybrid_model_state.py` 26 passed and
+`test_qsa_reference.py` 19. Both recipes now resolve the repo root from their own
+path (they hardcoded this checkout before), so the bundle works from any tree.
+
+Explicitly **excluded**: anything int8 (QSA-FN-5/6) — the capacity win is not
+worth a 2.5× prefill kernel on evidence we already have.
+
+**Remaining gate: the tester's report.** The real checkpoint (~60 GB, plus a
+PLE ngram table the CDNA recipe offloads) does not fit here, so quality and the
+serving numbers are theirs; `_serve_qsa_flash_gfx906.sh report` prints the
+checklist (`qsa-tester-build/README.md` §What to report back).
+
 ## High priority — user-requested (2026-09-17): upstream our fixes to vLLM
 
 Kevin, 2026-09-17: **upstream the fixes we made locally** — as PRs to

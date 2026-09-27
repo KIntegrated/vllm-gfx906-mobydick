@@ -32,7 +32,26 @@ requires_qsa_kernels = pytest.mark.skipif(
 )
 
 
-def test_ple_ngram_embedding_custom_op_uses_resident_weight(
+def _stage_host_table_buffers(ngram_embedding: torch.nn.Module) -> None:
+    """Provide the pinned staging buffers the host-table PLE path needs.
+
+    ``MmapShardedNGramEmbedding`` (the host-RAM PLE implementation) drives the
+    custom op through per-layer pinned ``_pinned_ngram_ids`` / ``_pinned_output``
+    buffers -- the device-resident implementation does not. Adding them when the
+    implementation exists lets this test exercise the op on either path; on the
+    device path it is a no-op.
+    """
+    if not hasattr(ple_layer_module, "MmapShardedNGramEmbedding"):
+        return
+    ngram_embedding._pinned_ngram_ids = torch.empty(
+        (4, 2), dtype=torch.long, device="cpu"
+    ).pin_memory()
+    ngram_embedding._pinned_output = torch.empty(
+        (4, 6), dtype=torch.float32, device="cpu"
+    ).pin_memory()
+
+
+def test_ple_ngram_embedding_custom_op_matches_reference_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     layer_name = "model.layers.0.ple"
@@ -40,6 +59,7 @@ def test_ple_ngram_embedding_custom_op_uses_resident_weight(
     torch.nn.Module.__init__(layer)
     layer.ple_embedding = torch.nn.Module()
     layer.ple_embedding.ngram_embedding = torch.nn.Embedding(8, 3)
+    _stage_host_table_buffers(layer.ple_embedding)
     context = SimpleNamespace(no_compile_layers={layer_name: layer})
     monkeypatch.setattr(ple_layer_module, "get_forward_context", lambda: context)
 
@@ -83,6 +103,28 @@ def _qsa_sparse_paged_attention_reference(
             q.dtype
         )
     return output
+
+
+def _qsa_mqa_paged_reference(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compress_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pages = page_table.index_select(0, token_to_req.long()).long()
+    keys = k_cache[pages, :, 0, :].flatten(1, 2)
+    scores = torch.einsum("rhd,rnd->rnh", q.float(), keys.float())
+    logits = torch.relu(scores).sum(dim=-1) / math.sqrt(q.shape[-1])
+    visible = torch.minimum(
+        (query_positions + 1) // compress_ratio,
+        sequence_lengths.index_select(0, token_to_req.long()) // compress_ratio,
+    )
+    positions = torch.arange(keys.shape[1], device=q.device).unsqueeze(0)
+    logits = logits.masked_fill(positions >= visible.unsqueeze(1), -torch.inf)
+    return logits, visible.to(torch.int32)
 
 
 def test_qsa_rope_uses_platform_dispatch() -> None:
@@ -197,6 +239,7 @@ def test_qsa_selection_uses_portable_topk_on_rocm(
 
 
 @requires_qsa_kernels
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize(
     ("num_rows", "num_query_heads", "num_kv_heads", "page_size"),
     [
@@ -212,6 +255,7 @@ def test_qsa_sparse_paged_attention_matches_reference(
     num_query_heads: int,
     num_kv_heads: int,
     page_size: int,
+    dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(2)
     head_dim = 256
@@ -222,16 +266,14 @@ def test_qsa_sparse_paged_attention_matches_reference(
     indexer_budget = 2048
     indexer_compress_ratio = 4
     selection_width = indexer_budget + indexer_compress_ratio - 1
-    q = torch.randn(
-        num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
+    q = torch.randn(num_rows, num_query_heads, head_dim, device="cuda", dtype=dtype)
     kv_cache = torch.randn(
         num_cache_blocks,
         page_size,
         num_kv_heads,
         2 * head_dim,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     k_cache, v_cache = kv_cache.split(head_dim, dim=-1)
     block_table = (
@@ -295,3 +337,147 @@ def test_qsa_sparse_paged_attention_matches_reference(
     )
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def _qsa_mqa_paged_case(
+    dtype: torch.dtype, *, num_rows: int, uniform: bool
+) -> tuple[Any, ...]:
+    """One indexer-scoring case.
+
+    ``uniform`` puts every row on request 0, which is the row-tiled route's
+    precondition; otherwise the rows are split across two requests, so the
+    per-row kernel must be used.
+    """
+    torch.manual_seed(3)
+    head_dim = 128
+    num_query_heads = 4
+    page_size, num_pages, num_requests = 64, 20, 2
+    q = torch.randn(num_rows, num_query_heads, head_dim, device="cuda", dtype=dtype)
+    k_cache = torch.randn(num_pages, page_size, 1, head_dim, device="cuda", dtype=dtype)
+    page_table = torch.randperm(num_pages, device="cuda", dtype=torch.int32).reshape(
+        num_requests, num_pages // num_requests
+    )
+    if uniform:
+        token_to_req = torch.zeros(num_rows, device="cuda", dtype=torch.int32)
+    else:
+        token_to_req = torch.repeat_interleave(
+            torch.arange(num_requests, device="cuda", dtype=torch.int32),
+            num_rows // num_requests,
+        )
+    sequence_lengths = torch.tensor(
+        [num_pages * page_size, num_pages * page_size - 37],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    request_lengths = sequence_lengths.index_select(0, token_to_req.long())
+    query_positions = (
+        request_lengths - num_rows + torch.arange(num_rows, device="cuda")
+    ).to(torch.int32)
+    return q, k_cache, page_table, token_to_req, query_positions, sequence_lengths
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("uniform", [False, True], ids=["per-row", "tiled"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_qsa_mqa_paged_matches_reference(dtype: torch.dtype, uniform: bool) -> None:
+    """The indexer's scoring kernel reads the compressed-key cache in its own dtype.
+
+    Both routes -- the per-row kernel and the row-tiled one that the uniform
+    prefill gate selects -- must reproduce the reference.
+    """
+    compress_ratio = 4
+    num_rows = 64
+    q, k_cache, page_table, token_to_req, query_positions, sequence_lengths = (
+        _qsa_mqa_paged_case(dtype, num_rows=num_rows, uniform=uniform)
+    )
+
+    actual, actual_visible = qsa_ops.qsa_mqa_paged(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+    )
+    expected, expected_visible = _qsa_mqa_paged_reference(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_visible, expected_visible)
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize(
+    ("dtype", "num_rows", "uniform", "expect_tiled"),
+    [
+        # fp16 is a native tl.dot everywhere; uniform prefill rows take the tiled route.
+        (torch.float16, 64, True, True),
+        # ... but only at prefill scale, and only when the rows share a request.
+        (torch.float16, 32, True, False),
+        (torch.float16, 64, False, False),
+        # bf16 is a hardware dot only where the platform has native bf16 (gfx906
+        # emulates it: the tiled route measured 0.42x there vs 1.39x in fp16).
+        (torch.bfloat16, 64, True, False),
+    ],
+    ids=["fp16-uniform", "fp16-small", "fp16-mixed-req", "bf16-uniform"],
+)
+def test_qsa_mqa_paged_route_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    num_rows: int,
+    uniform: bool,
+    expect_tiled: bool,
+) -> None:
+    """Pin the row-tiled gate: it must not be entered for bf16 on gfx906.
+
+    The tiled kernel's win is a hardware ``tl.dot``; where that is emulated
+    (bf16 on gfx906) it is 2.4x slower, so the gate -- not just correctness --
+    is the regression guard.
+    """
+    compress_ratio = 4
+    launched: list[str] = []
+
+    def recorder(name: str, original: Any) -> Any:
+        """Stand-in for a Triton kernel that records the launch and delegates."""
+
+        class _Recorder:
+            def __getitem__(self, grid: Any) -> Any:
+                def launch(*args: Any, **kwargs: Any) -> Any:
+                    launched.append(name)
+                    return original[grid](*args, **kwargs)
+
+                return launch
+
+        return _Recorder()
+
+    for name in ("_qsa_mqa_paged_tiled_kernel", "_qsa_mqa_paged_kernel"):
+        monkeypatch.setattr(qsa_ops, name, recorder(name, getattr(qsa_ops, name)))
+
+    q, k_cache, page_table, token_to_req, query_positions, sequence_lengths = (
+        _qsa_mqa_paged_case(dtype, num_rows=num_rows, uniform=uniform)
+    )
+    qsa_ops.qsa_mqa_paged(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+    )
+
+    if not expect_tiled and dtype == torch.bfloat16 and uniform and num_rows >= 64:
+        # bf16 is expected to take the tiled route only where the dot is native.
+        assert current_platform.supports_native_bf16 is False
+
+    assert launched == (
+        ["_qsa_mqa_paged_tiled_kernel"] if expect_tiled else ["_qsa_mqa_paged_kernel"]
+    )

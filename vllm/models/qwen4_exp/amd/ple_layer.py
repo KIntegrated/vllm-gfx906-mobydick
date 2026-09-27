@@ -3,6 +3,7 @@
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
 import math
+import os
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -11,6 +12,7 @@ from torch import nn
 
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -30,7 +32,9 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-from ..common.ple import PLEVocabParallelEmbedding
+logger = init_logger(__name__)
+
+# from ..common.ple import PLEVocabParallelEmbedding
 
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
@@ -64,6 +68,139 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
             variance = grouped.square().mean(dim=-1, keepdim=True)
             normalized = (grouped * torch.rsqrt(variance + self.eps)).flatten(-2)
         return (normalized * (1.0 + self.weight.float())).to(input_dtype)
+
+
+class MmapShardedNGramEmbedding(nn.Module):
+    """CPU-resident PLE ngram embedding backed directly by mmap'd safetensors
+    shard tensors, with no TP sharding and no copying. Every rank maps the
+    same on-disk shard files; the OS page cache backs all of them with the
+    same physical pages, so the full table's resident-RAM cost is paid once
+    across the whole node, not once per worker process."""
+
+    def __init__(
+        self,
+        num_shards: int,
+        shard_row_capacity: int,
+        embedding_dim: int,
+        dummy_weights: bool = False,
+    ) -> None:
+        super().__init__()
+        self.num_shards = num_shards
+        self.shard_row_capacity = shard_row_capacity
+        self.embedding_dim = embedding_dim
+        # Dummy-weight loads (``--load-format dummy``) never deliver shard
+        # tensors: the shards are read straight from the checkpoint's
+        # safetensors files and are not parameters, so nothing generates them.
+        # Serving zero rows for a missing shard keeps the path exercisable
+        # without a checkpoint (the tiny-config harness); a real load still
+        # raises.
+        self._dummy_weights = dummy_weights
+        self.params_dtype: torch.dtype | None = None
+        self._shards: list[torch.Tensor | None] = [None] * num_shards
+        self._warned_bad_ids = False
+
+    def set_shard(self, shard_index: int, tensor: torch.Tensor) -> None:
+        if tensor.device.type != "cpu":
+            raise ValueError(
+                f"PLE ngram shard {shard_index} must be loaded on CPU, "
+                f"got device {tensor.device}"
+            )
+        if self.params_dtype is None:
+            self.params_dtype = tensor.dtype
+        elif tensor.dtype != self.params_dtype:
+            raise ValueError(
+                f"PLE ngram shard {shard_index} dtype {tensor.dtype} does not "
+                f"match previously loaded shards' dtype {self.params_dtype}"
+            )
+        self._shards[shard_index] = tensor
+
+    # Ids outside [0, num_shards * shard_row_capacity) have two known producers,
+    # both legitimate, and neither is corruption of the table:
+    #
+    #   * the MTP drafter's "no sample here" marker. `sample_idx_mapping` is
+    #     pre-filled with PADDING_SENTINEL (spec_decode/dflash/speculator.py:145)
+    #     and reaches this lookup on every drafter warmup/capture.
+    #   * a pinned host id buffer that nothing has written yet. On 2026-09-23 a
+    #     graph-capture-time call arrived holding the poison pattern
+    #     0xff80ff80ff80ff80 repeated, which killed three boots with
+    #     "PLE ngram id out of range" -- see the 2026-09-23 entry in
+    #     docs/gfx906/degradation.md.
+    #
+    # Both are folded onto row 0 rather than rejected or clamped: rejecting them
+    # refuses a boot whose inputs are fine by the time they matter (this op is a
+    # splitting op, so it runs eagerly and the captured/replayed value is read
+    # later, from a buffer the producer has filled by then), and clamping the
+    # whole tensor would send large positive garbage to the *last* row, which is
+    # a real embedding and therefore a plausible wrong answer. Row 0 costs one
+    # wrong row for slots whose result is discarded anyway.
+    PADDING_SENTINEL = -1
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        if ids.device.type != "cpu":
+            raise ValueError("MmapShardedNGramEmbedding requires CPU ids")
+        original_shape = ids.shape
+        flat_ids = ids.reshape(-1).long()
+        table_rows = self.num_shards * self.shard_row_capacity
+        if flat_ids.numel() > 0:
+            # One range test over the whole tensor, host-side (ids are CPU by
+            # the check above), instead of one per shard inside the loop below.
+            low, high = int(flat_ids.min()), int(flat_ids.max())
+            if low < 0 or high >= table_rows:
+                bad = (flat_ids < 0) | (flat_ids >= table_rows)
+                if os.environ.get("VLLM_GFX906_PLE_STRICT", "0") == "1":
+                    raise ValueError(
+                        f"PLE ngram id out of range: ids span [{low}, {high}] "
+                        f"but the table holds {table_rows} rows "
+                        f"({self.num_shards} shards x {self.shard_row_capacity}), "
+                        f"{int(bad.sum())} of {flat_ids.numel()} ids affected "
+                        "(VLLM_GFX906_PLE_STRICT=1)"
+                    )
+                if not self._warned_bad_ids:
+                    self._warned_bad_ids = True
+                    logger.warning(
+                        "PLE ngram lookup: %d of %d ids were outside [0, %d) "
+                        "(span [%d, %d]); folded onto row 0. A few during boot "
+                        "or graph capture are expected -- the pinned id buffer "
+                        "is not always written first, and the drafter passes "
+                        "%d for 'no sample here' -- but a steady stream means "
+                        "the id producer is broken. Set "
+                        "VLLM_GFX906_PLE_STRICT=1 to raise instead of folding.",
+                        int(bad.sum()),
+                        flat_ids.numel(),
+                        table_rows,
+                        low,
+                        high,
+                        self.PADDING_SENTINEL,
+                    )
+                flat_ids = flat_ids.masked_fill(bad, 0)
+        shard_idx = torch.div(flat_ids, self.shard_row_capacity, rounding_mode="floor")
+        local_idx = flat_ids - shard_idx * self.shard_row_capacity
+        out = flat_ids.new_empty(
+            (flat_ids.numel(), self.embedding_dim), dtype=self.params_dtype
+        )
+        # The loop below can only write rows whose shard index is in
+        # range(num_shards). An id outside [0, num_shards * shard_row_capacity)
+        # matches no mask, so its row would keep whatever new_empty() found at
+        # that address: a silently wrong embedding instead of an error. That is
+        # why the range test above folds every out-of-range id onto row 0 first
+        # -- every row this function returns is a row that was actually read.
+        # Fixed-length loop over every shard, every call — no data-dependent
+        # iteration count. Necessary for CUDA graph capture safety: a Python
+        # loop whose length depends on which shards this specific batch
+        # happens to touch can execute a different number of steps during
+        # warmup/capture than during replay.
+        for shard in range(self.num_shards):
+            mask = shard_idx == shard
+            if not mask.any():
+                continue
+            tensor = self._shards[shard]
+            if tensor is None:
+                if self._dummy_weights:
+                    out[mask] = 0.0
+                    continue
+                raise RuntimeError(f"PLE ngram shard {shard} was never loaded")
+            out[mask] = tensor.index_select(0, local_idx[mask])
+        return out.reshape(*original_shape, self.embedding_dim)
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -172,13 +309,24 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         max_num_reqs: int,
         prefix: str,
         layer_name: str,
+        runtime_dtype: torch.dtype,
     ) -> None:
         super().__init__()
         self.embedding_dim = embedding_dim
+        self.runtime_dtype = runtime_dtype
         self.layer_name = layer_name
         self.ngram_size = int(config.ngram_size)
         self.heads_per_ngram = int(config.heads_per_ngram)
         self.ngram_heads = (self.ngram_size - 1) * self.heads_per_ngram
+        self._pinned_ngram_ids = torch.empty(
+            (max_total_tokens, self.ngram_heads), dtype=torch.long, device="cpu"
+        ).pin_memory()
+        self._pinned_output = torch.empty(
+            (max_total_tokens, self.embedding_dim),
+            dtype=self.runtime_dtype,
+            device="cpu",
+        ).pin_memory()
+
         if self.ngram_size < 2:
             raise ValueError(f"ngram_size must be >= 2, got {self.ngram_size}")
         if self.heads_per_ngram <= 0:
@@ -224,12 +372,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
-        self.ngram_embedding = PLEVocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim,
-            padding_size=divisor,
-            prefix=f"{prefix}.ngram_embedding",
+        shard_row_capacity = (
+            padded_vocab_size + self.split_ngram_parts - 1
+        ) // self.split_ngram_parts
+        self.ngram_embedding = MmapShardedNGramEmbedding(
+            dummy_weights=(
+                get_current_vllm_config().load_config.load_format == "dummy"
+            ),
+            num_shards=self.split_ngram_parts,
+            shard_row_capacity=shard_row_capacity,
+            embedding_dim=self.head_dim,
+            # params_dtype=torch.get_default_dtype(),
         )
+
         self.register_buffer(
             "positions_buffer",
             torch.arange(max_total_tokens, dtype=torch.int64),
@@ -346,7 +501,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_ids = torch.cat(id_blocks, dim=-1)
         output = ngram_ids.new_empty(
             (ngram_ids.shape[0], self.embedding_dim),
-            dtype=self.ngram_embedding.params_dtype,
+            dtype=self.runtime_dtype,
+            #            dtype=self.ngram_embedding.params_dtype,
         )
         torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding(
             ngram_ids,
@@ -393,27 +549,18 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"split_ngram_parts={self.split_ngram_parts}"
                     )
                 embedding = self.ngram_embedding
-                shard_size = (
-                    embedding.org_vocab_size + self.split_ngram_parts - 1
-                ) // self.split_ngram_parts
-                checkpoint_start = shard_index * shard_size
-                expected_rows = max(
-                    0,
-                    min(shard_size, embedding.org_vocab_size - checkpoint_start),
-                )
-                expected_shape = (expected_rows, embedding.embedding_dim)
-                if tuple(loaded_weight.shape) != expected_shape:
+                if loaded_weight.shape[1] != embedding.embedding_dim:
                     raise ValueError(
                         f"Shape mismatch for PLE embedding shard {shard_index}: "
-                        f"expected {expected_shape}, got "
+                        f"expected embedding_dim {embedding.embedding_dim}, got "
                         f"{tuple(loaded_weight.shape)}"
                     )
-                embedding.weight.weight_loader(
-                    embedding.weight,
-                    loaded_weight,
-                    checkpoint_start=checkpoint_start,
-                )
-                loaded.add("ngram_embedding.weight")
+                # Store the mmap-backed tensor by reference. No .copy_() or
+                # device move: this keeps the ~100GB table page-cache-backed
+                # and shared across every worker process on the node instead
+                # of privately materialized once per process.
+                embedding.set_shard(shard_index, loaded_weight.to("cpu"))
+                loaded.add(f"ngram_embedding.shard_{shard_index}")
                 continue
             regular_weights.append((name, loaded_weight))
 
@@ -460,6 +607,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             vllm_config.scheduler_config.max_num_seqs,
             f"{prefix}.ple_embedding",
             prefix,
+            runtime_dtype=model_config.dtype,
         )
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
@@ -1070,16 +1218,44 @@ def qwen4_exp_amd_ple_ngram_embedding(
     output: torch.Tensor,
     layer_name: str,
 ) -> None:
-    """Run the large PLE embedding lookup outside Inductor's FX graph.
-
-    Keeping the embedding weight in ``static_forward_context`` prevents AOT
-    compile-time autotuning from materializing a synthetic copy of the weight.
-    """
     layer = get_forward_context().no_compile_layers[layer_name]
     if not isinstance(layer, Qwen4ExpPLELayer):
         raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
-    result = layer.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
-    output.copy_(result)
+    ple_embedding = layer.ple_embedding
+    n = ngram_ids.shape[0]
+    pinned_ids = ple_embedding._pinned_ngram_ids[:n]
+    # The mmap'd shard lookup below runs on the host, so the device->host copy
+    # has to have landed before the host reads the buffer.  non_blocking=True
+    # only makes the copy stream-ordered; it does not wait for it.  The host
+    # would otherwise read ids that are stale, or -- on the first step after
+    # init, since _pinned_ngram_ids is torch.empty(...).pin_memory() and is
+    # never zeroed -- outright uninitialized.  Those values then index the
+    # shard table outside its row range (see MmapShardedNGramEmbedding.forward),
+    # which is what killed the engine at 00:26 / 00:31 with 'index out of range
+    # in self'.  The H2D copy of the result at the end stays async: it is
+    # stream-ordered against whatever consumes `output` and needs no host wait.
+    pinned_ids.copy_(ngram_ids, non_blocking=False)
+    result = ple_embedding.ngram_embedding(pinned_ids).flatten(-2)
+    pinned_out = ple_embedding._pinned_output[:n]
+    pinned_out.copy_(result.to(dtype=output.dtype))
+    output.copy_(pinned_out, non_blocking=True)
+
+
+# def qwen4_exp_amd_ple_ngram_embedding(
+#     ngram_ids: torch.Tensor,
+#     output: torch.Tensor,
+#     layer_name: str,
+# ) -> None:
+#     """Run the large PLE embedding lookup outside Inductor's FX graph.
+
+#     Keeping the embedding weight in ``static_forward_context`` prevents AOT
+#     compile-time autotuning from materializing a synthetic copy of the weight.
+#     """
+#     layer = get_forward_context().no_compile_layers[layer_name]
+#     if not isinstance(layer, Qwen4ExpPLELayer):
+#         raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
+#     result = layer.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
+#     output.copy_(result)
 
 
 def qwen4_exp_ple_short_conv(

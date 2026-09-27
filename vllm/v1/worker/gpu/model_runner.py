@@ -19,8 +19,9 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -182,6 +183,146 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
+
+
+# --- GFX906: optional GC guard around the boot-time capture regions ------------
+# The V1 runner wraps graph capture in gc.freeze() + gc.disable(); this V2 runner
+# had three bare gc.collect() calls and no guard, and the tester's 4-card box died
+# inside one of them under MTP + graphs (GC traversal faults on an already-
+# corrupted heap -- GC is the victim, the corruptor is unidentified). Measured:
+# freeze+disable alone is not enough (a third-party explicit gc.collect() still
+# traverses), shadowing gc.collect for the region is; and the guard's own exit
+# traversal was the crash site, so the default exit parks instead of collecting.
+# Off by default (GFX906_GC_FREEZE=1 enables, unset leaves upstream byte-identical).
+#   GFX906_GC_THAW=1  restore upstream's unfreeze()+collect() exit (fatal 5/5 there)
+#   GFX906_GC_DUMP=1  re-arm faulthandler inside the region (tvm_ffi replaces it)
+# Mechanism, measurements and the open root cause: docs/gfx906/DEVLOG-spec-decode.md
+# (2026-09-23, "V2 runner boot under MTP + graphs").
+_GC_FREEZE_ENV = "GFX906_GC_FREEZE"
+_GC_THAW_ENV = "GFX906_GC_THAW"
+_GC_DUMP_ENV = "GFX906_GC_DUMP"
+_GC_FROZEN_DEPTH = 0
+_GC_REAL_COLLECT = None
+
+
+def _gc_freeze_enabled() -> bool:
+    return os.environ.get(_GC_FREEZE_ENV, "0") == "1"
+
+
+def _gc_thaw_enabled() -> bool:
+    """Restore upstream's unfreeze()+collect() on exit. Default off: see above."""
+    return os.environ.get(_GC_THAW_ENV, "0") == "1"
+
+
+def _gc_collect_noop(*_args, **_kwargs) -> int:
+    """Stand-in for gc.collect() while a freeze region is active.
+
+    Returns 0 ("collected nothing"), which is what every caller in the boot path
+    ignores anyway. Not reached when GFX906_GC_FREEZE is unset.
+
+    Coverage, stated honestly: callers that look the function up as an attribute
+    (every `gc.collect()` call, and any `from gc import collect` executed after
+    the region opens) get this. Aliases bound before the region opened, and C
+    code calling PyGC_Collect directly, do not -- which is why the depth counter
+    below is kept as a second, independent line of defence for vLLM's own call
+    site.
+    """
+    return 0
+
+
+@contextmanager
+def _gc_freeze_guard(label: str):
+    global _GC_FROZEN_DEPTH, _GC_REAL_COLLECT
+    if not _gc_freeze_enabled():
+        yield
+        return
+    was_enabled = gc.isenabled()
+    t0 = time.perf_counter()
+    if os.environ.get(_GC_DUMP_ENV, "0") == "1":
+        # tvm_ffi installs its own SIGSEGV handler, which is why every crash dump
+        # in these logs is C frames only under a "!!!!!!! Segfault encountered
+        # !!!!!!" banner: the Python frame that held the corrupted object has
+        # never been named. Re-arming faulthandler here puts CPython's handler
+        # back, so a segfault inside the region prints the Python stack too.
+        try:
+            import faulthandler
+
+            faulthandler.enable(all_threads=True)
+        except Exception:
+            logger.exception("GFX906_GC_DUMP: faulthandler.enable() failed")
+    # freeze() first: it parks the young generation in the permanent generation,
+    # and it traverses young objects itself, so there is no ordering that makes
+    # it immune to an already-corrupted heap. It is not the observed crash site.
+    gc.freeze()
+    gc.disable()
+    if _GC_FROZEN_DEPTH == 0:
+        _GC_REAL_COLLECT = gc.collect
+        gc.collect = _gc_collect_noop
+    _GC_FROZEN_DEPTH += 1
+    logger.info(
+        "GFX906_GC_FREEZE: froze, disabled and shadowed gc.collect() around %s",
+        label,
+    )
+    try:
+        yield
+    finally:
+        _GC_FROZEN_DEPTH -= 1
+        outermost = _GC_FROZEN_DEPTH == 0
+        if outermost and _GC_REAL_COLLECT is not None:
+            gc.collect, _GC_REAL_COLLECT = _GC_REAL_COLLECT, None
+        thawed = False
+        if outermost:
+            # Only on the outermost exit: a nested region leaves the shadow in
+            # place so nothing collects mid-capture.
+            try:
+                if _gc_thaw_enabled():
+                    # Upstream's exit path, and the exact frame that died on all
+                    # five guard-enabled boots of 2026-09-21.
+                    gc.unfreeze()
+                    thawed = True
+                    gc.collect()
+                else:
+                    # Park, do not walk. Whatever the corruptor wrote is now in
+                    # the permanent generation, which every later collection
+                    # ignores, so the traversal that dies never runs.
+                    gc.freeze()
+            except Exception:
+                logger.exception("GFX906_GC_FREEZE: exit path failed after %s", label)
+            finally:
+                if was_enabled:
+                    gc.enable()
+                else:
+                    gc.disable()
+        logger.info(
+            "GFX906_GC_FREEZE: %s after %s (%.1f s frozen)",
+            "thawed and collected" if thawed else "left frozen, nothing traversed",
+            label,
+            time.perf_counter() - t0,
+        )
+
+
+def _gc_freeze_around(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _gc_freeze_guard(fn.__name__):
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _gc_maybe_collect() -> None:
+    """vLLM's pre-capture gc.collect(); suppressed while we hold GC frozen.
+
+    Deliberate -- the traversing collect is the frame that dies. Skipping it in
+    profile_run() makes measured free memory an UNDER-estimate (unreclaimed
+    garbage counts as used), i.e. a smaller KV cache: the safe direction.
+
+    Redundant with the gc.collect shadow above by design: this branch holds even
+    if the attribute swap is defeated (an alias bound before the region, a
+    reimported gc module, a future caller that caches the builtin).
+    """
+    if _GC_FROZEN_DEPTH == 0:
+        gc.collect()
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -739,7 +880,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.speculator is not None:
             # After set_attn, so the speculator can size its cudagraph mode
             # to its own attention support.
-            self.speculator.init_cudagraph_manager(cudagraph_mode)
+            # GFX906_DRAFTER_GRAPHS=0 disables graph capture for the draft model.
+            # Default keeps upstream behaviour (the drafter inherits the target's
+            # mode). Measured both ways: +6 % for enabling on Qwen4Exp (tester, PR
+            # #2), neutral on real payloads for Qwen3.8-27B dense MTP k=3
+            # (docs/gfx906/DEVLOG-spec-decode.md), so it stays a knob.
+            self.speculator.init_cudagraph_manager(
+                cudagraph_mode
+                if os.environ.get("GFX906_DRAFTER_GRAPHS", "1") != "0"
+                else CUDAGraphMode.NONE,
+            )
 
         # Capture warmup providers that depend on allocated KV-cache strides.
         with self.jit_warmup_registry.activate():
@@ -935,6 +1085,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner.dummy_pooler_run(hidden_states)
 
     @torch.inference_mode()
+    @_gc_freeze_around
     def profile_run(self) -> None:
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
@@ -967,7 +1118,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
         self.reset_encoder_cache()
-        gc.collect()
+        _gc_maybe_collect()
 
     def reset_mm_cache(self) -> None:
         if self.encoder_cache is not None:
@@ -995,6 +1146,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    @_gc_freeze_around
     def capture_model(self, *, profile_only: bool = False) -> int:
         assert self.cudagraph_manager is not None
         capture_encoder = (
@@ -1014,6 +1166,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         start_time = time.perf_counter()
         with freeze_gc_for_cudagraph_capture():
+            _gc_maybe_collect()
             torch.accelerator.empty_cache()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 

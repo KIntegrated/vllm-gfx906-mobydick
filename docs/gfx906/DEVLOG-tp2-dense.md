@@ -169,3 +169,5 @@ t/s. (One isolated GPU0 wedge 13:00:53 at the 2nd launch — retry clean;
   debt is paid; N=8 192.9/194.0 (record 191.0, soak 189.9±0.4).
 - Suites: 28/28 FA + 43/43 MoE GEMM (README line "15/15, 12/12" stale).
 - Prefill (cold): ~470-525 t/s at 2k-32k, 357 @64k (attention growth).
+
+> 2026-09-22: `--disable-custom-all-reduce` verified a **no-op** on this topology (PYNCCL is the only enabled AR backend with and without it; 3 arms within 0.25 %) — see `DEVLOG-spec-decode.md` (same session), which also measures the drafter-cudagraph knob at −7.9 % (graphs off) on the TP=2 MTP k=3 config.

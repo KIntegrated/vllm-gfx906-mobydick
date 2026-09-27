@@ -1899,6 +1899,36 @@ class VllmConfig:
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
         )
+        # Qwen4Exp's PLE n-gram lookup reads the (host-resident) table by
+        # gathering on the CPU and staging through pinned buffers, so HIP rejects
+        # it inside a graph capture ("operation not permitted when stream is
+        # capturing"). Keep it outside the captured pieces, like the attention
+        # ops: appended after the defaults so they are not replaced.
+        if (
+            self.model_config is not None
+            and getattr(self.model_config.hf_config, "model_type", None)
+            == "qwen4_exp"
+            and self.compilation_config.splitting_ops is not None
+        ):
+            self.compilation_config.splitting_ops.append(
+                "vllm::qwen4_exp_amd_ple_ngram_embedding"
+            )
+            # FULL capture wraps the whole forward, so the splitting list cannot
+            # keep that op out of the graph; PIECEWISE runs it in the eager
+            # regions between the captured pieces. Downgrade loudly rather than
+            # let the engine die with hipErrorStreamCaptureUnsupported.
+            # `has_full_cudagraphs()` rather than a member comparison: the
+            # full-capture modes are a tuple (FULL_AND_PIECEWISE, and
+            # FULL_DECODE_ONLY whose value is (FULL, NONE)), so an `in (...)`
+            # test silently misses FULL_DECODE_ONLY -- exactly the mode an
+            # explicit --compilation-config can ask for.
+            if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+                logger.warning_once(
+                    "Qwen4Exp's host-resident PLE n-gram lookup cannot run "
+                    "inside a full cudagraph (blocking D2H mid-graph); "
+                    "downgrading cudagraph_mode to PIECEWISE."
+                )
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
         if self.compilation_config.pass_config.enable_sp:
             # With pipeline parallelism, native rms norm tracing errors due to

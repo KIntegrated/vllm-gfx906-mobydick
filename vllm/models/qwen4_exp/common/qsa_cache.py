@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """Paged side-cache ownership and metadata for Qwen4Exp QSA.
 
 Each QSA layer keeps a fixed circular buffer of raw index keys (the
@@ -43,6 +44,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
+
+# The QSA attention and indexer kernels read 2-byte float activations and caches.
+# Both dtypes share one kernel path; hardware without native bf16 (gfx906) runs
+# the fp16 side, so fp16 is accepted everywhere bf16 is.
+QSA_ACTIVATION_DTYPES: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
+QSA_KV_CACHE_DTYPES: tuple[CacheDType, ...] = ("auto", "float16", "bfloat16")
 
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
@@ -727,11 +734,10 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
 class QSAStateBackend(AttentionBackend):
     """Key-only dummy backend for out-of-band QSA side-cache operations."""
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = list(QSA_ACTIVATION_DTYPES)
     # fp8 entries allow the optional e4m3 compressed indexer cache.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "auto",
-        "bfloat16",
+        *QSA_KV_CACHE_DTYPES,
         "fp8",
         "fp8_e4m3",
     ]
@@ -809,9 +815,11 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
 
 
 class QSAKeyStateCache(_QSAStateCache):
-    """Raw BF16 key, optionally followed by exact int64 MRoPE positions."""
+    """Raw 2-byte-float key, optionally followed by exact int64 MRoPE positions."""
 
-    _BF16_PER_INT64 = 4
+    # 8 B per int64 over 2 B per key element; the position tail is viewed as
+    # int64 once bound (see ``bind_kv_cache``).
+    _ELEMS_PER_INT64 = 4
     _NUM_ROPE_AXES = 3
 
     def __init__(self, *, cache_rope_positions: bool = False, **kwargs) -> None:
@@ -819,12 +827,12 @@ class QSAKeyStateCache(_QSAStateCache):
         self.key_head_size = key_head_size
         self.cache_rope_positions = bool(cache_rope_positions)
         self.rope_position_offset = (
-            (key_head_size + self._BF16_PER_INT64 - 1) // self._BF16_PER_INT64
-        ) * self._BF16_PER_INT64
+            (key_head_size + self._ELEMS_PER_INT64 - 1) // self._ELEMS_PER_INT64
+        ) * self._ELEMS_PER_INT64
         storage_head_size = key_head_size
         if self.cache_rope_positions:
             storage_head_size = self.rope_position_offset + (
-                self._NUM_ROPE_AXES * self._BF16_PER_INT64
+                self._NUM_ROPE_AXES * self._ELEMS_PER_INT64
             )
         super().__init__(head_size=storage_head_size, **kwargs)
 
@@ -860,7 +868,7 @@ class QSAKeyStateCache(_QSAStateCache):
 
 
 class QSACompressedKeyCache(_QSAStateCache):
-    """Normed, group-first-RoPE key at one row per complete group."""
+    """Normalized, group-first-RoPE 2-byte-float key at one row per group."""
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config

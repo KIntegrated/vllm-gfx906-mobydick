@@ -3358,3 +3358,167 @@ unreachable because the amdsmi call raises before it). Consequence: **do not gat
 healthy-boot runs of the same code (195 passed on this code family) plus the completed gates here (PPL 10.5472, QSA 22 + 19, PR #2 harnesses 52,
 tiny rig boot + 3/3 requests).
 
+---
+
+## Carried from the QSA-FN (0.29) line — `degradation_details.md`
+
+The Qwen3.8-Flash-Next/QSA work landed on this line from `gfx906/qsa-fn` (merged 2026-09-27). This section is that branch's content for this file, kept verbatim so the records survive the union; the entries above are this line's own.
+
+
+## 2026-09-22 20:23 — wedge #106 (kill-and-relaunch of the standing 27B MTP k=3 server; GPU1 left half-wedged)
+
+**Context.** A drafter-graph A/B needed the standing server restarted (two arms differing
+only in whether the drafter inherits the target's cudagraph mode, mirroring the tester's
+`GFX906_DRAFTER_GRAPHS` gate in PR #2 — a local, uncommitted patch, Python-only, no
+rebuild). The running server (pid 7181, Qwen3.8-27B-AWQ-INT4, TP=2, fp16, MTP k=3,
+maxlen 262144, util 0.82, both decks at 29.4 GiB) was SIGTERM-killed and the same config
+relaunched ~15 s later.
+
+**Event.** APIServer up 20:21:52; the weight load then died at worker init (20:23:21):
+
+```
+CUDA error: unspecified launch failure  /  hipErrorLaunchFailure
+  from c10::cuda::SetDevice  (at::native::copy_ -> HIPFunctions.cpp:334)
+Exception: WorkerProc initialization failed ... Failed core proc(s): {}
+RuntimeError: Engine core initialization failed.
+```
+
+The traceback is the chronic weight-load family (#93–#105), raised before any of the
+patched drafter code could run. The boot's pre-symptom matches the documented degradation
+signature: `[rocm.py:1063] Failed to get total memory via amdsmi, falling back to
+torch.cuda` (amdsmi broken since boot, as in #66/#67).
+
+**Post-state.** GPU0 drained back to 10.9 MB once the failed workers exited, but **GPU1
+stayed at 10.44 GB with no process in the KFD list** (only `gpuagent`) and did not clear
+across 2+ minutes of polling — zombie VRAM, i.e. a half-wedge that needs a BACO reset or a
+reboot to reclaim. Sequence observed right after the SIGTERM: GPU0 briefly held 2.1 GB
+(not yet released) while GPU1 was already at 19 MB, so the leak is specific to the crashed
+worker on GPU1.
+
+**Action.** One authorized retry, on **GPU0 only (TP=1)** — the A/B is a *relative*
+comparison of drafter graph capture, so TP=1 keeps the measurement valid while avoiding
+the wedged deck; the absolute t/s is therefore not comparable to the recorded TP=2
+numbers. A second consecutive wedge stops GPU work for the session (the "2 in a row →
+stop" rule).
+
+**Lesson for the entry protocol:** killing a long-running TP=2 server and immediately
+re-launching the same config is a load-lottery roll like any other first-load — the kill
+itself does not appear to be the trigger, but the retry budget should be assumed before
+starting an A/B that needs a restart.
+
+**Retry (20:34–20:55) — wedged again, differently, GPU work stopped.** The GPU0-only retry
+(`HIP_VISIBLE_DEVICES=0`, TP=1, util 0.90, same model/MTP k=3 config, `GFX906_DRAFTER_GRAPHS=1`)
+launched 20:34:16 and then **never reached the API server's first log line**: the process sat
+in kernel `D` state with `wchan = amddrm_sched_entity_flush` for 11+ minutes, 0.3 % CPU, no
+child processes, zero bytes of log, GPU0 back at the 10.9 MB baseline and GPU1 still holding
+the 10.44 GB zombie. `SIGKILL` cleared the process once the driver call returned; no VRAM
+came back on GPU1.
+
+That is a **second consecutive wedge** in the same session (first = #106's load-lottery
+`hipErrorLaunchFailure`, second = the retry stuck in the DRM scheduler), so per the
+"2 in a row → stop" rule **GPU work stopped for the session**. The driver state explains
+both: amdsmi has been broken since this boot (the documented pre-wedge symptom), and
+`amddrm_sched_entity_flush` cannot complete while a scheduler entity from the killed
+long-running server is still registered — the deck needs a BACO reset or a **host reboot**
+(root required for BACO), after which GPU1's zombie 10.44 GB should clear.
+
+**Consequence for the deferred work:** the drafter-graph A/B (the reason for the restart)
+did not run. Nothing about it has been measured; the PR-review claim that the tester's
+default would cost our spec configs their drafter graphs remains an argument from their own
++6 % measurement, not from our box.
+
+## 2026-09-23 06:20 — observation #107 (draft-model load stall, TP=1 arm abandoned)
+
+Boot from 2026-09-22 21:21 had served five clean TP=2 boots (the drafter-graph and
+all-reduce A/B) plus the FD arm. The sixth launch — the TP=1 arm, after two earlier
+non-GPU failures of the same arm (a KV-capacity refusal at `max-model-len 131072`,
+then a `Free memory 13.51/31.98 GiB < 0.82` race against the previous server's VRAM
+release) — loaded the target model normally (`Loading weights took 71.15 seconds`)
+and then **stalled loading the draft model**: the log held
+
+```
+Loading safetensors checkpoint shards:   0%|  | 0/5 [00:00<?, ?it/s]
+```
+
+for ~13 minutes, unchanged (0 bytes of log growth over 30 s), with the EngineCore at
+3.9 % CPU, 26 GB of VRAM held on GPU0, no error line, and `rocm-smi` showing both
+decks healthy (no reset, no zombie VRAM). This differs from the #93–#106 family,
+which dies or spins; here the load simply stopped. `SIGTERM` took the process down
+and released the VRAM.
+
+Recorded as a load-stall observation rather than a wedge (no reset, no leaked VRAM,
+and the driver stayed serviceable). Consequence: the TP=1 drafter-graph arm was
+abandoned, so the sweep's TP=1 half is unmeasured — the TP=2 half (three arms, three
+contexts, ±0.2 % ms/step) answers the question it was asked.
+
+## 2026-09-23 ~15:00–16:20 — observation #108 (quiet degradation: −4.7 % on both trees, no wedge)
+
+The PR #2 integration bench looked like a regression at first: the 35B house bench on
+the PR tip read **57.21 t/s** (57.16–57.30, mclk 1000) against the **59.79** recorded on
+the 2026-09-22 boot. Three samples per arm, tight, so it was worth chasing.
+
+Control: the *pre-cherry-pick* tip (`aa6982deb4`) benched on the **same boot** read
+**57.00 t/s** (56.96–57.06) — the same number, so the ~4.7 % is the host, not the
+branch. The branch is +0.4 % (inside noise) against its own control.
+
+Boot context: rebooted 2026-09-22 21:21, ~19 h up, after ~15 GPU loads (the drafter A-B-A
+session, the FD arm, the real-payload sweep, the tiny-rig boots, suites and two benches),
+with the earlier wedge #107 (draft-model load stall) in the window. `amdsmi` is broken on
+this boot (`_query_gcn_arch_from_amdsmi` raises `RuntimeError` — the same pre-wedge
+symptom documented for #106 and for the 2026-09-16 degradation), both trees fall back to
+`torch.cuda` and `on_gfx906()` is True in both, so the amdsmi fallback we merged from
+PR #2 is behaviour-identical here. No GPU reset appears in the reachable logs; the
+spec-decode canary was not run (the failure mode is a uniform slowdown, not the
+sync-cadence-only collapse the canary detects).
+
+Consequence: **perf gates measured on this boot are not comparable to the 09-22
+numbers** (the flips' 59.79 baseline, the drafter sweep, the AR arms). Functional gates
+(suites, tiny rig) are unaffected. Reboot before any further perf work, and re-run the
+35B bench to confirm the host is back at ~59.8 before quoting branch-vs-main perf.
+
+### #108, addendum (2026-09-24 ~18:30, next boot — degradation is not just the bench delta)
+
+On the following boot the same picture shows up in the suites, and much larger than
+4.7 %: `tests/kernels/mamba` (195 tests, ~56 s on a healthy boot, and 195 passed
+earlier the same day) ran at **~8 % progress per 9 minutes** — a ~50x slowdown, i.e.
+effectively the stalled pattern — and an earlier combined FA+mamba run on the
+previous boot hung at 56 % for ~10 min before it was stopped. The 35B bench on this
+boot is only ~4.7 % down, so the two do not scale together; sync-heavy / many-small-
+kernel workloads are the ones that collapse, which is the same asymmetry as the
+spec-decode-only collapse recorded for #106 (dense GPU work normal, sync cadence
+gone). `amdsmi` is broken here as well. The combined run was stopped by hand; the
+individual mamba run that followed died on its own on the next boot — see #109, which
+supersedes this addendum. The PLE change in question touches only
+`qwen4_exp/amd/ple_layer.py` and its test, so it cannot affect mamba kernels, and the
+same suite passed on this branch before the cherry-picks. Re-run them after a reboot.
+
+## 2026-09-24 18:13–18:45 — observation #109 (KFD resume failure 22 min into a fresh boot; one GPU's suite collapses)
+
+The host was rebooted at **18:13:44** (`who -b`, uptime 33 min at the time of writing) — so this
+is a *fresh* boot, and it is not clean. There is **no** GPU reset, `HwException`, ring timeout or
+OOM anywhere in `journalctl -k` for the day; the only kernel-side anomaly is:
+
+```
+Sep 24 18:36:22 mi50-01 kernel: amdgpu: amdgpu_amdkfd_restore_userptr_worker: Failed to resume KFD
+```
+
+Timeline: at ~18:33 two GPU jobs start — `tests/kernels/mamba` on GPU1 and the tiny QSA rig on
+GPU0. The suite reaches 46 % by 18:36, then slows to ~8 % per 9 minutes; at 18:45 it stops writing
+and the process has exited **silently** — no pytest summary, no traceback, 560 bytes of log, no OOM
+in the journal. The rig on the other GPU boots and serves its 1344/2016/4031-token sequence normally
+in the same window, and `rocm-smi` still reports both GPUs (VRAM back to the ~10 MB baseline).
+
+So this is neither the quiet uniform slowdown of #108 (the 35B bench was only ~4.7 % down there) nor
+a full wedge (no reset, rocm-smi alive). It is the *sync-heavy-suite-collapse* shape on one GPU,
+three minutes after that GPU's first real load of the boot, with a KFD resume failure at exactly
+that moment. Compare #106: dense GPU work at full speed while the sync cadence is gone; the same
+asymmetry, a different boot.
+
+Consequences for the record: the mamba/FA *kernel* suites cannot be run on this boot, so their
+verdict for the cherry-picks rests on (a) the suites that did complete on the changed code (their
+PLE + GC harnesses + our QSA file: 74 passed; tiny rig boot + requests with MTP k=1/k=3), and
+(b) construction — the PLE commits touch `qwen4_exp/amd/ple_layer.py` and its test, `config/vllm.py`
+behind a `model_type == "qwen4_exp"` gate, and the drafter knob restored to upstream's default, so
+no mamba or FA kernel is in the diff. Re-run them after a reboot; do not read their absence as a
+verdict on the branch.
+

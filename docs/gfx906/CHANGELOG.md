@@ -1061,3 +1061,182 @@ that both were gated wins awaiting a flip, not parked code.
   gfx906 fork on 2026-08-26 as `a4cb86c4aa`, after `v0.28.0rc2` had already
   been merged into the gfx906 release branch. The merge brought the three
   upstream rc2-to-final commits listed in that merge commit.
+
+---
+
+## Carried from the QSA-FN (0.29) line — `CHANGELOG.md`
+
+The Qwen3.8-Flash-Next/QSA work landed on this line from `gfx906/qsa-fn` (merged 2026-09-27). This section is that branch's content for this file, kept verbatim so the records survive the union; the entries above are this line's own.
+
+## 2026-09-21 (Qwen3.8-Flash-Next serves on gfx906 — tester report; PR #2 under review)
+
+- **The FN-8 gate is met.** An external tester (4× MI50 32 GB, PCIe-only, no XGMI)
+  served `Qwen3.8-Flash-Next` with our fp16 QSA patches: `TP=4`, fp16,
+  `max-model-len=147456`, `max-num-seqs=3`, MTP k=3, piecewise cudagraphs —
+  **46.8 t/s at B=1**. First end-to-end result on the real checkpoint; the fp16
+  enablement (QSA-FN-1) is confirmed on the model, not just in kernel probes.
+- Their measurements add two knobs we did not have: **drafter CUDA graphs cost
+  2.3 % of the KV cache and are worth +6 %** on MTP k=3 here, and `enforce_eager`
+  inside `--speculative-config` is a **no-op on this build** (read only by the
+  legacy `v1/spec_decode/` proposer, never propagated to the draft `ModelConfig`).
+- They also hit a **boot-time segfault under MTP + graphs** that we have never
+  reproduced: death inside `gc.collect()`'s traversal, i.e. GC as the victim of an
+  unidentified heap corruption (their suspect: a stale tvm_ffi torch-C-DLPack
+  addon keyed without a torch-version hash). `gc.freeze()`+`gc.disable()` do not
+  prevent it; shadowing the `gc.collect` attribute for the region does. Recorded as
+  **OPEN** — the guard is a mitigation.
+- Their PR #2 is reviewed in [`REVIEW-pr2-qsa-fn.md`](REVIEW-pr2-qsa-fn.md):
+  merge-worthy in parts, with three required edits (invert the drafter-graph
+  default, gate the PLE host-table replacement, trim the essay comments) and two
+  drops (their `.cu` clang-format commit, their `degradation.md` ops rows).
+
+## 2026-09-18 (two gated wins go default-on; stale-verdict sweep)
+
+Kevin's decision after the 0.30.0 review (`MERGE-0.30.0-review.md`) established
+that both were gated wins awaiting a flip, not parked code.
+
+- **`VLLM_GFX906_SKINNY_M16` is now default-on** (`=0` is the kill switch).
+  Record: `DEVLOG-fp16-skinny.md`, VERDICT SHIPPED — 35B MoE N=8 graph **191.0 vs
+  166.9 t/s (+14.5 %)**, 27B (Qwen3.8) N=8 **104.2 vs 98.2 (+6.1 %)**, 27B N=4
+  control flat (−0.6 %, flag inert), correctness + per-shape 2–7.5× PASS, and a
+  passed 30-rep × 2-model soak. Covers the M=5..16 spec-verify / 5–16-seq
+  concurrent-decode regime, which was falling back to the M-invariant Triton
+  skinny path.
+- **`VLLM_GFX906_QUANT_LAYER0_MOE` (C4) is now default-on** (`=0` is the kill
+  switch). Record: `DEVLOG-c4-layer0-quant.md` — GO 2026-09-01 with every gate
+  passed: unit 8/8; PPL 15.9531 → 15.9929 (Δ +0.04 against a 0.5 gate); greedy
+  serving fingerprint bit-identical; serving A/B 84.95 → **87.51 t/s (+3.0 %)**
+  against a ~1.8 % noise floor; ~1.5 GiB returned to graph capture.
+  **Re-measured after the flip on the house reference workload** (Qwen3.5-35B-A3B-AWQ,
+  `_bench_gfx906.py` pp2048/tg256, 4 samples, mclk 1000): **59.79 t/s**
+  (59.76–59.84) vs **58.40** before the flip = **+2.4 %** — so future 35B numbers
+  must be compared against the new baseline, not the 57.97–58.36 band.
+  **Quality, same build and prompt set (`VLLM_GFX906_QUANT_LAYER0_MOE` ON vs the
+  `=0` kill switch): PPL 15.9361 vs 16.0169** (359 tokens, 0 top-20 misses in both;
+  Δ 0.08 in the ON-better direction, while the 2026-09-01 pair differed 0.04 the
+  other way ⇒ the delta is at the probe's resolution, not a quality signal). Layer 0's
+  experts are quantized at load, which is a quality trade-off the checkpoint
+  author did not make — accepted on the measurement above.
+- **NH-4 stays** (`VLLM_GFX906_MAMBA_FUSED_GROUP_NORM`, default off) — Kevin's
+  call after the review; its neutral A/B result is unchanged, and its stale
+  "pending the serving A/B gate" comment is now accurate about what was measured.
+- **Stale-verdict sweep (first pass):** the three stale comments above
+  (NH-4, C4, SKINNY_M16 docstring) plus `DEAD-ENDS.md`'s "`VLLM_GFX906_FUSED_DRAFT`
+  has no reader in-tree" (the A3 opt-in was revived 2026-09-14 with three tests)
+  and a stale `V1`-pin recipe in `docs/gfx906/README.md` that contradicted the
+  same file's DFL2-2 closure note. Everything else in the ~60-flag gfx906
+  namespace reconciled (flag default ↔ comment claim ↔ recorded verdict). The
+  `GFX906_FA_LEGACY_ALLOW_UNVERIFIED` reference in `test_gfx906_fa.py` is a
+  deliberate guard that the removed override stays inert — kept.
+  New standing rule: [`AGENTS.md`](AGENTS.md) merge-train rule 6.
+
+## 2026-09-17 (QSA-FN-8 — tester bundle for Qwen3.8-Flash-Next on gfx906)
+
+- **Packaged and validated the external gate.** `docs/gfx906/qsa-tester-build/`
+  holds the README (quick start A, our branch; B, stock upstream 0.30.0; the
+  smoke rig; what to report) and `make_patches.sh`, which derives four patches
+  from the branch commits and bundles the Qwen3.8 tokenizer + tiny config for an
+  offline smoke run. Artifact: `/local/tmp/qsa-tester-build/` + `.tgz`, with
+  `BUILD-INFO.txt` (branch/head/base/generated).
+- **Bundle self-validation:** on `gfx906/v0.29.0` the four patches apply clean and
+  reproduce the branch's **63 shipped files byte-for-byte**; on
+  `upstream/releases/v0.30.0` 0002/0003/0004 apply clean, and 0001 applies with
+  `common/qsa_cache.py` excluded (upstream moved it 103/25 — five mechanical
+  edits listed in the README; `git apply -3` does not resolve it). A scratch
+  checkout of the base + the patches then **served the tiny rig from the patched
+  tree** and ran the 1344/2016/4031-token prefix-cached sequence that used to
+  fault (3/3 OK), with `test_qsa_amd.py` + `test_mamba_hybrid_model_state.py` 26
+  passed and `test_qsa_reference.py` 19.
+- Both serve recipes hardcoded this checkout's absolute path; they now resolve the
+  repo root from their own location, so the bundle works from any tree.
+- Excluded on purpose: int8 KV / int8-QK (QSA-FN-5/6).
+
+## 2026-09-17 (QSA-FN-4 — the tiled QSA indexer lands, fp16-gated)
+
+- **The one CDNA2 patch that ports is in**: `_qsa_mqa_paged_tiled_kernel` plus the
+  uniform-request dispatch in `vllm/models/qwen4_exp/amd/ops/qsa.py`, with the gate
+  the CDNA version lacks — `dot_is_native = q.dtype == torch.float16 or
+  current_platform.supports_native_bf16`. The win is the *hardware* `tl.dot` (the
+  tiling only amortizes the key load), so fp16 gains everywhere (gfx906
+  `v_dot2_f32_f16`, CDNA MFMA) while bf16 must not enter on gfx906, where the dot
+  is emulated per-scalar.
+- **Gate (launch-regime, one MI50, uniform mapping, same inputs, interleaved
+  ×3, two runs):** fp16 dispatch **1.33-1.35×** (4084/4061 vs 5439/5465 µs) with top-2048 agreement
+  **1.00000** and logits NRMSE 1.28e-07; **bf16 stays on the per-row route**
+  (6958 vs 6959 µs = 1.00×, versus the ungated CDNA kernel's 0.42×/16648 µs on the
+  same shape).
+- **Tests:** `tests/models/qwen4_exp/test_qsa_amd.py` **16 → 22 passed** — the
+  scoring test now runs both routes against the torch reference, and the new
+  `test_qsa_mqa_paged_route_selection` pins the gate with recording kernel
+  stand-ins (fp16 uniform 64 rows → tiled; 32 rows or mixed requests → per-row;
+  bf16 uniform → per-row). Non-regression in the same boot: `test_qsa_reference.py`
+  19 passed, `test_config.py` 7, `test_ple.py` 10, `test_gfx906_fa.py` 104, PPL
+  10.5472 (the recorded value for this build), MoE-35B reference workload 58.40
+  t/s mean (58.38-58.41) — at the top of the recorded 57.97-58.36 band.
+- **Not measured:** the indexer's serving share of prefill (the tiny rig cannot
+  transfer shares) — the tester's report (QSA-FN-8) is the only end-to-end number.
+
+## 2026-09-17 (V2-MAMBA-1 — V2 runner + mamba `align` mode no longer faults on gfx906)
+
+- **A GPU memory fault on any hybrid model with heterogeneous KV-group block
+  sizes is fixed**, found via Qwen3.8-Flash-Next (the V2-runner + prefix-caching
+  combination its recipe needs). `MambaHybridModelState.add_request` seeded the
+  per-request running mamba block column with `cache_config.block_size` instead
+  of `cache_config.mamba_block_size`; the engine narrows the former to the
+  **finest** KV-cache group's block size (4, from Qwen4Exp's
+  `CircularBufferSpec` indexer group) while the mamba geometry stays 192, so a
+  prefix-cache hit seeded a column ~57× too far out and the align pre-copy
+  followed a stale block-table entry to a wild address. One line (+assert) now
+  uses the mamba block size — the value the V1 path already used
+  (`mamba_utils.py`: `block_size = mamba_spec.block_size`).
+- **Not gfx906-specific and not an upstream fix re-derived:** `upstream/main`
+  (fetched 2026-09-17) still has the seed line verbatim. Upstream *did* narrow
+  the trigger the same day (only `prefix_cacheable` groups contribute to the
+  min), which masks it for this model rather than fixing it.
+- **Gates:** the tiny Qwen4Exp rig with prefix caching ON runs the sequence that
+  used to fault, with greedy tokens **and** top-5 logprobs bit-identical to the
+  prefix-caching-OFF arm (worst |Δ| = 0.000000, 6 prompt/rep pairs), with and
+  without MTP k=3; 12/12 requests OK per arm. New unit test
+  (`test_add_request_seeds_running_column_with_mamba_block_size`) fails on the
+  pre-fix code with `assert 287 == 5`. The two CUDA-gated mamba kernel tests are
+  now ROCm-enabled: **195 passed** on gfx906.
+- **Supersedes** the `--no-enable-prefix-caching` workaround in the QSA-FN-2
+  tester recipe (retired; kept there as a fallback for older builds). Record:
+  [`DEVLOG-v2-mamba-align.md`](DEVLOG-v2-mamba-align.md).
+
+## 2026-09-17 (QSA-FN-1 — Qwen3.8-Flash-Next / QSA runs in fp16 on gfx906)
+
+- **The reported `NotImplementedError: Qwen4Exp QSA currently requires BF16` is
+  fixed, and the fix is a 4.4× kernel win.** Admission of fp16 was added to every
+  place the QSA path stores or reads a 2-byte float, through one shared pair of
+  constants (`QSA_ACTIVATION_DTYPES` / `QSA_KV_CACHE_DTYPES`, `common/qsa_cache.py`):
+  the attention/backend/Impl guards, `forward_qsa`'s Q/K/V check, `get_kv_cache_spec`'s
+  storage check, the indexer's activation check and its raw/compressed key caches
+  (now the model dtype), the `qsa_sparse_paged_attention` assert, and the three AMD
+  `HyperConnectionConfig(params_dtype=…)` sites. `common/qsa_cache.py` is shared with
+  the NVIDIA implementation, so its edits are dtype-*general* (`self.dtype` / model
+  dtype) and **no NVIDIA/CUDA path changes**; the NVIDIA HC sites keep their bf16
+  literal.
+- **Why it was 4.4× and not a guard fix only:** gfx906 has no bf16 instruction, so
+  every bf16 `tl.dot` lowers to scalar `v_fmac_f32` (+ converts) while fp16 lowers to
+  `v_dot2_f32_f16`. Measured on MI50, launch-regime: sparse attention **26.5 ms fp16
+  vs 116.5 ms bf16** (interleaved reps, stable to ±0.2 %); the per-row indexer kernel
+  **5426 vs 6928 µs**.
+- **Gates (all green, one boot):** `test_qsa_amd.py` **9 → 16 passed** and
+  `test_qsa_reference.py` **16 → 19 passed** — the sparse-attention reference test is
+  now parametrized `bf16|fp16`, plus a new indexer-scoring reference test
+  (`qsa_mqa_paged`, bf16+fp16) and a new int64-MRoPE-packing test for the shared
+  state caches; FA suite **104 passed**; in-process PPL (Qwen3.8-27B-AWQ-INT4, fp16,
+  359 tokens) **10.5472, 0 top-20 misses**, identical to the value recorded for this
+  build; MoE 35B `_bench_gfx906.py` pp2048/tg256 4 samples **58.31/58.35/58.29/58.23
+  t/s** (mean 58.30, mclk 1000) — parity.
+- **Not covered — the end-to-end gate is QSA-FN-3's.** No served request has exercised
+  the fp16 path (the model needs ~60 GB of W4A16 weights), so the config-shape
+  plumbing is uninstantiated and the indexer's compress/store/selection kernels are
+  untested in fp16. Record + limits:
+  [`DEVLOG-qwen38-flash-qsa.md`](DEVLOG-qwen38-flash-qsa.md); pre-work evidence:
+  [`RECON-qwen38-flash-qsa.md`](RECON-qwen38-flash-qsa.md).
+- By-product baseline, first record: Qwen3.5-27B-AWQ in-process PPL **14.3750**
+  (359 tokens, 0 top-20 misses) — a different model from the 10.55 band, so not
+  comparable to it.
+

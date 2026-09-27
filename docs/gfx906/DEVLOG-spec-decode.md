@@ -556,3 +556,190 @@ would silently duplicate the non-FD control. Keep the confound too: the
 verdict above compares an **offline** arm against **serving** controls, so any
 revival must re-gate same-stack. Keep/strip analysis:
 `/local/tmp/b4/fd1-keep-strip-decision.md`.
+
+## 2026-09-22 — drafter CUDA graphs cost our TP=2 MTP k=3 config ~8%; `--disable-custom-all-reduce` is a no-op
+
+**VERDICT:** `OPEN` (config-dependent sign — keep it a knob, do not flip a global
+default on one config) · **GATE:** serving wall-clock, fixed acceptance, one boot
+per arm, A-B-A order control (ON → OFF → ON).
+
+### HYPOTHESIS
+
+If the drafter's cudagraph manager inherits the target's mode (our current
+behaviour), it captures graphs for its own 3-token forward pass; if forcing it to
+`CUDAGraphMode.NONE` helps or hurts, the sign should show as a t/s delta at fixed
+acceptance. Separately: if vLLM's custom all-reduce can actually be selected on
+this topology, dropping `--disable-custom-all-reduce` should change the AR kernel.
+
+### What was done
+
+Qwen3.8-27B-AWQ-INT4, TP=2, fp16, maxlen 262144, util 0.82, MTP k=3, capture
+`[4,8,12,16]`, `--max-num-seqs 4`, 32 000-token prompt, 256 output tokens, 3 reps
+per arm. A local (uncommitted, reverted) env gate mirrored the tester's PR #2 knob
+exactly (`GFX906_DRAFTER_GRAPHS` unset → `NONE`, `=1` → inherit). Drafter-graph
+OFF is measured in the middle arm, so the two ON arms bracket any drift.
+
+### Evidence
+
+| arm | `--disable-custom-all-reduce` | drafter graphs | decode t/s | ms/step |
+|---|---|---|---|---|
+| A (house) | yes | ON (inherit) | **55.40** (55.37–55.44) | 72.2 |
+| B | **no** | ON (inherit) | **55.52** (55.49–55.55) | 72.0 |
+| C | yes | **OFF (`NONE`)** | **59.78** (59.72–59.83) | 66.9 |
+| B2 (drift control) | **no** | ON (inherit) | **55.38** (55.33–55.43) | 72.2 |
+
+Acceptance **1.000** in every arm (filler prompt; spec tokens drafted/accepted
+identical), so the delta is pure step cost, not a scheduling difference.
+
+- **Drafter graphs: OFF is +7.9 %** on this config (59.78 vs 55.40 t/s; 66.9 vs
+  72.2 ms/step), reproduced on both ON arms. This is the *opposite* sign to the
+  tester's +6 % for enabling them (PR #2, their TP=4 / 147 456-ctx /
+  max-num-seqs 3 config) — so the effect is configuration-dependent and stays an
+  env knob rather than a default flip on either measurement.
+- **Custom all-reduce: no effect.** The engine's own backend dispatch line is
+  identical in every arm — `Using ['PYNCCL'] … out of potential backends
+  ['FLASHINFER', 'NCCL_SYMM_MEM', 'QUICK_REDUCE', 'AITER_CUSTOM', 'CUSTOM',
+  'SYMM_MEM', 'PYNCCL']` — i.e. `CustomAllreduce` is constructed and then
+  self-disables, so the flag only *documents intent* here. The 3 AR-flag arms span
+  55.38–55.52 t/s (0.25 %, within noise).
+- **KV pool is NOT readable from this session:** B reported 353 856 tokens while A
+  and B2 (identical flags to B and to each other minus the AR flag) both reported
+  381 369 — a 7 % swing with no knob difference, i.e. profiling/allocator noise.
+  The tester's −2.3 %-KV figure for drafter graphs is not reproduced (nor refuted)
+  here.
+
+### By-catch
+
+**Correction (same day, verified):** an earlier draft of this entry read
+`[speculator.py:120] Fused multi-step draft decode is not supported by attention
+backend(s) CUSTOM; falling back to rebuilding …` as "our CUSTOM FA refuses the fused
+path". It does not. The gate is the per-backend attribute
+`supports_draft_decode_metadata_update` (`speculator.py:104-124`), which our FA
+builder sets from `VLLM_GFX906_FUSED_DRAFT` (default off) — so the message appears
+only while the flag is unset, and it names the backend although the *flag* is what
+decided. Verified with the flag on: the message is **absent** (0 occurrences) and the
+fused multi-step path is used. Throughput there: **55.29 / 55.45 t/s** vs 55.40 for
+the flag-off house arm at 32 k with acceptance 1.000 — i.e. FD-1's recorded
+**NEUTRAL** verdict holds on this config too, now on a same-config pair.
+
+Side note from that boot: `[envs.py:2308] Unknown vLLM environment variable detected:
+VLLM_GFX906_FUSED_DRAFT`. Our `VLLM_GFX906_*` switches are read via `os.environ` and
+are not declared in `vllm/envs.py`, so every one of them emits this startup warning —
+cosmetic, but it makes a real typo'd variable look identical to a working one.
+
+### Evidence AGAINST / limits
+
+One prompt (filler, 100 % acceptance), one context (32 k), TP=2, `max-num-seqs 4`;
+real-payload acceptance (~0.7–0.9) and other contexts/TP are unmeasured, and those
+are exactly the regimes where a drafter-graph win could reappear. Nothing here
+tests correctness: acceptance was identical in all arms.
+
+### Interactions
+
+Feeds the PR #2 review (`REVIEW-pr2-qsa-fn.md`): the required edit is *not* "invert
+their default so we keep our graphs" — our config is faster with graphs off. The
+edit stays (default = upstream behaviour, knob to disable) but the justification is
+now "one config measures +7.9 % the other way, one measures +6 %, so keep it
+switchable", not "their default costs us 6 %".
+
+### 2026-09-23 — real-payload sweep: the knob is **neutral**; the filler +7.9 % did not transfer
+
+**Same session, one arm per boot, TP=2, MTP k=3, maxlen 262144, util 0.82, capture
+`[4,8,12,16]`; prompts are *token ids* from `corpus_mixed.json` body 0 (real
+chat/agent payload, prefix fills), identical byte-for-byte across arms; 1 warmup +
+3 reps × 256 tokens per context; ms/step is the acceptance-independent comparator.**
+
+| context | T2ON ms/step (acc) | T2OFF ms/step (acc) | T2ON2 ms/step (acc) |
+|---|---|---|---|
+| 2 k | 60.0 (0.622) | 59.9 (0.588) | 59.8 (0.622) |
+| 8 k | 62.1 (0.611) | 62.2 (0.584) | 62.2 (0.633) |
+| 64 k | 92.0 (0.525) | 92.1 (0.544) | 92.2 (0.581) |
+
+**ms/step is identical across all three arms at every context (±0.2 %)**, and the t/s
+differences track acceptance only (e.g. 8 k: 45.8/46.8 t/s at acc 0.611/0.633 with
+graphs ON vs 44.3 at 0.584 with them OFF). T2ON2 is the drift control and matches
+T2ON. So on real payloads the drafter-graph knob is **neutral on this config**, and
+the earlier +7.9 % (OFF faster) reproduced **only** in the 100 %-acceptance filler
+regime (72.2 → 66.9 ms/step). Mechanism not investigated: the two regimes differ in
+tokens per step, so the verify path's block-boundary behaviour differs, but the
+effect is single-regime and I have not isolated it.
+
+**Consequence.** Our serving never sees 100 % acceptance on real payloads, so: keep
+the upstream default (drafter inherits the target's mode) and keep the knob
+available. No default flip on either side is justified by either measurement, and
+the PR #2 edit stands as "make it switchable, do not change the default".
+
+**TP=1 pair not measured** (three attempts lost, none of them a GPU fault):
+(1) `max-model-len 131072` cannot fit TP=1/0.82 — the engine refuses with
+`9.29 GiB KV cache is needed, larger than available`; (2) the relaunch at 65 536
+raced the previous server's VRAM release (`Free memory on device cuda:0
+(13.51/31.98 GiB) < desired 0.82`) — the kill needs an explicit drain wait;
+(3) the third attempt **stalled at the drafter's shard load** (0/5, log frozen for
+13 min, 3.9 % CPU, 26 GB VRAM held, no error) — logged as degradation observation
+#107, process killed. The TP=2 answer does not depend on it; a TP=1 confirmation
+would need a fresh boot.
+
+### 2026-09-23 — the drafter-graph sign difference may be architecture, not config
+
+The tester's reply to the sweep offers the explanation their numbers imply: the
++6 % they measured is on **Qwen3.8-Flash-Next (Qwen4Exp/QSA)**, while every number
+of ours in this entry is **Qwen3.8-27B-AWQ-INT4 (dense, Qwen3, MTP k=3)**. Different
+architectures ⇒ different drafter shapes and step structure, so a knob that is a
++6 % win there and neutral (real payloads) / +7.9 % off-favouring (100 %-acceptance
+filler) here is not necessarily contradictory — it is two model-specific answers to
+the same question.
+
+Consequence for the plan (unchanged, but better justified): restore the upstream
+default (drafter inherits the target's mode) and keep `GFX906_DRAFTER_GRAPHS` as the
+switch, so their `=1` configuration stays available on the model it helps. Our
+"neutral" claim must be quoted with its model attached — it is a Qwen3.8-27B-dense
+result, not a statement about Qwen4Exp.
+
+## 2026-09-23 — V2 runner boot under MTP + graphs: the GC guard (tester's box, PR #2)
+
+**VERDICT:** `SHIPPED` as an opt-in **mitigation** (`GFX906_GC_FREEZE=1`, default off);
+root cause `OPEN` — GC is the victim of a heap corruption nobody has identified.
+· **GATE:** their boot lottery on 4× MI50 (5/5 fatal with the exit traversal, 2/2 with
+park-at-exit); nothing reproduced on our 2-card box.
+
+The tester's box (4× MI50, TP=4 + EP, Qwen3.8-Flash-Next, MTP k=3) died during engine
+init on the first boot that added MTP. Three faces of the same boot phase:
+
+1. `!!!!!!! Segfault encountered !!!!!!!` from an **explicit `gc.collect()`** —
+   `gc_collect_main` → `deduce_unreachable` → `update_refs` — after the `eagle_head`
+   AOT artifact load and around `profile_run` / `capture_model`, on all four workers.
+2. The same phase, different face: a `ProcessGroupNCCL` watchdog timeout ~1 s after
+   `Capturing model for speculator...`.
+3. Without speculation: `list index out of range` from
+   `torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding` inside the AOT piecewise graph —
+   this one was a *real* bug of theirs: the PLE custom op staged ids through a pinned
+   buffer with an async D2H, so the host read stale ids (or, on the first step,
+   `torch.empty(...).pin_memory()` garbage), which then indexed outside the table.
+   Fixed with `non_blocking=False`, plus a hardening that raises on out-of-range ids
+   instead of returning an uninitialised row.
+
+Findings that survive the runbook:
+
+- **The GC traversal is the victim, not the bug** (`bpo-31181` shape): something
+  corrupted the heap first, and the guard only removes the frame that dies.
+- **`gc.freeze()` + `gc.disable()` are not sufficient**: `disable()` stops *automatic*
+  collections, so any third-party explicit `gc.collect()` still traverses. Shadowing
+  the `gc.collect` **attribute** for the region does reach them (29 attribute-style call
+  sites under `torch/`, no `from gc import collect` bindings in `torch/` or `vllm/`).
+- **The guard's own exit was the crash site** (5/5 boots died in the restoring
+  collect) — hence the default exit *parks* (`gc.freeze()`, no traversal) and the old
+  `unfreeze()+collect()` exit is opt-in via `GFX906_GC_THAW=1`.
+- **`tvm_ffi` installs its own `SIGSEGV` handler, replacing `faulthandler`'s**
+  (`src/ffi/backtrace.cc`), which is why eleven boots produced C-only backtraces with
+  no `File "*.py"` line; `PYTHONMALLOC=debug` is the way to get a Python trace.
+- Prime (unproven) suspect: a stale tvm_ffi torch-C-DLPack addon cached by *filename*
+  without a torch-version hash, importing `THPVariable_Wrap` against a newer torch.
+
+**Not carried into the tree** (recorded only): their operational mitigations — a
+`BOOT_TRIES` retry loop gated on *measured* VRAM release rather than a clock, a reaper
+for leaked workers, and `TVMFFI=disable` (`TVM_FFI_DISABLE_TORCH_C_DLPACK=1`).
+
+Also from this PR and recorded above: the drafter-cudagraph knob (+6 % on their
+Qwen4Exp config, neutral on our dense 27B), whose default we restored to upstream
+behaviour with `GFX906_DRAFTER_GRAPHS=0` as the switch.
+
