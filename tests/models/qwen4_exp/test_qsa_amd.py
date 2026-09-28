@@ -481,3 +481,78 @@ def test_qsa_mqa_paged_route_selection(
     assert launched == (
         ["_qsa_mqa_paged_tiled_kernel"] if expect_tiled else ["_qsa_mqa_paged_kernel"]
     )
+
+
+def test_reference_block_ranks_follows_the_kernel_contract() -> None:
+    """The reference selection mirrors ``top_k_per_row_decode``'s output contract.
+
+    Per row: the top ``block_topk`` visible blocks by score, -1 past the row's
+    visible end. Row ends are block counts, as ``qsa_mqa_paged`` returns them.
+    """
+
+    logits = torch.tensor(
+        [[0.5, 3.0, 1.0, 2.0], [4.0, 0.25, 0.0, -1.0]], dtype=torch.float32
+    )
+    row_ends = torch.tensor([3, 1], dtype=torch.int32)
+    blocks = torch.full((2, 2), 123, dtype=torch.int32)
+
+    qsa_ops._reference_block_ranks(logits, row_ends, blocks, 2)
+
+    # Row 0 sees blocks 0..2 -> 1 (3.0) and 2 (1.0); row 1 sees block 0 only.
+    assert blocks.tolist() == [[1, 2], [0, -1]]
+
+
+def test_reference_block_ranks_clamps_a_width_wider_than_the_cache() -> None:
+    logits = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
+    row_ends = torch.tensor([3], dtype=torch.int32)
+    blocks = torch.full((1, 8), 123, dtype=torch.int32)
+
+    qsa_ops._reference_block_ranks(logits, row_ends, blocks, 8)
+
+    assert blocks.tolist() == [[2, 1, 0, -1, -1, -1, -1, -1]]
+
+
+def test_reference_block_ranks_handles_an_empty_cache() -> None:
+    blocks = torch.full((2, 4), 123, dtype=torch.int32)
+
+    qsa_ops._reference_block_ranks(
+        torch.empty((2, 0), dtype=torch.float32),
+        torch.zeros((2,), dtype=torch.int32),
+        blocks,
+        4,
+    )
+
+    assert blocks.tolist() == [[-1, -1, -1, -1], [-1, -1, -1, -1]]
+
+
+def test_select_qsa_block_ranks_dispatches_by_measured_ceiling(monkeypatch) -> None:
+    """Kernel up to the verified width ceiling, reference above it.
+
+    The ceiling is measured, not assumed: on gfx906 the decode kernel agrees with
+    the reference selection at 8192 and corrupts memory at 12288/16384
+    (`/local/tmp/wht1/topk_case.py`). A model whose indexer budget covers its
+    context selects 65536 blocks, which is past the ceiling by construction.
+    """
+
+    calls: list[int] = []
+
+    def _fake_kernel(logits, next_n, row_ends, blocks, num_rows, s0, s1, topk):
+        calls.append(topk)
+        blocks.fill_(-1)
+
+    monkeypatch.setattr(qsa_ops.ops, "top_k_per_row_decode", _fake_kernel)
+
+    logits = torch.zeros((1, 4), dtype=torch.float32)
+    row_ends = torch.tensor([4], dtype=torch.int32)
+    blocks = torch.empty((1, 4), dtype=torch.int32)
+
+    for width in (2, 512, 2048, qsa_ops._TOPK_KERNEL_MAX_WIDTH):
+        qsa_ops._select_qsa_block_ranks(logits, row_ends, blocks, width)
+
+    assert calls == [2, 512, 2048, 8192]
+
+    # Just past the ceiling -- and the width of the model this was written for.
+    for width in (8193, 65536):
+        qsa_ops._select_qsa_block_ranks(logits, row_ends, blocks, width)
+
+    assert calls == [2, 512, 2048, 8192]

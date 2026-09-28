@@ -19,6 +19,25 @@ _QSA_CONFIG_FIELDS = (
     "indexer_compress_ratio",
 )
 
+# Selection widths (`indexer_budget // indexer_compress_ratio`) that vLLM's
+# tuned top-k kernels are exercised at. The released Qwen3.8-Flash-Next family
+# uses 2048; `512` and `1024` are the other tuned widths.
+#
+# This is a *performance* property, not a geometry invariant: the decode top-k
+# kernel (`_C.top_k_per_row_decode`) takes the width as a runtime argument, and
+# the QSA selection path falls back to a reference implementation for widths
+# outside this set (see `qsa_select_paged_tokens`). Model families that select
+# more blocks than this -- e.g. a distilled model whose indexer budget covers
+# its whole context, so the selection is a no-op -- are therefore servable, just
+# not on the tuned path. Keep this tuple in sync with the kernels that actually
+# branch on width.
+_QSA_TUNED_TOPK_WIDTHS = (512, 1024, 2048)
+
+
+def qsa_uses_tuned_topk_width(block_topk: int) -> bool:
+    """Whether a selection width is one vLLM's tuned top-k kernels cover."""
+    return block_topk in _QSA_TUNED_TOPK_WIDTHS
+
 
 class Qwen4ExpVisionConfig(Qwen3VLVisionConfig):
     model_type = "qwen4_exp"
@@ -149,18 +168,43 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
             raise ValueError(
                 "indexer_budget must be divisible by indexer_compress_ratio"
             )
+        # The selection width (`block_topk` = budget / compress_ratio) is
+        # deliberately NOT restricted here. Upstream required it to be 512 or
+        # 2048 -- the widths its tuned top-k kernels cover -- which rejects
+        # legitimate model families for a performance reason, not a correctness
+        # one: the width is consumed as a runtime argument and widths outside the
+        # tuned set take the reference selection path. See
+        # `_QSA_TUNED_TOPK_WIDTHS` and `qsa_select_paged_tokens`.
         block_topk = values["indexer_budget"] // values["indexer_compress_ratio"]
-        if block_topk not in (512, 2048):
-            raise ValueError(
-                "QSA requires indexer_budget / indexer_compress_ratio "
-                f"to be 512 or 2048, got {block_topk}"
-            )
+        if block_topk < 1:
+            raise ValueError(f"QSA selection width must be positive, got {block_topk}")
         rotary_dim = int(self.head_dim * self.partial_rotary_factor)
         if rotary_dim > values["indexer_head_dim"]:
             raise ValueError(
                 "QSA indexer_head_dim must cover the attention rotary "
                 f"dimension, got {values['indexer_head_dim']} < {rotary_dim}"
             )
+
+    @property
+    def qsa_block_topk(self) -> int | None:
+        """Number of key blocks one query selects (the QSA selection width)."""
+        budget = getattr(self, "indexer_budget", None)
+        ratio = getattr(self, "indexer_compress_ratio", None)
+        if budget is None or ratio is None:
+            return None
+        return int(budget) // int(ratio)
+
+    @property
+    def qsa_uses_tuned_topk(self) -> bool:
+        """Whether the selection width is one of the tuned top-k widths.
+
+        False is not an error: the selection path falls back to a reference
+        implementation, which is correct but untuned.
+        """
+        block_topk = self.qsa_block_topk
+        if block_topk is None:
+            return False
+        return qsa_uses_tuned_topk_width(block_topk)
 
     @property
     def layers_block_type(self) -> list[str]:

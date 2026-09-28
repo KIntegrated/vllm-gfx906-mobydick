@@ -91,9 +91,12 @@ base (`logic65/Whittle-Qwen-3.8-35B-A3B`, `bf16-agentfix2/`, 66.2 GiB over 14 sh
 12–14 (19.4 GiB) are the per-token read path, so those are the ones that want NVMe/page
 cache behind them. The GGUF is **not** the route on this stack (see `DEAD-ENDS.md`); the
 vLLM arm loads the bf16 checkpoint with the n-gram table off-GPU. **Blocked on:** the
-download, plus our own `Qwen4ExpConfig._validate_qsa_config` rejecting this geometry
-(`indexer_budget 262144 / indexer_compress_ratio 4 → block_topk 65536`; only 512/2048 are
-accepted). **Gate (arm A3):** peak VRAM/card at init and the largest `max_model_len` that
+download only — the config gate that refused this geometry is fixed on
+`gfx906/wht1-qsa-topk` (`DEVLOG-wht1-qsa-topk.md`): the selection width is a runtime
+property of the decode kernel, and past a **measured** ceiling of 8192 blocks (12288 and
+16384 corrupt memory; filed upstream as UPR-3) selection takes a reference path instead.
+Unit-verified and loadable through `get_config`; not on the line until a real model load
+exercises it. **Gate (arm A3):** peak VRAM/card at init and the largest `max_model_len` that
 fits at `gpu_memory_utilization 0.90`, memory resident vs in host RAM (delta ≈ 18.6 GiB at
 bf16). Refs: issue #36, `DEVLOG-wht1-whittle-onboarding.md`.
 
@@ -235,6 +238,13 @@ duplicate checks per item.
 
 `IPCRecvHandle` EOF spin and the EventPool permanent allocation latch. Ref:
 `cpu-stuck-threads.md`.
+
+### UPR-3 — report upstream: top-k kernel memory corruption above width 8192 · [#37](../../issues/37)
+
+`top_k_per_row_decode` (runtime `topK`) raises an illegal memory access at selection widths
+12288/16384 instead of a clean error; 8192 is verified good, so upstream's `{512, 2048}`
+config rule is hiding a safety limit behind a geometry reason. Evidence in
+`DEVLOG-wht1-qsa-topk.md`.
 
 ## Standing requirements (not issues)
 
