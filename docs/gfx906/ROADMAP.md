@@ -127,10 +127,19 @@ own-context per-token streaming. Also re-anchor the published B=1 prefill sweep
 
 ### MTP-1b — remaining Qwen3.8 MTP optimization opportunities · [#18](../../issues/18)
 
-The umbrella for the open SYV/CAT/J2G candidates (SYV-2 lookahead, SYV-7b mamba
-block size, SYV-9 int8-QK prefill, SYV-11 KV compression, CAT-2/3/4/5/6,
-J2G-2/3/4/5/6/7), each with its profile-first rule. `MTP-1a`/`MTP-1b-0` are
-closed (k=2 wins at long context once the `kv_split` clamp is fixed).
+Candidate list cross-checked against `DEAD-ENDS.md` and the spec-decode / FA
+dev logs (2026-09-27; full table in the issue). **Covered, do not re-open:**
+SYV-2 (our n-gram/prompt-lookup drafter probe is a 0.68× dead-end; the
+block-extension form is SYV-12, parked) and SYV-9 (the FA already runs int8 Q8
+K at full rate; the Q-side is C6, rejected; the format upside is M6 Part C,
+refrigerated). **Partial:** CAT-2 (GQA head packing already shipped; only
+head-dim Split-D remains) and J2G-5 (a tuned AMD_GFX906 MoE config already
+ships in-tree). **Not applicable:** CAT-4 (the source XQA change has no
+counterpart; wide aligned loads are already our latency-hiding rule). **Open:**
+SYV-7b, CAT-5, CAT-6 (profile first), J2G-2/3/4/6/7, and SYV-11 + CAT-3 — the
+last two blocked by the custom FA's fp16-only `supported_kv_cache_dtypes`.
+`MTP-1a`/`MTP-1b-0` are closed (k=2 wins at long context once the `kv_split`
+clamp is fixed).
 
 ### MTP-1c — dynamic MTP depth / per-request policy · [#19](../../issues/19)
 

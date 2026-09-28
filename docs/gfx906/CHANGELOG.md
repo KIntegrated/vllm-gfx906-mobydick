@@ -121,6 +121,21 @@ and moves parked work to `REFRIGERATOR.md`. Open items now live as issues #3–#
   (vs 9.18 / 22.1) — so the "crossover" was clamp-specific. Regression test
   `test_forward_sq_multi_kv_split_vs_fp32_ref` (7 cases). Record:
   `DEVLOG-mtp1.md`.
+- **MTP-1b candidate cross-check (same day).** The external-repo candidate
+  list (SYV/CAT/J2G) was re-checked against `DEAD-ENDS.md` and the spec-decode /
+  FA dev logs. Two candidates are covered by prior work and removed from the open
+  list: **SYV-2** (our own n-gram/prompt-lookup drafter probe was a 0.68×
+  dead-end, L3 closed the CPU-proposer cost, GPU n-gram was rejected on draft
+  quality, and the verify-extension form is SYV-12) and **SYV-9** (the custom FA
+  already runs int8 Q8 K with `v_dot4_i32_i8` at full rate; the Q-side Q8_1 path
+  is the rejected C6; the remaining format upside is M6 Part C, refrigerated).
+  Corrections to the rest: **CAT-2**'s GQA head-packing half already shipped
+  (only head-dim Split-D remains), **J2G-5**'s tuned-config mechanism already
+  ships in-tree (`E=256,N=128,device_name=AMD_GFX906,dtype=int4_w4a16.json`),
+  and **CAT-3/SYV-11** are gated by the custom FA's fp16-only
+  `supported_kv_cache_dtypes` (the original list did not note this). CAT-4 is
+  not applicable (wide aligned loads are already our latency-hiding rule).
+  Detail: issue #18.
 - **SYV-4 — sort-free small-k top-k/top-p sampler (MERGED).** One `torch.topk(k)`
   replaces the full-vocab sort when all rows' k ≤ 64 and B < 8; opt-out
   `VLLM_GFX906_SORT_FREE_SMALL_K=0`. GPU bench 1.17× @B=1 k=64, **6.55× @B=4

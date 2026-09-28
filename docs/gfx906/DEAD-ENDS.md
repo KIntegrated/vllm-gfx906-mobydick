@@ -96,3 +96,16 @@ The Qwen3.8-Flash-Next/QSA work landed on this line from `gfx906/qsa-fn` (merged
 | `--disable-custom-all-reduce` improves TP=2 decode on this box | serving A-B-A at fixed acceptance (DevLog 2026-09-22) | **NEUTRAL** (no-op) | flag kept in the recipe as intent-documentation | The engine dispatches `['PYNCCL']` with *and* without the flag: `CustomAllreduce` is constructed and self-disables on this topology, so the flag cannot change the kernel. 3 arms span 55.38-55.52 t/s (0.25 %, noise) | DEVLOG-spec-decode.md |
 
 | FD-1 fused-draft decode-metadata path @B=4/120k | offline 4×122880 wall | **NEUTRAL** (stack-confounded: offline arm vs serving control) | **same code as A3** — A3's original opt-in was **stripped** 2026-09-13 (`f8a9400789`) and then **revived 2026-09-14** on the V2 bring-up branch, where the flag is again the opt-in for the fused multi-step draft-metadata protocol (`_generate_fused_drafts` is in-tree) with three tests incl. a reuse/corruption guard — so `VLLM_GFX906_FUSED_DRAFT` **does have a reader** (corrected 2026-09-17; the earlier "no reader" note was stale). FD-1's *neutral* verdict stands for the B=4/120k offline arm only; **re-verified 2026-09-22 on a same-config pair (flag on 55.29/55.45 t/s vs off 55.40 t/s, 32 k, acceptance 1.000) — still NEUTRAL**, so the default stays off. The enabling gate is the per-backend `supports_draft_decode_metadata_update` attribute, which our FA sets from the flag: with the flag unset the speculator logs 'not supported by attention backend(s) CUSTOM' and rebuilds metadata per draft step (it names the backend, but the flag decided) | — | DEVLOG-spec-decode.md, fd1-keep-strip-decision.md |
+
+## Candidate cross-check (2026-09-27) — do not relist as new work
+
+- **SYV-2 (lookahead/context drafting)** is our n-gram/prompt-lookup drafter:
+  DEAD-END 0.68× (`DEVLOG-spec-decode.md` 2026-08-18) plus the L3 proposer
+  closure. The verify-extension form is SYV-12 (parked, `REFRIGERATOR.md`).
+- **SYV-9 (int8-QK prefill attention)** is already realised: the custom FA runs
+  int8 Q8 K with `v_dot4_i32_i8` at the measured full rate (the "salvage
+  LEGACY=0" row above); the Q-side is C6 (rejected, `CHANGELOG.md` 2026-08-18);
+  the remaining format upside is M6 Part C (`REFRIGERATOR.md`).
+- **CAT-4 (128-bit aligned KV loads)** is not applicable: `global_load_dwordx4`
+  is already the documented latency-hiding rule (`latency-hiding.md`), and the
+  source win is an XQA-specific page-load change absent from our custom Q8 FA.
