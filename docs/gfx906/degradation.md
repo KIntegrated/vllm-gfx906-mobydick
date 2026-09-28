@@ -737,3 +737,31 @@ text re-sent costs **4.46 s at 65,455 tokens (93.0 % saved)** and **4.17 s at 13
 than a cold one. Raw series kept: `logs/gpu-samples-20260926-1528.tsv`, `logs/prefill-64-128-20260926.log`.
 NVMe read across the window: 21.9 GiB = **29.3 KiB per prefill token** (upper bound: the window also
 carried this agent's own decode and other users' traffic; boot C's cleaner measurement was 20.8).
+
+### 2026-09-26 16:40 — tooling: the launcher is now in the tree, with its API key removed
+
+**Class:** tooling/docs. **No live change, no boot.**
+
+`tools/gfx906/run-vllm.sh` is a copy of the reference box's launcher so the flags and the
+measurement notes behind them travel with the source instead of living on one machine. Exactly one
+line differs semantically:
+
+```diff
+-export VLLM_API_KEY=<64-char secret>
++export VLLM_API_KEY="${VLLM_API_KEY:?set VLLM_API_KEY in the environment - this copy ships without the key}"
+```
+
+plus a provenance header and one `shellcheck disable` line (this repo lints every `.sh`; the live
+script's five findings — SC2012 `ls`-for-path-discovery, SC2086 `tee -a $LOG_FILE`, SC2206 the
+intentional unquoted `$@` pass-through — are benign by design, and silencing them in the copy beats
+diverging the copy from what the box runs).
+
+`tools/gfx906/export-run-vllm.sh` produces the copy and `--check` re-derives it and compares, so
+"the copy is the live script minus the key" is a checked claim rather than a promise; it also fails
+if any long literal token survives, which is what keeps a future re-sync from leaking a key by
+accident. `scripts/test-optimized-bundle.sh` passes all 20 arms **against the copy**, including the
+argv golden test, so the copy is the same launcher, not a paraphrase of it.
+
+**Process note:** the exporter nearly leaked nothing but nearly failed its own linter — a comment
+line that began `# shellcheck line and that one key line` was parsed by shellcheck as a directive
+(SC1073). A prose line that starts with a directive name *is* that directive.
