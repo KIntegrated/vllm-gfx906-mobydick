@@ -373,16 +373,33 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_state_indices: torch.Tensor | None = None
         prefill_has_initial_state: torch.Tensor | None = None
         if num_decodes > 0:
-            # V1 invariant: non-spec 1-token decodes are scheduled first, so
-            # the front slice of the non-spec ramp is 0..num_decodes. The peel
-            # (and every consumer of the prefill_* fields below) relies on it;
-            # fail loudly instead of silently mis-slicing. CPU-side tensors,
+            # V1 invariant: non-spec 1-token decodes are scheduled first, so the
+            # front slice of the non-spec ramp advances by one per request. The
+            # peel (and every consumer of the prefill_* fields below) relies on
+            # it; fail loudly instead of silently mis-slicing. CPU-side tensors,
             # so this adds no device sync.
-            assert non_spec_query_start_loc_cpu[: num_decodes + 1].equal(
-                torch.arange(
-                    num_decodes + 1, dtype=non_spec_query_start_loc_cpu.dtype
-                )
-            ), "GDN decode-first invariant violated: non-spec decodes not first"
+            #
+            # FULL-cudagraph replay pads the request dimension up to a captured
+            # size with zero-length dummy requests, and those are deliberately
+            # counted as decodes so that num_decodes matches the captured size
+            # (split_decodes_and_prefills: "some requests may have a query
+            # length of 0 but since they are padding its fine to treat them as
+            # decodes (ensures num_decodes matches the captured size)"). Such a
+            # step stalls the ramp instead of advancing it, so the check
+            # tolerates 0-length decode steps while still rejecting any request
+            # with more than one token in the decode region — which is the
+            # mis-slicing the peel must never see. It also cross-checks the
+            # ramp against the scalar max_query_len that drove the split.
+            non_spec_decode_lens = (
+                non_spec_query_start_loc_cpu[1 : num_decodes + 1]
+                - non_spec_query_start_loc_cpu[:num_decodes]
+            )
+            assert bool((non_spec_decode_lens <= 1).all()), (
+                "GDN decode-first invariant violated: non-spec decodes not first "
+                f"(num_decodes={num_decodes}, num_reqs={m.num_reqs}, "
+                f"ramp={non_spec_query_start_loc_cpu.tolist()}, "
+                f"decode_lens={non_spec_decode_lens.tolist()})"
+            )
 
         if num_prefills > 0:
             # In a mixed non-spec batch (spec-mixed or not), decodes are peeled

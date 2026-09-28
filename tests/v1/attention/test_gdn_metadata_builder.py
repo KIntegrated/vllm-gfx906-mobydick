@@ -128,6 +128,36 @@ GDN_BUILD_TEST_CASES = {
         expected_num_prefill_tokens=0,
         expected_num_spec_decodes=1,
     ),
+    # FULL-cudagraph request padding, no spec decode (issue #35). Cudagraph
+    # replay pads the request dimension up to a captured size with
+    # zero-length dummy requests; they are deliberately counted as decodes so
+    # that num_decodes matches the captured size that indexes the GDN state /
+    # cudagraph tensors (split_decodes_and_prefills: "some requests may have a
+    # query length of 0 but since they are padding its fine to treat them as
+    # decodes (ensures num_decodes matches the captured size)"). Used to abort
+    # the engine in the builder's decode-first ramp check.
+    "non_spec_full_cg_pad_decode": GDNBuildTestCase(
+        seq_lens=[40, 30, 20, 20],
+        query_lens=[1, 1, 1, 0],
+        num_decode_draft_tokens=None,
+        num_speculative_tokens=0,
+        expected_num_decodes=4,
+        expected_num_prefills=0,
+        expected_num_prefill_tokens=0,
+        expected_num_spec_decodes=0,
+    ),
+    # Padding in the middle of the decode region, followed by a real prefill:
+    # the peel must start after the last decode row (including the padded one).
+    "non_spec_full_cg_pad_then_prefill": GDNBuildTestCase(
+        seq_lens=[40, 30, 20, 2048],
+        query_lens=[1, 1, 0, 2048],
+        num_decode_draft_tokens=None,
+        num_speculative_tokens=0,
+        expected_num_decodes=3,
+        expected_num_prefills=1,
+        expected_num_prefill_tokens=2048,
+        expected_num_spec_decodes=0,
+    ),
 }
 
 
