@@ -47,7 +47,12 @@ decisive number: **0 of 1022 tensors mapped.**
    rows show the `.replace("_", "")` trick this would need.
 4. **The plugin's kernels are CUDA-only.** `_C_gguf.abi3.so` links `libcudart.so.13`,
    `libtorch_cuda.so`, `libc10_cuda.so` (all unresolved on this box) — there is no ROCm
-   dequant/GEMV path, so even a complete mapping would have nowhere to run.
+   dequant/GEMV path, so even a complete mapping would have nowhere to run. **Checked
+   2026-09-28: nothing is in flight upstream either** — the plugin's recent commits are
+   Gemma4 / iq3xs / mellum (#136, #122–#124), and its open PRs target Qwen-VL, DeepSeek-V4,
+   Kimi-K3, MiniMax-H3, diffusion models and MoE kernel dispatch (#135, #134, #125…): no
+   `qwen4exp` work, no ROCm work. The reopen gate therefore starts with an upstream change
+   that does not exist yet, not with a review queue we can wait on.
 5. `gguf-py` must come from llama.cpp (blocker 2), which also means pinning that checkout.
 
 Side finding: llama.cpp's **C++** does know `LLM_ARCH_QWEN4EXP` (`src/llama-arch.h:48`,
