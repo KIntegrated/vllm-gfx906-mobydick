@@ -23,15 +23,6 @@ E=256, topk=8, hidden=2048, W4A16 group-128 experts; B=1 decode step
 
 ## Now — user-requested / high priority
 
-### P2P-1 — re-test vLLM's custom all-reduce under live PCIe P2P · [#3](../../issues/3)
-
-The `--disable-custom-all-reduce` in every TP=2 recipe is inherited from the
-no-P2P era and was never re-measured; P2P is live and byte-clean since
-2026-09-22. Same-day A/B on the old config showed only +1 % @2k / +0.5 % @8k,
-so the gate is **B=4 and/or long context**. **Gate:** interleaved A-B-A
-same-boot ms/step, B=1 and B=4, fresh boot, mclk 1000. Refs:
-`/local/tmp/4g-handover.md`, `DEVLOG-tp2-dense.md` S1/S4.
-
 ### QSA-FN-9 — land Qwen3.8-Flash-Next PR #2 and close the validation · [#4](../../issues/4)
 
 External tester gate met: 4× MI50, TP=4, fp16, 147 456 ctx, MTP k=3, PLE table
@@ -88,6 +79,23 @@ prefix caching at 147k — one ~30 min session on the tester's box.
 Blocked on a 0.30.1-based line (`vllm-project/vllm#57497`). Verify
 `VLLM_PLE_CPU_OFFLOAD=1` engages with the tiny rig, port #57497's AMD half,
 validate on the real checkpoint, then delete the bespoke mmap path.
+
+### WHT-1 — Whittle-Qwen-3.8-35B-A3B runs locally (a second `qwen4_exp` implementation) · [#36](../../issues/36)
+
+**10.0 B of its 35.1 B parameters is a hashed n-gram memory** (8 tables × 4.88 M rows ×
+256) that its card says can sit in host RAM while the GPU holds a 27 B-class footprint at
+3 B-active decode — the same lever QSA-FN-9/11/15 pull, and the datum that decides whether
+the Flash-Next line serves at 256k on 2×32 GiB. **Postponed 2026-09-28** pending the bf16
+base (`logic65/Whittle-Qwen-3.8-35B-A3B`, `bf16-agentfix2/`, 66.2 GiB over 14 shards):
+`/local` has only 38 GiB free, `/data` (NFS) has 453 GiB — but the n-gram-bearing files
+12–14 (19.4 GiB) are the per-token read path, so those are the ones that want NVMe/page
+cache behind them. The GGUF is **not** the route on this stack (see `DEAD-ENDS.md`); the
+vLLM arm loads the bf16 checkpoint with the n-gram table off-GPU. **Blocked on:** the
+download, plus our own `Qwen4ExpConfig._validate_qsa_config` rejecting this geometry
+(`indexer_budget 262144 / indexer_compress_ratio 4 → block_topk 65536`; only 512/2048 are
+accepted). **Gate (arm A3):** peak VRAM/card at init and the largest `max_model_len` that
+fits at `gpu_memory_utilization 0.90`, memory resident vs in host RAM (delta ≈ 18.6 GiB at
+bf16). Refs: issue #36, `DEVLOG-wht1-whittle-onboarding.md`.
 
 ### U30-1 — Nemotron-H: separate/quantized MTP lm_head + latent-MoE TP>1 AR · [#12](../../issues/12)
 

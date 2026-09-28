@@ -8,6 +8,39 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-09-28 (P2P-1 closed NO-GO — the custom all-reduce "win" was measured on a broken reduction)
+
+### P2P-1 — re-test vLLM's custom all-reduce under live PCIe P2P (#3) — **NO-GO, not a win**
+
+Opened to re-measure the inherited `--disable-custom-all-reduce` now that PCIe P2P is
+live. The throughput A/B produced what looked like the largest single result on the 0.30
+line (+17.1 % B=1, +6.4 % B=4 concurrent decode; TP=2, 27B-AWQ-INT4, same boot, interleaved
+A-B-A, mclk 1000). **All of those figures are void: the treatment arm was numerically
+broken.**
+
+- **Correctness gate (runs 5/6, `/local/tmp/p2p1/r6/`):** arm A (`NCCL_P2P_DISABLE=1`,
+  PYNCCL) coherent and identical across repeats (2/2). Arms B (CUSTOM, P2P off) and C
+  (CUSTOM, P2P live) produced degenerate loops (`post post post…`, `parallel parallel
+  parallel…`) **4/4**, with top-1 logprobs −2.4…−5.8 against −0.1…−1.8 for the coherent arm
+  and 1/96 token agreement. It reproduces **with and without** P2P, so the failure is the
+  implementation, not a P2P interaction.
+- **Why:** upstream `CustomAllreduce` is MI300/XGMI territory. The platform gate says so
+  ("We only enable custom allreduce for MI300 series", `gfx94`/`gfx95`), and on ROCm the
+  peer-write-ordering check is skipped (`custom_all_reduce.py`: `same_node and not is_rocm
+  and not _can_p2p`, comment "p2p is always enabled between XGMI connected GPUs"). These two
+  cards are PCIe-only, so nothing validates the ordering the flag-based spin synchronisation
+  depends on.
+- **Action:** the `VLLM_GFX906_CUSTOM_AR` override and the amdsmi `is_fully_connected` guard
+  were reverted; upstream's MI300-only gate is restored and `vllm/platforms/rocm.py` is
+  byte-identical to the line. RCCL gains nothing from P2P either: PYNCCL + P2P live = PYNCCL
+  + P2P off (33.92 t/s both).
+- **Method lesson (now enforced for every numerics-touching A/B):** `stop_agreement` /
+  `rep_frac8` do **not** catch a broken distribution — the garbage arm scored a *better*
+  repetition fraction (0.0392) than the coherent one (0.32–0.36). Gate on coherent text +
+  sane top-1 logprobs from run 1.
+- Records: `DEVLOG-tp2-dense.md` §S10 (verdict-first, figures marked VOID), `DEAD-ENDS.md`,
+  the issue #3 correction comment, and the `mi50-vllm-serving-ab` skill.
+
 ## 2026-09-27 (roadmap migration — closed items retired from ROADMAP.md)
 
 The roadmap was pruned to open work only. This section banks the closed items
