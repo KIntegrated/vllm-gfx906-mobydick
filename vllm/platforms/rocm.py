@@ -1239,7 +1239,16 @@ class RocmPlatform(Platform):
     @classmethod
     def use_custom_allreduce(cls) -> bool:
         # We only enable custom allreduce for MI300 series
-        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
+        if any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"]):
+            return True
+        # gfx906 probe (P2P-1, issue #3): opt-in only, default OFF — zero
+        # production impact unless the env var is set. Enabling it only makes
+        # sense when PCIe P2P is actually live (32 GiB BARs landing below the
+        # gfx906 44-bit DMA mask + the pci_p2pdma whitelist patch); without
+        # that the IPC peer path faults at init, which is why the historical
+        # `--disable-custom-all-reduce` recipe flag was forced.
+        # See docs/gfx906/DEVLOG-tp2-dense.md S10.
+        return os.environ.get("VLLM_GFX906_CUSTOM_AR", "0") == "1"
 
     @classmethod
     def opaque_attention_op(cls) -> bool:

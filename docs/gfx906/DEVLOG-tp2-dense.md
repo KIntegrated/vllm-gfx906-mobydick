@@ -174,14 +174,15 @@ t/s. (One isolated GPU0 wedge 13:00:53 at the 2nd launch — retry clean;
 
 ---
 
-### S10 — P2P-1 (custom all-reduce re-test): BLOCKED on the UEFI/BAR state; the recipe flag is inert by construction (2026-09-28, boot 0)
+### S10 — P2P-1 (custom all-reduce re-test): UNBLOCKED — UEFI/BAR state restored, platform gate now env-overridable (2026-09-28, boots 0/heal)
 
-**VERDICT:** OPEN (blocked — no measurement reachable) · **GATE:** interleaved
-same-boot A-B-A ms/step at B=1 and B=4, fresh boot, mclk 1000.
+**VERDICT:** OPEN (measurement in flight) · **GATE:** interleaved same-boot
+A-B-A ms/step at B=1 and B=4, fresh boot, mclk 1000.
 
-**HYPOTHESIS (issue #3 / P2P-1):** now that PCIe P2P is live, dropping
-`--disable-custom-all-reduce` from the TP=2 recipes engages vLLM's custom
-all-reduce (or QuickReduce) and wins at B=4 / long context.
+**HYPOTHESIS (issue #3 / P2P-1):** now that PCIe P2P is live, engaging vLLM's
+custom all-reduce (instead of PYNCCL) wins at B=4 / long context. Two prior
+blockers — both now cleared — were: (a) the platform gate making the recipe
+flag a no-op, (b) PCIe P2P not actually being up.
 
 **Finding 1 — the flag cannot change anything on gfx906 (root-caused; source + live log).**
 
@@ -229,6 +230,46 @@ experiment must instead gate the platform check itself (planned env knob
 → Action: re-apply the UEFI settings (Above 4G Decoding = Enabled; MMIO high
 base ~1 TiB and window ~1 TiB so both 32 GiB BARs sit below 2^44), then verify
 `BAR=32768M` in the boot log **and** `showtopoaccess` True before measuring.
+
+**Finding 3 — the P2P precondition is now met (2026-09-28 13:12 boot, verified).**
+
+```
+root bus resource [mem 0x10000000000-0x13fffffffff window]      # 1 TiB .. 5 TiB
+pci 0000:04:00.0: BAR 0 [mem 0x10000000000 …] [size=32G]
+pci 0000:07:00.0: BAR 0 [mem 0x11000000000 …] [size=32G]
+amdgpu 0000:04:00.0: added peer-to-peer DMA memory 0x10000000000-0x107ffffffff
+amdgpu 0000:07:00.0: added peer-to-peer DMA memory 0x11000000000-0x117ffffffff
+Detected VRAM RAM=32752M, BAR=32768M          # was BAR=256M on every boot since 09-22 21:18
+rocm-smi --showtopoaccess : 0->1 True, 1->0 True
+hipDeviceCanAccessPeer = 1 both ways; enablePeerAccess clean
+/local/tmp/x99wl/p2p_check : 4/64/256 MB both directions bad=0 -> P2P-CHECK: PASS
+no "PCIe P2P access … is not supported by the chipset" lines
+24003M of GTT memory ready per card           # 48 GB host; GTT = RAM/2 (no gttsize override)
+```
+
+Two UEFI changes are needed, not one: Above 4G Decoding **and** the MMIO high
+base lowered to ~1 TiB. With only the first, the BARs land at ~56 TiB and the
+44-bit DMA-mask gate in `amdgpu_device_is_peer_accessible()` still fails — both
+32 GiB BARs must sit **below 2^44 (16 TiB)**. The 09-22 21:18 relapse (and the
+future-dated RTC on boot −25) points at a weak CMOS battery; a fresh cell has
+been fitted.
+
+**Change 1 — the platform gate is now env-overridable (`rocm.py:1240`, default OFF).**
+
+`VLLM_GFX906_CUSTOM_AR=1` → `use_custom_allreduce()` returns True on gfx906;
+unset or `0` → False (production behaviour unchanged). Verified by direct call
+on arch `gfx906:sramecc+:xnack+`: unset → False, `0` → False, `1` → True. The
+downstream `parallel.py:1080` only forces `disable_custom_all_reduce=True` when
+the platform says no, so this one knob flips the whole path
+(`gpu_worker` → `_ENABLE_CUSTOM_ALL_REDUCE` → `cuda_communicator` constructs
+`CustomAllreduce`/QuickReduce). Inits that could still refuse on gfx906: the
+world-size / same-node gates pass at TP=2, and the explicit `_can_p2p` probe is
+**skipped on ROCm** (`custom_all_reduce.py:249`) — so the peer IPC buffer open
+is the real test, which is exactly what used to fault.
+
+Note this is not foreclosed by S1: S1's stall was the **RCCL** P2P transport
+(`NCCL_P2P_DISABLE=1` made it disappear), which is a different path from custom
+AR's own IPC buffers.
 
 **Refs:** issue #3 · `/local/tmp/4g-handover.md` (gates 1–3 + enablement
 recipe) · `DEVLOG-spec-decode.md` (2026-09-22 no-op session) · `degradation.md`
