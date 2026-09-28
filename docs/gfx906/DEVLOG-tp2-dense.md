@@ -171,3 +171,65 @@ t/s. (One isolated GPU0 wedge 13:00:53 at the 2nd launch — retry clean;
 - Prefill (cold): ~470-525 t/s at 2k-32k, 357 @64k (attention growth).
 
 > 2026-09-22: `--disable-custom-all-reduce` verified a **no-op** on this topology (PYNCCL is the only enabled AR backend with and without it; 3 arms within 0.25 %) — see `DEVLOG-spec-decode.md` (same session), which also measures the drafter-cudagraph knob at −7.9 % (graphs off) on the TP=2 MTP k=3 config.
+
+---
+
+### S10 — P2P-1 (custom all-reduce re-test): BLOCKED on the UEFI/BAR state; the recipe flag is inert by construction (2026-09-28, boot 0)
+
+**VERDICT:** OPEN (blocked — no measurement reachable) · **GATE:** interleaved
+same-boot A-B-A ms/step at B=1 and B=4, fresh boot, mclk 1000.
+
+**HYPOTHESIS (issue #3 / P2P-1):** now that PCIe P2P is live, dropping
+`--disable-custom-all-reduce` from the TP=2 recipes engages vLLM's custom
+all-reduce (or QuickReduce) and wins at B=4 / long context.
+
+**Finding 1 — the flag cannot change anything on gfx906 (root-caused; source + live log).**
+
+- `vllm/platforms/rocm.py:1240-1242` — `use_custom_allreduce()` returns True
+  only for `gfx94`/`gfx95` (**MI300-only**).
+- `vllm/config/parallel.py:1080-1081` — `if not
+  current_platform.use_custom_allreduce(): self.disable_custom_all_reduce = True`
+  → the platform gate **overrides the CLI flag**.
+- `vllm/v1/worker/gpu_worker.py:1532` — `set_custom_all_reduce(not
+  disable_custom_all_reduce)` → `_ENABLE_CUSTOM_ALL_REDUCE = False`.
+- `cuda_communicator.py:143/169` — `CustomAllreduce` (`ca_comm`) and
+  QuickReduce (`qr_comm`) are constructed **only** when that flag is true, so
+  both are skipped and the backend list resolves to `['PYNCCL']`.
+- Live corroboration (2026-09-28 06:04 server, launched **without** the flag):
+  logged `disable_custom_all_reduce=True` and `Using ['PYNCCL'] all-reduce
+  backends ... out of potential backends ['FLASHINFER_PCIE_IPC', 'FLASHINFER',
+  'NCCL_SYMM_MEM', 'QUICK_REDUCE', 'AITER_CUSTOM', 'CUSTOM', 'SYMM_MEM',
+  'PYNCCL']`.
+- The one other P2P-shaped backend, FlashInfer PCIe IPC
+  (`VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC`, default 0), is **CUDA-only**
+  (`flashinfer_pcie_ipc_all_reduce.py:69` — "requires the CUDA platform").
+
+→ Deliverable (a) "remove the flag from the recipes" is a **no-op**; the
+experiment must instead gate the platform check itself (planned env knob
+`VLLM_GFX906_CUSTOM_AR`, default off).
+
+**Finding 2 — the P2P precondition is not met (hard blocker).**
+
+- `rocm-smi --showtopoaccess`: `0->1 False`, `1->0 False` (diagonal only).
+- BARs are **256 MiB** at ~3 GiB: `pci 0000:04:00.0: BAR 0 [mem
+  0xc0000000-0xcfffffff]`; root-port windows are 32-bit (`Memory behind
+  bridge: dfc00000-dfdfffff`, prefetchable `c0000000-d01fffff`) → the firmware
+  exposes **no high MMIO window**, i.e. Above-4G Decoding / the lowered MMIO
+  high base from 2026-09-22 is not in effect.
+- BAR history (`Detected VRAM RAM=32752M, BAR=`): the 32 GiB BAR exists only on
+  **boot −12 (2026-09-22 15:32)** and **boot −11 (2026-09-22 18:47)**, is lost
+  again on **boot −10 (2026-09-22 21:18)** and on **every** boot since
+  (−9 … 0, 2026-09-24 → 09-28). Boot −25 carries a future-dated RTC
+  (**Oct 18 10:09**) mid-sequence — the signature of a CMOS/UEFI reset — which
+  matches the enablement failing to persist.
+- Kernel side is intact: cmdline carries **no** `pci=nocrs`; the running
+  `6.8.12-acso` (built 2026-09-22 16:15) is the build the p2pdma whitelist
+  patch targets (`/local/git/linux-acs-override/build-debian.sh:41`).
+
+→ Action: re-apply the UEFI settings (Above 4G Decoding = Enabled; MMIO high
+base ~1 TiB and window ~1 TiB so both 32 GiB BARs sit below 2^44), then verify
+`BAR=32768M` in the boot log **and** `showtopoaccess` True before measuring.
+
+**Refs:** issue #3 · `/local/tmp/4g-handover.md` (gates 1–3 + enablement
+recipe) · `DEVLOG-spec-decode.md` (2026-09-22 no-op session) · `degradation.md`
+#104/#105.
