@@ -1014,23 +1014,7 @@ class RocmPlatform(Platform):
         """
         Query if the set of gpus are fully connected by xgmi (1 hop)
         """
-        handles = amdsmi_get_processor_handles()
-        if any(pid < 0 or pid >= len(handles) for pid in physical_device_ids):
-            # amdsmi can enumerate fewer processors than the device IDs the
-            # caller holds (observed on gfx906: 0 handles, so every index
-            # raises IndexError and kills the engine). The other amdsmi
-            # helpers in this class guard the same way. Report the
-            # conservative answer: this only gates the >2-GPU custom-AR /
-            # QuickReduce paths, where a wrong True is the dangerous one.
-            logger.warning(
-                "Cannot determine XGMI connectivity: amdsmi reports %d "
-                "processor handle(s) for physical device IDs %s. Reporting "
-                "the devices as not fully connected.",
-                len(handles),
-                physical_device_ids,
-            )
-            return False
-        handles = [handles[i] for i in physical_device_ids]
+        handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
                 if i < j:
@@ -1255,16 +1239,7 @@ class RocmPlatform(Platform):
     @classmethod
     def use_custom_allreduce(cls) -> bool:
         # We only enable custom allreduce for MI300 series
-        if any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"]):
-            return True
-        # gfx906 probe (P2P-1, issue #3): opt-in only, default OFF — zero
-        # production impact unless the env var is set. Enabling it only makes
-        # sense when PCIe P2P is actually live (32 GiB BARs landing below the
-        # gfx906 44-bit DMA mask + the pci_p2pdma whitelist patch); without
-        # that the IPC peer path faults at init, which is why the historical
-        # `--disable-custom-all-reduce` recipe flag was forced.
-        # See docs/gfx906/DEVLOG-tp2-dense.md S10.
-        return os.environ.get("VLLM_GFX906_CUSTOM_AR", "0") == "1"
+        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
 
     @classmethod
     def opaque_attention_op(cls) -> bool:
