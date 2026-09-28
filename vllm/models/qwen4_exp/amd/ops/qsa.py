@@ -926,10 +926,13 @@ def _reference_block_ranks(
         column_ids.unsqueeze(0) >= ends.unsqueeze(1), float("-inf")
     )
     selected = masked.topk(width, dim=-1).indices
-    in_range = torch.arange(width, device=logits.device).unsqueeze(0) < ends.unsqueeze(
-        1
+    # A column at or past the row's end is not selectable -- the kernel never scans it.
+    # Rows with fewer visible blocks than the width must therefore come back -1-padded
+    # rather than carrying indices for blocks the row cannot see. (Padding by position
+    # instead would leak them, which only shows up when width > visible blocks.)
+    blocks[:, :width].copy_(
+        torch.where(selected < ends.unsqueeze(1), selected, -1).to(blocks.dtype)
     )
-    blocks[:, :width].copy_(torch.where(in_range, selected, -1).to(blocks.dtype))
 
 
 def _select_qsa_block_ranks(

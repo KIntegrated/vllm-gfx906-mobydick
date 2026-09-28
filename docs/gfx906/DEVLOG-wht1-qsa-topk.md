@@ -80,6 +80,39 @@ Two files.
    width wider than the cache -- the same output contract `top_k_per_row_decode` honours,
    which the probe above verifies by agreement at every width the kernel serves.
 
+## Prefill-scale check: a bug in my own reference path, and what selection costs
+
+2048 rows × 65536 columns (a 2048-token prefill chunk over a full context), all blocks
+visible:
+
+| width | reference | kernel | agreement |
+|---|---|---|---|
+| 8192 | 410.4 ms | 5.9 ms | yes, 2048/2048 rows |
+| 65536 (= columns) | 86.0 ms | n/a (past the ceiling) | every block selected exactly once |
+
+The 8192 case cross-checks both implementations at production row counts -- and it exposed a
+bug in the reference path that no small probe could see. With `row_ends == columns` there is
+nothing to leak, and my `-1` padding was by output **position** rather than by
+**visibility**: for a row seeing fewer blocks than the width, the tail carried real block
+indices the row cannot see instead of `-1`. Silent wrong selection, not a crash -- and it is
+exactly what production rows look like, since a decode row sees far fewer blocks than the
+cache holds. Fixed: the padding now keys off `selected < row_end`.
+
+Partial-visibility agreement after the fix (width 8192, row ends 1 / 64 / 100 / 700 / 4096 /
+30000 / 65536 ×2, `/local/tmp/wht1/topk_partial_probe.py`): kernel and reference **AGREE on
+all 8 rows, 0 indices leaked past a row end**.
+
+**Cost.** The reference is a sort: 410 ms for a 2048-row chunk at width 8192 versus 5.9 ms
+for the kernel -- ~70×, which is why the ceiling exists instead of always using the
+reference. At this model's width (65536 = columns) it is 86 ms/chunk, and there the
+selection is the identity (`block_topk >= columns` = take everything). Skipping the topk and
+writing column order would remove that 86 ms, but it changes the *order* of the selection
+(column order vs score order), so it is a candidate to validate with the QSA-FN-7
+non-regression gate (PPL + FA suite) once the model runs -- recorded, not done.
+
+Timing here is a rough cost indicator (single shot, no mclk pinning, no interleaved arms),
+not a gated measurement.
+
 ## Verification
 
 - **The real model now loads through vLLM's own config path**
@@ -94,21 +127,20 @@ Two files.
   `test_qsa_selection_uses_portable_topk_on_rocm` (width 2) stays green, which is the check
   that no previously-servable width changed path.
 - Siblings: `test_qsa_pre_indexer.py`, `test_ple.py`, `test_hc_ops.py`,
-  `test_qsa_reference.py` green (19 passed / 52 skipped alone). Known pre-existing wart:
+  `test_qsa_reference.py` green (19 passed / 52 skipped alone). Two **pre-existing**
+  test-isolation warts, both reproduced on the pristine tree with my four files stashed:
   collecting `test_qsa_reference.py` together with `test_config.py` in one process raises
-  `RuntimeError: Tried to r...` during collection -- reproduced on the pristine tree
-  (stashed my four files), so it is not from this train.
+  `RuntimeError: Tried to r...` during collection, and running `test_qsa_amd.py` together with
+  `test_config.py` fails `test_qwen4_exp_mtp_returns_sample_and_multi_streams` (which passes
+  on its own). Neither comes from this train; run those files separately.
 - `ruff check` + `ruff format --check` clean over `vllm/models/qwen4_exp/` and
   `tests/models/qwen4_exp/`.
 
 ## What is NOT verified yet
 
-- The reference path **at production scale**: `torch.topk` over `(rows, columns)` is a sort,
-  so a prefill chunk with thousands of rows and 65536 columns is genuinely expensive. No
-  timing claim is made here; decode rows are 1-few, where it is trivial. Gate for the
-  follow-up: once the model runs, compare prefill ms/token against the llm.cpp reference and
-  decide whether a Triton radix-select for wide widths is warranted.
-- The model end-to-end, which needs the bf16 base (`WHT-1` remains blocked on that).
+- The model end-to-end, which needs the bf16 base (`WHT-1` remains blocked on that) --
+  including whether the reference path's cost matters at real chunk sizes, which needs a
+  gated measurement rather than this probe's single-shot numbers.
 
 ## Upstream finding worth reporting
 

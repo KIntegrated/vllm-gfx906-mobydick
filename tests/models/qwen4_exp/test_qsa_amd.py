@@ -525,6 +525,28 @@ def test_reference_block_ranks_handles_an_empty_cache() -> None:
     assert blocks.tolist() == [[-1, -1, -1, -1], [-1, -1, -1, -1]]
 
 
+def test_reference_block_ranks_pads_by_visibility_not_position() -> None:
+    """Blocks past a row's visible end must never be selected.
+
+    Regression from the prefill-scale probe: padding by output position leaked real
+    block indices for blocks the row cannot see (the kernel never scans them), which
+    only shows up once the width exceeds the row's visible block count.
+    """
+
+    logits = torch.tensor(
+        [[5.0, 4.0, 3.0, 2.0], [0.1, 0.4, 0.3, 0.2]], dtype=torch.float32
+    )
+    row_ends = torch.tensor([1, 4], dtype=torch.int32)
+    blocks = torch.full((2, 4), 123, dtype=torch.int32)
+
+    qsa_ops._reference_block_ranks(logits, row_ends, blocks, 4)
+
+    # Row 0 sees only block 0, so the other three slots are invalid, not blocks 1..3.
+    assert blocks[0].tolist() == [0, -1, -1, -1]
+    # Row 1 sees everything, in descending score order.
+    assert blocks[1].tolist() == [1, 2, 3, 0]
+
+
 def test_select_qsa_block_ranks_dispatches_by_measured_ceiling(monkeypatch) -> None:
     """Kernel up to the verified width ceiling, reference above it.
 
