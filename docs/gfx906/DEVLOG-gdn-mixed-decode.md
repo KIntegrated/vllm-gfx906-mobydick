@@ -332,6 +332,15 @@ that indexes the GDN state/cudagraph tensors.
   (`non_spec_full_cg_pad_decode`, `non_spec_full_cg_pad_then_prefill`).
   RED without the fix: 2 failed; GREEN: **12 passed**. `tests/kernels/mamba/cpu/`
   **3 passed, 1 skipped**.
+- The peel block (and therefore this guard) is reached in **spec-mixed** batches
+  too, not only pure non-spec ones, so the fix covers both. Probed spec + padding
+  shapes (throwaway `/local/tmp/gdn2/probe_spec_pad.py`): a trailing padded row
+  with all-spec decodes builds with `spec_decodes=2` (the spec path excludes
+  zero-length rows from its own counts), and `spec_mixed_with_pad` /
+  `spec_pad_first` both keep `num_decode_tokens == num_decodes`, i.e.
+  `_forward_core`'s assert stays satisfied. No second crash family there.
+- The check now also requires `decode_lens >= 0`, so a non-monotonic (garbage)
+  ramp cannot slip through the `< = 1` bound.
 - Serving: the previously fatal shape occurs 12× and is accepted; B=4 completes
   `out_total=1024/1024`, `stop_agreement=true`, `rep_frac8_min` **0.0392**
   (B=1 reference 0.0394 → no degeneration), 0 assertions, 0 engine deaths.

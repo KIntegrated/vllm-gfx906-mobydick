@@ -394,7 +394,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_query_start_loc_cpu[1 : num_decodes + 1]
                 - non_spec_query_start_loc_cpu[:num_decodes]
             )
-            assert bool((non_spec_decode_lens <= 1).all()), (
+            assert bool(
+                ((non_spec_decode_lens <= 1) & (non_spec_decode_lens >= 0)).all()
+            ), (
                 "GDN decode-first invariant violated: non-spec decodes not first "
                 f"(num_decodes={num_decodes}, num_reqs={m.num_reqs}, "
                 f"ramp={non_spec_query_start_loc_cpu.tolist()}, "
