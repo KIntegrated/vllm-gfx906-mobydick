@@ -1014,7 +1014,23 @@ class RocmPlatform(Platform):
         """
         Query if the set of gpus are fully connected by xgmi (1 hop)
         """
-        handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
+        handles = amdsmi_get_processor_handles()
+        if any(pid < 0 or pid >= len(handles) for pid in physical_device_ids):
+            # amdsmi can enumerate fewer processors than the device IDs the
+            # caller holds (observed on gfx906: 0 handles, so every index
+            # raises IndexError and kills the engine). The other amdsmi
+            # helpers in this class guard the same way. Report the
+            # conservative answer: this only gates the >2-GPU custom-AR /
+            # QuickReduce paths, where a wrong True is the dangerous one.
+            logger.warning(
+                "Cannot determine XGMI connectivity: amdsmi reports %d "
+                "processor handle(s) for physical device IDs %s. Reporting "
+                "the devices as not fully connected.",
+                len(handles),
+                physical_device_ids,
+            )
+            return False
+        handles = [handles[i] for i in physical_device_ids]
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
                 if i < j:

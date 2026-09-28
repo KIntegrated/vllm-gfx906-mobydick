@@ -271,6 +271,62 @@ Note this is not foreclosed by S1: S1's stall was the **RCCL** P2P transport
 (`NCCL_P2P_DISABLE=1` made it disappear), which is a different path from custom
 AR's own IPC buffers.
 
+**Change 2 — a latent upstream crash on the custom-AR path, found and fixed (`rocm.py:1013`).**
+
+Reaching `CustomAllreduce.__init__` on gfx906 exposed a crash that had never
+been reachable here: `current_platform.is_fully_connected()` →
+`amdsmi_get_processor_handles()[i]` → `IndexError: list index out of range`.
+On this host **amdsmi enumerates 0 processor handles** (verified directly in
+and out of the worker's env — not a visibility-env artefact), so every index
+raises and the engine dies (`EngineDeadError`). Every other amdsmi helper in
+the class already guards `physical_device_id >= len(handles)`; this one did
+not. Fixed by guarding and returning **False** (the conservative answer: the
+result only gates the >2-GPU custom-AR / QuickReduce paths, where a wrong True
+is the dangerous direction). Upstream-worthy as a stand-alone fix.
+
+**Result — custom AR engages on gfx906 and wins at B=1 (+17.1% decode).**
+
+| arm | env | AR backend | B=1 decode t/s | prefill agg t/s | ttft |
+|---|---|---|---|---|---|
+| A1 | `NCCL_P2P_DISABLE=1` | `['PYNCCL']` | **33.94 / 33.94** | 175.6 | 4.12 s |
+| B | + `VLLM_GFX906_CUSTOM_AR=1` | `['CUSTOM', 'PYNCCL']` | **39.72 / 39.71** | 193.7 | 4.13 s |
+| A2 | `NCCL_P2P_DISABLE=1` (repeat) | `['PYNCCL']` | **33.89 / 33.89** | 175.4 | 4.12 s |
+| C | `VLLM_GFX906_CUSTOM_AR=1`, P2P live | `['CUSTOM', 'PYNCCL']` | **39.62 / 39.66** | 193.4 | 4.11 s |
+| control (run 3) | P2P live, no knobs | `['PYNCCL']` | **33.92 / 33.92** | 174.4 / 175.5 | 4.2 / 4.1 s |
+
+- **+17.1 % decode** (33.90 → 39.67 mean of the four baseline/treatment reps),
+  **+10 % prefill aggregate** (175.4 → 193.5), TTFT unchanged. Arms differ in
+  the all-reduce backend only. mclk 1000 MHz confirmed in every arm (20+ samples
+  ≥1000 MHz each); warm-cache loads 190–260 s; peak GTT use during load 42 MiB of
+  24 GiB (no aperture pressure on this workload).
+- Arm C proves the knob does **not** need the RCCL workaround: custom AR runs
+  with P2P live as well as with `NCCL_P2P_DISABLE=1`.
+
+**Correction — the run-1 "baseline stalls with P2P live" observation was NOT the RCCL P2P path.**
+Run 1 arm A1 (baseline, P2P live) sat at 0 % GPU util with `shm_broadcast`
+warnings for >4 min; the run-3 control run the *same* config and was up in
+200 s at 33.92 t/s. It was a one-off **first-real-load transient** on that boot
+(the first load after the RAM upgrade + BAR change), not a regression from P2P.
+Treat the first load after a hardware change as suspect, never as a datum.
+
+**Blocking finding (unrelated to AR) — a mixed prefill+decode batch kills the engine.**
+The B=4 gate cell is currently unmeasurable. With `--max-num-batched-tokens 4096`
+and four 2048-token prompts, the scheduler admits the prefills in waves, so
+steps contain prefills *and* decodes →
+`AssertionError: GDN decode-first invariant violated: non-spec decodes not first`
+(`vllm/v1/attention/backends/gdn_attn.py:385` — our own guard from `233e8f202b`)
+→ `EngineDeadError`, HTTP 500 to all four requests. Reproduced in **all four
+arms** (A1, B, A2, C) and via run 3's warmup; **no GPU event** in the journal —
+pure software. The guard is behaving as designed (fail loudly rather than
+silently mis-slice), so the defect is in what produces that batch order.
+Filed as its own issue: it is a crash on ordinary concurrent traffic, not a
+perf item.
+
+**Next:** (a) the GDN mixed-batch crash (blocks the B=4 cell); (b) re-run the
+B=4 cell once fixed, or measure decode-only B=4 with 4×512-token prompts so all
+four prefills land in one step; (c) a quality/numerics gate for the AR swap
+(bit-exactness or PPL) before the knob could ever default on.
+
 **Refs:** issue #3 · `/local/tmp/4g-handover.md` (gates 1–3 + enablement
 recipe) · `DEVLOG-spec-decode.md` (2026-09-22 no-op session) · `degradation.md`
 #104/#105.
