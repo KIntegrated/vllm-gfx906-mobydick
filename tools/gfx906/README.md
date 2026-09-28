@@ -39,13 +39,27 @@ trusting it:
 
 ```bash
 tools/gfx906/export-run-vllm.sh --check /path/to/live/run-vllm
+tools/gfx906/test-optimized-bundle.sh            # 20 arms against the in-tree copy
 ```
 
 `--check` re-derives the copy from the live script and compares; it also fails if any
 long literal token survives in the tracked file, so a careless re-sync cannot leak a
 key. To publish a newer launcher: run the exporter without `--check`, then
-`scripts/test-optimized-bundle.sh tools/gfx906/run-vllm.sh` (argv golden test + the
-bundle precedence arms) before committing.
+`test-optimized-bundle.sh` (argv golden test + the bundle precedence arms) before
+committing.
+
+### `test-optimized-bundle.sh` — the launcher's own harness
+
+Neither the `OPTIMIZED` bundle nor `boot_once`'s argv can be tested by booting the
+launcher (on the reference box that restarts the engine serving the agent doing the
+testing), so the harness **extracts** the two marked blocks and runs them against
+stubs. 20 arms: bundle precedence (default / on / explicit override / set-but-empty /
+garbage / export-to-child), the engine command line asserted token by token against a
+golden list, and a red control — a deliberately mutated launcher has to fail, so a
+green run means something. Pass a path to test a different launcher.
+
+The golden argv names the reference box's model and chat-template paths, so on another
+box those two arms fail by construction rather than by regression.
 
 ### Related
 
