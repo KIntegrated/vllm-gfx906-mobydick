@@ -155,9 +155,16 @@ without a runnable check" item.
 
 ### C5 — fuse the shared-expert chain · [#21](../../issues/21)
 
-One chain kernel removes two launches per layer (~150–250 µs after the
-critical-path discount). Bit-correctness + serving A/B. Ref:
-`DEVLOG-moe-m1-sprint.md`.
+**Mechanism corrected 2026-09-28** by the pre-gate measurement: launch
+elimination is worth **0** in the served (graphed) config — 958 µs/step of eager
+launch cost that the capture already amortizes — so the lever is
+node-count/bandwidth fusion. Measured residual: 6.08 µs/layer = **243 µs/step =
+1.6 %** of the 15 ms B=1 reference step above the bandwidth floor, and the
+cheapest piece is the `silu_and_mul` node itself (2.22 µs/layer in-graph for
+2 KB of payload). Next step: fold the activation into the gate_up producer
+(barrier-free — pair row `i` with row `i+d`), gate = ≥2 µs/layer better
+in-graph, then bit-correctness + serving A/B. Ref:
+`DEVLOG-moe-c5-chain-fusion.md`.
 
 ### N2 — B>1 FA direct store · [#22](../../issues/22)
 
