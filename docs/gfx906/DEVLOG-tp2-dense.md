@@ -171,3 +171,259 @@ t/s. (One isolated GPU0 wedge 13:00:53 at the 2nd launch — retry clean;
 - Prefill (cold): ~470-525 t/s at 2k-32k, 357 @64k (attention growth).
 
 > 2026-09-22: `--disable-custom-all-reduce` verified a **no-op** on this topology (PYNCCL is the only enabled AR backend with and without it; 3 arms within 0.25 %) — see `DEVLOG-spec-decode.md` (same session), which also measures the drafter-cudagraph knob at −7.9 % (graphs off) on the TP=2 MTP k=3 config.
+
+---
+
+### S10 — P2P-1 (custom all-reduce re-test): NO-GO — upstream's custom AR produces garbage on gfx906 (2026-09-28)
+
+**VERDICT:** DEAD-END (all code reverted; upstream's MI300-only gate is correct —
+do not re-open it) · **GATE:** serving, same-boot interleaved arms,
+`_bench_serve_grid_gfx906.py`, TP=2, graph, 0.82, max_seqs 4, and the logprob
+numerics gate on identical greedy requests. Logs `/local/tmp/p2p1/r4/` (throughput)
+and `/local/tmp/p2p1/r5|r6/` (numerics).
+
+**HYPOTHESIS (refuted, issue #3 / P2P-1):** now that PCIe P2P is live, engaging
+vLLM's custom all-reduce (instead of PYNCCL) wins at B=4 / long context. The
+hypothesis is **not** merely unconfirmed — the configuration it depends on is
+**numerically broken**: custom AR is faster but emits garbage. Two prior
+blockers — both cleared — were: (a) the platform gate making the recipe flag a
+no-op, (b) PCIe P2P not actually being up.
+
+**Finding 1 — the flag cannot change anything on gfx906 (root-caused; source + live log).**
+
+- `vllm/platforms/rocm.py:1240-1242` — `use_custom_allreduce()` returns True
+  only for `gfx94`/`gfx95` (**MI300-only**).
+- `vllm/config/parallel.py:1080-1081` — `if not
+  current_platform.use_custom_allreduce(): self.disable_custom_all_reduce = True`
+  → the platform gate **overrides the CLI flag**.
+- `vllm/v1/worker/gpu_worker.py:1532` — `set_custom_all_reduce(not
+  disable_custom_all_reduce)` → `_ENABLE_CUSTOM_ALL_REDUCE = False`.
+- `cuda_communicator.py:143/169` — `CustomAllreduce` (`ca_comm`) and
+  QuickReduce (`qr_comm`) are constructed **only** when that flag is true, so
+  both are skipped and the backend list resolves to `['PYNCCL']`.
+- Live corroboration (2026-09-28 06:04 server, launched **without** the flag):
+  logged `disable_custom_all_reduce=True` and `Using ['PYNCCL'] all-reduce
+  backends ... out of potential backends ['FLASHINFER_PCIE_IPC', 'FLASHINFER',
+  'NCCL_SYMM_MEM', 'QUICK_REDUCE', 'AITER_CUSTOM', 'CUSTOM', 'SYMM_MEM',
+  'PYNCCL']`.
+- The one other P2P-shaped backend, FlashInfer PCIe IPC
+  (`VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC`, default 0), is **CUDA-only**
+  (`flashinfer_pcie_ipc_all_reduce.py:69` — "requires the CUDA platform").
+
+→ Deliverable (a) "remove the flag from the recipes" is a **no-op**; the
+experiment must instead gate the platform check itself (planned env knob
+`VLLM_GFX906_CUSTOM_AR`, default off).
+
+**Finding 2 — the P2P precondition is not met (hard blocker).**
+
+- `rocm-smi --showtopoaccess`: `0->1 False`, `1->0 False` (diagonal only).
+- BARs are **256 MiB** at ~3 GiB: `pci 0000:04:00.0: BAR 0 [mem
+  0xc0000000-0xcfffffff]`; root-port windows are 32-bit (`Memory behind
+  bridge: dfc00000-dfdfffff`, prefetchable `c0000000-d01fffff`) → the firmware
+  exposes **no high MMIO window**, i.e. Above-4G Decoding / the lowered MMIO
+  high base from 2026-09-22 is not in effect.
+- BAR history (`Detected VRAM RAM=32752M, BAR=`): the 32 GiB BAR exists only on
+  **boot −12 (2026-09-22 15:32)** and **boot −11 (2026-09-22 18:47)**, is lost
+  again on **boot −10 (2026-09-22 21:18)** and on **every** boot since
+  (−9 … 0, 2026-09-24 → 09-28). Boot −25 carries a future-dated RTC
+  (**Oct 18 10:09**) mid-sequence — the signature of a CMOS/UEFI reset — which
+  matches the enablement failing to persist.
+- Kernel side is intact: cmdline carries **no** `pci=nocrs`; the running
+  `6.8.12-acso` (built 2026-09-22 16:15) is the build the p2pdma whitelist
+  patch targets (`/local/git/linux-acs-override/build-debian.sh:41`).
+
+→ Action: re-apply the UEFI settings (Above 4G Decoding = Enabled; MMIO high
+base ~1 TiB and window ~1 TiB so both 32 GiB BARs sit below 2^44), then verify
+`BAR=32768M` in the boot log **and** `showtopoaccess` True before measuring.
+
+**Finding 3 — the P2P precondition is now met (2026-09-28 13:12 boot, verified).**
+
+```
+root bus resource [mem 0x10000000000-0x13fffffffff window]      # 1 TiB .. 5 TiB
+pci 0000:04:00.0: BAR 0 [mem 0x10000000000 …] [size=32G]
+pci 0000:07:00.0: BAR 0 [mem 0x11000000000 …] [size=32G]
+amdgpu 0000:04:00.0: added peer-to-peer DMA memory 0x10000000000-0x107ffffffff
+amdgpu 0000:07:00.0: added peer-to-peer DMA memory 0x11000000000-0x117ffffffff
+Detected VRAM RAM=32752M, BAR=32768M          # was BAR=256M on every boot since 09-22 21:18
+rocm-smi --showtopoaccess : 0->1 True, 1->0 True
+hipDeviceCanAccessPeer = 1 both ways; enablePeerAccess clean
+/local/tmp/x99wl/p2p_check : 4/64/256 MB both directions bad=0 -> P2P-CHECK: PASS
+no "PCIe P2P access … is not supported by the chipset" lines
+24003M of GTT memory ready per card           # 48 GB host; GTT = RAM/2 (no gttsize override)
+```
+
+Two UEFI changes are needed, not one: Above 4G Decoding **and** the MMIO high
+base lowered to ~1 TiB. With only the first, the BARs land at ~56 TiB and the
+44-bit DMA-mask gate in `amdgpu_device_is_peer_accessible()` still fails — both
+32 GiB BARs must sit **below 2^44 (16 TiB)**. The 09-22 21:18 relapse (and the
+future-dated RTC on boot −25) points at a weak CMOS battery; a fresh cell has
+been fitted.
+
+**Change 1 — the platform gate is now env-overridable (`rocm.py:1240`, default OFF).**
+
+`VLLM_GFX906_CUSTOM_AR=1` → `use_custom_allreduce()` returns True on gfx906;
+unset or `0` → False (production behaviour unchanged). Verified by direct call
+on arch `gfx906:sramecc+:xnack+`: unset → False, `0` → False, `1` → True. The
+downstream `parallel.py:1080` only forces `disable_custom_all_reduce=True` when
+the platform says no, so this one knob flips the whole path
+(`gpu_worker` → `_ENABLE_CUSTOM_ALL_REDUCE` → `cuda_communicator` constructs
+`CustomAllreduce`/QuickReduce). Inits that could still refuse on gfx906: the
+world-size / same-node gates pass at TP=2, and the explicit `_can_p2p` probe is
+**skipped on ROCm** (`custom_all_reduce.py:249`) — so the peer IPC buffer open
+is the real test, which is exactly what used to fault.
+
+Note this is not foreclosed by S1: S1's stall was the **RCCL** P2P transport
+(`NCCL_P2P_DISABLE=1` made it disappear), which is a different path from custom
+AR's own IPC buffers.
+
+**Change 2 — a latent upstream crash on the custom-AR path, found and fixed (`rocm.py:1013`).**
+
+Reaching `CustomAllreduce.__init__` on gfx906 exposed a crash that had never
+been reachable here: `current_platform.is_fully_connected()` →
+`amdsmi_get_processor_handles()[i]` → `IndexError: list index out of range`.
+On this host **amdsmi enumerates 0 processor handles** (verified directly in
+and out of the worker's env — not a visibility-env artefact), so every index
+raises and the engine dies (`EngineDeadError`). Every other amdsmi helper in
+the class already guards `physical_device_id >= len(handles)`; this one did
+not. Fixed by guarding and returning **False** (the conservative answer: the
+result only gates the >2-GPU custom-AR / QuickReduce paths, where a wrong True
+is the dangerous direction). Upstream-worthy as a stand-alone fix.
+
+**Result — VOID: custom AR engages at B=1 and *looks* +17.1 % faster, but its output is garbage.**
+
+The throughput numbers below are real measurements of a **broken** configuration
+(see the numerics gate further down); they are kept only as the record of how the
+false win was produced. **Do not quote the +17.1 %.**
+
+| arm | env | AR backend | B=1 decode t/s | prefill agg t/s | output |
+|---|---|---|---|---|---|
+| A1 | `NCCL_P2P_DISABLE=1` | `['PYNCCL']` | 33.94 / 33.94 | 175.6 | coherent |
+| B | + `VLLM_GFX906_CUSTOM_AR=1` | `['CUSTOM', 'PYNCCL']` | ~~39.72 / 39.71~~ | 193.7 | **garbage** |
+| A2 | `NCCL_P2P_DISABLE=1` (repeat) | `['PYNCCL']` | 33.89 / 33.89 | 175.4 | coherent |
+| C | `VLLM_GFX906_CUSTOM_AR=1`, P2P live | `['CUSTOM', 'PYNCCL']` | ~~39.62 / 39.66~~ | 193.4 | **garbage** |
+| control (run 3) | P2P live, no knobs | `['PYNCCL']` | 33.92 / 33.92 | 174.4 / 175.5 | coherent |
+
+- mclk 1000 MHz confirmed in every arm (20+ samples ≥1000 MHz each); warm-cache
+  loads 190–260 s; peak GTT use during load 42 MiB of 24 GiB (no aperture
+  pressure on this workload). None of that matters: a wrong reduction that skips
+  or short-circuits work can easily be *faster*.
+- The lesson that cost the most here: the perf harness's validity screens
+  (`stop_agreement`, `rep_frac8`) **do not catch a broken distribution** — a 96-
+  token generation that is pure word salad still returns 96 tokens and can score
+  a *better* repetition fraction than coherent text. Perf A/B on this stack needs
+  a text/logprob gate from the start.
+
+**Correction — the run-1 "baseline stalls with P2P live" observation was NOT the RCCL P2P path.**
+Run 1 arm A1 (baseline, P2P live) sat at 0 % GPU util with `shm_broadcast`
+warnings for >4 min; the run-3 control run the *same* config and was up in
+200 s at 33.92 t/s. It was a one-off **first-real-load transient** on that boot
+(the first load after the RAM upgrade + BAR change), not a regression from P2P.
+Treat the first load after a hardware change as suspect, never as a datum.
+
+**Blocking finding (unrelated to AR) — a mixed prefill+decode batch kills the engine.**
+The B=4 gate cell is currently unmeasurable. With `--max-num-batched-tokens 4096`
+and four 2048-token prompts, the scheduler admits the prefills in waves, so
+steps contain prefills *and* decodes →
+`AssertionError: GDN decode-first invariant violated: non-spec decodes not first`
+(`vllm/v1/attention/backends/gdn_attn.py:385` — our own guard from `233e8f202b`)
+→ `EngineDeadError`, HTTP 500 to all four requests. Reproduced in **all four
+arms** (A1, B, A2, C) and via run 3's warmup; **no GPU event** in the journal —
+pure software. The guard is behaving as designed (fail loudly rather than
+silently mis-slice), so the defect is in what produces that batch order.
+Filed as its own issue: it is a crash on ordinary concurrent traffic, not a
+perf item.
+
+**B=4 gate cell — VOID (same cause)** (`gfx906/p2p1-b4` @ `77390fc6ac`, which
+merges `gfx906/gdn-2`; see [DEVLOG-gdn-mixed-decode](DEVLOG-gdn-mixed-decode.md)
+§2026-09-28). The cell was *unmeasurable* before that fix and is *meaningless*
+after it, because the treatment arm is the broken one. Same boot, arms identical
+to run 2,
+`_bench_serve_grid_gfx906.py '[[2048,256,4]]' 2`, logs `/local/tmp/p2p1/r4/`:
+
+| arm | AR backend | wall tps (2 reps) | peak per-seq decode tps | prefill agg t/s |
+|---|---|---|---|---|
+| A1 | `['PYNCCL']` | 35.93 / 36.03 | 20.26 | 287.5 |
+| B | `['CUSTOM','PYNCCL']` | **36.82 / 36.88** | **21.56** | 294.5 |
+| A2 | `['PYNCCL']` | 35.88 / 35.92 | 20.25 | 287.1 |
+
+- The apparent **+6.4 % decode-rate / +2.6 % wall-throughput** deltas are **void**
+  for the same reason as B=1: every custom-AR sample came from the broken arm.
+  All 12 samples still showed `stop_agreement=true`, `out_total=1024/1024`,
+  mclk 1000 (22 samples/arm), 0 GDN aborts and 0 engine deaths — which is exactly
+  how a correctness failure hides from a throughput harness.
+- `rep_frac8_min` differing across arms here (0.0392 baseline vs 0.32–0.36
+  custom) was the one **early warning** in the throughput data, and it was read
+  the wrong way round at the time ("a different reduction order flips
+  near-ties"). It is the signature of the bug: the custom-AR arm was not
+  producing coherent text at all.
+- Bookkeeping: arm A1 imported the tree before the `decode_lens >= 0` hardening
+  of the GDN assert landed, B/A2 after. The hardening only *narrows* the accepted
+  set (it rejects a non-monotonic ramp) and no arm produced a negative step
+  (0 aborts everywhere), so the comparison is unaffected.
+
+### Numerics gate — the decisive measurement (2026-09-28, runs 5/6)
+
+Same prompt, greedy (`temperature=0`, `max_tokens=96`, `logprobs=5`), one server
+per arm, two independent requests per arm. Logs `/local/tmp/p2p1/r5|r6/`.
+
+| arm | config | request 1 | request 2 |
+|---|---|---|---|
+| A | `NCCL_P2P_DISABLE=1` (`['PYNCCL']`) | `"\n\nThis is a classic systems engineering problem. To measure…"` | identical, coherent |
+| B | + `VLLM_GFX906_CUSTOM_AR=1` (`['CUSTOM','PYNCCL']`) | `"\n\ns不爽 /Native i虚 i� M3新On恶…rena iELA post post post post…"` | `"\n\n em glo...ies\n\nisこ vsio� iress去何 i虚…"` |
+| C | `VLLM_GFX906_CUSTOM_AR=1`, P2P live | `"\n\ndrid,s万只 iELA parallel parallel parallel i� iTransparent高等…"` | `"\n\n_live (.parentElement iellis-dino (-kits -羽 (kins \nocking…"` |
+
+- **Baseline coherent and byte-identical across repeats; custom AR garbage in 4/4
+  requests, with degenerate loops** (`post post post`, `parallel parallel
+  parallel`) and top-1 logprobs of −2.4…−5.8 vs −0.1…−1.8 for the baseline
+  (high-entropy output = broken logits, not a near-tie flip). Token-level
+  agreement with the baseline: 1/96 positions.
+- Broken **with and without P2P**, so this is not a P2P-interaction artefact —
+  the custom-AR implementation itself is wrong on this hardware.
+
+### Why it fails (mechanism, from the code)
+
+- Upstream's own gate: `vllm/platforms/rocm.py` `use_custom_allreduce()` —
+  *"We only enable custom allreduce for MI300 series"* → `gfx94`/`gfx95` only.
+  The MI300-only restriction is exactly this class of risk being fenced off.
+- Inside the module the correctness check is **skipped on ROCm**:
+  `custom_all_reduce.py:246-257` — `same_node and not current_platform.is_rocm()
+  and not _can_p2p(...)`, with the comment *"On AMD GPU, p2p is always enabled
+  between XGMI connected GPUs"*. These two cards are **PCIe-only, no XGMI**, so
+  the P2P/ordering assumption is never validated here.
+- The implementation writes into peer IPC buffers and synchronizes with flag
+  spin-waits (`ops.meta_size()`, `create_shared_buffer`, one-shot / two-shot
+  kernels, fp16/bf16 only, `_SUPPORTED_WORLD_SIZES = [2,4,6,8,16]`). Correctness
+  depends on peer-write ordering/visibility of the sort NVLink/XGMI provide; over
+  PCIe the results are wrong rather than absent.
+- `VLLM_GFX906_CUSTOM_AR` therefore opened a path upstream deliberately closes.
+  **Reverted** (with the amdsmi `is_fully_connected` guard, which is only
+  reachable once this path is enabled). The amdsmi finding itself is upstream-
+  worthy: `amdsmi_get_processor_handles()` returns 0 handles on this host, and
+  `is_fully_connected()` indexed it unguarded → `IndexError` kills the engine.
+
+### What survives from P2P-1
+
+- The **hardware result stands**: with Above-4G decoding **and** the MMIO high
+  base at ~1 TiB, both 32-GiB BARs land below gfx906's 44-bit DMA mask and
+  `showtopoaccess` is True/True with six byte-exact peer copies (4/64/256 MB both
+  directions). P2P is real and usable — it just has **no consumer** in this
+  stack: custom AR is broken, and RCCL does not benefit (run 3: PYNCCL with P2P
+  live = 33.92 t/s = PYNCCL with P2P disabled).
+- The only measured all-reduce win on this box remains the recon-sourced
+  **J2G-1 RCCL/persistent knobs (+2.77 %, already shipped)**; the real gfx906 AR
+  lead is joe2gaan's **persistent tree LL AR** prebuilt
+  (`VLLM_GFX906_PERSISTENT_AR=1` + `libgfx906_persistent_tree_ll_ar_default_20260613.so`,
+  `RECON-joe2gaan-localaiservers.md` lead 1) — a *different* implementation from
+  the upstream one tested here, and the thing to port if AR is revisited.
+
+**Next:** (a) if AR is revisited, port joe2gaan's persistent tree LL AR (their
+prebuilt blob first, as a measurement, then a port) — **with the logprob gate in
+the loop from the first run**; (b) leave PCIe P2P enabled (costs nothing, and a
+peer-pointer AR is exactly what would use it); (c) treat *any* AR/all-reduce
+experiment on this host as unproven until a coherent-text/logprob check passes —
+the throughput harness alone cannot tell a fast wrong answer from a fast right
+one.
+
+**Refs:** issue #3 · `/local/tmp/4g-handover.md` (gates 1–3 + enablement
+recipe) · `DEVLOG-spec-decode.md` (2026-09-22 no-op session) · `degradation.md`
+#104/#105.
