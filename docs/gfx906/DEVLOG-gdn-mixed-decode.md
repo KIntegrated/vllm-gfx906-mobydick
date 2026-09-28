@@ -265,3 +265,92 @@ wall-clock A/B — passed.
 - `docs/gfx906/running.md` (session 2: harness env-var surface)
 - removed (session 2): `benchmarks/kernels/gfx906/{bench_ngram_cpu,
   compare_ngram_cpu_gpu,probe_ngram_cpu_engine}.py` (L3 scope creep)
+
+---
+
+## 2026-09-28 — GDN-2: the decode-first ramp check aborted the engine on FULL-cudagraph request padding
+
+> Branch `gfx906/gdn-2` off `gfx906/v0.30.0` @ `1c4d1065ad` · model
+> `cyankiwi/Qwen3.8-27B-AWQ-INT4` (TP=2, graph, 0.82, max_seqs 4) ·
+> issue #35 · logs `/local/tmp/gdn2/verify-{driver,server,bench}.log`.
+
+**VERDICT:** SHIPPED (crash fix) · **GATE:** serving — `_bench_serve_grid_gfx906.py`
+`[[2048,256,1],[2048,256,4]]`, 1 sample/cell, TP=2, graph.
+
+### Symptom
+
+Any decode step whose batch is padded up to a FULL-cudagraph capture size
+killed EngineCore and returned HTTP 500 to **every** in-flight request:
+
+```
+AssertionError: GDN decode-first invariant violated: non-spec decodes not first
+```
+
+4/4 P2P-1 serving arms (issue #3) died on it, both all-reduce backends, with no
+GPU event in the journal and VRAM released — pure software, and it blocks the
+B=4 cells of every multi-request campaign.
+
+### Root cause (measured, not inferred)
+
+The guard (`233e8f202b`, added as an explicit W1 contract check) asserted
+`non_spec_query_start_loc_cpu[:num_decodes+1] == arange(num_decodes+1)`.
+With `cudagraph_mode=FULL_AND_PIECEWISE` the runner pads the request dimension
+up to a captured size with **zero-length dummy requests**, and
+`split_decodes_and_prefills` counts those zeros as decodes *deliberately* —
+upstream comment on the padded-uniform branch: *"some requests may have a query
+length of 0 but since they are padding its fine to treat them as decodes
+(ensures num_decodes matches the captured size)"*. A padded row therefore
+*stalls* the ramp instead of advancing it, so the ramp ends in a repeat and the
+strict equality check fails. Captured with a temporary dump in the builder:
+
+```
+num_reqs=4 num_actual_tokens=4 max_query_len=1 num_decodes=4 num_prefills=0
+ramp=[0, 1, 2, 3, 3]        # 12 occurrences in one B=4 run, each fatal
+```
+
+The failing step is a *decode-only* batch: `num_prefills=0`, so the peel the
+guard protects is not even active on it.
+
+| hypothesis | test | result |
+|---|---|---|
+| a 0-token request from the scheduler | dump in `reorder_batch_to_split_decodes_and_prefills` | never fired — **ruled out** |
+| FULL-cudagraph request padding | cudagraph mode + ramp shape | **confirmed** (`FULL_AND_PIECEWISE`; ramp ends `3,3`) |
+| GPU fault / all-reduce / P2P | journal + A/B arms | no GPU event, backend-independent — ruled out |
+| scheduler mixed-batch ordering bug | decode-only batch at the failure | not mixed — ruled out |
+
+### Fix
+
+The check now rejects only what the peel cannot survive — a non-decode
+(`>1` token) request inside the decode region — while tolerating 0-length
+padding steps, and it still cross-checks the ramp against the scalar
+`max_query_len` that drove the split. `num_decodes` stays == the captured size
+that indexes the GDN state/cudagraph tensors.
+
+### Evidence
+
+- Unit: `tests/v1/attention/test_gdn_metadata_builder.py` +2 cases
+  (`non_spec_full_cg_pad_decode`, `non_spec_full_cg_pad_then_prefill`).
+  RED without the fix: 2 failed; GREEN: **12 passed**. `tests/kernels/mamba/cpu/`
+  **3 passed, 1 skipped**.
+- The peel block (and therefore this guard) is reached in **spec-mixed** batches
+  too, not only pure non-spec ones, so the fix covers both. Probed spec + padding
+  shapes (throwaway `/local/tmp/gdn2/probe_spec_pad.py`): a trailing padded row
+  with all-spec decodes builds with `spec_decodes=2` (the spec path excludes
+  zero-length rows from its own counts), and `spec_mixed_with_pad` /
+  `spec_pad_first` both keep `num_decode_tokens == num_decodes`, i.e.
+  `_forward_core`'s assert stays satisfied. No second crash family there.
+- The check now also requires `decode_lens >= 0`, so a non-monotonic (garbage)
+  ramp cannot slip through the `< = 1` bound.
+- Serving: the previously fatal shape occurs 12× and is accepted; B=4 completes
+  `out_total=1024/1024`, `stop_agreement=true`, `rep_frac8_min` **0.0392**
+  (B=1 reference 0.0394 → no degeneration), 0 assertions, 0 engine deaths.
+  B=1 decode **33.97 t/s** — unchanged vs the 33.94 t/s P2P-1 reference, so the
+  fix costs nothing on the unpadded path.
+
+### Interactions
+
+Unblocks the P2P-1 B=4 gate cell (issue #3) — previously unmeasurable — and any
+multi-request campaign on a hybrid (mamba/attention) model with cudagraphs.
+Recurring lesson: a defensive assert must be reconciled with the *documented*
+padding conventions of the layer feeding it; this one contradicted the comment
+in `split_decodes_and_prefills` that sanctions exactly the shape it rejected.
