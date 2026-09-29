@@ -582,9 +582,12 @@ def rocm_unquantized_gemm_impl(
             out = _gfx906_gemv_long_k(weight, x_view)
         if out is not None:
             return out.reshape(*x.shape[:-1], weight.shape[0])
+        # NOTE(gfx906): triton_matmul takes 2D (N, K) only, same as the n==1
+        # branch above; x may be >2D, so feed the flattened view and restore
+        # x's leading dims afterwards.
         return triton_matmul(
-            x if x.is_contiguous() else x.contiguous(), weight
-        )
+            x_view if x_view.is_contiguous() else x_view.contiguous(), weight
+        ).reshape(*x.shape[:-1], weight.shape[0])
     elif m > 8 and 0 < n <= 4 and (on_gfx9() or on_gfx1x()):
         out = ops.wvSplitK(weight, x_view, cu_count, bias)  # matrix cores not supported by gfx906 so excluded here
         return out.reshape(*x.shape[:-1], weight.shape[0])
@@ -608,7 +611,12 @@ def rocm_unquantized_gemm_impl(
         if on_gfx906() and n > 1 and m == 5120 and 2048 <= k <= 2304:
             return torch.nn.functional.linear(x, weight, bias)
 
-        return triton_matmul(x if x.is_contiguous() else x.contiguous(), weight)
+        # NOTE(gfx906): triton_matmul takes 2D (N, K) only, same as the n==1
+        # branch above; x may be >2D, so feed the flattened view and restore
+        # x's leading dims afterwards.
+        return triton_matmul(
+            x_view if x_view.is_contiguous() else x_view.contiguous(), weight
+        ).reshape(*x.shape[:-1], weight.shape[0])
 
     # otherwise, use native torch
     return torch.nn.functional.linear(x, weight, bias)

@@ -582,6 +582,16 @@ class RocmPlatform(Platform):
         "auto_awq",
         "awq_marlin",  # will be overwritten with awq
         "gptq",
+        # "auto_gpt" was a typo for "auto_gptq".
+        # AutoGPTQConfig.override_quantization_method() unconditionally claims any
+        # checkpoint whose quant_method is "gptq" whenever the user passes
+        # --quantization gptq/gptq_marlin/auto_gptq/marlin (see auto_gptq.py), so this
+        # name is what actually reaches verify_quantization(). gfx906 has a first-class
+        # WNA16 path for it: choose_mp_linear_kernel() front-loads ExllamaLinearKernel
+        # for quantized linears, oracle/int_wna16.py exposes the GFX906_HIP MoE backend
+        # (torch.ops._rocm_C.moe_gptq_gemm_gfx906) and AutoGPTQConfig.get_quant_method()
+        # forces MoeWNA16Config on gfx906. Mirrors xpu.py, which lists "auto_gptq".
+        "auto_gptq",
         "auto_gpt",
         "fp8",
         "deepseek_v4_fp8",
@@ -975,6 +985,20 @@ class RocmPlatform(Platform):
 
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
+
+        # ROCm needs a graceful engine shutdown so that KFD/VM
+        # resources are released while the sched entities are still alive.
+        # With shutdown_timeout=0 the process manager force-kills EngineCore
+        # mid-teardown; the destroyed "delayed" entity then makes every later
+        # KFD unmap (amdgpu_vm_clear_freed -> drm_suballoc_new ->
+        # dma_fence_wait) block forever, wedging the whole box in D state.
+        # Mirrors the existing XPU guard in platforms/xpu.py.
+        if vllm_config.shutdown_timeout == 0:
+            vllm_config.shutdown_timeout = 60
+            logger.info(
+                "ROCm platform: set server shutdown_timeout=%d.",
+                vllm_config.shutdown_timeout,
+            )
 
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
             # decode context parallel does not support full cudagraphs

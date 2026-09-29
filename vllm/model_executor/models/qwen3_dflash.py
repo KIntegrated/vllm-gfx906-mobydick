@@ -5,7 +5,6 @@ import io
 from collections.abc import Iterable
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3Config
 
@@ -486,14 +485,12 @@ class DFlashQwen3Model(nn.Module):
     ) -> None:
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
-        # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
-        if has_bias:
-            kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
-            self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
-        else:
-            self._fused_kv_bias = None
+        # The draft's qkv_proj may itself be quantized (e.g. W4A16), in which
+        # case it exposes no dense `.weight` to fuse into a single GEMM. Keep
+        # the attention layers and let _project_context_kv project K/V per
+        # layer through each layer's own qkv_proj. `has_bias` is unused here
+        # but retained: subclass overrides (laguna/gemma4) take it.
+        self._context_attn_layers = layers_attn
 
         # K-norm weights stacked into one contiguous [num_layers, head_dim]
         # tensor so the per-layer K-norm runs as a single grouped kernel.
@@ -504,10 +501,10 @@ class DFlashQwen3Model(nn.Module):
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
 
-        Must be called after weights are loaded. Stacks the KV-projection
-        weights, K-norm weights, and RoPE parameters from every attention
-        layer so that precompute_and_store_context_kv can run one fused
-        GEMM for all layers at once. Also aliases the weight of the hidden_norm.
+        Must be called after weights are loaded. Stacks the K-norm weights and
+        RoPE parameters from every attention layer so that
+        precompute_and_store_context_kv can precompute all layers at once.
+        Also aliases the weight of the hidden_norm.
         """
         layers_attn = [layer.self_attn for layer in self.layers]
         attn0 = layers_attn[0]
@@ -552,7 +549,10 @@ class DFlashQwen3Model(nn.Module):
         num_kv_heads: int,
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # --- Fused KV projection (one GEMM for all layers) ---
+        # --- Per-layer KV projection ---
+        # Each layer's qkv_proj may be quantized and thus has no dense weight
+        # to fuse into one GEMM, so project layer by layer.  Result: two
+        # contiguous [L, num_ctx, nkv, hd] tensors.
         normed_context_states = torch.empty_like(context_states)
         ops.rms_norm(
             normed_context_states,
@@ -560,19 +560,19 @@ class DFlashQwen3Model(nn.Module):
             self._hidden_norm_weight,
             self._rms_norm_eps,
         )
-        all_kv_flat = F.linear(
-            normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+        all_k_layers = []
+        all_v_layers = []
+        for attn in self._context_attn_layers:
+            qkv, _ = attn.qkv_proj(normed_context_states)
+            _, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+            all_k_layers.append(k)
+            all_v_layers.append(v)
+        all_k = torch.stack(all_k_layers, dim=0).view(
+            num_layers, num_ctx, num_kv_heads, head_dim
         )
-        # Single contiguous copy that separates K/V and transposes to
-        # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
-        # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
-        all_kv = (
-            all_kv_flat.view(num_ctx, num_layers, 2, num_kv_heads, head_dim)
-            .permute(2, 1, 0, 3, 4)
-            .contiguous()
+        all_v = torch.stack(all_v_layers, dim=0).view(
+            num_layers, num_ctx, num_kv_heads, head_dim
         )
-        all_k = all_kv[0]  # [L, num_ctx, nkv, hd], contiguous
-        all_v = all_kv[1]  # [L, num_ctx, nkv, hd], contiguous
         return all_k, all_v
 
     def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
@@ -678,7 +678,13 @@ class DFlashQwen3Model(nn.Module):
                 hidden_states=hidden_states,
                 residual=residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        # ---- last layer uses fp32 (else the residual is downcast and overflows) ----
+        if residual is None:
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states = _fp32_rms(
+                self.norm, hidden_states.float() + residual.float()
+            )
         return hidden_states
 
     def _preprocess(
@@ -897,3 +903,165 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             MASK_EMBEDDING_FILENAME,
         )
         return state.reshape(-1)
+
+
+# ---- fp32 residual stream / probes ------------------------------------
+_FP32_STATE: dict = {"n": 0, "seen": set()}
+_CAND_STATE: dict = {"cand": 0, "out": 0}
+
+
+def _fp32_rms(norm_mod, x32):
+    """fp32 RMSNorm. Output dtype follows the weight (norms may be built in fp32)."""
+    import torch
+
+    w = norm_mod.weight
+    eps = getattr(norm_mod, "variance_epsilon", None)
+    if eps is None:
+        eps = getattr(norm_mod, "eps", 1e-6)
+    assert eps is not None
+    var = x32.pow(2).mean(dim=-1, keepdim=True)
+    y = x32 * torch.rsqrt(var + float(eps))
+    wf = w.float()
+    if "gemma" in type(norm_mod).__name__.lower():
+        wf = wf + 1.0
+    out_dtype = w.dtype if w.dtype in (torch.float16, torch.bfloat16) else torch.float16
+    return (y * wf).to(out_dtype)
+
+
+def _fp32_lname(mod) -> str:
+    """Return the full layer_name (the gate needs it to look up the metadata)."""
+    try:
+        a = getattr(getattr(mod, "self_attn", None), "attn", None)
+        nm = getattr(a, "layer_name", None)
+        if nm:
+            return str(nm)
+    except Exception:
+        pass
+    return "?"
+
+
+def _fp32_short(nm) -> str:
+    return str(nm).replace(".self_attn.attn", "").replace("model.layers.", "L")
+
+
+def _fp32_is_real(mod) -> bool:
+    try:
+        from vllm.forward_context import get_forward_context
+
+        md = getattr(get_forward_context(), "attn_metadata", None)
+        if not isinstance(md, dict) or not md:
+            return False
+        nm = _fp32_lname(mod)
+        return (nm in md and md[nm] is not None) or nm == "?"
+    except Exception:
+        return False
+
+
+def _cand_is_real() -> bool:
+    try:
+        from vllm.forward_context import get_forward_context
+
+        md = getattr(get_forward_context(), "attn_metadata", None)
+        return isinstance(md, dict) and bool(md)
+    except Exception:
+        return False
+
+
+def _fp32_trace(mod, res32, out) -> None:
+    """On the first pass print residual magnitude/dtype to confirm the fp16
+    overflow is gone (needs VLLM_GFX906_DFLASH_TRACE=1)."""
+    try:
+        import os
+
+        if os.environ.get("VLLM_GFX906_DFLASH_TRACE", "") not in ("1", "true", "on"):
+            return
+        import torch
+
+        if _FP32_STATE["n"] >= 40 or not _fp32_is_real(mod):
+            return
+        nm = _fp32_lname(mod)
+        key = (nm, "trace")
+        if key in _FP32_STATE["seen"]:
+            return
+        _FP32_STATE["seen"].add(key)
+        _FP32_STATE["n"] += 1
+        print(
+            "DFLASH-TRACE {:<5} res absmax={:<12.5g} nonfin={:<6d} dtype={:<6} "
+            "| out absmax={:<12.5g} nonfin={:<6d} dtype={}".format(
+                _fp32_short(nm),
+                float(res32.detach().abs().max()),
+                int((~torch.isfinite(res32)).sum()),
+                str(res32.dtype).replace("torch.", ""),
+                float(out.detach().float().abs().max()),
+                int((~torch.isfinite(out)).sum()),
+                str(out.dtype).replace("torch.", ""),
+            ),
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+def _fp32_cand(hidden) -> None:
+    """Whether compute_candidates' input (after the final norm) still has NaN."""
+    try:
+        import torch
+
+        if _CAND_STATE["cand"] >= 4 or not _cand_is_real():
+            return
+        if not isinstance(hidden, torch.Tensor) or not hidden.numel():
+            return
+        _CAND_STATE["cand"] += 1
+        fl = hidden.detach().float()
+        print(
+            "DFLASH-CAND in shape={} dtype={} nonfin={:<8d} absmax={:<12.5g} "
+            "absmin={:.5g}".format(
+                tuple(hidden.shape),
+                str(hidden.dtype).replace("torch.", ""),
+                int((~torch.isfinite(fl)).sum()),
+                float(fl.abs().max()),
+                float(fl.abs().min()),
+            ),
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+def _fp32_cand_out(out) -> None:
+    """Candidate ids: a fixed 0..15 permutation means the logits are degenerate."""
+    try:
+        import torch
+
+        if _CAND_STATE["out"] >= 4:
+            return
+        _CAND_STATE["out"] += 1
+        ids = out[0] if isinstance(out, (tuple, list)) else out
+        lg = out[1] if isinstance(out, (tuple, list)) and len(out) > 1 else None
+        if not isinstance(ids, torch.Tensor):
+            return
+        row = (
+            ids.reshape(-1, ids.shape[-1])[0].tolist()
+            if ids.dim() >= 2
+            else ids.reshape(-1).tolist()
+        )
+        extra = ""
+        if isinstance(lg, torch.Tensor):
+            fl = lg.detach().float()
+            extra = " logits_nonfin={:d} logits_absmax={:.5g}".format(
+                int((~torch.isfinite(fl)).sum()), float(fl.abs().max())
+            )
+        print(
+            "DFLASH-CAND out ids={} head={} uniq={}/{} min={} max={}{}".format(
+                tuple(ids.shape),
+                row[:16],
+                int(torch.unique(ids).numel()),
+                int(ids.numel()),
+                int(ids.min()),
+                int(ids.max()),
+                extra,
+            ),
+            flush=True,
+        )
+    except Exception:
+        pass

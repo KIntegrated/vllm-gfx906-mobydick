@@ -151,13 +151,23 @@ extern "C" __global__ void gather_paged_kv_q8_kernel(
 
     // Out-of-range (or block_table shorter than Sk — guard, same as V2)
     // -> zero V (leave K alone; the FA kernel cuts it).
-    if (tok_pos >= seq_len || block_tab_idx >= max_blocks_per_seq) {
-        __half * vdst = v_out + v_dst_base;
-        for (int i = lane; i < D; i += 64) {
-            vdst[i] = __float2half(0.0f);
-        }
-        return;
-    }
+    // --- block-table tail handling -------------------------------------------------
+    // Was: zero-fill V for this token, then return. Under the FULL decode
+    // graph the gather is captured with Sk frozen at max_model_len
+    // (vllm/v1/worker/gpu_model_runner.py: max_seq_len = max_model_len)
+    // while the live seq_len is ~150, so grid.z = Sk makes ~4.18M excess
+    // workgroups (B=16, Hkv=4, Sk=65536) each storing D*2 = 512 B of zeros:
+    // 2.14 GB of dead stores per call, per layer (3.271 ms/call at
+    // Sk=65536 vs 0.026 ms at Sk=128).
+    //
+    // Skipping the store is safe for exactly the reason the clip_start
+    // branch above already skips its prefix (see the kernel doc): the FA
+    // kernel walks [k0_base, k_VKQ_max) with k_VKQ_max derived from the
+    // per-seq KV_max / seq_lens, so it never reads a column >= seq_len.
+    // Whatever sits in [seq_len, Sk) stays finite (a previous layer's rows)
+    // and is never visited. The K copies below rely on the same rule.
+    // ----------------------------------------------------------------------
+    if (tok_pos >= seq_len || block_tab_idx >= max_blocks_per_seq) return;
 
     // Valid token -> read block_table[seq, block_tab_idx].
     int phys_block = 0;
@@ -339,6 +349,10 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
 
     // If no token in the paged block is valid — just zero V, leave K alone.
     const bool full_oob = (block_start_tok >= seq_len) || (phys_block < 0);
+    // an entirely out-of-range paged block used to zero-fill V for
+    // all block_size tokens. The FA k-loop never reaches those columns, so
+    // there is nothing to materialise (see the V1 kernel's own note).
+    if (full_oob) return;
 
     // ---------- FLAT ITERATION: the WG's work is spread evenly ----------
     //
@@ -374,14 +388,14 @@ extern "C" __global__ void gather_paged_kv_q8_kernel_v2(
         if (tok_global >= Sk) continue;
         if (tok_global < clip_start) continue;   // M1 clip: no write
 
-        const bool tok_valid = !full_oob && (tok_global < seq_len);
-        uint4 val;
-        if (tok_valid) {
-            const __half * v_src_tok = v_src_base_bh + (int64_t)t * v_cache_token_stride;
-            val = reinterpret_cast<const uint4 *>(v_src_tok)[c];
-        } else {
-            val = make_uint4(0u, 0u, 0u, 0u);
-        }
+        // a token at/after seq_len is not materialised at all (was: V
+        // zero-fill). full_oob already returned above, so this is the
+        // per-token case; std::memcmp-identical behaviour is checked by the
+        // NaN-tail / golden probe.
+        if (tok_global >= seq_len) continue;
+
+        const __half * v_src_tok = v_src_base_bh + (int64_t)t * v_cache_token_stride;
+        const uint4 val = reinterpret_cast<const uint4 *>(v_src_tok)[c];
         __half * v_dst_tok = v_out + dst_V_sh_base + (int64_t)tok_global * D;
         reinterpret_cast<uint4 *>(v_dst_tok)[c] = val;
     }

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Copyright (C) Nick — nick413@gmail.com
 # SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
@@ -363,6 +364,65 @@ def _gather_clip_start(seq_lens: torch.Tensor,
             .to(torch.int32).contiguous())
 
 
+# ---- out_flat buffer reuse: avoids the 190 MiB/layer peak in long-context prefill ----
+# Why: out_flat = [num_tokens, Hq*D] float32; at crash time 12160*4096*4 B = 190.00 MiB;
+# a fresh one was allocated per layer per step, so each layer held its own copy.
+# every other large buffer (k/v_gather_buf, q_pad_buf) is reused; only these were left.
+# Safe: the caller (gfx906_fa_backend.py:1424) copies out and drops the reference.
+# Opt-out: VLLM_GFX906_OUT_FLAT_REUSE=0 falls back to torch.empty (for A/B runs).
+_OUT_FLAT_BUF = None
+_OUT_FLAT_REUSE_ON = _os.environ.get("VLLM_GFX906_OUT_FLAT_REUSE", "1") != "0"
+
+
+def _get_out_flat(num_tokens: int, width: int, device):
+    # Take a [num_tokens, width] fp32 buffer; reuse the block when it is large enough.
+    global _OUT_FLAT_BUF
+    need = num_tokens * width
+    if not _OUT_FLAT_REUSE_ON:
+        return torch.empty((num_tokens, width), dtype=torch.float32, device=device)
+    b = _OUT_FLAT_BUF
+    if b is None or b.numel() < need or b.device != device:
+        _OUT_FLAT_BUF = torch.empty(
+            (num_tokens, width), dtype=torch.float32, device=device
+        )
+        return _OUT_FLAT_BUF
+    return b[:num_tokens, :width]
+
+
+# q_pad fallback reuse. Both forward_paged branches (direct-paged
+# near line 494, gather near line 860) already reuse q_pad_decode_buf /
+# q_pad_buf on their normal paths; only the trailing else still allocated
+# fresh. That else is reachable only when neither buffer fits (a decode
+# step with num_seqs > 1 while q_pad_buf.dim0 was grown for Sq=1, and
+# q_pad_decode_buf not yet widened). Per call the slice is small
+# (B x Hq x 2 x D fp32, about 393 KB at B=8), but it repeats every
+# attention layer and every step, so it fragments the pool. Reuse one
+# buffer here too; callers always overwrite row 0, and pad rows are
+# either zeroed below (non _decode_fast) or never read (_decode_fast).
+_QPAD_FALLBACK_BUF = None
+_QPAD_FALLBACK_REUSE_ON = _os.environ.get("VLLM_GFX906_QPAD_FALLBACK_REUSE", "1") != "0"
+
+
+def _get_qpad_fallback(num_seqs: int, nhead: int, sq_pad: int, dsz: int, device):
+    global _QPAD_FALLBACK_BUF
+    if not _QPAD_FALLBACK_REUSE_ON:
+        return None
+    b = _QPAD_FALLBACK_BUF
+    if (
+        b is None
+        or b.shape[0] < num_seqs
+        or b.shape[1] != nhead
+        or b.shape[2] < sq_pad
+        or b.shape[3] != dsz
+        or b.device != device
+    ):
+        _QPAD_FALLBACK_BUF = torch.empty(
+            (num_seqs, nhead, sq_pad, dsz), dtype=torch.float32, device=device
+        )
+        return _QPAD_FALLBACK_BUF
+    return b[:num_seqs, :, :sq_pad, :]
+
+
 def forward_paged(
     query: torch.Tensor,            # [num_tokens, Hq, D] fp16 (cast into fp32 q_pad)
     key_cache: torch.Tensor,        # [num_blocks, block_size, Hkv, D]  fp16
@@ -380,6 +440,11 @@ def forward_paged(
     k_gather_buf: torch.Tensor | None = None,  # [B,Hkv,Sk_pad,bytes_per_row] uint8
     v_gather_buf: torch.Tensor | None = None,  # [B,Hkv,Sk_pad,D]             fp16
     window: int = 0,  # sliding-window size in tokens (0 = off)
+    # Non-causal (bidirectional) drafting attention
+    # (dflash2 draft has is_causal=False). The tile kernel then drops the
+    # per-row causal upper bound while keeping the per-row window cutoff —
+    # the same semantics as ROCM_ATTN (causal=... + sliding_window=...).
+    non_causal: bool = False,
     cu_seqlens_q_host: torch.Tensor | None = None,  # [B+1] CPU int — avoids
     # the per-seq int(cu[...]) D2H syncs in the variable-Q branches (M3).
 ) -> torch.Tensor:
@@ -463,10 +528,13 @@ def forward_paged(
             q_padded = q_pad_buf[:num_seqs, :Hq, :Sq_pad, :].contiguous()
             q_padded.zero_()
         else:
-            q_padded = torch.zeros(
-                (num_seqs, Hq, Sq_pad, D),
-                dtype=torch.float32, device=query.device
-            )
+            q_padded = _get_qpad_fallback(num_seqs, Hq, Sq_pad, D, query.device)
+            if q_padded is None:
+                q_padded = torch.zeros(
+                    (num_seqs, Hq, Sq_pad, D), dtype=torch.float32, device=query.device
+                )
+            else:
+                q_padded.zero_()
 
         if max_seqlen_q == 1 and num_tokens == num_seqs:
             q_padded[:, :, :1, :] = query.unsqueeze(2)
@@ -549,6 +617,7 @@ def forward_paged(
                 None,                     # mask
                 q_abs_offset_tensor,      # inline causal
                 window=window,
+                q_non_causal=non_causal,
                 kv_start=kv_start_tensor,
             )
             if _DBG:
@@ -576,8 +645,7 @@ def forward_paged(
             cu = cu_seqlens_q_host.to(torch.long).tolist()
         else:
             cu = cu_seqlens_q.to(torch.long).tolist()
-        out_flat = torch.empty(
-            (num_tokens, Hq * D), dtype=torch.float32, device=query.device)
+        out_flat = _get_out_flat(num_tokens, Hq * D, query.device)
         for s in range(num_seqs):
             n = cu[s + 1] - cu[s]
             if n > 0:
@@ -828,15 +896,19 @@ def forward_paged(
         if not _decode_fast:
             q_padded.zero_()
     else:
-        q_padded = (
-            torch.empty(
-                (num_seqs, Hq, Sq_pad, D),
-                dtype=torch.float32, device=query.device
-            ) if _decode_fast else torch.zeros(
-                (num_seqs, Hq, Sq_pad, D),
-                dtype=torch.float32, device=query.device
+        q_padded = _get_qpad_fallback(num_seqs, Hq, Sq_pad, D, query.device)
+        if q_padded is None:
+            q_padded = (
+                torch.empty(
+                    (num_seqs, Hq, Sq_pad, D), dtype=torch.float32, device=query.device
+                )
+                if _decode_fast
+                else torch.zeros(
+                    (num_seqs, Hq, Sq_pad, D), dtype=torch.float32, device=query.device
+                )
             )
-        )
+        elif not _decode_fast:
+            q_padded.zero_()
 
     # Сложить Q в [B, Hq, Sq_pad, D] (copy_ делает fp16->fp32 cast).
     # При Sq=1 (decode) — максимально частый случай: не гоняем Python-цикл
@@ -907,6 +979,7 @@ def forward_paged(
             mask=None,
             q_abs_offset=q_abs_offset_tensor,
             window=window,
+            q_non_causal=non_causal,
             kv_start=kv_start_tensor,
         )
         global _dump_n
@@ -946,8 +1019,7 @@ def forward_paged(
         cu = cu_seqlens_q_host.to(torch.long).tolist()
     else:
         cu = cu_seqlens_q.to(torch.long).tolist()
-    out_flat = torch.empty(
-        (num_tokens, Hq * D), dtype=torch.float32, device=query.device)
+    out_flat = _get_out_flat(num_tokens, Hq * D, query.device)
     for s in range(num_seqs):
         n = cu[s + 1] - cu[s]
         if n > 0:

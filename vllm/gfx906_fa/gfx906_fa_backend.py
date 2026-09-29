@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (C) Nick — nick413@gmail.com
 # SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 #
@@ -30,7 +31,7 @@ K to Q8 on device, and runs the Q8 FA kernel.
 """
 
 import os as _os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import ClassVar
 
 import torch
@@ -45,6 +46,7 @@ from vllm.gfx906_fa.gfx906_fa_paged import (  # noqa: E402
 )
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -61,6 +63,189 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# PACKED KV layout: K stored as Q8_0 bytes, V as fp16, one cell holds both.
+#
+# Enabled by GFX906_FA_PACKED=1. With the flag off every path below keeps its
+# pre-existing behaviour byte-for-byte: the layout is only ever published
+# through customize_spec(), which returns the spec untouched when off.
+#
+#   cell (per block, per KV head) = K region | pad | V region
+#                                 = k_row          v_off  ->  v_off + D*2
+#     k_row = (D/32)*34                 (the Q8_0 row width, NOT rounded)
+#     v_off = align16(k_row)            (V starts on a 16 B boundary)
+#     cell  = v_off + D*2
+#
+#     D=128: k_row 136 -> v_off 144 -> cell 400 B   (baseline 512 B, x1.280)
+#     D=64:  k_row  68 -> v_off  80 -> cell 208 B   (baseline 256 B, x1.231)
+#     D=256: k_row 272 -> v_off 272 -> cell 784 B   (baseline 1024 B, x1.306)
+#
+# k_row and v_off are TWO DIFFERENT quantities and must not be conflated:
+#   * the K view's last dimension must be EXACTLY k_row, because both C++ entry
+#     points hard-check it — reshape_and_cache_q8 (gfx906_fa.cpp:685) and
+#     gather_paged_kv_q8 (:767 `bytes_per_row == (D/32)*34`).
+#   * v_off only decides where the V region begins inside the cell. The row
+#     stride stays `cell` bytes for both views, so both regions start on a
+#     16 B boundary for every head slot (cell % 16 == 0 and v_off % 16 == 0).
+#   (v1 of this patch used one constant for both and was rejected on device
+#    with "k_cache_q8 last dim mismatch: got 144 expected 136".)
+#
+# Why this is a ZERO-precision-loss change: the bytes in the K region are
+# produced by the SAME kernel (reshape_and_cache_q8 -> Q8_0 block layout) that
+# the incumbent LEGACY=0 alias path already deposits into the fp16 K half
+# (_ensure_q8_sidebuffer). Only WHERE those k_row bytes live changes (own
+# region vs. parasitising the K half), so K is bit-identical and V stays fp16.
+#
+# Pool arithmetic: state_content_bytes=cell makes vLLM size each page as
+# num_heads * block_size * cell B instead of * (D+D)*2. The matching view
+# geometry is published by get_kv_cache_shape(); the two MUST stay in lockstep.
+#
+# The V write is a V-only Triton scatter with an
+# in-kernel padding guard, so the layout no longer forces AttentionCGSupport
+# .NEVER. Measured on the first paired run: of the -58.74% c1 regression,
+# 18.17% was the lost CUDA graph and 40.57% was the first implementation's
+# nonzero()-filtered scatter - neither of which is inherent to the layout.
+# -----------------------------------------------------------------------------
+_PACKED_ENV = "GFX906_FA_PACKED"
+
+# This path supports 2-byte KV cache dtypes only (the cell arithmetic below is in
+# fp16 elements). --kv-cache-dtype must therefore stay auto/float16/bfloat16.
+_PACKED_2B_DTYPES = ("auto", "float16", "half", "bfloat16", "bf16")
+
+
+def _packed_enabled() -> bool:
+    return _os.environ.get(_PACKED_ENV, "0") == "1"
+
+
+def _packed_align16(n: int) -> int:
+    return ((n + 15) // 16) * 16
+
+
+def _packed_k_row_bytes(head_size: int) -> int:
+    """Q8_0 row width (D/32)*34 — exactly what both C++ entry points require
+    as the K view's last dimension. Deliberately NOT rounded up."""
+    assert head_size % 32 == 0, f"head_size={head_size} must be a multiple of 32"
+    return (head_size // 32) * 34
+
+
+def _packed_v_offset_bytes(head_size: int) -> int:
+    """Where the V region starts inside the cell: the q8 row rounded up to a
+    16 B boundary (136 -> 144 for D=128; 272 -> 272 for D=256)."""
+    return _packed_align16(_packed_k_row_bytes(head_size))
+
+
+def _packed_cell_bytes(head_size: int) -> int:
+    """Bytes per (block, KV head) cell in the packed layout."""
+    cell = _packed_v_offset_bytes(head_size) + head_size * 2
+    assert cell % 16 == 0, f"packed cell {cell} B is not 16 B aligned"
+    return cell
+
+
+def _packed_v_offset_elems(head_size: int) -> int:
+    """V region start in KV-cache elements (v_off is 16 B aligned, hence
+    even, so this is always a whole number of 2-byte elements)."""
+    v_off = _packed_v_offset_bytes(head_size)
+    assert v_off % 2 == 0
+    return v_off // 2
+
+
+def _packed_cell_elems(head_size: int) -> int:
+    """Last-dim size of get_kv_cache_shape() in the packed layout (2 B/el)."""
+    return _packed_cell_bytes(head_size) // 2
+
+
+# -----------------------------------------------------------------------------
+# V-only Triton scatter for the packed layout
+#
+# The packed cell keeps K as Q8_0 bytes and V as fp16, so the two regions differ
+# in width AND dtype. Neither stock writer fits:
+#   * triton_reshape_and_cache_flash writes K and V into two equal-shaped
+#     tensors of one dtype - it cannot express "K here as q8 bytes, V there as
+#     fp16", and its 5D branch reinterprets the shape as a head-major layout,
+#     which the packed [nb, 1, bs, Hkv, cell] shape is not;
+#   * reshape_and_cache_kernel_flash_diffkv comes close (one combined buffer)
+#     but its `head_size_k` doubles as the *source* head stride
+#     (src_key_idx = token_idx * key_stride + tile_i * head_size_k), and it
+#     always stores K alongside V - the K half cannot be suppressed;
+#   * the C++ Q8 kernel (reshape_and_cache_q8) only writes K.
+# So V gets its own scatter. It is the minimal shadow of the vLLM kernel:
+#   * every address comes from the strides of the views handed in, so the packed
+#     geometry needs no special-casing here;
+#   * the padding guard is in-kernel (`slot_idx < 0`), which is what keeps the
+#     launch a pure function of the token count - no data-dependent shape, no
+#     host sync, and therefore cudagraph-capturable (unlike an earlier attempt that had
+#     filter with nonzero() and consequently declared AttentionCGSupport.NEVER);
+#   * grid = (num_tokens, num_kv_heads): one program owns one whole head row of
+#     one token, so the shape is static under replay.
+# -----------------------------------------------------------------------------
+@triton.jit
+def _packed_v_scatter_kernel(
+    value_ptr,  # [num_tokens, num_kv_heads, head_size]
+    v_cache_ptr,  # [num_blocks, block_size, num_kv_heads, head_size]
+    slot_mapping_ptr,  # [num_tokens]
+    value_stride: tl.int64,  # stride over tokens in `value`
+    value_head_stride: tl.int64,  # stride over KV heads in `value`
+    block_stride: tl.int64,  # v_cache.stride(0)
+    page_stride: tl.int64,  # v_cache.stride(1)
+    head_stride: tl.int64,  # v_cache.stride(2) == one packed cell
+    head_size: tl.constexpr,
+    block_size: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(axis=0)
+    head_idx = tl.program_id(axis=1)
+
+    slot_idx = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
+    if slot_idx < 0:
+        # Padding token: leave the slot untouched.
+        return
+
+    block_idx = slot_idx // block_size
+    block_offset = slot_idx % block_size
+
+    offs = tl.arange(0, TILE_SIZE)
+    mask = offs < head_size
+    src = token_idx * value_stride + head_idx * value_head_stride
+    tgt = block_idx * block_stride + block_offset * page_stride + head_idx * head_stride
+    v = tl.load(value_ptr + src + offs, mask=mask)
+    tl.store(v_cache_ptr + tgt + offs, v, mask=mask)
+
+
+def _packed_v_scatter(
+    value: torch.Tensor,
+    v_view: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Write `value` into the fp16 V region of the packed pool.
+
+    value  : [num_tokens, num_kv_heads, head_size]
+    v_view : [num_blocks, block_size, num_kv_heads, head_size] - the strided
+             slice produced by _ensure_packed_views(). Its head stride is the
+             packed cell width, so the stores land in the V region only.
+    """
+    num_heads = value.shape[1]
+    head_size = value.shape[2]
+    assert v_view.shape[2] == num_heads and v_view.shape[3] == head_size, (
+        f"V view {tuple(v_view.shape)} does not match value {tuple(value.shape)}"
+    )
+    assert v_view.stride(3) == 1, f"V view last dim must be contiguous: {v_view}"
+    grid = (value.shape[0], num_heads)
+    _packed_v_scatter_kernel[grid](
+        value,
+        v_view,
+        slot_mapping,
+        value.stride(0),
+        value.stride(1),
+        v_view.stride(0),
+        v_view.stride(1),
+        v_view.stride(2),
+        head_size=head_size,
+        block_size=v_view.shape[1],
+        TILE_SIZE=triton.next_power_of_2(head_size),
+        num_warps=4,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -95,6 +280,21 @@ class Gfx906FAMetadataBuilder(
     def get_cudagraph_support(
         cls, vllm_config: VllmConfig, kv_cache_spec: AttentionSpec
     ) -> AttentionCGSupport:
+        # PACKED: the pool cell is [K q8 | V fp16] instead of two
+        # equal halves, so the spec/shape hooks below diverge from the
+        # baseline. The V write now goes through a static-shape Triton scatter
+        # (_packed_v_scatter_kernel) whose only guard is the in-kernel
+        # `if slot_idx < 0: return` - no host-side filtering, no
+        # data-dependent shape - so the layout no longer constrains the
+        # cudagraph level and the baseline logic below applies unchanged.
+        # (An earlier attempt could not: its nonzero() filter read device data on the
+        # host every step and forced AttentionCGSupport.NEVER, which cost
+        # 18.17% of c1 on top of the implementation's own 40.57%.)
+        if _packed_enabled():
+            logger.info(
+                "GFX906_FA_PACKED=1: packed KV layout (K q8 | V fp16) with the "
+                "V-only Triton scatter; cudagraph level unchanged."
+            )
         # LEGACY=0 (Q8 side-view path): the Q8 view aliases the fp16 K
         # half, so the old desync class is structural-impossible (page
         # copies and captured writes move both halves at once). Kept as a
@@ -203,6 +403,44 @@ class Gfx906FABackend(AttentionBackend):
     def get_impl_cls() -> type["Gfx906FAImpl"]:
         return Gfx906FAImpl
 
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        """Publish the packed cell size so the pool shrinks its page.
+
+        Only the byte count is published here; the matching view geometry is
+        published by get_kv_cache_shape() below. The two are verified against
+        each other at runtime in Gfx906FAImpl._ensure_packed_views(), so they
+        cannot drift apart silently.
+
+        vLLM hook: v1/attention/backend.py (default returns spec unchanged),
+        called from v1/worker/gpu/attn_utils.py get_kv_cache_spec() and
+        v1/worker/gpu_model_runner.py, both BEFORE the pool is sized.
+        """
+        if not _packed_enabled():
+            return spec
+        if spec.head_size_v != spec.head_size:
+            raise NotImplementedError(
+                "GFX906_FA_PACKED assumes head_size_v == head_size, got "
+                f"{spec.head_size_v} vs {spec.head_size}"
+            )
+        cell = _packed_cell_bytes(spec.head_size)
+        k_row = _packed_k_row_bytes(spec.head_size)
+        base_cell = (spec.head_size + spec.head_size_v) * (
+            2 if spec.dtype in (torch.float16, torch.bfloat16) else 1
+        )
+        logger.warning(
+            "GFX906_FA_PACKED=1: KV cell %d B (K q8 row %d B at offset 0, "
+            "V %d B at offset %d) vs baseline %d B -> pool token capacity "
+            "x%.3f",
+            cell,
+            k_row,
+            spec.head_size * 2,
+            _packed_v_offset_bytes(spec.head_size),
+            base_cell,
+            base_cell / cell if cell else 0.0,
+        )
+        return replace(spec, state_content_bytes=cell, page_size_padded=None)
+
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
@@ -213,6 +451,28 @@ class Gfx906FABackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        if _packed_enabled():
+            # Packed geometry. Must satisfy, for the contiguous reshape
+            # branch of _reshape_attention_kv_cache:
+            #     prod(shape[1:]) * elem_size == page_size_bytes
+            #   = num_heads * block_size * state_content_bytes
+            # with num_heads == num_kv_heads (num_head_slots stays None):
+            #   block_size * Hkv * (cell // 2) * 2 == Hkv * block_size * cell
+            # which holds identically. The leading 1 keeps the view 5-D so the
+            # existing 5-D callers keep working.
+            s = (cache_dtype_str or "auto").lower()
+            if s not in _PACKED_2B_DTYPES:
+                raise NotImplementedError(
+                    "GFX906_FA_PACKED supports 2-byte KV cache dtypes only "
+                    f"(auto/float16/bfloat16), got --kv-cache-dtype={s!r}"
+                )
+            return (
+                num_blocks,
+                1,
+                block_size,
+                num_kv_heads,
+                _packed_cell_elems(head_size),
+            )
         # Identical to TritonAttentionBackend, so backends can be
         # switched without re-allocating the KV cache.
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
@@ -237,6 +497,22 @@ class Gfx906FABackend(AttentionBackend):
     def supports_head_size(cls, head_size: int) -> bool:
         # Kernel validated for 64/128; 256 (Qwen3.5/3.6) added.
         return head_size in (64, 128, 256)
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        # A dflash2 draft declares is_causal=False, which
+        # makes vLLM set use_non_causal=True for its AttentionSelectorConfig.
+        # The tile kernel now expresses "block-bidirectional" by disabling the
+        # per-row causal upper bound (the q_non_causal arg) while keeping the
+        # per-row window cutoff — exactly ROCM_ATTN's causal=False +
+        # sliding_window semantics (rocm_attn.py keeps the two independent).
+        # Without this the draft cannot run on CUSTOM and falls to ROCM_ATTN.
+        #
+        # Verified = the arg is threaded end-to-end: fattn-q8-paged.cuh /
+        # fattn-q8.cuh mask sites, gfx906_fa_launcher.cu, the pybind bindings,
+        # gfx906_fa_paged.forward_paged(non_causal=...). Default 0/false keeps
+        # every existing (causal) path bit-identical.
+        return True
 
     @classmethod
     def supports_sliding_window(cls) -> bool:
@@ -414,6 +690,33 @@ class Gfx906FAImpl(AttentionImpl):
                 "layers beyond the window (perf A/B arm only).")
         else:
             self.sliding_window = sliding_window or 0
+        # Non-causal (bidirectional) drafting attention. vLLM carries
+        # this only in attention_config (v1/attention/selector.py:168), never
+        # through the impl constructor args, so read it from the ambient
+        # config here: Attention.__init__ runs inside the owning model's
+        # construction context (model_executor/layers/attention/
+        # attention.py:336 does the same for cache_config), which for the
+        # dflash2 draft is the replaced draft_vllm_config
+        # (spec_decode/dflash/utils.py:29-41). Read ONCE at build time — the
+        # runtime (forward) context is not the model-construction one.
+        try:
+            from vllm.config import get_current_vllm_config
+
+            self.non_causal = bool(
+                getattr(
+                    get_current_vllm_config().attention_config,
+                    "use_non_causal",
+                    False,
+                )
+            )
+        except Exception:  # pragma: no cover - ambient config may be absent
+            self.non_causal = False
+        if self.non_causal:
+            logger.info_once(
+                "GFX906_FA: non-causal (bidirectional) attention enabled "
+                "for this layer set (dflash2 draft); per-row causal upper "
+                "bound disabled, window cutoff kept."
+            )
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
@@ -436,6 +739,24 @@ class Gfx906FAImpl(AttentionImpl):
         # the alias must be re-derived.
         self._k_cache_q8_src: torch.Tensor | None = None
         self._legacy = _os.environ.get("GFX906_FA_LEGACY", "1") == "1"
+
+        # ------------------------------------------------------------------
+        # PACKED layout state. The pool cell becomes
+        # v_off + 2*D (400 B for D=128) instead of 4*D (512 B): K owns a
+        # dedicated Q8_0 region and V its own fp16 region, so the bundled
+        # (K, V) unbind is replaced by _ensure_packed_views().
+        # _legacy is forced off: in the packed layout there is no fp16 K
+        # half left to re-quantize on read - the Q8 bytes ARE the K store.
+        # ------------------------------------------------------------------
+        self._packed = _packed_enabled()
+        if self._packed:
+            self._legacy = False
+            self._v_cache: torch.Tensor | None = None
+            self._packed_src: torch.Tensor | None = None
+            if head_size % 32 != 0:
+                raise NotImplementedError(
+                    f"GFX906_FA_PACKED: head_size={head_size} must be a multiple of 32"
+                )
 
         # ------------------------------------------------------------------
         # q_pad buffers for forward_paged are CLASS-level (see the
@@ -511,6 +832,74 @@ class Gfx906FAImpl(AttentionImpl):
         # (attention seq_lens only cover written slots), so the fill buys
         # nothing.
 
+    # ------------------------------------------------------------------
+    def _ensure_packed_views(
+        self, kv_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split a packed cell into (K q8 uint8, V fp16) strided views.
+
+        kv_cache: [num_blocks, 1, block_size, Hkv, cell_elems] (2 B/el),
+        cell_elems = (v_off + 2*D) // 2.
+
+        Returns, both zero-copy views into the same pool bytes:
+          k_q8 : [num_blocks, block_size, Hkv, k_row]  uint8
+          v    : [num_blocks, block_size, Hkv, D]      fp16
+
+        Identity caching mirrors _ensure_q8_sidebuffer: kv_cache is a fresh
+        view object on every forward, so `is` would re-derive (and re-slice)
+        once per layer per step; we key on the storage/layout instead.
+        """
+        src = self._packed_src
+        if (
+            self._k_cache_q8 is not None
+            and self._v_cache is not None
+            and src is not None
+            and src.data_ptr() == kv_cache.data_ptr()
+            and src.shape == kv_cache.shape
+            and src.stride() == kv_cache.stride()
+        ):
+            return self._k_cache_q8, self._v_cache
+
+        shape = kv_cache.shape
+        assert len(shape) == 5 and shape[1] == 1, (
+            "packed KV cache must be [num_blocks, 1, block_size, Hkv, cell], "
+            f"got {tuple(shape)} - is get_kv_cache_shape() still packed?"
+        )
+        expected_elems = _packed_cell_elems(self.head_size)
+        assert shape[4] == expected_elems, (
+            f"packed cell mismatch: pool last dim {shape[4]} elements but "
+            f"head_size={self.head_size} implies {expected_elems} "
+            f"({_packed_cell_bytes(self.head_size)} B) - customize_spec() "
+            "and get_kv_cache_shape() are out of lockstep"
+        )
+
+        k_row = _packed_k_row_bytes(self.head_size)
+        v_off = _packed_v_offset_elems(self.head_size)
+        cell = _packed_cell_bytes(self.head_size)
+
+        # view(torch.uint8) is legal on the last (contiguous) dim. The head
+        # stride equals the cell width in bytes, so the K slice ends exactly
+        # k_row in and the V slice starts exactly v_off in - both 16 B
+        # aligned, and both with stride(3) == 1, which is what
+        # reshape_and_cache_q8 / gather_paged_kv_q8 require.
+        #
+        # The K slice width MUST be exactly k_row, not v_off: both C++ entry
+        # points hard-check size(3) == (D/32)*34 (gfx906_fa.cpp:685 and :767),
+        # so a 144-wide K view is rejected on device.
+        k_q8 = kv_cache.view(torch.uint8)[:, 0, :, :, :k_row]
+        v = kv_cache[:, 0, :, :, v_off : v_off + self.head_size]
+        assert k_q8.stride(3) == 1, f"K view must be last-dim contiguous: {k_q8}"
+        assert v.stride(3) == 1, f"V view must be last-dim contiguous: {v}"
+        assert k_q8.stride(2) == cell, (
+            f"K head stride {k_q8.stride(2)} != cell {cell} - the K view is "
+            "no longer stepping exactly one cell per head"
+        )
+
+        self._k_cache_q8 = k_q8
+        self._v_cache = v
+        self._packed_src = kv_cache
+        return k_q8, v
+
     @classmethod
     def _ensure_forward_buffers(
         cls,
@@ -572,7 +961,7 @@ class Gfx906FAImpl(AttentionImpl):
             capturing = torch.cuda.is_current_stream_capturing()
             cur = cls._q_pad_buf
             new_shape = (
-                max(qpad_num_seqs, cur.shape[0]),
+                qpad_num_seqs,
                 num_heads,
                 max(Sq_pad, cur.shape[2]),
                 head_size,
@@ -866,6 +1255,9 @@ class Gfx906FAImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ):
+        if self._packed:
+            self._packed_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+            return
         key_cache, value_cache = kv_cache.unbind(1)
 
         # 1) Primary fp16 write — the vLLM-standard path for V (and for K
@@ -905,6 +1297,44 @@ class Gfx906FAImpl(AttentionImpl):
                 self._k_cache_q8,
             )
 
+    def _packed_kv_cache_update(
+        self,
+        layer: AttentionLayer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Packed-layout write: K via the Q8_0 scatter kernel, V via the
+        V-only Triton scatter. There is NO fp16 K write at all - the K region
+        holds Q8 bytes only, which is exactly what the packed layout buys us.
+
+        Padding slots (slot_mapping < 0) are dropped in-kernel rather than
+        clamped: clamping would overwrite a live slot, and a host-side filter
+        would force a D2H sync per step. Keeping the guard on device is also
+        what lets the launch stay capturable.
+        """
+        k_q8, v_view = self._ensure_packed_views(kv_cache)
+        from vllm import _gfx906_fa_C as gfx906_fa  # type: ignore[attr-defined]
+
+        sm = slot_mapping
+        if sm.dtype != torch.int64:
+            sm = sm.to(torch.int64)
+
+        # K: quantize + scatter into the Q8 region. The kernel derives its
+        # row stride from the tensor, so the k_row bytes land in the K
+        # region and nowhere else.
+        gfx906_fa.reshape_and_cache_q8(
+            key.contiguous() if not key.is_contiguous() else key,
+            sm,
+            k_q8,
+        )
+
+        # V: static-shape Triton scatter into the V region. Padding slots are
+        # skipped inside the kernel, so the grid depends only on the token
+        # count - never on the data.
+        _packed_v_scatter(value, v_view, sm)
+
     def fused_rope_kvcache_supported(self):
         return False
 
@@ -938,8 +1368,15 @@ class Gfx906FAImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Unbind KV cache: (..., 2, ...) → (K, V) each [num_blocks, block_size, Hkv, D]
-        key_cache, value_cache = kv_cache.unbind(1)
+        # Split KV cache: baseline is (..., 2, ...) -> (K, V) each
+        # [num_blocks, block_size, Hkv, D]; packed is a single
+        # [K q8 | pad | V fp16] region per cell, so the split is
+        # region-based. Both branches set self._k_cache_q8, which the
+        # forward_paged call below feeds as key_cache_q8.
+        if self._packed:
+            key_cache, value_cache = self._ensure_packed_views(kv_cache)
+        else:
+            key_cache, value_cache = kv_cache.unbind(1)
 
         # query [num_tokens, Hq, D] fp16 (forward_paged casts it into the
         # fp32 q_pad buffer inside the copy_ — a standalone .float() was
@@ -992,6 +1429,7 @@ class Gfx906FAImpl(AttentionImpl):
             k_gather_buf=k_gather_buf,
             v_gather_buf=v_gather_buf,
             window=self.sliding_window,
+            non_causal=self.non_causal,
         )  # [num_tokens, Hq*D] fp32
 
         # Write the result into output in-place (it is either
