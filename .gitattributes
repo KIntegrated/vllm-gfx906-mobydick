@@ -1,0 +1,4 @@
+* text=auto eol=lf
+tests/v1/ec_connector/integration/test_epd_correctness.py -text
+vllm/config/fault_tolerance.py -text
+tests/v1/ec_connector/integration/README.md -text
