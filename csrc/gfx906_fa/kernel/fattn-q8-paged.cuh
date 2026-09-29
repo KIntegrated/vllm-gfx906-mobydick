@@ -130,6 +130,12 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter_paged(
         // (tests cover both via test_forward_sliding_window* /
         // test_forward_paged_direct_sliding_window*).
         const int window,
+        // Non-causal (bidirectional) drafting attention.
+        // != 0 disables the per-row causal upper bound (k_pos_abs > q_abs_row);
+        // the k-loop already stops at k_VKQ_max, so that bound becomes a no-op
+        // (block-bidirectional). The window LOWER bound stays per-row: ROCM_ATTN
+        // keeps causal and sliding_window independent.
+        const int q_non_causal,
         const int sequence,
         const int col_Q_0_iter) {
     constexpr int cpy_ne = ggml_cuda_get_max_cpy_bytes() / 4;
@@ -211,7 +217,7 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter_paged(
                     // num_i_KQ_iters>1 site below): overflow-free window
                     // cutoff — `q_abs_row - k_pos_abs >= window` is
                     // equivalent for all int32 window and cannot wrap.
-                    if (k_pos_abs > q_abs_row ||
+                    if ((!q_non_causal && k_pos_abs > q_abs_row) ||
                         (window > 0 && q_abs_row - k_pos_abs >= window)) {
                         KQ_acc[jc0] = -INFINITY;
                     }
@@ -245,7 +251,7 @@ static __device__ __forceinline__ void flash_attn_tile_q8_q8_iter_paged(
                         // M3 #10 (LOCKSTEP with the num_i_KQ_iters==1 site
                         // above and fattn-q8.cuh): overflow-free window
                         // cutoff.
-                        if (k_pos_abs > q_abs_row ||
+                        if ((!q_non_causal && k_pos_abs > q_abs_row) ||
                             (window > 0 && q_abs_row - k_pos_abs >= window)) {
                             KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = -INFINITY;
                         }
@@ -423,6 +429,8 @@ static __global__ void flash_attn_tile_q8_paged(
         const int  * __restrict__ KV_max,
         const int32_t * __restrict__ q_abs_offset,
         const int window,
+        // See flash_attn_tile_q8_q8_iter_paged (q_non_causal).
+        const int q_non_causal,
         // Per-row KV scan start (sliding-window clip, phase C): the k-loop
         // walks [k0_base, k_VKQ_max) instead of [0, k_VKQ_max). Bit-identical
         // to scanning [0, k0_base) when k0_base >= q_abs_row - window + 1
@@ -464,7 +472,7 @@ static __global__ void flash_attn_tile_q8_paged(
 #ifdef FLASH_ATTN_AVAILABLE
 
     if (use_logit_softcap && !(DV == 128 || DV == 256)) {
-        GGML_UNUSED_VARS(Q, K_paged_base, V_paged_base, mask, sinks, KV_max, q_abs_offset, window, kv_start, tile_clip, block_table,
+        GGML_UNUSED_VARS(Q, K_paged_base, V_paged_base, mask, sinks, KV_max, q_abs_offset, window, q_non_causal, kv_start, tile_clip, block_table,
             dst, dst_meta, scale, max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03, nb01, nb02, nb03,
             ne10, ne11, ne12, ne13,
@@ -617,7 +625,7 @@ static __global__ void flash_attn_tile_q8_paged(
             flash_attn_tile_q8_q8_iter_paged<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_values, Q_scales, paged_K, paged_V, maskh, logit_softcap, slope, KQ, K_values, K_scales, KV_tmp,
                 stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max,
-                q_abs_offset, window, sequence, col_Q_0);
+                q_abs_offset, window, q_non_causal, sequence, col_Q_0);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
@@ -625,7 +633,7 @@ static __global__ void flash_attn_tile_q8_paged(
             flash_attn_tile_q8_q8_iter_paged<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_values, Q_scales, paged_K, paged_V, maskh, logit_softcap, slope, KQ, K_values, K_scales, KV_tmp,
                 stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max,
-                q_abs_offset, window, sequence, col_Q_0);
+                q_abs_offset, window, q_non_causal, sequence, col_Q_0);
         }
     } else {
         for (int k_VKQ_0 = k0_base + blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
@@ -635,13 +643,13 @@ static __global__ void flash_attn_tile_q8_paged(
                 flash_attn_tile_q8_q8_iter_paged<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                     (Q_values, Q_scales, paged_K, paged_V, maskh, logit_softcap, slope, KQ, K_values, K_scales, KV_tmp,
                     stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max,
-                    q_abs_offset, window, sequence, col_Q_0);
+                    q_abs_offset, window, q_non_causal, sequence, col_Q_0);
             } else {
                 constexpr bool oob_check = false;
                 flash_attn_tile_q8_q8_iter_paged<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                     (Q_values, Q_scales, paged_K, paged_V, maskh, logit_softcap, slope, KQ, K_values, K_scales, KV_tmp,
                     stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max,
-                    q_abs_offset, window, sequence, col_Q_0);
+                    q_abs_offset, window, q_non_causal, sequence, col_Q_0);
             }
         }
     }
@@ -752,7 +760,7 @@ static __global__ void flash_attn_tile_q8_paged(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q, K_paged_base, V_paged_base, mask, sinks, KV_max, q_abs_offset, window, kv_start, block_table,
+    GGML_UNUSED_VARS(Q, K_paged_base, V_paged_base, mask, sinks, KV_max, q_abs_offset, window, q_non_causal, kv_start, block_table,
         dst, dst_meta, scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03, nb01, nb02, nb03,
         ne10, ne11, ne12, ne13,

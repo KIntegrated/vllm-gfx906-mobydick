@@ -374,7 +374,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_query_start_loc: torch.Tensor | None = None
         prefill_state_indices: torch.Tensor | None = None
         prefill_has_initial_state: torch.Tensor | None = None
-        if num_decodes > 0:
+        if num_decodes > 0 and num_prefills > 0:
             # V1 invariant: non-spec 1-token decodes are scheduled first, so
             # the front slice of the non-spec ramp is 0..num_decodes. The peel
             # (and every consumer of the prefill_* fields below) relies on it;

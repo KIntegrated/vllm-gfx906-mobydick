@@ -195,7 +195,8 @@ class CudaGraphManager:
         # to capture graphs for all possible values during decode.
         speculative_config = self.vllm_config.speculative_config
         if (
-            speculative_config
+            getattr(self, "_use_dynamic_schedule", True)
+            and speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
         ):
             num_spec_per_batch_size = (

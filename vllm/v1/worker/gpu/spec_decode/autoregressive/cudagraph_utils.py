@@ -27,6 +27,26 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
     earlier capture would execute kernels with stale buffer contents.
     """
 
+    # The dyn table (`num_speculative_tokens_per_batch_size`) describes the
+    # target model's decode-time verify depth; it is meaningless for
+    # draft/prefill managers. The base `_init_candidates` instead derives it
+    # from `decode_query_len - num_speculative_tokens` and expands the dyn
+    # table; this class's decode instances are built by
+    # `autoregressive/speculator.py:144` with an explicit `decode_query_len=1`,
+    # which gives `1 - 3 = -2`, so `decode_query_lens = [1, -1]` (negative
+    # values). `round_up(n, -1) // -1` then yields a negative num_reqs,
+    # tripping `assert 0 < num_reqs <= num_tokens` in `InputBatch.make_dummy`.
+    # This class therefore opts out of the dyn table
+    # (`_use_dynamic_schedule=False`); the base defaults to True.
+    def __init__(self, *args, honor_dynamic_sd: bool = False, **kwargs):
+        # It must be set before super().__init__(): the base __init__ calls
+        # self._init_candidates() at around line 145, and setting it afterwards
+        # leaves the attribute undefined, so getattr(..., True) returns True and
+        # the crash is unchanged (verified by 3/3 cold-start failures with a
+        # traceback proving the patch was active).
+        self._use_dynamic_schedule = honor_dynamic_sd
+        super().__init__(*args, **kwargs)
+
     def capture(
         self,
         forward_fn: Callable,
@@ -43,6 +63,9 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
         ) -> Callable[[CUDAGraphMode], None]:
             num_tokens = desc.num_tokens
             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+            # Defensive: satisfy the InputBatch.make_dummy contract
+            # (`assert 0 < num_reqs <= num_tokens`); clamp explicitly rather than crash.
+            num_reqs = max(1, min(num_reqs, num_tokens))
             num_tokens_across_dp = (
                 torch.full((self.dp_size,), num_tokens, dtype=torch.int32, device="cpu")
                 if self.dp_size > 1

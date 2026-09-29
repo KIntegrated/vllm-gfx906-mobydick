@@ -266,3 +266,10 @@ gfx906_fa_launcher*.hipi
 gfx906_fa_launcher*.o
 gfx906_fa_launcher*.s
 gfx906_fa_launcher*.out*
+# --- local backup copies ---
+# The .bak family mixes into the source tree and breaks any
+# "file count / grep hit count" style conclusion.
+# Such conclusions must state whether *.bak* is excluded.
+*.bak
+*.bak_*
+*_bak_*

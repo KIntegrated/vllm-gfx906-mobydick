@@ -424,7 +424,34 @@ class DefaultModelLoader(BaseModelLoader):
 
         self._init_ep_weight_filter(model_config)
 
+        # Observation only: log device memory around load_weights (no behavior change).
+        try:
+            import torch as _t
+
+            _d = _t.cuda.current_device()
+            logger.info(
+                "[load-weights-mem] load_weights BEGIN alloc=%.3f GiB peak=%.3f GiB "
+                "reserved=%.3f GiB",
+                _t.cuda.memory_allocated(_d) / 2**30,
+                _t.cuda.max_memory_allocated(_d) / 2**30,
+                _t.cuda.memory_reserved(_d) / 2**30,
+            )
+        except Exception as _e:
+            logger.info("[load-weights-mem] probe-begin failed: %r", _e)
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        try:
+            import torch as _t
+
+            _d = _t.cuda.current_device()
+            logger.info(
+                "[load-weights-mem] load_weights END   alloc=%.3f GiB peak=%.3f GiB "
+                "reserved=%.3f GiB",
+                _t.cuda.memory_allocated(_d) / 2**30,
+                _t.cuda.max_memory_allocated(_d) / 2**30,
+                _t.cuda.memory_reserved(_d) / 2**30,
+            )
+        except Exception as _e:
+            logger.info("[load-weights-mem] probe-end failed: %r", _e)
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(

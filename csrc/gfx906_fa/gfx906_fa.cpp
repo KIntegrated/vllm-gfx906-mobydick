@@ -55,6 +55,8 @@ extern "C" hipError_t gfx906_fa_launch(
     // (mask_ptr тогда ДОЛЖЕН быть nullptr). q_abs_offset[b] = seq_len_total[b] - n_q[b].
     const int32_t * Q_ABS_OFFSET_d,
     int window,
+    // Non-causal (bidirectional) drafting; see the kernel.
+    int q_non_causal,
     // M1 gather-path window clip start [B] (nullptr = full scan); the K
     // buffer must contain rows [kv_start[b], seq_len[b]) (see
     // launch_gather_paged_kv_quant_persistent).
@@ -254,6 +256,7 @@ extern "C" hipError_t gfx906_fa_launch_paged(
     int32_t         mask_seq_kv_padded,
     const int32_t * Q_ABS_OFFSET_d,
     int             window,
+    int             q_non_causal,
     const int32_t * KV_START_d,
     int             tile_clip,
     int             batch,
@@ -379,6 +382,7 @@ torch::Tensor gfx906_fa_forward(
     // evaluated (the kernel silently degrades to full attention if it is
     // missing, so we error instead).
     int64_t window = 0,
+    bool q_non_causal = false,
     // M1 gather-path window clip start [B] (abs position; see the paged
     // binding of the same name). The K buffer must contain rows
     // [kv_start[b], seq_len[b]); the backend pairs it with the
@@ -568,6 +572,7 @@ torch::Tensor gfx906_fa_forward(
         mask_seq_kv_padded,
         q_abs_offset_ptr,
         window,
+        (int) q_non_causal,
         kv_start_ptr,
         tile_clip,
         batch, heads_q, heads_kv, seq_q, seq_kv, head_dim,
@@ -1216,6 +1221,7 @@ torch::Tensor gfx906_fa_forward_paged_direct(
     c10::optional<torch::Tensor> mask         = c10::nullopt,
     c10::optional<torch::Tensor> q_abs_offset = c10::nullopt,
     int64_t window = 0,
+    bool q_non_causal = false,
     c10::optional<torch::Tensor> kv_start = c10::nullopt
 ) {
     TORCH_CHECK(window == 0 || q_abs_offset.has_value(),
@@ -1404,6 +1410,7 @@ torch::Tensor gfx906_fa_forward_paged_direct(
         mask_seq_kv_padded,
         q_abs_offset_ptr,
         window,
+        (int) q_non_causal,
         kv_start_ptr,
         tile_clip,
         batch, heads_q, heads_kv, seq_q, max_seq_kv, head_dim,
@@ -1440,6 +1447,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("mask")          = c10::nullopt,
           py::arg("q_abs_offset")  = c10::nullopt,
           py::arg("window")        = 0,
+          py::arg("q_non_causal")  = false,
           py::arg("kv_start")      = c10::nullopt);
     m.def("quantize_q8_0", &quantize_q8_0,
           "Quantize fp16 tensor (last dim D) → block_q8_0 uint8 (device-side)",
@@ -1508,5 +1516,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("mask")         = c10::nullopt,
           py::arg("q_abs_offset") = c10::nullopt,
           py::arg("window")       = 0,
+          py::arg("q_non_causal") = false,
           py::arg("kv_start")     = c10::nullopt);
 }

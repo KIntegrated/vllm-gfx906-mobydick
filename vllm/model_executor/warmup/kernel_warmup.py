@@ -37,6 +37,9 @@ from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup,
 )
+from vllm.model_executor.warmup.tq_triton_warmup import (
+    tq_triton_warmup,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
@@ -124,6 +127,11 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         )
 
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
+
+    # TurboQuant Triton kernels (decode / full dequant / fused store) are
+    # first reached during long-context inference; compile them ahead of the
+    # real requests, exactly as the Qwen warmup above does for GDN kernels.
+    tq_triton_warmup(worker)
 
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
