@@ -22,7 +22,7 @@ from pydantic import ConfigDict, Field, model_validator
 
 import vllm.envs as envs
 from vllm.logger import enable_trace_function_call, init_logger
-from vllm.models.qwen4_exp.config import is_qwen4_exp_config
+from vllm.models.qwen4_exp.config import needs_ple_ngram_split
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
@@ -1914,8 +1914,23 @@ class VllmConfig:
             # engine died with hipErrorStreamCaptureUnsupported.  The
             # (possibly multimodal) wrapper config and its text sub-config are
             # both consulted.
+            #
+            # Widening the match must cost nothing to family members that do not
+            # use the n-gram memory, nor to a platform whose implementation is
+            # capturable: ``needs_ple_ngram_split`` asks the family question, the
+            # "does this checkpoint emit the op at all" question
+            # (``bool(ple_layer_ids)``, the model state's own gate) and the ROCm
+            # question.  A PLE-less Qwen4Exp checkpoint -- and the MTP drafter,
+            # whose config is rewritten to ``qwen4_exp_mtp`` -- therefore keeps
+            # the capture mode it asked for instead of being downgraded to
+            # PIECEWISE for an op that is never emitted, and CUDA (whose lookup
+            # is a stream prefetch over a device-side table, with no such op
+            # registered) keeps full-graph capture too.
+            from vllm.platforms import current_platform
+
+            is_rocm = current_platform.is_rocm()
             _qwen4_exp_ple_model = any(
-                is_qwen4_exp_config(config)
+                needs_ple_ngram_split(config, is_rocm=is_rocm)
                 for config in (
                     self.model_config.hf_config,
                     self.model_config.hf_text_config,

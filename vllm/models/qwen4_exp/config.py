@@ -289,19 +289,24 @@ class Qwen4ExpConfig(PretrainedConfig):
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 
 
-# Every ``model_type`` the Qwen4Exp family can present, derived from the config
-# classes that declare one, plus the MTP drafter's rewrite (``SpeculativeConfig``
-# turns a family checkpoint's ``model_type`` into ``qwen4_exp_mtp``). Anything
-# that has to recognise *the family* rather than one spelling of it must go
-# through ``is_qwen4_exp_model_type`` / ``is_qwen4_exp_config``: an exact
-# comparison against a single spelling silently misses the rest, and a missed
-# match in the compilation guard leaves the PLE n-gram lookup -- a blocking
-# device->host copy into pinned memory -- inside a full cudagraph capture, which
-# kills engine init with ``hipErrorStreamCaptureUnsupported``.
+# Every ``model_type`` the Qwen4Exp family can present, taken from the classes
+# that declare one in their own body (``__dict__``, not attribute lookup: an
+# inherited value would import a *parent's* spelling, e.g. ``qwen3_next``, into
+# the family), plus the MTP drafter's rewrite (``SpeculativeConfig`` turns a
+# family checkpoint's ``model_type`` into ``qwen4_exp_mtp``). Anything that has to
+# recognise *the family* rather than one spelling of it must go through
+# ``is_qwen4_exp_model_type`` / ``is_qwen4_exp_config``: an exact comparison
+# against a single spelling silently misses the rest, and a missed match in the
+# compilation guard leaves the PLE n-gram lookup -- a blocking device->host copy
+# into pinned memory -- inside a full cudagraph capture, which kills engine init
+# with ``hipErrorStreamCaptureUnsupported``.
+QWEN4_EXP_CONFIG_CLASSES = (Qwen4ExpConfig, Qwen4ExpTextConfig, Qwen4ExpVisionConfig)
 QWEN4_EXP_MODEL_TYPES: tuple[str, ...] = tuple(
     dict.fromkeys(
-        config_cls.model_type
-        for config_cls in (Qwen4ExpConfig, Qwen4ExpTextConfig, Qwen4ExpVisionConfig)
+        declared
+        for config_cls in QWEN4_EXP_CONFIG_CLASSES
+        for declared in (config_cls.__dict__.get("model_type"),)
+        if isinstance(declared, str)
     )
 ) + ("qwen4_exp_mtp",)
 
@@ -317,24 +322,66 @@ def is_qwen4_exp_config(hf_config: object) -> bool:
     ``model_type`` is the primary signal (the family spells it ``qwen4_exp``,
     ``qwen4_exp_text`` or ``qwen4_exp_mtp`` depending on the checkpoint and
     variant); the declared ``architectures`` entry is the fallback for a config
-    that omits or re-spells it.
+    that omits or re-spells it. Only known container types are iterated, so an odd
+    ``architectures`` value in a third-party config cannot raise here -- this runs
+    for every model that is built, not just this family's.
     """
     if is_qwen4_exp_model_type(getattr(hf_config, "model_type", None)):
         return True
-    architectures = getattr(hf_config, "architectures", None) or ()
-    if isinstance(architectures, str):  # some configs store a bare string
-        architectures = (architectures,)
+    architectures = getattr(hf_config, "architectures", None)
+    if isinstance(architectures, str):
+        architectures = (architectures,)  # some configs store a bare string
+    if not isinstance(architectures, (list, tuple, set, frozenset)):
+        return False
     return any(
         isinstance(architecture, str) and architecture.startswith("Qwen4Exp")
         for architecture in architectures
     )
 
 
+def uses_ngram_embedding(hf_config: object) -> bool:
+    """Whether this config builds the host-resident PLE n-gram lookup.
+
+    Mirrors the model state's own gate (``vllm/models/qwen4_exp/amd/model_state.py``
+    and its nvidia twin: ``uses_ngram_embedding = bool(config.ple_layer_ids)``),
+    which is also what decides whether the PLE layers -- and therefore
+    ``vllm::qwen4_exp_amd_ple_ngram_embedding`` -- exist at all. Callers that
+    reason about that op must ask this as well as the family question: a family
+    checkpoint without ``ple_layer_ids`` never emits the op, so splitting it out
+    of the graph (and downgrading full-graph capture) would be pure cost.
+    """
+    return bool(getattr(hf_config, "ple_layer_ids", None))
+
+
+def needs_ple_ngram_split(hf_config: object, *, is_rocm: bool) -> bool:
+    """Whether this config's PLE n-gram lookup must be kept out of the captured graph.
+
+    Three questions, and all three are necessary:
+
+    * the family (``is_qwen4_exp_config``),
+    * does this checkpoint actually use the host-resident memory
+      (``uses_ngram_embedding``) -- otherwise the op is never emitted,
+    * and is this the platform whose implementation cannot be captured.  Only the
+      ROCm path gathers the mmap'd host table inside a single op with a *blocking*
+      device->host copy (``amd/ple_layer.py``:
+      ``pinned_ids.copy_(ngram_ids, non_blocking=False)``), which HIP rejects
+      inside a stream capture.  The CUDA path prefetches through streams over a
+      device-side table (``nvidia/ple_layer.py``) and registers no such op, so it
+      stays capturable and must keep whatever capture mode it asked for.
+    """
+    return (
+        is_rocm and is_qwen4_exp_config(hf_config) and uses_ngram_embedding(hf_config)
+    )
+
+
 __all__ = [
+    "QWEN4_EXP_CONFIG_CLASSES",
     "QWEN4_EXP_MODEL_TYPES",
     "Qwen4ExpConfig",
     "Qwen4ExpTextConfig",
     "Qwen4ExpVisionConfig",
     "is_qwen4_exp_config",
     "is_qwen4_exp_model_type",
+    "needs_ple_ngram_split",
+    "uses_ngram_embedding",
 ]

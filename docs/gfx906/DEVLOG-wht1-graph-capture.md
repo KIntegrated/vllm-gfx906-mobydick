@@ -143,6 +143,48 @@ Regression cover, kept knowingly as two layers rather than one:
 | Capture-illegal HIP API in the fork's C++ | No — the `cudaMalloc`/`cudaMemcpy`/`hipMalloc` hits are in `custom_all_reduce`/`quickreduce`, both out of play (`--disable-custom-all-reduce`) |
 | EP/MoE all-to-all host syncs | No — the `fused_moe` `.item()`/`.tolist()` hits are init-time (`expert_map`) or `routed_experts_capturer` (off by default) |
 
+## Self-review: what the widened match must not cost
+
+Widening a guard is only safe if every added match *needs* it. Reviewing the wider
+match against the family's own runtime gates found three ways it could have cost
+something it must not -- all now closed, all covered by tests:
+
+| risk | why it would have happened | fix |
+| --- | --- | --- |
+| A family checkpoint with **no PLE layers** (and the **MTP drafter**, whose config is rewritten to `qwen4_exp_mtp`) got downgraded `FULL_AND_PIECEWISE` → `PIECEWISE` | the guard asked only "is this the family?", while the op exists only when the text config declares `ple_layer_ids` -- the model state's own gate (`bool(config.ple_layer_ids)`) | `uses_ngram_embedding()` is now required as well |
+| **Non-ROCm platforms** lost full-graph capture for nothing | the op is AMD-only: `vllm::qwen4_exp_amd_ple_ngram_embedding` is registered only in `amd/ple_layer.py`, and the CUDA path prefetches the lookup through streams over a device-side table (`nvidia/ple_layer.py`) with no such op, so it is capturable by construction; on CUDA the append matched nothing while the downgrade still applied | `needs_ple_ngram_split(hf_config, is_rocm=...)` -- the guard is now ROCm-only |
+| A future family config class that omits its own `model_type` **dragged a parent's spelling into the family** (`qwen3_next`, `qwen3_vl_vision`) | the tuple was built by attribute lookup, so a missing class attribute silently inherited the parent's value, and the compilation guard would then fire for unrelated models | the tuple reads each class's own `__dict__`, and a test fails if a family class does not declare its own `model_type` |
+
+Two smaller hardenings: `is_qwen4_exp_config()` now only iterates known container
+types for `architectures` (it runs for *every* model built, so a malformed
+third-party value must not raise during engine init), and the `architectures`
+string form is accepted rather than iterated character-wise.
+
+The tests were the other finding: the guard's regression test built its config from
+the Whittle snapshot's `config.json` on a hard-coded path and skipped as a *module*
+when that was absent, so the fix was unpinned on any other machine. It now builds
+synthetic config dirs (runs anywhere), keeps a real-checkpoint test that runs when
+the snapshot is cached, and asserts the negatives too -- a PLE-less family config and
+a non-family config must **not** be split, and must **not** have their capture mode
+touched.
+
+Resulting behaviour, through the real `ModelConfig`/`VllmConfig` path (the one the
+engine uses at init), on this ROCm box:
+
+| checkpoint config | op split out | cudagraph_mode |
+| --- | --- | --- |
+| `qwen4_exp_text` + `ple_layer_ids: [2]` (Whittle) | yes | `PIECEWISE` |
+| `qwen4_exp` + `ple_layer_ids: [2]` | yes | `PIECEWISE` |
+| `qwen4_exp_text` + `ple_layer_ids: []` | no | `FULL_AND_PIECEWISE` (untouched) |
+| `qwen4_exp_text` without the key | no | `FULL_AND_PIECEWISE` (untouched) |
+| `llama` | no | `FULL_AND_PIECEWISE` (untouched) |
+
+Verified after the change: 54 tests pass across the two files (including the
+real-Whittle-config case), `ruff check`/`ruff format --check` clean, and
+`import vllm.config.vllm` unchanged at ~12.5 s. The narrowing does not touch the
+measured behaviour above: Whittle still appends the op and still downgrades, which is
+why the verified capture run stays valid.
+
 ## Open
 
 - **Is `backed_size_oblivious` still required now that the split is applied?**
