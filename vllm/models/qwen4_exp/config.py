@@ -289,8 +289,50 @@ class Qwen4ExpConfig(PretrainedConfig):
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 
 
+# Every ``model_type`` the Qwen4Exp family can present, derived from the config
+# classes that declare one, plus the MTP drafter's rewrite (``SpeculativeConfig``
+# turns a family checkpoint's ``model_type`` into ``qwen4_exp_mtp``). Anything
+# that has to recognise *the family* rather than one spelling of it must go
+# through ``is_qwen4_exp_model_type`` / ``is_qwen4_exp_config``: an exact
+# comparison against a single spelling silently misses the rest, and a missed
+# match in the compilation guard leaves the PLE n-gram lookup -- a blocking
+# device->host copy into pinned memory -- inside a full cudagraph capture, which
+# kills engine init with ``hipErrorStreamCaptureUnsupported``.
+QWEN4_EXP_MODEL_TYPES: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        config_cls.model_type
+        for config_cls in (Qwen4ExpConfig, Qwen4ExpTextConfig, Qwen4ExpVisionConfig)
+    )
+) + ("qwen4_exp_mtp",)
+
+
+def is_qwen4_exp_model_type(model_type: object) -> bool:
+    """Whether a ``model_type`` string belongs to the Qwen4Exp family."""
+    return isinstance(model_type, str) and model_type in QWEN4_EXP_MODEL_TYPES
+
+
+def is_qwen4_exp_config(hf_config: object) -> bool:
+    """Whether a resolved HF config belongs to the Qwen4Exp family.
+
+    ``model_type`` is the primary signal (the family spells it ``qwen4_exp``,
+    ``qwen4_exp_text`` or ``qwen4_exp_mtp`` depending on the checkpoint and
+    variant); the declared ``architectures`` entry is the fallback for a config
+    that omits or re-spells it.
+    """
+    if is_qwen4_exp_model_type(getattr(hf_config, "model_type", None)):
+        return True
+    architectures = getattr(hf_config, "architectures", None) or ()
+    return any(
+        isinstance(architecture, str) and architecture.startswith("Qwen4Exp")
+        for architecture in architectures
+    )
+
+
 __all__ = [
+    "QWEN4_EXP_MODEL_TYPES",
     "Qwen4ExpConfig",
     "Qwen4ExpTextConfig",
     "Qwen4ExpVisionConfig",
+    "is_qwen4_exp_config",
+    "is_qwen4_exp_model_type",
 ]

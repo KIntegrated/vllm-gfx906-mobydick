@@ -16,6 +16,7 @@ from vllm.config.model import HfOverrides, ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
+from vllm.models.qwen4_exp.config import is_qwen4_exp_model_type
 from vllm.transformers_utils.config import get_hf_text_config
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
@@ -829,7 +830,7 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["Qwen3NextMTP"]}
             )
-        if hf_config.model_type in {"qwen4_exp", "qwen4_exp_text"}:
+        if is_qwen4_exp_model_type(hf_config.model_type):
             hf_config.model_type = "qwen4_exp_mtp"
         if hf_config.model_type == "qwen4_exp_mtp":
             text_config = get_hf_text_config(hf_config)

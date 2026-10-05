@@ -22,6 +22,7 @@ from pydantic import ConfigDict, Field, model_validator
 
 import vllm.envs as envs
 from vllm.logger import enable_trace_function_call, init_logger
+from vllm.models.qwen4_exp.config import is_qwen4_exp_config
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
@@ -1904,10 +1905,25 @@ class VllmConfig:
         # it inside a graph capture ("operation not permitted when stream is
         # capturing"). Keep it outside the captured pieces, like the attention
         # ops: appended after the defaults so they are not replaced.
+        _qwen4_exp_ple_model = False
+        if self.model_config is not None:
+            # Match the family, not one spelling of it (``is_qwen4_exp_config``):
+            # a checkpoint's ``model_type`` varies -- Whittle ships
+            # ``qwen4_exp_text``, which the original exact ``== "qwen4_exp"`` test
+            # missed, so the PLE op stayed inside the captured graph and the
+            # engine died with hipErrorStreamCaptureUnsupported.  The
+            # (possibly multimodal) wrapper config and its text sub-config are
+            # both consulted.
+            _qwen4_exp_ple_model = any(
+                is_qwen4_exp_config(config)
+                for config in (
+                    self.model_config.hf_config,
+                    self.model_config.hf_text_config,
+                )
+            )
         if (
             self.model_config is not None
-            and getattr(self.model_config.hf_config, "model_type", None)
-            == "qwen4_exp"
+            and _qwen4_exp_ple_model
             and self.compilation_config.splitting_ops is not None
         ):
             self.compilation_config.splitting_ops.append(
