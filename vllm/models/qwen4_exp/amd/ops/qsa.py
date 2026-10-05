@@ -10,12 +10,25 @@ import math
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
 from vllm.models.qwen4_exp.common.qsa_cache import QSA_ACTIVATION_DTYPES
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+logger = init_logger(__name__)
+
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
+
+# Largest selection width `_C.top_k_per_row_decode` is safe for on gfx906.
+#
+# Measured 2026-09-28 (`/local/tmp/wht1/topk_case.py`, one process per width so a
+# sticky HIP error cannot masquerade as the next case's failure): widths 4, 512,
+# 2048, 4096, 8192 agree with the reference selection, while 12288 and 16384
+# raise `illegal memory access` -- a memory-safety failure, not a clean limit, so
+# the ceiling is "verified working", not "documented maximum". Widths above it
+# take `_reference_block_ranks`.
+_TOPK_KERNEL_MAX_WIDTH = 8192
 
 
 @triton.jit
@@ -885,6 +898,80 @@ def expand_qsa_block_indices_cuda(
     return out
 
 
+def _reference_block_ranks(
+    logits: torch.Tensor,
+    row_ends: torch.Tensor,
+    blocks: torch.Tensor,
+    block_topk: int,
+) -> None:
+    """Reference selection for widths the tuned top-k kernel does not cover.
+
+    Mirrors the ``torch`` backend of ``vllm/model_executor/layers/indexer_topk.py``:
+    mask the columns at or past each row's visible end, take the ``block_topk``
+    highest scores, then -1-fill every entry that falls outside the row's
+    visibility so the expand step skips it. Rows with fewer visible blocks than
+    the width come back -1-padded, and a width wider than the cache is clamped --
+    the same contract ``_C.top_k_per_row_decode`` honours.
+    """
+
+    rows, columns = logits.shape
+    ends = row_ends.reshape(-1)[:rows].to(torch.int64)
+    blocks.fill_(-1)
+    if columns == 0:
+        return
+
+    width = min(int(block_topk), columns)
+    column_ids = torch.arange(columns, device=logits.device)
+    masked = logits.masked_fill(
+        column_ids.unsqueeze(0) >= ends.unsqueeze(1), float("-inf")
+    )
+    selected = masked.topk(width, dim=-1).indices
+    # A column at or past the row's end is not selectable -- the kernel never scans it.
+    # Rows with fewer visible blocks than the width must therefore come back -1-padded
+    # rather than carrying indices for blocks the row cannot see. (Padding by position
+    # instead would leak them, which only shows up when width > visible blocks.)
+    blocks[:, :width].copy_(
+        torch.where(selected < ends.unsqueeze(1), selected, -1).to(blocks.dtype)
+    )
+
+
+def _select_qsa_block_ranks(
+    logits: torch.Tensor,
+    row_ends: torch.Tensor,
+    blocks: torch.Tensor,
+    block_topk: int,
+) -> None:
+    """Fill ``blocks`` with each row's top ``block_topk`` block ranks.
+
+    The decode kernel serves any width up to ``_TOPK_KERNEL_MAX_WIDTH`` (and the
+    tuned widths above upstream's 512/2048 restriction are among them). Wider
+    selections -- e.g. a model whose indexer budget covers its whole context, so
+    the selection degenerates to "every block" -- take the reference path, which
+    is correct but untuned.
+    """
+
+    if block_topk <= _TOPK_KERNEL_MAX_WIDTH:
+        ops.top_k_per_row_decode(
+            logits,
+            1,
+            row_ends,
+            blocks,
+            blocks.shape[0],
+            logits.stride(0),
+            logits.stride(1),
+            block_topk,
+        )
+        return
+
+    logger.warning_once(
+        "QSA selection width %d is beyond the top-k kernel's verified ceiling "
+        "(%d); using the reference selection path (correct, but untuned).",
+        block_topk,
+        _TOPK_KERNEL_MAX_WIDTH,
+    )
+    _reference_block_ranks(logits, row_ends, blocks, block_topk)
+
+
 def qsa_select_paged_tokens(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -956,16 +1043,7 @@ def qsa_select_paged_tokens(
                 columns,
             )
         else:
-            ops.top_k_per_row_decode(
-                logits,
-                1,
-                visible_blocks,
-                blocks,
-                blocks.shape[0],
-                logits.stride(0),
-                logits.stride(1),
-                block_topk,
-            )
+            _select_qsa_block_ranks(logits, visible_blocks, blocks, block_topk)
         expand_qsa_block_indices_cuda(
             blocks,
             query_positions[row_slice],

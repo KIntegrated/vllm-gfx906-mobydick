@@ -481,3 +481,145 @@ def test_qsa_mqa_paged_route_selection(
     assert launched == (
         ["_qsa_mqa_paged_tiled_kernel"] if expect_tiled else ["_qsa_mqa_paged_kernel"]
     )
+
+
+def test_reference_block_ranks_follows_the_kernel_contract() -> None:
+    """The reference selection mirrors ``top_k_per_row_decode``'s output contract.
+
+    Per row: the top ``block_topk`` visible blocks by score, -1 past the row's
+    visible end. Row ends are block counts, as ``qsa_mqa_paged`` returns them.
+    """
+
+    logits = torch.tensor(
+        [[0.5, 3.0, 1.0, 2.0], [4.0, 0.25, 0.0, -1.0]], dtype=torch.float32
+    )
+    row_ends = torch.tensor([3, 1], dtype=torch.int32)
+    blocks = torch.full((2, 2), 123, dtype=torch.int32)
+
+    qsa_ops._reference_block_ranks(logits, row_ends, blocks, 2)
+
+    # Row 0 sees blocks 0..2 -> 1 (3.0) and 2 (1.0); row 1 sees block 0 only.
+    assert blocks.tolist() == [[1, 2], [0, -1]]
+
+
+def test_reference_block_ranks_clamps_a_width_wider_than_the_cache() -> None:
+    logits = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
+    row_ends = torch.tensor([3], dtype=torch.int32)
+    blocks = torch.full((1, 8), 123, dtype=torch.int32)
+
+    qsa_ops._reference_block_ranks(logits, row_ends, blocks, 8)
+
+    assert blocks.tolist() == [[2, 1, 0, -1, -1, -1, -1, -1]]
+
+
+def test_reference_block_ranks_handles_an_empty_cache() -> None:
+    blocks = torch.full((2, 4), 123, dtype=torch.int32)
+
+    qsa_ops._reference_block_ranks(
+        torch.empty((2, 0), dtype=torch.float32),
+        torch.zeros((2,), dtype=torch.int32),
+        blocks,
+        4,
+    )
+
+    assert blocks.tolist() == [[-1, -1, -1, -1], [-1, -1, -1, -1]]
+
+
+def test_reference_block_ranks_pads_by_visibility_not_position() -> None:
+    """Blocks past a row's visible end must never be selected.
+
+    Regression from the prefill-scale probe: padding by output position leaked real
+    block indices for blocks the row cannot see (the kernel never scans them), which
+    only shows up once the width exceeds the row's visible block count.
+    """
+
+    logits = torch.tensor(
+        [[5.0, 4.0, 3.0, 2.0], [0.1, 0.4, 0.3, 0.2]], dtype=torch.float32
+    )
+    row_ends = torch.tensor([1, 4], dtype=torch.int32)
+    blocks = torch.full((2, 4), 123, dtype=torch.int32)
+
+    qsa_ops._reference_block_ranks(logits, row_ends, blocks, 4)
+
+    # Row 0 sees only block 0, so the other three slots are invalid, not blocks 1..3.
+    assert blocks[0].tolist() == [0, -1, -1, -1]
+    # Row 1 sees everything, in descending score order.
+    assert blocks[1].tolist() == [1, 2, 3, 0]
+
+
+def test_select_qsa_block_ranks_dispatches_by_measured_ceiling(monkeypatch) -> None:
+    """Kernel up to the verified width ceiling, reference above it.
+
+    The ceiling is measured, not assumed: on gfx906 the decode kernel agrees with
+    the reference selection at 8192 and corrupts memory at 12288/16384
+    (`/local/tmp/wht1/topk_case.py`). A model whose indexer budget covers its
+    context selects 65536 blocks, which is past the ceiling by construction.
+    """
+
+    calls: list[int] = []
+
+    def _fake_kernel(logits, next_n, row_ends, blocks, num_rows, s0, s1, topk):
+        calls.append(topk)
+        blocks.fill_(-1)
+
+    monkeypatch.setattr(qsa_ops.ops, "top_k_per_row_decode", _fake_kernel)
+
+    logits = torch.zeros((1, 4), dtype=torch.float32)
+    row_ends = torch.tensor([4], dtype=torch.int32)
+    blocks = torch.empty((1, 4), dtype=torch.int32)
+
+    for width in (2, 512, 2048, qsa_ops._TOPK_KERNEL_MAX_WIDTH):
+        qsa_ops._select_qsa_block_ranks(logits, row_ends, blocks, width)
+
+    assert calls == [2, 512, 2048, 8192]
+
+    # Just past the ceiling -- and the width of the model this was written for.
+    for width in (8193, 65536):
+        qsa_ops._select_qsa_block_ranks(logits, row_ends, blocks, width)
+
+    # Above the ceiling the reference path answers, so the kernel is not called.
+    assert calls == [2, 512, 2048, 8192]
+
+
+@pytest.mark.parametrize(
+    ("budget", "ratio", "max_model_len", "expected"),
+    [
+        # Whittle-Qwen-3.8-35B-A3B: a full-context budget on a 32k server.
+        (262144, 4, 32768, 8192),
+        # The same checkpoint served at its full 262144 context.
+        (262144, 4, 262144, 65536),
+        # A budget that already fits is untouched.
+        (2048, 4, 262144, 2048),
+        (8192, 4, 32768, 8192),
+    ],
+)
+def test_addressable_token_topk_caps_a_full_context_budget(
+    budget: int, ratio: int, max_model_len: int, expected: int
+) -> None:
+    """An indexer budget wider than the context can address buys nothing.
+
+    Unclamped, the selection buffer is ``max_num_batched_tokens x
+    (budget + ratio - 1)`` int32 *per layer*: 4 GiB per layer for Whittle at
+    MBT 4096, which OOMed the loader at layer 7 of 40.
+    """
+
+    from vllm.models.qwen4_exp.amd.indexer_qsa import addressable_token_topk
+
+    assert addressable_token_topk(budget, ratio, max_model_len) == expected
+
+
+def test_addressable_token_topk_never_truncates_an_addressable_row() -> None:
+    """The cap stays above every row's reachable compressed tokens.
+
+    A row addresses at most ``ceil(max_model_len / ratio)`` compressed tokens, so
+    the cap must not fall below that -- and must stay divisible by the compression
+    ratio, which the index-expansion kernel requires.
+    """
+
+    from vllm.models.qwen4_exp.amd.indexer_qsa import addressable_token_topk
+
+    for max_model_len in (1, 63, 64, 65, 4096, 32768, 32770, 131072, 262144):
+        for ratio in (2, 4, 8):
+            width = addressable_token_topk(10**9, ratio, max_model_len)
+            assert width >= math.ceil(max_model_len / ratio)
+            assert width % ratio == 0

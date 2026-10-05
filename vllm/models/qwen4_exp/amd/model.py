@@ -94,6 +94,31 @@ def without_modelopt_fp4(
     return quant_config
 
 
+# ``Whittle-Qwen-3.8-35B-A3B`` repacks the PLE embedding table out of the PLE
+# layer and onto the checkpoint root -- ``ngram_embedding.shard_<n>.weight`` and
+# ``ple_embedding.layer_multipliers`` -- where the parent family serializes them
+# as ``layers.<ple>.ple.ple_embedding.<...>``. Each root key maps to itself under
+# the owning layer's ``ple_embedding`` child, and the match is anchored at the
+# start of the name so parent-style names, which already carry a layer prefix,
+# are left alone.
+_PACKED_PLE_ROOT_PREFIXES = {
+    "ngram_embedding.": "ngram_embedding.",
+    "ple_embedding.": "",
+}
+
+
+def _remap_packed_ple_table_name(name: str, ple_layer_index: int | None) -> str:
+    """Move a root-packed PLE embedding table onto its owning layer."""
+
+    if ple_layer_index is None:
+        return name
+    for root_prefix, child_prefix in _PACKED_PLE_ROOT_PREFIXES.items():
+        if name.startswith(root_prefix):
+            leaf = name[len(root_prefix) :]
+            return f"layers.{ple_layer_index}.ple.ple_embedding.{child_prefix}{leaf}"
+    return name
+
+
 def _remap_qsa_cache_scale_name(
     name: str,
     qsa_layer_ids: frozenset[int],
@@ -406,6 +431,13 @@ class Qwen4ExpModel(nn.Module):
             if layer_type == "full_attention"
             and getattr(config, "indexer_n_heads", None) is not None
         )
+        # A root-packed embedding table (see ``_remap_packed_ple_table_name``) can
+        # only be placed when the model owns exactly one PLE layer to hold it;
+        # ``ple_layer_ids`` is 1-based, the layer prefix is not.
+        ple_layer_ids = sorted(set(getattr(config, "ple_layer_ids", ()) or ()))
+        self._ple_layer_index = (
+            ple_layer_ids[0] - 1 if len(ple_layer_ids) == 1 else None
+        )
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
@@ -558,6 +590,13 @@ class Qwen4ExpModel(nn.Module):
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        weights = (
+            (
+                _remap_packed_ple_table_name(name, self._ple_layer_index),
+                weight,
+            )
+            for name, weight in weights
+        )
         weights = (
             (
                 _remap_qsa_cache_scale_name(name, self._qsa_layer_ids),
