@@ -85,20 +85,29 @@ validate on the real checkpoint, then delete the bespoke mmap path.
 **10.0 B of its 35.1 B parameters is a hashed n-gram memory** (8 tables × 4.88 M rows ×
 256) that its card says can sit in host RAM while the GPU holds a 27 B-class footprint at
 3 B-active decode — the same lever QSA-FN-9/11/15 pull, and the datum that decides whether
-the Flash-Next line serves at 256k on 2×32 GiB. **Postponed 2026-09-28** pending the bf16
-base (`logic65/Whittle-Qwen-3.8-35B-A3B`, `bf16-agentfix2/`, 66.2 GiB over 14 shards):
-`/local` has only 38 GiB free, `/data` (NFS) has 453 GiB — but the n-gram-bearing files
-12–14 (19.4 GiB) are the per-token read path, so those are the ones that want NVMe/page
-cache behind them. The GGUF is **not** the route on this stack (see `DEAD-ENDS.md`); the
-vLLM arm loads the bf16 checkpoint with the n-gram table off-GPU. **Blocked on:** the
-download only — the config gate that refused this geometry is fixed on
-`gfx906/wht1-qsa-topk` (`DEVLOG-wht1-qsa-topk.md`): the selection width is a runtime
-property of the decode kernel, and past a **measured** ceiling of 8192 blocks (12288 and
-16384 corrupt memory; filed upstream as UPR-3) selection takes a reference path instead.
-Unit-verified and loadable through `get_config`; not on the line until a real model load
-exercises it. **Gate (arm A3):** peak VRAM/card at init and the largest `max_model_len` that
-fits at `gpu_memory_utilization 0.90`, memory resident vs in host RAM (delta ≈ 18.6 GiB at
-bf16). Refs: issue #36, `DEVLOG-wht1-whittle-onboarding.md`.
+the Flash-Next line serves at 256k on 2×32 GiB. **Serving since 2026-10-05** (`DEVLOG-wht1-whittle-load.md`): the bf16 checkpoint (root
+= Phase-2 step 32010, 66.26 GiB over 14 shards, in `/biglocal/cache/hf`) **loads and
+serves** on 2× MI50 — TP=2 + EP, fp16, util 0.85, `max-model-len 16384`, MBT 512,
+`--enforce-eager` — at **24.38 GiB of weights per card** and 2.0 GiB of KV (117,964
+tokens, 7.2× at 16k). Coherent at temperature 0; **5.61 t/s at B=1 in eager mode**, not
+comparable to the tester's 46.8 t/s with MTP / 25.4 without (that was TP=4, graphed).
+~17 GiB of the n-gram table stays in host RAM — the offload lever this item exists to
+test. Four load blockers found and fixed, all in the devlog: the launch recipe (FA
+Triton env, fp16, V2 runner), a **4 GiB-per-layer** index buffer forced by this
+checkpoint's full-context `indexer_budget` (now clamped losslessly to what a row can
+address, which also brings the block selection back under the kernel ceiling), a
+**root-packed PLE embedding table** the fork now remaps onto its owning layer, and the
+MTP drafter — whose weights the checkpoint does **not** ship despite
+`mtp_num_hidden_layers: 1`, so it serves without spec decode. **Next:** the graph-capture
+arm (drop `--enforce-eager`, understood as a V2-runner profiler guard rather than the
+capture ladder), then the maxlen/MBT envelope at util 0.85. The selection-width work in
+`DEVLOG-wht1-qsa-topk.md` stands (measured ceiling 8192 blocks; UPR-3 filed).
+**Measured (2026-10-05, TP=2, util 0.85):** peak VRAM/card at init **25.03 GiB**; 24.38 GiB
+of weights resident per rank against a 66.26 GiB checkpoint, i.e. **~17 GiB of the n-gram
+table in host RAM** (the predicted delta was ≈ 18.6 GiB at bf16). Loaded at util 0.85 only —
+0.90 stays off the table on this box (mode-NONE high-util loading wedges GPU0). The
+remaining arm-A3 work is the largest `max_model_len`/MBT that fits. Refs: issue #36,
+`DEVLOG-wht1-whittle-load.md`, `DEVLOG-wht1-whittle-onboarding.md`.
 
 ### U30-1 — Nemotron-H: separate/quantized MTP lm_head + latent-MoE TP>1 AR · [#12](../../issues/12)
 

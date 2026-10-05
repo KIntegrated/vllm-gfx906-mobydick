@@ -12,6 +12,7 @@ from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -27,6 +28,46 @@ from ..common.qsa_cache import (
     QSAKeyStateCache,
     canonical_qsa_rope_positions,
 )
+
+logger = init_logger(__name__)
+
+
+def addressable_token_topk(
+    budget: int,
+    compress_ratio: int,
+    max_model_len: int,
+) -> int:
+    """Cap the QSA selection width at what a row can actually address.
+
+    The indexer's selection buffer is one row per scheduled token and one column
+    per request-relative compressed-token index, so a budget wider than the
+    longest sequence the server accepts buys nothing: a row can address at most
+    ``ceil(seq_len / compress_ratio)`` compressed tokens, and ``seq_len`` is
+    bounded by ``max_model_len``. Capping is therefore lossless -- it selects
+    the same set -- and it is what keeps a full-context budget servable.
+
+    Checkpoints that inherit the QSA indexer but are trained as dense models
+    carry ``indexer_budget == max_position_embeddings`` (Whittle-Qwen-3.8-35B-A3B:
+    262144 at ratio 4). Unclamped that sized a 262144-wide int32 buffer per
+    layer -- 4 GiB at ``max_num_batched_tokens`` 4096 -- and OOMed the loader at
+    the 7th of 40 layers on a 32 GB card. The result is rounded up to a multiple
+    of the compression ratio because the kernel requires
+    ``token_topk % compress_ratio == 0``.
+    """
+    addressable = -(-max_model_len // compress_ratio)
+    addressable = -(-addressable // compress_ratio) * compress_ratio
+    if budget <= addressable:
+        return budget
+    logger.warning_once(
+        "QSA indexer budget %d exceeds the %d compressed tokens a row can "
+        "address at max_model_len=%d (compress_ratio=%d); capping the "
+        "selection width to the addressable count.",
+        budget,
+        addressable,
+        max_model_len,
+        compress_ratio,
+    )
+    return addressable
 
 
 def apply_qsa_rope(
@@ -101,8 +142,12 @@ class QSAIndexer(nn.Module):
         self.index_n_heads = int(config.indexer_n_heads)
         self.index_kv_heads = int(config.indexer_kv_heads)
         self.index_head_dim = int(config.indexer_head_dim)
-        self.token_topk = int(config.indexer_budget)
         self.compress_ratio = int(config.indexer_compress_ratio)
+        self.token_topk = addressable_token_topk(
+            int(config.indexer_budget),
+            self.compress_ratio,
+            int(vllm_config.model_config.max_model_len),
+        )
         self.rotary_emb = rotary_emb
         self.prefix = prefix
         # MTP step 0 selects the target-aligned rows; later steps reuse them

@@ -577,4 +577,49 @@ def test_select_qsa_block_ranks_dispatches_by_measured_ceiling(monkeypatch) -> N
     for width in (8193, 65536):
         qsa_ops._select_qsa_block_ranks(logits, row_ends, blocks, width)
 
+    # Above the ceiling the reference path answers, so the kernel is not called.
     assert calls == [2, 512, 2048, 8192]
+
+
+@pytest.mark.parametrize(
+    ("budget", "ratio", "max_model_len", "expected"),
+    [
+        # Whittle-Qwen-3.8-35B-A3B: a full-context budget on a 32k server.
+        (262144, 4, 32768, 8192),
+        # The same checkpoint served at its full 262144 context.
+        (262144, 4, 262144, 65536),
+        # A budget that already fits is untouched.
+        (2048, 4, 262144, 2048),
+        (8192, 4, 32768, 8192),
+    ],
+)
+def test_addressable_token_topk_caps_a_full_context_budget(
+    budget: int, ratio: int, max_model_len: int, expected: int
+) -> None:
+    """An indexer budget wider than the context can address buys nothing.
+
+    Unclamped, the selection buffer is ``max_num_batched_tokens x
+    (budget + ratio - 1)`` int32 *per layer*: 4 GiB per layer for Whittle at
+    MBT 4096, which OOMed the loader at layer 7 of 40.
+    """
+
+    from vllm.models.qwen4_exp.amd.indexer_qsa import addressable_token_topk
+
+    assert addressable_token_topk(budget, ratio, max_model_len) == expected
+
+
+def test_addressable_token_topk_never_truncates_an_addressable_row() -> None:
+    """The cap stays above every row's reachable compressed tokens.
+
+    A row addresses at most ``ceil(max_model_len / ratio)`` compressed tokens, so
+    the cap must not fall below that -- and must stay divisible by the compression
+    ratio, which the index-expansion kernel requires.
+    """
+
+    from vllm.models.qwen4_exp.amd.indexer_qsa import addressable_token_topk
+
+    for max_model_len in (1, 63, 64, 65, 4096, 32768, 32770, 131072, 262144):
+        for ratio in (2, 4, 8):
+            width = addressable_token_topk(10**9, ratio, max_model_len)
+            assert width >= math.ceil(max_model_len / ratio)
+            assert width % ratio == 0
