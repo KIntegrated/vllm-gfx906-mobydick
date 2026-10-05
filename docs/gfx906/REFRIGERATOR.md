@@ -8,6 +8,23 @@ only by meeting its gate (or by a user decision). Dev-log-level
 refrigerated levers stay in their `DEVLOG-*.md` residue sections; this
 file indexes roadmap-level items only (see Cross-references).
 
+## WHT-1 GGUF half — Q8_0 onboarding for Whittle-Qwen-3.8-35B-A3B
+
+**Parked: tooling-blocked (user decision 2026-10-05, when WHT-1 was closed with the bf16
+path serving).** The item was opened to test `Whittle-Qwen-3.8-35B-A3B-Q8_0.gguf`
+(`fb13eb28e82d0bd44394f886e119424e584a82dd0883c79c64cf06d8f48c52b1`, 37,828,807,904 B, kept
+at `/local/models/logic65/Whittle-Qwen-3.8-35B-A3B-GGUF/`) so the `qwen4_exp` line could be
+optimized against this box's VRAM. Two blockers: the fork has **no in-tree GGUF loader**
+(upstream moved GGUF to the out-of-tree `vllm-gguf-plugin`; `gguf_loader.py` and
+`layers/quantization/gguf.py` are absent and the venv has no `gguf` module), and
+**llama.cpp is not installed** on mi50-01, so there is no reference implementation to compare
+against either. **Reopen gate:** the OOT `vllm-gguf-plugin` can be made to build and load on
+gfx906 (ROCm 7.x, `extra-quant: ["vllm-gguf-plugin>=0.0.2"]`) *and* its quant path passes a
+coherence gate on this box, or llama.cpp becomes available for the reference side. On reopen:
+onboard the Q8_0 file, gate coherence against the bf16 serving path, and measure what the
+quantized file does to the host-resident-PLE footprint — that comparison, not the throughput,
+is why the item existed.
+
 ## DeepSeek-V4-Flash
 
 **Parked: hardware-blocked, not an active target (user decision

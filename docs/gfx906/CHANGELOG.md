@@ -8,6 +8,100 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-05 (WHT-1 closed — Whittle serves on 2× MI50, graphed, with the n-gram memory in host RAM)
+
+### WHT-1 — Whittle-Qwen-3.8-35B-A3B runs locally (a second `qwen4_exp` implementation) (#36)
+
+Whittle-Qwen-3.8-35B-A3B (Logic65's Phase-2 step-32010 conversion, bf16, 66.26 GiB over 14
+shards in `/biglocal/cache/hf`) **loads and serves on 2× MI50**, and it is the n-gram-memory
+experiment this item existed to run: 10.0 B of its 35.1 B parameters is a hashed n-gram table
+(8 tables × 4.88 M rows × 256) that stays in **host RAM** while each rank holds 24.38 GiB of
+weights — the same offload lever as QSA-FN-9/11/15, and the datum that decides whether the
+Flash-Next line serves at long context on 2×32 GiB.
+
+**Serving recipe:** TP=2 + `--enable-expert-parallel`, fp16 (no native bf16 on gfx906), util
+0.85 (0.90+ wedges GPU0 on this box), `max-model-len 16384`, MBT 512, block 64, no MTP (the
+checkpoint ships `mtp_num_hidden_layers: 1` with zero MTP tensors), and no `--enforce-eager`
+since 2026-10-05. `-cc.dynamic_shapes_config.type=backed_size_oblivious` is still in the
+winning combination — see the residue item below.
+
+| | eager (control) | graphed |
+| --- | --- | --- |
+| rep 1 / rep 2, 26-token probe | 2.75 / 5.61 t/s | 4.25 / **21.15 t/s** |
+| capture | `--enforce-eager` | PIECEWISE 3/3 in 27 s / 0.66 GiB (2nd round 4 s / 0.26 GiB) |
+| KV cache | 2.0 GiB / 117,964 tok (7.2× @16k) | 1.07 GiB / 62,914 tok (3.84× @16k) |
+| output | coherent | coherent, byte-identical |
+| peak VRAM/card at init | 25.03 GiB | 25.03 GiB |
+
+Coherent at temperature 0 end to end; canaries 37.9–38.8 t/s before and after the runs (38.7
+t/s post-load). 21.15 t/s is a **26-token probe — a signpost, not a benchmark**, and the
+tester's 46.8 t/s with MTP / 25.4 without are TP=4 and not comparable.
+
+**What blocked it, and what shipped** (four load fixes and one capture fix, all in the fork):
+
+- **Launch recipe** — the gfx906 flash-attn Triton gate (`FLASH_ATTENTION_TRITON_AMD_ENABLE`),
+  fp16 (QSA needs 2-byte floats), V2 model runner.
+- **A 4 GiB-per-layer index buffer.** This checkpoint carries a full-context `indexer_budget`
+  (262144), which sizes a 262144-wide int32 selection buffer per attention layer — 4 GiB each
+  at MBT 4096, 40 layers — and OOMed the loader at layer 7. Clamped losslessly to what a row
+  can address (`block_topk 65536 → 1024`), which also brings the decode selection back under
+  the kernel's measured 8192-block ceiling instead of falling back to the reference path.
+- **Root-packed PLE table.** The checkpoint ships `ngram_embedding.shard_N.weight` and
+  `ple_embedding.layer_multipliers` at the config root where the family nests them under
+  `layers.<ple>.ple.ple_embedding.`; the loader now remaps the names onto their owning layer.
+- **The MTP drafter** — absent from the checkpoint despite the config, so it serves without
+  speculative decode; `mtp_num_hidden_layers: 1` with no MTP tensors is a config/checkpoint
+  inconsistency, reported to the uploader.
+- **The cudagraph split guard — this is what unlocked capture.** The host-resident PLE lookup
+  is a *blocking* device→host copy (`pinned_ids.copy_(ngram_ids, non_blocking=False)`,
+  `vllm/models/qwen4_exp/amd/ple_layer.py:1237`; deliberate, because the host gathers rows out
+  of the mmap'd shards, and the async form read stale ids), and HIP refuses that inside a
+  stream capture — so the op must run in an eager region between captured pieces. The fork had
+  that guard, but it matched `hf_config.model_type == "qwen4_exp"` exactly while this
+  checkpoint declares `qwen4_exp_text`, so the op stayed inside the graph and engine init died
+  at `Capturing CUDA graphs (PIECEWISE): 0/3` with `hipErrorStreamCaptureUnsupported`.
+  Fixed family-wide rather than by widening one literal: the family's spellings now live in one
+  place (`vllm/models/qwen4_exp/config.py`, derived from the config classes that declare them,
+  plus the MTP rewrite `qwen4_exp_mtp`) behind `is_qwen4_exp_model_type` /
+  `is_qwen4_exp_config`, and both matching sites use it — the compilation guard and
+  `SpeculativeConfig`'s MTP rewrite, which had carried its own literal (the third such list,
+  which is why the drift existed).
+- **A self-review narrowed that widening before merge**, so it costs nothing it need not:
+  the guard now also requires the checkpoint to actually use the memory
+  (`uses_ngram_embedding`, the model state's own `bool(ple_layer_ids)` gate, which also
+  excludes the MTP drafter and any PLE-less family member) **and** the platform to be ROCm
+  (the op is AMD-only — `vllm::qwen4_exp_amd_ple_ngram_embedding` is registered in
+  `amd/ple_layer.py`, while the CUDA path prefetches through streams over a device-side table
+  and registers no such op), via `needs_ple_ngram_split(hf_config, is_rocm=…)`. A family
+  config with no PLE layers, the drafter, and every CUDA model keep the capture mode they
+  asked for. Regression cover: `tests/config/test_qwen4_exp_ple_splitting_ops.py` (the guard,
+  both spellings, the negatives, no duplicate append) and
+  `tests/config/test_qwen4_exp_family_match.py` (the predicate, the derived tuple vs inherited
+  `model_type`, odd `architectures` inputs).
+
+**Left open at closure — now #39 (WHT-1r, `ROADMAP.md`):** whether `backed_size_oblivious` is
+still required once the split applies (cheap bisect); the largest `max_model_len`/MBT that
+fits **with graphs on** (the graph pool takes KV from 2.0 to 1.07 GiB, so the envelope has to
+be re-measured); the AMD warmup gap
+(`model_executor/warmup/qwen4_exp_qsa_warmup.py` looks up `vllm.models.qwen4_exp.nvidia.*` in
+`sys.modules` and returns early on gfx906, so the QSA/indexer warmup never runs here); and a
+throughput number at a realistic probe length.
+
+**The Q8_0 GGUF half of this item is parked** — `REFRIGERATOR.md`: the fork has no in-tree
+GGUF loader (upstream moved GGUF to the out-of-tree `vllm-gguf-plugin`) and llama.cpp is not
+installed on mi50-01. The file is retained with its sha256
+(`fb13eb28…c52b1`, 37,828,807,904 B).
+
+**One figure is an inference, not a measurement:** "~17 GiB of the n-gram table stays in host
+RAM" is 66.26 GiB checkpoint − 2 × 24.38 GiB resident (the predicted bf16 delta was ≈ 18.6
+GiB). Nothing measured host memory.
+
+Records: `DEVLOG-wht1-whittle-onboarding.md`, `DEVLOG-wht1-whittle-load.md`,
+`DEVLOG-wht1-qsa-topk.md`, `DEVLOG-wht1-graph-capture.md` (which carries the two concurrent
+accounts folded into one, the ruled-out tables and the self-review). Commits `e3b6542393`,
+`b6873ecc25`, `df22877eee`, `d1a647a78a` on `gfx906/wht1-graph-capture`, fast-forwarded into
+the `gfx906/v0.30.0` line.
+
 ## 2026-09-28 (P2P-1 closed NO-GO — the custom all-reduce "win" was measured on a broken reduction)
 
 ### P2P-1 — re-test vLLM's custom all-reduce under live PCIe P2P (#3) — **NO-GO, not a win**
