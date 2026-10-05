@@ -95,3 +95,66 @@ reverts. Commit `6c97dc6492`.
   protects the LEGACY=0 flip). Do not cite the gather numbers for R3.
   Both live in the kv_max/tile-construction path; the serving campaign
   ran on the combined build.
+
+## 2026-10-05 — MBT-1r re-anchor: the published 64k B=1 point does NOT reproduce tonight
+
+**VERDICT: INCONCLUSIVE — the published point stands; tonight's reading is
+recorded as a candidate regression (box or code), not as a new anchor.**
+Recipe: the 2026-08-29 one replayed through `_serve_tp2_gfx906.sh` (maxlen
+262144) + `_bench_serve_grid_gfx906.py '[[65536,128]]' 2` — Qwen3.8-27B-AWQ-INT4,
+TP=2, **spec-free**, prefix caching OFF, `GFX906_FA_LEGACY` at its default, on
+`gfx906/v0.30.0` @ `a12f960a6d`, canary-gated first (38.7 t/s).
+
+| datum | published 2026-08-29 | post-0.30.0 note 2026-09-24 | re-anchor 2026-10-05 |
+|---|---|---|---|
+| prefill t/s @64k | 364.8 (365.1 / 364.5) | 354 | **307.1 / 308.9** |
+| TTFT s | 179.49 / 179.78 | 185.3 | **206.68 / 205.28** |
+| decode t/s @64k | — (out=1, EOS on filler) | — | 21.50 / 21.47 |
+| canary t/s | 38.9 | — | 38.7 |
+
+Two samples 0.6 % apart, so the −15.6 % vs the record (−13.2 % vs the 09-24
+note) is not sampling noise. Candidates, all still open:
+
+- **Instrument — NOT a difference for the 08-29 comparison (measured).** `syv9phase` was
+  installed 2026-09-03, i.e. *after* the 08-29 record, and tonight's arm logged 0
+  `SYV9PLUGIN` lines → both arms are plugin-free V1. What the plugin does change is
+  *reproducibility*: the 08-29 recipe can no longer boot as recorded on a box where it is
+  installed, because its gate does `open(<arm cfg>)` per hooked forward and dies in
+  `torch._dynamo` under this V1+fullgraph arm — the two earlier attempts of this same job
+  both failed exactly there (`phase1-rootcause.md`). The 09-24 note at 354 t/s is the
+  confounded datum instead: V2 runner + MTP k=3 + the plugin live.
+- **Flag drift:** the harness leaves `GFX906_FA_LEGACY` at its default, which was **1** on
+  08-29 and has been **0** since 2026-09-16 (KVLAYOUT-1, see `README.md`), so the record
+  differs from tonight's arm in that switch too. The LEGACY=0 bake was prefill-neutral, and
+  the 354 note was explicitly LEGACY=0 — recorded, not dismissed.
+- **Prompt drift:** the published 64k row ended `out=1 (EOS on filler)`; tonight the same
+  nominal pp65536 filler generated all 128 tokens. Same token count, different completion
+  behaviour — the two arms are not provably the same input.
+- **DVFS / mclk (leading box-side candidate, with a same-night control):** sampled mid-bench from
+  sysfs (`rocm-smi` blocks under load), `pp_dpm_mclk` **toggles 800 ↔ 1000 MHz** on both cards
+  during the 64k prefill. The control is the campaign's own traces: all four campaign-1 arms the
+  same night sampled the same reader every 5 s across their load windows
+  (`/local/tmp/qsa12/mclk_{A1,A2,C,D}.txt`, ~140 samples) and show **1000 MHz held under load,
+  350 at idle, and not one 800 MHz sample**. The 64k prefill bench is the only load tonight that
+  showed 800. So the down-shift is load-pattern dependent — a sustained full-bandwidth 65k prefill
+  pulls the memory clock down, a 32k campaign arm does not — and it is invisible to the
+  short-prompt canary. No root on this box, so mclk cannot be pinned to price it exactly.
+- **Gate implication:** tonight is a concrete counter-example to "canary healthy ⇒ perf work is
+  comparable" for *long-context prefill*: the canary is a short-prompt decode probe (no sustained
+  memory traffic), and it read its healthy 38.7 t/s while the 64k prefill point sat 15 % low. A
+  prefill-based gate is what this class of degradation needs.
+- **Code:** the tree has moved substantially since the 08-29 record and the 09-24 note
+  (0.30.0 base, the PLE/GDN train, the fork-switch registration). Not excluded — and with
+  the instrument difference retired, this and the box state are the only two survivors.
+- **Not implicated:** the wedge family — `journalctl -k` shows no `GPU reset` /
+  `wedged` in the window, and the boot was preceded by a 38.7 t/s canary on the
+  same cards.
+
+Next, cheapest first: (1) sample `pp_dpm_mclk` across a whole bench (not a mid-point
+grab) to price the 800-MHz share of the wall — the one candidate measurable without
+touching the tree; (2) a same-boot A/B against the pre-0.30.0 tip for the code side;
+(3) only then decide whether the README row gets re-anchored.
+
+Raw: `/local/tmp/mbt1r/bench_27b_64k_noplugin.out`,
+`/local/tmp/lcbench_mbt1r-np_server.log` (ready in ~695 s),
+`/local/tmp/mbt1r/phase1-rootcause.md`.
