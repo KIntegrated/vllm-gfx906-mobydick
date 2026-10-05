@@ -91,6 +91,10 @@ serves** on 2× MI50 — TP=2 + EP, fp16, util 0.85, `max-model-len 16384`, MBT 
 `--enforce-eager` — at **24.38 GiB of weights per card** and 2.0 GiB of KV (117,964
 tokens, 7.2× at 16k). Coherent at temperature 0; **5.61 t/s at B=1 in eager mode**, not
 comparable to the tester's 46.8 t/s with MTP / 25.4 without (that was TP=4, graphed).
+**Graph capture landed 2026-10-05** (`DEVLOG-wht1-cudagraph-guard.md`): PIECEWISE 3/3 in
+27 s / 0.66 GiB, 21.15 t/s on the same 26-token probe, bought with KV 2.0 → 1.07 GiB
+(the graph pool comes out of the same headroom) — the blocker was a `model_type` string
+mismatch in the compilation guard (`qwen4_exp_text` vs `qwen4_exp`), not a kernel.
 ~17 GiB of the n-gram table stays in host RAM — the offload lever this item exists to
 test. Four load blockers found and fixed, all in the devlog: the launch recipe (FA
 Triton env, fp16, V2 runner), a **4 GiB-per-layer** index buffer forced by this
@@ -98,9 +102,17 @@ checkpoint's full-context `indexer_budget` (now clamped losslessly to what a row
 address, which also brings the block selection back under the kernel ceiling), a
 **root-packed PLE embedding table** the fork now remaps onto its owning layer, and the
 MTP drafter — whose weights the checkpoint does **not** ship despite
-`mtp_num_hidden_layers: 1`, so it serves without spec decode. **Next:** the graph-capture
-arm (drop `--enforce-eager`, understood as a V2-runner profiler guard rather than the
-capture ladder), then the maxlen/MBT envelope at util 0.85. The selection-width work in
+`mtp_num_hidden_layers: 1`, so it serves without spec decode. **Graph capture landed 2026-10-05** (`DEVLOG-wht1-graph-capture.md`): decode at B=1 went
+from **5.61 → 21.15 t/s** on the same probe, with byte-identical coherent output. The
+blocker was one line of config plumbing — the fork's PLE-split guard matched
+`hf_config.model_type == "qwen4_exp"` exactly, and this checkpoint spells it
+`qwen4_exp_text`, so the host-resident n-gram lookup stayed inside the captured graph and
+engine init died with `hipErrorStreamCaptureUnsupported`. Now matched family-wide
+(resolved architecture first) with a regression test; the serving mode is
+`-cc.dynamic_shapes_config.type=backed_size_oblivious` plus that split, with no
+`--enforce-eager`. KV drops 2.0 → 1.07 GiB because the cudagraph pool reserves up front.
+**Next:** the maxlen/MBT envelope at util 0.85, and whether `backed_size_oblivious` is
+still required now that the split applies. The selection-width work in
 `DEVLOG-wht1-qsa-topk.md` stands (measured ceiling 8192 blocks; UPR-3 filed).
 **Measured (2026-10-05, TP=2, util 0.85):** peak VRAM/card at init **25.03 GiB**; 24.38 GiB
 of weights resident per rank against a 66.26 GiB checkpoint, i.e. **~17 GiB of the n-gram

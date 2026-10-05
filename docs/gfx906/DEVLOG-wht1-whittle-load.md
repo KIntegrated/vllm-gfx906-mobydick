@@ -114,7 +114,8 @@ compile path meeting the profiler's shapes on this build, not the ladder.
 
 ## Next
 
-- **Graph-capture arm**: drop `--enforce-eager` once the V2-runner profiler
+- **Graph-capture arm** (CLOSED 2026-10-05 — `DEVLOG-wht1-cudagraph-guard.md`):
+  drop `--enforce-eager` once the V2-runner profiler
   interaction is understood, then re-measure. The tester's validated 4x MI50
   config (TP=4, util 0.91, MBT 4096, MTP k=3) is **46.8 t/s at B=1, 25.4 without
   MTP**; our 5.61 t/s is eager, TP=2, MTP-less, so it is not comparable yet.

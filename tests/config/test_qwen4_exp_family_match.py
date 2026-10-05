@@ -69,6 +69,12 @@ def test_config_level_check_falls_back_to_architectures():
     assert is_qwen4_exp_config(config)
 
 
+def test_config_level_check_accepts_a_bare_architecture_string():
+    """``architectures`` is a list in practice, but some configs store a string."""
+    config = SimpleNamespace(model_type="", architectures="Qwen4ExpForCausalLM")
+    assert is_qwen4_exp_config(config)
+
+
 def test_config_level_check_tolerates_a_missing_model_type():
     config = SimpleNamespace()
     assert not is_qwen4_exp_config(config)

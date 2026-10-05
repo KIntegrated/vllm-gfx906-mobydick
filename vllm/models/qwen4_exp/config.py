@@ -322,6 +322,8 @@ def is_qwen4_exp_config(hf_config: object) -> bool:
     if is_qwen4_exp_model_type(getattr(hf_config, "model_type", None)):
         return True
     architectures = getattr(hf_config, "architectures", None) or ()
+    if isinstance(architectures, str):  # some configs store a bare string
+        architectures = (architectures,)
     return any(
         isinstance(architecture, str) and architecture.startswith("Qwen4Exp")
         for architecture in architectures
