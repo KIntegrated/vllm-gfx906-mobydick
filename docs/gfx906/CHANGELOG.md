@@ -102,6 +102,45 @@ accounts folded into one, the ruled-out tables and the self-review). Commits `e3
 `b6873ecc25`, `df22877eee`, `d1a647a78a` on `gfx906/wht1-graph-capture`, fast-forwarded into
 the `gfx906/v0.30.0` line.
 
+### #40 — the PLE n-gram lookup used the runtime's stride, not the checkpoint's split (fixed in the fork)
+
+Whittle's host-resident n-gram table killed the engine on any longer generation:
+`IndexError: index out of range in self` at `amd/ple_layer.py:202` from the lookup op at `:1238`,
+graphed (16:34:19) and eager (16:39:23) alike. Two row layouts were in play. The runtime computed
+`shard_row_capacity = ceil(39,040,640 / 5) = 7,808,128` from **its own** prime-based vocab layout
+before any weight was loaded, while the checkpoint is a plain contiguous split — 7,812,500 × 4 +
+7,790,000 = 39,040,000 rows, matching its own `ngram_heads_offsets` / `ngram_heads_vocab_sizes`
+(8 × 4,880,000). Every id >= 7,808,128 therefore read the wrong row silently (id 7,810,000 →
+runtime (shard 1, row 1,872) vs the checkpoint's row 7,810,000 of shard 0), and the last 17,488 ids
+indexed off the end of shard 4 and killed EngineCore. That window is 0.36 % of a token's draws —
+one per token, since only the last head reaches it — so short probes usually survive (~83 % for a
+26-token prompt, which is why dozens passed all day), while the counting prompt sits inside the
+window, which is why both decode-length arms died at the same frame.
+
+The boundaries now come from the shards that were loaded and the id space from the checkpoint's own
+layout buffers, required to agree: `build_ple_shard_layout` (new), recorded by
+`MmapShardedNGramEmbedding.finalize_shard_layout`, called at the end of
+`Qwen4ExpNGramEmbedding.load_weights` so a chunked delivery completes on the last chunk;
+`forward` masks by `[start, start + rows)` per shard instead of `id // shard_row_capacity` and folds
+against the loaded rows (39,040,000 here, not 39,040,640). A split that does not add up to the id
+space is a load-time `ValueError`; a split that is merely non-canonical is served and **warned
+about** — and this checkpoint is non-canonical, which the load log now says out loud. The nvidia path
+already validates shard shapes (`nvidia/ngram_embedding.py:896-920`) and would have refused this
+checkpoint; the AMD port had dropped that check, which is why it loaded silently.
+
+**Validated on 2× MI50** (util 0.85, TP=2 + EP, fp16, 16k / MBT 512, graphs on, compile cache
+wiped, single arm `FIX_graphed`): the 512-token prompt that killed EngineCore twice now completes —
+**rep1 21.64, rep2 25.55, rep3 25.57 t/s** at mclk 1000 MHz, coherent, KV cache unchanged at
+1.07 GiB / 62,914 tokens (3.84× @16k), load 731 s, capture 26 s / 0.66 GiB, and both workers log the
+layout line (`id space 39040000 … [7812500, 7812500, 7812500, 7812500, 7790000]`). Canaries 38.6 t/s
+before and 38.7 t/s after; VRAM back to baseline. This also answers WHT-1r item 4: **25.6 t/s at 512
+tokens**, against the 21.6 t/s of the 26-token probes.
+
+12 new tests in `tests/models/qwen4_exp/test_ple_mmap_shards.py` (34 in the file; `test_ple.py` 50,
+`test_ple_table_remap_amd.py` 9, ruff check + format clean), including the checkpoint's own
+arithmetic without allocating a 39 M-row table. Devlog: `DEVLOG-wht1r-residue.md`. Follow-up for the
+uploader, not for this fork: a re-split to vLLM's canonical layout would silence the warning.
+
 ## 2026-09-28 (P2P-1 closed NO-GO — the custom all-reduce "win" was measured on a broken reduction)
 
 ### P2P-1 — re-test vLLM's custom all-reduce under live PCIe P2P (#3) — **NO-GO, not a win**

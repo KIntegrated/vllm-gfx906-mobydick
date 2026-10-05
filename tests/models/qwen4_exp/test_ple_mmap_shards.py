@@ -387,3 +387,181 @@ def test_load_weights_rejects_embedding_dim_mismatch():
     wrong = torch.zeros(CAPACITY, DIM + 1, dtype=torch.float16)
     with pytest.raises(ValueError, match="Shape mismatch for PLE embedding shard"):
         _load(stub, [("ngram_embedding.shard_0.weight", wrong)])
+
+
+# --------------------------------------------------------------------------
+# the id -> row map comes from the checkpoint's split, not from the runtime's
+# stride (issue #40: a mismatch killed the engine and mis-read most ids)
+# --------------------------------------------------------------------------
+
+
+def _split_shard(base: int, n: int) -> torch.Tensor:
+    return _shard(base, n=n)
+
+
+@pytest.fixture
+def checkpoints_split():
+    """A checkpoint whose shards are shorter than the configured stride.
+
+    `CAPACITY` is the stride the runtime computes from its own vocab layout before
+    any weight is loaded, and the files here hold fewer rows than that per shard --
+    the shape of the real case, scaled down (see
+    `test_real_checkpoint_split_numbers` for the real one).
+    """
+    capacity, rows, num_shards = 5, [4, 4, 4, 4, 4], 5
+    e = ple.MmapShardedNGramEmbedding(num_shards, capacity, DIM)
+    for index, n in enumerate(rows):
+        e.set_shard(index, _split_shard(index * 100, n))
+    return e, capacity, rows, num_shards
+
+
+def test_uniform_stride_mis_locates_ids_when_the_split_differs(checkpoints_split):
+    """The bug, reproduced: with the stride alone, in-range ids either raise or
+    land on another shard's rows."""
+    e, _, _, _ = checkpoints_split
+    assert e.table_rows == 25  # the configured uniform split, pre-finalize
+    with pytest.raises(IndexError, match="index out of range"):
+        e(torch.tensor([9]))  # stride 5 -> shard 1, local 4; shard 1 holds 4 rows
+
+
+def test_finalized_layout_maps_every_id_to_its_own_row(checkpoints_split):
+    """After finalize the lookup equals one dense table built from the shards --
+    which is what the checkpoint's split means."""
+    e, _, rows, num_shards = checkpoints_split
+    assert e.finalize_shard_layout(sum(rows)) is True
+    assert e._shard_starts == [0, 4, 8, 12, 16]
+    assert e._shard_rows == rows
+    assert e.table_rows == sum(rows)
+
+    ids = torch.arange(sum(rows))
+    assert torch.equal(e(ids), _reference(e._shards, ids, DIM))
+    # the ids the stride alone crashed on, one per shard boundary
+    assert torch.equal(
+        e(torch.tensor([4, 9, 14, 19])),
+        _reference(e._shards, torch.tensor([4, 9, 14, 19]), DIM),
+    )
+    # and the fold still covers ids outside the table
+    assert torch.equal(
+        e(torch.tensor([sum(rows), -1])),
+        _reference(e._shards, torch.tensor([0, 0]), DIM),
+    )
+
+
+def test_layout_rejects_a_split_that_does_not_add_up_to_the_id_space():
+    """Serving this would mean serving embeddings from rows the checkpoint never
+    meant for those ids, so it is a load-time error rather than a warning."""
+    with pytest.raises(
+        ValueError, match=r"hold 19 rows but the model's ngram id space is 20"
+    ):
+        ple.build_ple_shard_layout(
+            [4, 4, 4, 3, 4],
+            num_shards=5,
+            shard_row_capacity=5,
+            vocab_size=20,
+        )
+
+
+def test_layout_rejects_a_non_positive_shard():
+    with pytest.raises(ValueError, match="holds 0 rows"):
+        ple.build_ple_shard_layout(
+            [4, 0, 4], num_shards=3, shard_row_capacity=4, vocab_size=8
+        )
+
+
+def test_layout_accepts_the_canonical_split_without_warning(caplog):
+    """vLLM's own splitter: one uniform stride, short last shard. No grumbling."""
+    with caplog.at_level("WARNING"):
+        starts, rows = ple.build_ple_shard_layout(
+            [8, 8, 4], num_shards=3, shard_row_capacity=8, vocab_size=20
+        )
+    assert (starts, rows) == ([0, 8, 16], [8, 8, 4])
+    assert not [r for r in caplog.records if "canonical split" in r.getMessage()]
+
+
+def test_layout_warns_on_a_non_canonical_split(caplog):
+    """The split is served, but whoever produced it should see that it is not the
+    layout vLLM's own splitter would have written."""
+    with caplog.at_level("WARNING"):
+        ple.build_ple_shard_layout(
+            [4, 4, 4, 4, 4], num_shards=5, shard_row_capacity=5, vocab_size=20
+        )
+    warned = [r for r in caplog.records if "canonical split" in r.getMessage()]
+    assert len(warned) == 1
+    assert "re-split" in warned[0].getMessage()
+
+
+def test_layout_warns_when_the_id_space_is_unknown(caplog):
+    """A load with no layout buffers (a stub, or a partial checkpoint) still gets
+    the row boundaries from the shards, but says that it could not check them."""
+    with caplog.at_level("WARNING"):
+        starts, rows = ple.build_ple_shard_layout(
+            [4, 4], num_shards=2, shard_row_capacity=4, vocab_size=None
+        )
+    assert (starts, rows) == ([0, 4], [4, 4])
+    assert [r for r in caplog.records if "id space is unknown" in r.getMessage()]
+
+
+def test_real_checkpoint_split_numbers():
+    """`Whittle-Qwen-3.8-35B-A3B` verbatim: 7,812,500 x 4 + 7,790,000 rows against
+    a stride of 7,808,128 derived from the runtime's own prime-based layout, with
+    the checkpoint's buffers (8 x 4,880,000) defining an id space of 39,040,000.
+
+    This is the arithmetic behind issue #40, asserted without allocating the table:
+    the id that used to crash, and the ids the stride used to mis-locate.
+    """
+    capacity = 7_808_128
+    rows = [7_812_500, 7_812_500, 7_812_500, 7_812_500, 7_790_000]
+    vocab_size = 39_040_000
+    starts, out_rows = ple.build_ple_shard_layout(
+        rows, num_shards=5, shard_row_capacity=capacity, vocab_size=vocab_size
+    )
+    assert starts == [0, 7_812_500, 15_625_000, 23_437_500, 31_250_000]
+    assert out_rows == rows and sum(rows) == vocab_size
+
+    # the first id the uniform stride could not address: shard 4, local 7,790,000,
+    # one past the last row of the file
+    crash_lo = 4 * capacity + rows[4]
+    assert crash_lo == 39_022_512
+    assert (vocab_size - crash_lo) == 17_488
+
+    # after the fix it is simply row 7,772,512 of shard 4
+    assert crash_lo - starts[4] == 7_772_512
+    assert crash_lo - starts[4] < rows[4]
+
+    # an id the stride mis-located: stride says shard 1 row 1,872, the checkpoint
+    # stores it as row 7,810,000 of shard 0
+    misread = 7_810_000
+    assert divmod(misread, capacity) == (1, 1_872)
+    assert misread - starts[0] == 7_810_000 and misread < starts[1]
+
+    # only the last shard is short, and only the last 17,488 ids were unreachable
+    assert out_rows[:4] == [capacity + 4_372] * 4
+
+
+def test_load_weights_finalizes_the_layout_from_the_shards():
+    """`load_weights` is where a chunked delivery ends, so that is where the
+    boundaries are derived -- the stub's layout buffers stay zeroed, which is the
+    'id space unknown' path: the rows still define the mapping."""
+    stub = _Stub()
+    for index in range(NUM_SHARDS):
+        _load(stub, [(f"ngram_embedding.shard_{index}.weight", _shard(index * 100))])
+    emb = stub.ngram_embedding
+    assert emb._shard_starts == [0, CAPACITY, 2 * CAPACITY]
+    assert emb._shard_rows == [CAPACITY] * NUM_SHARDS
+    ids = torch.tensor([0, CAPACITY - 1, CAPACITY, 2 * CAPACITY - 1])
+    assert torch.equal(emb(ids), _reference(emb._shards, ids, DIM))
+
+
+def test_load_weights_refuses_a_split_that_does_not_match_the_id_space():
+    """With the layout buffers present, a split that does not add up is refused at
+    load time instead of being served."""
+    stub = _Stub()
+    stub.ngram_heads_vocab_sizes = torch.tensor([7], dtype=torch.long)
+    stub.ngram_heads_offsets = torch.tensor([0], dtype=torch.long)
+    shards = [
+        (f"ngram_embedding.shard_{index}.weight", _shard(index * 100))
+        for index in range(NUM_SHARDS)
+    ]
+    weights = shards + [("ngram_heads_offsets", torch.tensor([0], dtype=torch.long))]
+    with pytest.raises(ValueError, match="id space"):
+        _load(stub, weights)

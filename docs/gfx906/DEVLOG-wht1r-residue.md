@@ -257,19 +257,30 @@ that are actually loaded. Two consequences:
 
 ### Why short probes passed and long ones die
 
-The window is 17,488 ids of 39,040,000 and only head 7's range reaches it, so ~0.0056 % per token
-lookup: ~0.1 % over a 26-token probe, ~2.8 % over 512 tokens. For a *repetitive* prompt
-("Count from 1 to 400": `1\n2\n3...`) the n-gram hash lands on a small set of ids, so a prompt
-that happens to sit inside the window dies on its first long request — which is what both
-attempts did.
+The lookup produces one id per (token, head) — `ngram_ids` is `[tokens, 8]` for this checkpoint —
+and the eight heads tile the id space in blocks of 4,880,000. Only the last block,
+`[34,160,000, 39,040,000)`, reaches the unaddressable tail, so exactly one of a token's eight ids
+can fall in the window: 17,488 / 4,880,000 = **0.36 % per token** with a near-uniform hash. A
+short request usually survives (a 26-token prompt plus its 26-token answer: ~83 %), while a
+512-token generation fails with ~84 % probability. That is the shape of the day: dozens of
+26-token probe requests, none of which hit.
+
+It also explains why the two decode-length arms died at the *same frame*. Both arms sent the
+identical prompt and the n-gram ids are a deterministic function of the token ids, so the prompt's
+ids are one draw, not two: the counting prompt sits inside the window and dies on its first long
+request (12.8 s graphed, 45.9 s eager — that difference is load, not luck).
 
 ### Evidence, reproducible without a GPU
 
 `/local/tmp/wht1r/pin_ple_range.py` drives the class's own `forward()` with the real capacity and
 a short last shard: with capacity 4 and files `[4,4,4,4,3]`, id 19 raises
 `IndexError: index out of range in self`, while the ids the guard is designed for (-1, and one
-beyond the table) are folded to row 0 without an exception. Scaled to this checkpoint, the crash
-window is `[39,022,512, 39,040,640)` and the stride mismatch is visible on any id >= 7,808,128.
+beyond the table) are folded to row 0 without an exception. Its crash id is outside that mini's
+own id space (19 rows, ids 0-18), which is the one thing it does not mirror; the mechanism is
+faithful. The faithful mirror is the regression test below, where the crash ids are *inside* the
+id space: capacity 5 with four-row files (id space 20) raises on ids 4, 9, 14 and 19, and
+`test_real_checkpoint_split_numbers` asserts this checkpoint's own arithmetic — crash window
+`[39,022,512, 39,040,000)`, and a wrong row on any id >= 7,808,128.
 
 ### Why the AMD port did not catch it at load time
 
@@ -306,3 +317,101 @@ exception text and is provable on CPU. The two mechanisms were conflated.
   that exceed the *actual* shard rows, so any residual mismatch degrades to row 0 instead of
   killing the engine.
 - (b) alone stops the crash; (a) is what makes the served model the model.
+
+## The fix (option (a), implemented in the fork)
+
+The decision above was to fix the fork rather than ask the uploader to re-split, so the boundaries
+now come from the shards that were loaded and the id space from the checkpoint's own layout buffers,
+with the two required to agree.
+
+- `build_ple_shard_layout(rows, num_shards=..., shard_row_capacity=..., vocab_size=...)` (new) turns
+  the *loaded* shards' row counts into cumulative `starts`, refuses a split whose rows do not add up
+  to the model's id space, and warns when the split is not the one vLLM's own splitter would have
+  written (`canonical_ple_shard_rows`) -- so a non-canonical checkpoint is served correctly *and*
+  says so in the log.
+- `MmapShardedNGramEmbedding.finalize_shard_layout(vocab_size)` records that layout;
+  `Qwen4ExpNGramEmbedding.load_weights` calls it at the end of every call, so a chunked delivery
+  completes on the last chunk. Until then -- dummy weights, or a harness that constructs the class
+  directly -- the configured uniform split stands, and a shard that never arrives still raises on
+  use instead of being papered over.
+- `forward` masks each shard by `flat_ids in [start, start + rows)` instead of
+  `id // shard_row_capacity`, and folds against the table's real row count (`table_rows`, now the
+  loaded rows: 39,040,000 for this checkpoint, not the runtime layout's 39,040,640). The loop stays
+  fixed-length over all shards, so CUDA-graph capture safety is not traded away.
+- The id space is `max(ngram_heads_offsets + ngram_heads_vocab_sizes)`, read *after* the checkpoint's
+  buffers have replaced the runtime's; when it is unavailable the rows still define the mapping and
+  only the consistency check is skipped, with a warning.
+
+Containment (option b) is implicit -- the fold now uses the loaded row count -- but the mapping
+itself is (a): every id reads the row the checkpoint stored for it.
+
+What this deliberately does not do: it does not re-split the checkpoint, does not write to the
+uploader's files, and does not touch the nvidia path (which already validates, and would refuse this
+checkpoint outright -- `logic65`'s split is non-canonical relative to vLLM's formula, which stays a
+note for the uploader).
+
+### Tests
+
+`tests/models/qwen4_exp/test_ple_mmap_shards.py`: 12 new tests, 34 in the file, all passing
+(`test_ple.py` 50 and `test_ple_table_remap_amd.py` 9 still pass; ruff check + format clean).
+
+- `test_uniform_stride_mis_locates_ids_when_the_split_differs` -- the bug, scaled: capacity 5 with
+  four-row files (id space 20), id 9 raises before finalize.
+- `test_finalized_layout_maps_every_id_to_its_own_row` -- after it, the lookup equals one dense table
+  built from the shards for *every* id, including the four the stride crashed on (4, 9, 14, 19); the
+  fold still covers ids outside the table.
+- `test_layout_rejects_a_split_that_does_not_add_up_to_the_id_space`,
+  `test_layout_rejects_a_non_positive_shard` -- load-time errors, not warnings.
+- `test_layout_accepts_the_canonical_split_without_warning`, `test_layout_warns_on_a_non_canonical_split`,
+  `test_layout_warns_when_the_id_space_is_unknown`.
+- `test_real_checkpoint_split_numbers` -- this checkpoint's arithmetic asserted directly: starts
+  `[0, 7,812,500, 15,625,000, 23,437,500, 31,250,000]`, the first unaddressable id 39,022,512 (17,488
+  of them), and the mis-located id 7,810,000 (stride says shard 1 row 1,872; the checkpoint stores it
+  as row 7,810,000 of shard 0).
+- `test_load_weights_finalizes_the_layout_from_the_shards` (one shard per call, i.e. chunked) and
+  `test_load_weights_refuses_a_split_that_does_not_match_the_id_space` -- the loader path.
+
+### Validation on 2x MI50 (the prompt that killed the engine, twice)
+
+One arm, `FIX_graphed`, same recipe as the campaign's `A_flag` cell (util 0.85, TP=2 + EP, fp16, 16k
+/ MBT 512, graphs on, compile cache wiped, `backed_size_oblivious`), launched clean on an idle box
+after the harness fix below. Canary 38.6 t/s before, 38.7 t/s after; VRAM back to baseline at the end.
+
+| | value |
+| --- | --- |
+| load | 731 s (weights 145.3 s, 24.38 GiB/rank) |
+| capture | 26 s / 0.66 GiB, then 4 s / 0.26 GiB |
+| KV cache | 1.07 GiB / 62,914 tokens (3.84x @16k) -- identical to pre-fix `A_flag` |
+| cold first call (1 token) | 0.18 s |
+| 512-token probe | rep1 21.64, rep2 25.55, rep3 25.57 t/s |
+| mclk under load | 1000 MHz |
+
+The same prompt that produced `IndexError: index out of range in self` at 16:34:19 (graphed) and
+16:39:23 (eager) now completes three full 512-token generations with coherent text, and no
+`IndexError` appears anywhere in the run's log window. The load log carries the new line from both
+workers, which is the fix working as designed:
+
+```
+WARNING [ple_layer.py:138] PLE ngram shards are not vLLM's canonical split (5 rows, id space
+39040000, stride 7808128) but [7812500, 7812500, 7812500, 7812500, 7790000] rows totalling
+39040000 ids. Serving the checkpoint's own boundaries, which is correct for the rows on disk; a
+re-split would restore the uniform layout.
+```
+
+The KV geometry being byte-identical to the pre-fix arm matters: the layout fix changes which rows
+are *read*, not how much memory the table or the cache takes, so the #39 envelope table stays valid.
+
+This answers WHT-1r item 4 -- the real-probe throughput is **25.6 t/s at 512 tokens**, well above the
+21.6 t/s the 26-token probes reported, because a long generation amortises the prefill instead of
+ending at the prompt's own EOS.
+
+### Harness bug found on the way (and banked in the skill)
+
+The first attempt at this validation launched while the previous run's canary was still resident:
+`canary()` in the harness starts the 27B canary server, reads its number, and never stopped it, so
+the tail canary from the crashed eager arm was still holding 22 GiB of card 0 sixteen minutes later.
+The arm was killed 30 s in and restarted on an idle box, and `probe2.sh` now (a) stops the canary and
+waits for VRAM to return to baseline, (b) refuses to launch an arm when a card is not idle, and
+(c) reads the canary's t/s from the log offset captured before the run, so a hung canary cannot be
+reported with the previous run's number. The recorded campaign arms are unaffected -- their canaries
+exited promptly, which is what a clean box looks like.

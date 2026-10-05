@@ -70,6 +70,99 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
         return (normalized * (1.0 + self.weight.float())).to(input_dtype)
 
 
+def canonical_ple_shard_rows(
+    num_shards: int, shard_row_capacity: int, vocab_size: int
+) -> list[int]:
+    """The row count vLLM's own splitter would give each shard: one uniform stride
+    with a short last shard.
+
+    Used to *describe* the expectation -- the mapping itself is taken from the
+    shards that were actually loaded -- and to warn when a checkpoint's split
+    disagrees with it.
+    """
+    return [
+        max(0, min(shard_row_capacity, vocab_size - index * shard_row_capacity))
+        for index in range(num_shards)
+    ]
+
+
+def build_ple_shard_layout(
+    rows: Sequence[int],
+    *,
+    num_shards: int,
+    shard_row_capacity: int,
+    vocab_size: int | None,
+) -> tuple[list[int], list[int]]:
+    """Turn the row count of each loaded shard into id -> (shard, row) boundaries.
+
+    The boundaries have to come from the checkpoint, not from the runtime's own
+    arithmetic. `shard_row_capacity` is computed before any weight is loaded --
+    from the vocab layout this module builds itself, with a per-head prime and a
+    padded total -- while the model's actual id space is whatever the checkpoint's
+    `ngram_heads_offsets` / `ngram_heads_vocab_sizes` say once those buffers have
+    been loaded over it. When the two disagree, a uniform-stride lookup reads the
+    wrong row for every id past the first boundary, and ids in the gap between
+    what the stride can address and the real id space index off the end of a
+    shard: `Whittle-Qwen-3.8-35B-A3B` splits 7,812,500 x 4 + 7,790,000 rows
+    (39,040,000 ids, matching its own flat 8 x 4,880,000 layout) against a stride
+    of 7,808,128, which crashed the engine on the last 17,488 ids and mis-read
+    every id >= 7,808,128 -- see issue #40.
+
+    `vocab_size` is the model's id space, or None when it is not known yet (a
+    stub load, or a checkpoint that never delivered the layout buffers): then the
+    shards still define the row -> id mapping and only the consistency check is
+    skipped. A `vocab_size` that does not match the rows is a hard error rather
+    than a warning, because serving it means serving wrong embeddings silently.
+    """
+    if num_shards <= 0:
+        raise ValueError(f"num shards must be positive, got {num_shards}")
+    if len(rows) != num_shards:
+        raise ValueError(
+            f"expected {num_shards} PLE ngram shards, got {len(rows)}: {list(rows)}"
+        )
+    for index, count in enumerate(rows):
+        if count <= 0:
+            raise ValueError(f"PLE ngram shard {index} holds {count} rows")
+
+    total = sum(rows)
+    if vocab_size:
+        if total != vocab_size:
+            raise ValueError(
+                f"PLE ngram shards hold {total} rows but the model's ngram id space "
+                f"is {vocab_size} (shards: {list(rows)}). The checkpoint's split and "
+                "its vocab layout disagree, so a lookup could not be mapped to a row "
+                "that the checkpoint meant to store there; refusing to serve."
+            )
+        canonical = canonical_ple_shard_rows(num_shards, shard_row_capacity, vocab_size)
+        if list(rows) != canonical:
+            logger.warning(
+                "PLE ngram shards are not vLLM's canonical split (%s rows, id space "
+                "%d, stride %d) but %s rows totalling %d ids. Serving the checkpoint's "
+                "own boundaries, which is correct for the rows on disk; a re-split "
+                "would restore the uniform layout.",
+                num_shards,
+                vocab_size,
+                shard_row_capacity,
+                list(rows),
+                total,
+            )
+    else:
+        logger.warning(
+            "PLE ngram id space is unknown (layout buffers not loaded); taking the "
+            "row boundaries from the %d loaded shards (%s rows) without checking them "
+            "against the model's vocab layout.",
+            num_shards,
+            list(rows),
+        )
+
+    starts: list[int] = []
+    offset = 0
+    for count in rows:
+        starts.append(offset)
+        offset += count
+    return starts, [int(count) for count in rows]
+
+
 class MmapShardedNGramEmbedding(nn.Module):
     """CPU-resident PLE ngram embedding backed directly by mmap'd safetensors
     shard tensors, with no TP sharding and no copying. Every rank maps the
@@ -98,6 +191,10 @@ class MmapShardedNGramEmbedding(nn.Module):
         self.params_dtype: torch.dtype | None = None
         self._shards: list[torch.Tensor | None] = [None] * num_shards
         self._warned_bad_ids = False
+        # Set by finalize_shard_layout() from the shards actually loaded. Until
+        # then (and for dummy weights) the configured uniform capacity is used.
+        self._shard_starts: list[int] | None = None
+        self._shard_rows: list[int] | None = None
 
     def set_shard(self, shard_index: int, tensor: torch.Tensor) -> None:
         if tensor.device.type != "cpu":
@@ -114,7 +211,46 @@ class MmapShardedNGramEmbedding(nn.Module):
             )
         self._shards[shard_index] = tensor
 
-    # Ids outside [0, num_shards * shard_row_capacity) have two known producers,
+    @property
+    def table_rows(self) -> int:
+        """Number of addressable ids: the loaded shards' rows once the layout is
+        known, otherwise the configured uniform split's total."""
+        if self._shard_rows is not None:
+            return sum(self._shard_rows)
+        return self.num_shards * self.shard_row_capacity
+
+    def finalize_shard_layout(self, vocab_size: int | None) -> bool:
+        """Fix the id -> (shard, row) map from the shards that were actually loaded.
+
+        Called at the end of every `load_weights` call, so it is also the point at
+        which a chunked delivery becomes complete. It needs the checkpoint's
+        `ngram_heads_offsets` / `ngram_heads_vocab_sizes` buffers to have replaced
+        the runtime's own layout -- only then is the model's id space known -- and
+        the shards themselves, which are the only record of where each id's row
+        lives. See `build_ple_shard_layout` for what goes wrong otherwise.
+
+        Returns True once a layout was derived from every shard. Until then the
+        configured uniform split stands, and a shard that never arrives still
+        raises on use rather than being papered over.
+        """
+        if any(tensor is None for tensor in self._shards):
+            if not self._dummy_weights:
+                logger.debug(
+                    "PLE ngram layout not finalised yet: %d of %d shards loaded",
+                    sum(t is not None for t in self._shards),
+                    self.num_shards,
+                )
+            return False
+        rows = [int(tensor.shape[0]) for tensor in self._shards if tensor is not None]
+        self._shard_starts, self._shard_rows = build_ple_shard_layout(
+            rows,
+            num_shards=self.num_shards,
+            shard_row_capacity=self.shard_row_capacity,
+            vocab_size=vocab_size,
+        )
+        return True
+
+    # Ids outside the table's rows have two known producers,
     # both legitimate, and neither is corruption of the table:
     #
     #   * the MTP drafter's "no sample here" marker. `sample_idx_mapping` is
@@ -140,7 +276,7 @@ class MmapShardedNGramEmbedding(nn.Module):
             raise ValueError("MmapShardedNGramEmbedding requires CPU ids")
         original_shape = ids.shape
         flat_ids = ids.reshape(-1).long()
-        table_rows = self.num_shards * self.shard_row_capacity
+        table_rows = self.table_rows
         if flat_ids.numel() > 0:
             # One range test over the whole tensor, host-side (ids are CPU by
             # the check above), instead of one per shard inside the loop below.
@@ -148,10 +284,14 @@ class MmapShardedNGramEmbedding(nn.Module):
             if low < 0 or high >= table_rows:
                 bad = (flat_ids < 0) | (flat_ids >= table_rows)
                 if os.environ.get("VLLM_GFX906_PLE_STRICT", "0") == "1":
+                    geometry = (
+                        f"{self.num_shards} shards, rows {self._shard_rows}"
+                        if self._shard_rows is not None
+                        else f"{self.num_shards} shards x {self.shard_row_capacity}"
+                    )
                     raise ValueError(
                         f"PLE ngram id out of range: ids span [{low}, {high}] "
-                        f"but the table holds {table_rows} rows "
-                        f"({self.num_shards} shards x {self.shard_row_capacity}), "
+                        f"but the table holds {table_rows} rows ({geometry}), "
                         f"{int(bad.sum())} of {flat_ids.numel()} ids affected "
                         "(VLLM_GFX906_PLE_STRICT=1)"
                     )
@@ -173,24 +313,43 @@ class MmapShardedNGramEmbedding(nn.Module):
                         self.PADDING_SENTINEL,
                     )
                 flat_ids = flat_ids.masked_fill(bad, 0)
-        shard_idx = torch.div(flat_ids, self.shard_row_capacity, rounding_mode="floor")
-        local_idx = flat_ids - shard_idx * self.shard_row_capacity
+        starts, rows = self._shard_starts, self._shard_rows
+        if starts is None:
+            # No checkpoint layout recorded (dummy weights, or a direct-construction
+            # harness): the configured uniform split is all there is.
+            shard_idx = torch.div(
+                flat_ids, self.shard_row_capacity, rounding_mode="floor"
+            )
+            local_idx = flat_ids - shard_idx * self.shard_row_capacity
         out = flat_ids.new_empty(
             (flat_ids.numel(), self.embedding_dim), dtype=self.params_dtype
         )
         # The loop below can only write rows whose shard index is in
-        # range(num_shards). An id outside [0, num_shards * shard_row_capacity)
-        # matches no mask, so its row would keep whatever new_empty() found at
-        # that address: a silently wrong embedding instead of an error. That is
-        # why the range test above folds every out-of-range id onto row 0 first
-        # -- every row this function returns is a row that was actually read.
+        # range(num_shards). An id outside the table matches no mask, so its row
+        # would keep whatever new_empty() found at that address: a silently wrong
+        # embedding instead of an error. That is why the range test above folds
+        # every out-of-range id onto row 0 first -- every row this function
+        # returns is a row that was actually read.
+        #
+        # Where each id's row lives is decided by the shard boundaries
+        # (finalize_shard_layout), not by a uniform stride: a checkpoint may split
+        # its rows however it likes, and the runtime's stride is computed before
+        # the checkpoint's vocab layout is known. Using the stride against a
+        # different split both mis-maps ids and indexes off the end of a shard.
+        #
         # Fixed-length loop over every shard, every call — no data-dependent
         # iteration count. Necessary for CUDA graph capture safety: a Python
         # loop whose length depends on which shards this specific batch
         # happens to touch can execute a different number of steps during
         # warmup/capture than during replay.
         for shard in range(self.num_shards):
-            mask = shard_idx == shard
+            if starts is None:
+                mask = shard_idx == shard
+                local = local_idx[mask]
+            else:
+                start = starts[shard]
+                mask = (flat_ids >= start) & (flat_ids < start + rows[shard])
+                local = flat_ids[mask] - start
             if not mask.any():
                 continue
             tensor = self._shards[shard]
@@ -199,7 +358,7 @@ class MmapShardedNGramEmbedding(nn.Module):
                     out[mask] = 0.0
                     continue
                 raise RuntimeError(f"PLE ngram shard {shard} was never loaded")
-            out[mask] = tensor.index_select(0, local_idx[mask])
+            out[mask] = tensor.index_select(0, local)
         return out.reshape(*original_shape, self.embedding_dim)
 
 
@@ -566,6 +725,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+        # Every shard and both layout buffers are in by now, so this is the first
+        # point where the checkpoint's id space and its row split can be compared.
+        # A checkpoint whose split does not add up to its own id space is refused
+        # here rather than mis-read at serving time.
+        layout = self.ngram_heads_offsets + self.ngram_heads_vocab_sizes
+        vocab_size = int(layout.max()) if layout.numel() else 0
+        self.ngram_embedding.finalize_shard_layout(
+            vocab_size if vocab_size > 0 else None
+        )
         return loaded
 
 
