@@ -91,7 +91,7 @@ serves** on 2× MI50 — TP=2 + EP, fp16, util 0.85, `max-model-len 16384`, MBT 
 `--enforce-eager` — at **24.38 GiB of weights per card** and 2.0 GiB of KV (117,964
 tokens, 7.2× at 16k). Coherent at temperature 0; **5.61 t/s at B=1 in eager mode**, not
 comparable to the tester's 46.8 t/s with MTP / 25.4 without (that was TP=4, graphed).
-**Graph capture landed 2026-10-05** (`DEVLOG-wht1-cudagraph-guard.md`): PIECEWISE 3/3 in
+**Graph capture landed 2026-10-05** (`DEVLOG-wht1-graph-capture.md`): PIECEWISE 3/3 in
 27 s / 0.66 GiB, 21.15 t/s on the same 26-token probe, bought with KV 2.0 → 1.07 GiB
 (the graph pool comes out of the same headroom) — the blocker was a `model_type` string
 mismatch in the compilation guard (`qwen4_exp_text` vs `qwen4_exp`), not a kernel.
