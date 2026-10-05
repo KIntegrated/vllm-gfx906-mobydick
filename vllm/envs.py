@@ -1442,6 +1442,59 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LOG_BATCHSIZE_INTERVAL": lambda: float(
         os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")
     ),
+# --- gfx906 fork switches ---------------------------------------------
+    # Fork switches that select kernels or compilation behaviour. They are read
+    # with os.environ.get / getenv at their use sites, but they MUST be listed
+    # here as well: compile_factors() hashes this dict into the torch.compile
+    # cache key, and a switch that changes which kernels enter the graph would
+    # otherwise replay a graph compiled under the other setting. Registering a
+    # var only adds it to the hash -- the read site keeps its own default.
+    # MoE align-M1 tile
+    "VLLM_GFX906_ALIGN_M1": lambda: os.environ.get("VLLM_GFX906_ALIGN_M1", "1") == "1",
+    # dense GEMV kernels
+    "VLLM_GFX906_DENSE_GEMV": lambda: os.environ.get("VLLM_GFX906_DENSE_GEMV", "1") != "0",
+    # down-projection GEMV
+    "VLLM_GFX906_DOWN_GEMV": lambda: os.environ.get("VLLM_GFX906_DOWN_GEMV", "1") != "0",
+    # FA fallback raises
+    "VLLM_GFX906_FA_STRICT": lambda: os.environ.get("VLLM_GFX906_FA_STRICT", "0") == "1",
+    # fused drafter
+    "VLLM_GFX906_FUSED_DRAFT": lambda: os.environ.get("VLLM_GFX906_FUSED_DRAFT", "0") == "1",
+    # int8 GEMV rows/thread (C++ reader)
+    "VLLM_GFX906_GEMV_I8_RPT": lambda: os.getenv("VLLM_GFX906_GEMV_I8_RPT"),
+    # GEMV-M rows/thread (C++ reader)
+    "VLLM_GFX906_GEMVM_RPT": lambda: os.getenv("VLLM_GFX906_GEMVM_RPT"),
+    # dense GEMV rows/thread (C++ reader)
+    "VLLM_GFX906_GEMV_RPT": lambda: os.getenv("VLLM_GFX906_GEMV_RPT"),
+    # fused mamba group-norm
+    "VLLM_GFX906_MAMBA_FUSED_GROUP_NORM": lambda: os.environ.get("VLLM_GFX906_MAMBA_FUSED_GROUP_NORM", "0") == "1",
+    # MoE mid-bucket pin
+    "VLLM_GFX906_MOE_BM": lambda: os.environ.get("VLLM_GFX906_MOE_BM"),
+    # MoE M1 kernel (C++ reader)
+    "VLLM_GFX906_MOE_M1": lambda: os.getenv("VLLM_GFX906_MOE_M1"),
+    # MoE n-per-thread (C++ reader)
+    "VLLM_GFX906_MOE_NPT": lambda: os.getenv("VLLM_GFX906_MOE_NPT"),
+    # PLE id guard raises
+    "VLLM_GFX906_PLE_STRICT": lambda: os.environ.get("VLLM_GFX906_PLE_STRICT", "0") == "1",
+    # q_gemm M1 max-ILP (C++ reader)
+    "VLLM_GFX906_QGEMM_M1_MAXILP": lambda: os.getenv("VLLM_GFX906_QGEMM_M1_MAXILP"),
+    # layer-0 MoE quant
+    "VLLM_GFX906_QUANT_LAYER0_MOE": lambda: os.environ.get("VLLM_GFX906_QUANT_LAYER0_MOE", "1") != "0",
+    # keep FULL cudagraph for qwen4_exp (QSA-FN-12)
+    "VLLM_GFX906_QWEN4_EXP_ALLOW_FULL_CUDAGRAPH": lambda: os.environ.get("VLLM_GFX906_QWEN4_EXP_ALLOW_FULL_CUDAGRAPH", "0") == "1",
+    # skinny M16 path
+    "VLLM_GFX906_SKINNY_M16": lambda: os.environ.get("VLLM_GFX906_SKINNY_M16", "1") != "0",
+    # sort-free small-K top-k
+    "VLLM_GFX906_SORT_FREE_SMALL_K": lambda: os.environ.get("VLLM_GFX906_SORT_FREE_SMALL_K", "1") == "1",
+    # spec small capture sizes
+    "VLLM_GFX906_SPEC_CG_SMALL": lambda: os.environ.get("VLLM_GFX906_SPEC_CG_SMALL", "1") != "0",
+    # spec-decode GEMM
+    "VLLM_GFX906_SPEC_GEMM": lambda: os.environ.get("VLLM_GFX906_SPEC_GEMM", "1") != "0",
+    # single-group top-k
+    "VLLM_GFX906_TOPK_SINGLE_GROUP": lambda: os.environ.get("VLLM_GFX906_TOPK_SINGLE_GROUP", "1") == "1",
+    # w8a16 int8 GEMV
+    "VLLM_GFX906_W8A16_INT8": lambda: os.environ.get("VLLM_GFX906_W8A16_INT8", "0") == "1",
+    # w8a16 int8 CUDA-byte-load GEMV
+    "VLLM_GFX906_W8A16_INT8_CUDA": lambda: os.environ.get("VLLM_GFX906_W8A16_INT8_CUDA", "0") == "1",
     "VLLM_DISABLE_COMPILE_CACHE": disable_compile_cache,
     # If set to "0", disable LayerName opaque type for layer_name
     # parameters in custom ops.  Defaults to enabled on torch >= 2.11.

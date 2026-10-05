@@ -8,6 +8,70 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-05 (QSA-FN-12 closed — the `qwen4_exp` cudagraph mode is settled by measurement)
+
+### QSA-FN-12 — the `full → PIECEWISE` cudagraph downgrade stays · [#7](../../issues/7)
+
+The downgrade was written while no Qwen4Exp checkpoint would load on this host, so its own gate
+(`FULL_AND_PIECEWISE` + splitting list vs current PIECEWISE, interleaved A,B,A) had never been run.
+`logic65/Whittle-Qwen-3.8-35B-A3B` now serves locally, so it was run: **the downgrade is not a
+caution, it is the only mode that runs here.**
+
+Asking for full graphs (`-cc.cudagraph_mode=FULL_AND_PIECEWISE`) dies at the **first** capture,
+inside `vllm/v1/engine/core.py:308 → determine_available_memory()`:
+
+```
+RuntimeError: Worker failed with error 'CUDA error: operation not permitted when stream is
+capturing / hipErrorStreamCaptureUnsupported
+```
+
+Two same-box controls make this a property of the model rather than of the box or the driver: the
+27B canary captures FULL graphs successfully on the same HIP, and this same checkpoint captures
+PIECEWISE minutes earlier. The offending op is the PLE n-gram lookup — a host-side gather with a
+blocking device→host copy, which HIP refuses inside a stream capture, exactly as the downgrade's
+warning has claimed since it was written.
+
+Shipped default, measured (A1/A2 interleaved, 2.4 % drift): **25.76 / 26.38 t/s** decode, ~6k
+prefill 17.6–17.8 s, prefix reuse ×21.4, KV cache 72,089 tokens at 32k, mclk 1000 — on 2× MI50
+(TP=2 + `--enable-expert-parallel`, fp16, util 0.85, `--max-num-seqs 2`, block 64, MBT 512, V2
+runner), canary-gated at 38–39 t/s before every arm.
+
+**Landed:** the rewrite stays, with an escape hatch —
+`VLLM_GFX906_QWEN4_EXP_ALLOW_FULL_CUDAGRAPH=1` keeps the requested mode, so the question can be
+re-asked (a newer HIP, or a reworked gather that prefetches ahead of the graph) with one
+environment variable instead of a patch. Off by default; when on it fails loudly in ~11 minutes
+with one clear HIP error rather than silently running the other mode.
+`tests/config/test_qwen4_exp_ple_splitting_ops.py` covers both sides of the hatch.
+
+**Prefix caching (QSA-FN-10 item 5, arm C)** was lost to the load-lottery wedge #111
+(`degradation.md`) and re-ran clean the same night (22:41–22:57, load 701 s): decode is unchanged
+— **26.32 t/s** median (22.19/26.32/26.38) against A1 25.76 / A2 26.38, i.e. inside the interleave
+drift — while the KV pool grows 72,089 → **80,099 tokens** at the *same* 0.97 GiB available and the
+same VRAM (27,956/27,996 MiB), and reuse collapses ×21.4 → **×1.35** (a repeated 2.2k-token prefix
+costs 3.825 s instead of 0.237 s). Prefix caching on is what selects the mamba `align` cache mode,
+so the single-arm 6k-prefill reading (15.12 s vs 17.6–17.8 s) is recorded as an observation, not a
+win.
+
+Record: `DEVLOG-qwen38-flash-qsa.md` (2026-10-05), `DEAD-ENDS.md`. Refrigerated: PR #34's
+`ple_prefetch.py` is the shape that could make this capturable, and it is not ours to land.
+
+### QSA-FN-15 arm A — the generic UVA offload path cannot carry the PLE table · [#9](../../issues/9)
+
+`--cpu-offload-gb 24 --cpu-offload-params ngram_embedding` **engages and moves nothing**: both
+halves of the test fired (`'cpu_offload_gb': 24.0, 'cpu_offload_params': ['ngram_embedding']`
+accepted, `Offloader set to UVAOffloader` in every worker) and yet the KV cache (**72,089 tokens**)
+and the VRAM footprint (**27,956/27,996 MiB**) are byte-for-byte the shipped default's, with decode
+inside the 2.4 % interleave drift (25.53 vs 25.76 t/s). The PLE table is not a GPU-resident
+parameter: `MmapShardedNGramEmbedding` (`vllm/models/qwen4_exp/amd/ple_layer.py:166`) is
+CPU-resident by design, backed directly by mmap'd safetensors shards that every rank maps and the
+page cache shares, and `set_shard()` refuses anything but a CPU tensor — the shards "are not
+parameters". The mmap layout *is* the offload, so a per-parameter offloader has nothing to move.
+**Arm A closed as a dead-end**; **arm B stays open** — pinned host RAM vs page cache is the
+deciding datum and it needs the reporter's 128 GB machine (this box is 46 GB).
+
+Record: `DEVLOG-qwen38-flash-qsa.md` (2026-10-05), `DEAD-ENDS.md` (both rows),
+`ROADMAP.md` (arm A retired, arm B kept).
+
 ## 2026-10-05 (WHT-1 closed — Whittle serves on 2× MI50, graphed, with the n-gram memory in host RAM)
 
 ### WHT-1 — Whittle-Qwen-3.8-35B-A3B runs locally (a second `qwen4_exp` implementation) (#36)

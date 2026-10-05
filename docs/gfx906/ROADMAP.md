@@ -32,14 +32,6 @@ land PR #2, and the PLE comparison (QSA-FN-15). **Gate:** PR #2 review discharge
 + QSA-FN-15; QSA-FN-7 non-regression stays green. Refs:
 `REVIEW-pr2-qsa-fn.md`, `DEVLOG-qwen38-flash-qsa.md`.
 
-### QSA-FN-12 — decide the `qwen4_exp` cudagraph mode · [#7](../../issues/7)
-
-The PLE host gather + blocking D2H cannot be captured, so `qwen4_exp` gets the op
-in `splitting_ops` and a PIECEWISE downgrade under `has_full_cudagraphs()`. The
-downgrade *may* cost this model full-graph decode, unmeasured here. **Gate:** on
-the tester's box, `FULL_AND_PIECEWISE` + splitting list vs current PIECEWISE,
-MTP k=3 @147 456, interleaved A,B,A → keep the downgrade or close the question.
-
 ### QSA-FN-13 — report the pinned-id hazard upstream (#57497) · [#8](../../issues/8)
 
 Two PLE id-bug classes (stale/uninitialised pinned ids; the capture-time
@@ -50,9 +42,20 @@ fold-and-warn recommendation. Cheap, upstream value.
 ### QSA-FN-15 — PLE offload comparison (bespoke mmap vs upstream pinned/UVA) · [#9](../../issues/9)
 
 Decides whether the tester's `MmapShardedNGramEmbedding` survives QSA-FN-11.
-Arm A: generic UVA offload / `VLLM_PLE_CPU_OFFLOAD=1`; Arm B: the current mmap
-table. **Deciding datum:** pinned host RAM (26 GiB now) vs page cache on their
-128 GB box. Needs the tester's box.
+
+**Arm A is closed as a dead-end** (2026-10-05, `DEAD-ENDS.md`): the generic UVA path cannot express
+this table. With `--cpu-offload-gb 24 --cpu-offload-params ngram_embedding` the flags are accepted
+(`'cpu_offload_params': ['ngram_embedding']`) and the path engages (`Offloader set to UVAOffloader`
+per worker) — yet the KV cache (**72,089 tokens**) and the VRAM footprint (**27,956/27,996 MiB**)
+are byte-for-byte the no-flag arm's, and decode is inside the 2.4 % interleave drift. The table is
+CPU-resident by design: `MmapShardedNGramEmbedding` maps the shard files directly, every rank shares
+one page-cache copy, and `set_shard()` refuses anything but CPU tensors — the shards "are not
+parameters", so a per-parameter offloader has nothing to move. The mmap *is* the offload.
+
+**Arm B remains open, and it is why this item stays**: the deciding datum is pinned host RAM
+(26 GiB now) vs page cache, on the tester's 128 GB box. This host has 46 GB, so no honest
+eviction-pressure experiment exists here — the only local contribution is the served host-memory
+profile. Ref: `DEVLOG-qwen38-flash-qsa.md` (2026-10-05).
 
 ### UP-1 — upstream the mamba `align` seed fix (V2-MAMBA-1) · [#10](../../issues/10)
 

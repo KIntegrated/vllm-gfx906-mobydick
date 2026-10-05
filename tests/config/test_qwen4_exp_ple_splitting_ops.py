@@ -127,6 +127,47 @@ def test_ple_lookup_is_split_out_of_the_captured_graph(
 
 
 @pytest.mark.parametrize("model_type", _FAMILY_SPELLINGS)
+def test_allow_full_cudagraph_hatch_keeps_the_requested_mode(
+    tmp_path, model_type, monkeypatch
+):
+    """The escape hatch must keep FULL, not merely stay quiet about it.
+
+    QSA-FN-12 / tracker #7: the downgrade is a judgement about this HIP, so the
+    judgement has to be *measurable*. With the hatch set the split stays and the
+    full-graph mode survives -- the arm then fails at capture with
+    ``hipErrorStreamCaptureUnsupported``, which is the point: a loud failure with
+    the real cause beats silently running a mode nobody asked for.
+    """
+    model_dir = _write_config(
+        tmp_path,
+        f"{model_type}-hatch",
+        {**_BASE_CONFIG, "model_type": model_type, "ple_layer_ids": [2]},
+    )
+    monkeypatch.setenv("VLLM_GFX906_QWEN4_EXP_ALLOW_FULL_CUDAGRAPH", "1")
+    vllm_config = _vllm_config_for(model_dir)
+
+    assert PLE_NGRAM_OP in vllm_config.compilation_config.splitting_ops
+    assert vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs(), (
+        "with the hatch set the guard must stand aside so full-graph capture can "
+        "be attempted (and fail visibly) on this HIP"
+    )
+
+
+@pytest.mark.parametrize("value", ["0", ""], ids=["zero", "empty"])
+def test_allow_full_cudagraph_hatch_is_exactly_one(tmp_path, monkeypatch, value):
+    """Only the exact string ``1`` opens the hatch -- like every other GFX906 switch."""
+    model_dir = _write_config(
+        tmp_path,
+        f"hatch-{value or 'empty'}",
+        {**_BASE_CONFIG, "model_type": "qwen4_exp_text", "ple_layer_ids": [2]},
+    )
+    monkeypatch.setenv("VLLM_GFX906_QWEN4_EXP_ALLOW_FULL_CUDAGRAPH", value)
+    vllm_config = _vllm_config_for(model_dir)
+
+    assert not vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
+
+
+@pytest.mark.parametrize("model_type", _FAMILY_SPELLINGS)
 @pytest.mark.parametrize(
     "ple", [[], None], ids=["empty", "absent"]
 )  # `None` = key missing from config.json entirely

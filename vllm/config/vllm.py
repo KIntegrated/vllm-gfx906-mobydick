@@ -1954,12 +1954,32 @@ class VllmConfig:
             # test silently misses FULL_DECODE_ONLY -- exactly the mode an
             # explicit --compilation-config can ask for.
             if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
-                logger.warning_once(
-                    "Qwen4Exp's host-resident PLE n-gram lookup cannot run "
-                    "inside a full cudagraph (blocking D2H mid-graph); "
-                    "downgrading cudagraph_mode to PIECEWISE."
-                )
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                if (
+                    os.environ.get("VLLM_GFX906_QWEN4_EXP_ALLOW_FULL_CUDAGRAPH", "0")
+                    == "1"
+                ):
+                    # Escape hatch (QSA-FN-12 / issue #7): the downgrade is a
+                    # judgement call, not a law -- HIP may grow capture support
+                    # for blocking D2H, and the measurement that decides whether
+                    # this model wants full graphs has to be able to ask for
+                    # them. Keeping the mode here is expected to fail at capture
+                    # with hipErrorStreamCaptureUnsupported; the point is to fail
+                    # with that message rather than silently run the wrong mode.
+                    logger.warning_once(
+                        "Qwen4Exp's host-resident PLE n-gram lookup cannot run "
+                        "inside a full cudagraph (blocking D2H mid-graph), but "
+                        "VLLM_GFX906_QWEN4_EXP_ALLOW_FULL_CUDAGRAPH=1: keeping "
+                        "%s. Capture is expected to fail with "
+                        "hipErrorStreamCaptureUnsupported.",
+                        self.compilation_config.cudagraph_mode,
+                    )
+                else:
+                    logger.warning_once(
+                        "Qwen4Exp's host-resident PLE n-gram lookup cannot run "
+                        "inside a full cudagraph (blocking D2H mid-graph); "
+                        "downgrading cudagraph_mode to PIECEWISE."
+                    )
+                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
         if self.compilation_config.pass_config.enable_sp:
             # With pipeline parallelism, native rms norm tracing errors due to

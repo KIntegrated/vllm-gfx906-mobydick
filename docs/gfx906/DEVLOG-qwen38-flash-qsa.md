@@ -6,6 +6,99 @@
 > bf16-only site inventory, the ISA facts and the kernel timings live there; not
 > restated per entry). Newest entry first.
 
+## 2026-10-05 — QSA-FN-12 (cudagraph mode) and QSA-FN-15 arm A (PLE offload), decided on a real checkpoint
+
+**VERDICT:** `DEAD-END` for full-graph capture of the Qwen4Exp path on this HIP ·
+`SHIPPED` for the escape hatch `VLLM_GFX906_QWEN4_EXP_ALLOW_FULL_CUDAGRAPH` ·
+`DEAD-END` for the generic per-parameter UVA path as a way to express the PLE table.
+
+**GATE:** graph-serving A/B on `mi50-01` (2× MI50, gfx906), `logic65/Whittle-Qwen-3.8-35B-A3B`
+served as `whittle`, TP=2 + `--enable-expert-parallel`, fp16, util 0.85, `--max-model-len 32768`,
+`--max-num-seqs 2`, block 64, MBT 512, V2 runner, `backed_size_oblivious` dynamic shapes,
+`FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`, 27B canary gate (38–39 t/s) before **every** arm.
+Arms interleaved A1/B/A2/C/D via `/local/tmp/qsa12/driver.sh`; per-arm records in
+`/local/tmp/qsa12/arms.jsonl` (numbers restated here — `/tmp` is not the record).
+
+### HYPOTHESIS
+
+1. *If* the `full → PIECEWISE` rewrite is only a caution written while no Qwen4Exp checkpoint
+   would load here, *then* a real checkpoint will capture full graphs and the rewrite costs us
+   decode t/s.
+2. *If* the PLE table can be expressed by the generic UVA per-parameter offload path, *then*
+   `--cpu-offload-gb 24 --cpu-offload-params ngram_embedding` will move bytes off the cards and
+   change the KV cache budget.
+
+### What was done
+
+Arm B ran `-cc.cudagraph_mode=FULL_AND_PIECEWISE` **with** the new hatch (so the rewrite could
+not silently undo the experiment); arm A1/A2 ran the shipped default; arm D ran the offload
+flags. The hatch was added first precisely so (1) could be *measured* rather than argued.
+
+### Evidence — FOR (hypothesis 1 refuted, hypothesis 2 refuted)
+
+| arm | decode | prefill-6k | prefix reuse | KV cache | VRAM | offload log |
+|---|---|---|---|---|---|---|
+| A1 default | 25.76 t/s | 17.76 s | ×21.42 | 72,089 tok | 27,956/27,996 MiB | — |
+| A2 default (control) | 26.38 t/s | 17.60 s | ×21.51 | 72,089 tok | same | — |
+| B full graphs | **did not boot** — `hipErrorStreamCaptureUnsupported` at the first capture (691 s) | | | | | |
+| D `--cpu-offload-gb 24 …` | 25.53 t/s | 18.34 s | ×21.17 | **72,089 tok** | **identical** | `Offloader set to UVAOffloader` |
+| C prefix caching off | 26.32 t/s | 15.12 s | **×1.35** | **80,099 tok** | 27,956/27,996 MiB | — |
+
+* **Hypothesis 1 is dead.** The capture was refused inside
+  `vllm/v1/engine/core.py:308 → determine_available_memory()` — i.e. at the first graph build,
+  not later in serving. `RuntimeError: Worker failed with error 'CUDA error: operation not
+  permitted when stream is capturing` / `hipErrorStreamCaptureUnsupported`. Two same-box controls
+  make it model-specific, not box-specific: the 27B canary logs `Capturing CUDA graphs (FULL):
+  0/1` completing, and A1/A2 captured *this* checkpoint in PIECEWISE minutes earlier. The only
+  variable is the requested mode.
+* **Hypothesis 2 is dead.** Both halves fired and nothing moved: the flags were accepted
+  (`'cpu_offload_gb': 24.0, 'cpu_offload_params': ['ngram_embedding']`), the path engaged
+  (`Offloader set to UVAOffloader` per worker), and yet the KV cache and VRAM footprint are
+  byte-for-byte A1's. A1 ships no offload lines at all.
+* Interleave drift A1↔A2 is **2.4 %**, so D's −0.9 % decode is noise and is reported as such.
+
+### Evidence — AGAINST / limits
+
+* The alternative reading of hypothesis 2 — "the offload worked but the table is small" — is
+  excluded by the KV cache figure: freeing 24 GiB would move it, and it did not move by a token.
+* C is **answered** (re-run 22:41–22:57 the same night; the 20:19 wedge #111 had killed the first
+  attempt — the resume driver re-ran only C, since D was already healthy). Prefix caching **off**
+  does not move decode: **26.32 t/s** median (22.19/26.32/26.38) against A1 25.76 / A2 26.38, i.e.
+  inside the 2.4 % interleave drift. It moves two other things: the KV pool rises 72,089 →
+  **80,099 tokens (+11.1 %)** at the same 0.97 GiB available and the *same* VRAM footprint
+  (27,956/27,996 MiB, byte-for-byte A1's), and reuse collapses — a repeated 2.2k-token prefix costs
+  **3.825 s instead of 0.237 s** (×21.4 → ×1.35), so ~3.6 s per reuse. The 6k prefill reads 15.12 s
+  against 17.76/17.60 with caching on; that direction is *not* expected, it is a single
+  non-interleaved arm, and prefix caching on is what sets the mamba cache mode to `align` — recorded
+  as an observation, not a win.
+* `--gpu-memory-utilization` was held at 0.85 throughout (≥ 0.90 wedges GPU0 on this box).
+
+### Why it failed
+
+* Capture: the PLE n-gram lookup is a **host-side gather with a blocking D2H copy** (the shards
+  are mmap'd on the host), and HIP refuses that inside a stream capture. The split-op guard keeps
+  the op in the eager region, which is only meaningful in PIECEWISE.
+* Offload: the table is not a GPU-resident parameter. `MmapShardedNGramEmbedding`
+  (`vllm/models/qwen4_exp/amd/ple_layer.py:166`) is "CPU-resident … backed directly by mmap'd
+  safetensors shard tensors, with no TP sharding and no copying"; every rank maps the same files
+  and the page cache shares one physical copy across the node. `set_shard()` raises if a shard
+  arrives on anything but CPU, and the shards "are not parameters" — so a per-parameter offloader
+  finds nothing to move. The mmap layout *is* the offload.
+
+### Interactions / superseded-by · Refrigerated residue
+
+* Supersedes the "no loadable Qwen4Exp checkpoint here" caveat that gated QSA-FN-12 and QSA-FN-15
+  in `ROADMAP.md`; those entries move to `CHANGELOG.md` (see below).
+* The hatch is the durable part: a future HIP with capture support, or a reworked PLE gather that
+  prefetches ahead of the graph (PR #34's `ple_prefetch.py`, not ours to land), can be re-measured
+  with one environment variable instead of a patch.
+* Refrigerated: pinned-vs-page-cache residency for the mmap is the *real* remaining shape of
+  QSA-FN-15 — the decision datum needs the reporter's 128 GB machine (this box is 46 GB, so no
+  honest eviction-pressure experiment exists here). Only the host-memory profile is contributable.
+* **Budget note:** this log is 30 KB, over the ~20–25 KB dev-log budget; this entry is deliberately
+  compact and the staleness/archive pass belongs to the next merge train (rule 1 in
+  `AGENTS.md`).
+
 ## 2026-09-27 (1) — the 0.30 merge check: one build break, one supersession
 
 **VERDICT:** `SHIPPED` for the merge prep (both findings acted on); nothing about
