@@ -80,30 +80,6 @@ Blocked on a 0.30.1-based line (`vllm-project/vllm#57497`). Verify
 `VLLM_PLE_CPU_OFFLOAD=1` engages with the tiny rig, port #57497's AMD half,
 validate on the real checkpoint, then delete the bespoke mmap path.
 
-### QSA-PLE-1 — PLE n-gram shard stride: crash + wrong rows · [#40](../../issues/40)
-
-**High, release-blocking for this checkpoint.** The PLE n-gram lookup maps ids to rows with a
-stride computed from the runtime's own prime-based vocab layout (39,040,640 / 5 = 7,808,128)
-while the checkpoint's shards are a plain contiguous split (7,812,500 x 4 + 7,790,000 =
-39,040,000, and its own layout buffers say 8 x 4,880,000 flat). So ids in
-[39,022,512, 39,040,640) index past `shard_4` and **kill the engine** — reproduced in both
-graphed and eager modes on the first long-generation request — and every other id >= 7,808,128
-reads the **wrong row**, silently. The AMD loader dropped nvidia's shard-shape validation, which
-is why it loaded at all. CPU repro + numbers: `DEVLOG-wht1r-residue.md`, issue #40. Blocks #39
-item 4.
-
-### WHT-1r — WHT-1 residue: WHT-1's leftovers · [#39](../../issues/39)
-
-State after the 2026-10-05 campaign (`DEVLOG-wht1r-residue.md`): **item 1 answered — the flag
-stays** (default dynamic shapes still dies in `profile_run` with the split in place); **item 2
-answered — the graphed envelope with util 0.85 is 32768 / MBT 512** (KV 0.97 GiB, 72,089 tokens,
-2.20x, i.e. two full 32k streams; 64k/512 serves one stream at 1.04x, and MBT is what costs KV
-capacity, not `max_model_len`); **item 3 characterised** (the AMD QSA warmer is a silent no-op —
-the warmup module resolves nvidia module names and returns; the cold call costs 0.16-0.38 s and
-rep 1 runs 4.3-4.5 t/s against 21.6 t/s for reps 2-3). **Item 4 (a decode-length throughput
-number) is blocked by #40** — the 512-token probe is what found the crash. Remaining: decide
-whether to port the AMD warmup helpers or record them as harmless, and re-measure once #40 lands.
-
 ### U30-1 — Nemotron-H: separate/quantized MTP lm_head + latent-MoE TP>1 AR · [#12](../../issues/12)
 
 Re-run the Nemotron TP=2 decode A/B on the 0.30 base; confirm the lm_head loads

@@ -67,6 +67,16 @@ a cold first request. Measured by the timed cold 1-token call and by rep 1 vs re
 dispatch by platform in the warmup module; (b) record it as harmless once the cold-call cost is
 quantified. The measurement decides; a sub-second cold call makes (a) pointless work.
 
+**Verdict: (b) — recorded as harmless, with the cost on the record.** The cold 1-token call is
+0.16–0.18 s across every arm that measured it, including the post-#40 validation arm (`FIX_graphed`,
+0.18 s), and rep 1 of a 512-token generation runs 21.64 t/s against 25.55/25.57 t/s for reps 2–3 —
+so the missing warmup costs one first-request latency (tens of milliseconds) and about 4 s of
+first-request throughput on a 512-token generation. That is a first-request cost, not a serving
+cost, and porting the two helpers would add AMD-side warmup code whose absence is not observable
+in steady state. Reopen gate: if a future AMD `qsa`/`indexer` kernel lands with a *large*
+first-call compile (multi-second cold call, measurable as a p99 latency spike on the first
+request after a restart), port (a) then, with this section as the before-state.
+
 ## Item 2 — the envelope, on paper before burning arms
 
 `addressable_token_topk()` (`amd/indexer_qsa.py:35`) caps the QSA selection width at
