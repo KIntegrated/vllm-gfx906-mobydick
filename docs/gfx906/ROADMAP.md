@@ -193,11 +193,6 @@ NH-4 default flip (after a non-GEMV-bound config), NH-2′ M≤6 revival, NH-6,
 TP=2 validation, the batched fp32 GEMV, and the 6 GQA layers on ROCM_ATTN.
 Ref: `DEVLOG-nemotron-h.md`.
 
-### TRITON-1i — triton-3.8.0-adopting docker image · [#26](../../issues/26)
-
-Stock Triton 3.8.0 is the default and the in-tree rebuild passed; the published
-image still ships the fork. Needs a new tag shape. Ref: `RECON-triton-1.md`.
-
 ### HK-1 — drop the legacy env sourcing from `/local/git/AGENTS.md` · [#27](../../issues/27)
 
 In-repo recipes are done; the remaining edit is the protected file plus the

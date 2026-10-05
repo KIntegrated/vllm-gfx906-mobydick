@@ -212,6 +212,37 @@ broken.**
 - Records: `DEVLOG-tp2-dense.md` §S10 (verdict-first, figures marked VOID), `DEAD-ENDS.md`,
   the issue #3 correction comment, and the `mi50-vllm-serving-ab` skill.
 
+### TRITON-1i — a triton-3.8.0-adopting docker image (#26)
+
+*Record provenance:* this issue was closed **COMPLETED** on 2026-09-28 by `unverbraucht` and its
+`ROADMAP.md` line was left in place until 2026-10-05, so the entry below is taken from that closing
+comment rather than from a landing commit in this repository. The image identity was re-verified at
+record time (`docker buildx imagetools inspect`, 2026-10-05).
+
+- **Image** `unverbraucht/vllm-gfx906:0.30.0-1c4d1065ad`, digest
+  `sha256:cccaa5925cd03acc930548dd7f8208539621685b1c97f75df54fef1a601708f1`, built from
+  `gfx906/v0.30.0` @ `1c4d1065ad` (branch tag `gfx906/v0.30.0-final`). The floating
+  `0.30.0-rocm-7.14` tag resolves to the **same** digest — confirmed at record time. The published
+  `0.29.0-e730ef4066` image (fork Triton) is left untouched, and the earlier 3.6.0-based 0.30.0
+  image is superseded by this build. The new tag shape the item asked for is `0.30.0-<commit>`.
+- **Triton**: stock upstream `triton-lang/triton` **v3.8.0**, built from source with
+  `TRITON_CODEGEN_BACKENDS=amd` and
+  `TRITON_APPEND_CMAKE_ARGS=-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON`. Verified in-image as `triton
+  3.8.0`; the fork `v3.6.0+gfx906` is rollback-only, with its pin and rationale in
+  `vllm-v2/preset.0.30.0-rocm-7.14-kintegrated.sh`.
+- **Runtime validation** (Qwen3.8-27B-AWQ-INT4, TP=2, 256k context, ngram n=5, batched 4096):
+  `/health` 200; `vllm 0.30.0` on `torch 2.13.0+gfx906`; the custom `GFX906_FA` backend registered;
+  KV cache 411,940 tokens (1.57× concurrency for 262,144-token requests); ~28 GB VRAM/GPU;
+  generations correct (greedy "capital of France" → `Paris`, plus a 200-token structured
+  generation).
+- **Two build-side fixes**, both in `ML-gfx906`: `ARG MAX_JOBS` was declared before `FROM` and so
+  never reached the `RUN` step (falling back to `nproc` = 16 and OOM-killing the host twice), and
+  the branch's annotated `gfx906/vX.Y.Z-final` tag broke setuptools-scm version parsing. See
+  `ML-gfx906/AGENTS.md` ("Build memory: the build can OOM-kill the host").
+
+Roadmap line retired with this record; the underlying reconnaissance remains in
+`docs/gfx906/RECON-triton-1.md` and the 2026-09-15 TRITON-1 entries below.
+
 ## 2026-09-27 (roadmap migration — closed items retired from ROADMAP.md)
 
 The roadmap was pruned to open work only. This section banks the closed items
