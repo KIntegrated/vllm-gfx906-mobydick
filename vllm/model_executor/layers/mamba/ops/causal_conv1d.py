@@ -874,8 +874,7 @@ def _causal_conv1d_update_kernel(
         # Bounds port of upstream PR #50021 (SYV-10, vendored FLA file):
         # num_accepted outside [1, seqlen] previously read state rows out
         # of range (positive garbage block id for i_n > 0). Zero-fill and
-        # return — inspected-only on gfx906 (no gate run yet, see
-        # DEVLOG-ttft-prefill-stall.md T4-2).
+        # return. Gated: tests/kernels/mamba/test_spec_decode_bounds.py.
         num_accepted = tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64)
         if (num_accepted < 1) | (num_accepted > seqlen):
             zero = tl.zeros((BLOCK_N,), dtype=tl.float32)

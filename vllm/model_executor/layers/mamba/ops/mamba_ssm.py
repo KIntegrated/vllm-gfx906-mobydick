@@ -360,7 +360,7 @@ def _selective_scan_update_kernel(
             # Bounds port of upstream PR #50021 (SYV-10, vendored FLA
             # file): invalid initial token -> zero-fill the output rows
             # instead of reading state through a garbage block id.
-            # Inspected-only on gfx906 (no gate run yet).
+            # Gated: tests/kernels/mamba/test_spec_decode_bounds.py.
             offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
             zero = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32)
             out_ptr += bos * stride_out_batch + pid_h * stride_out_head
