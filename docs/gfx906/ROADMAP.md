@@ -141,12 +141,6 @@ Design work only until MTP-1b shows a real remaining static win; the fork's
 dynamic-SD keys on batch tokens, not context length. **Gate:** beat the best
 static config on a mixed-context workload.
 
-### GDN-1 — SYV-10 bounds-port test coverage · [#20](../../issues/20)
-
-The #50021 port is merged but only inspected; add one test per zero-fill/early-out
-path plus an out-of-range accepted-count case. Retires the last T4 "shipped
-without a runnable check" item.
-
 ### C5 — fuse the shared-expert chain · [#21](../../issues/21)
 
 One chain kernel removes two launches per layer (~150–250 µs after the

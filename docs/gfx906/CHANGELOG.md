@@ -8,6 +8,38 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-06 (GDN-1 closed — the "red" gate was the test's indexing, and all four guards are live)
+
+### GDN-1 — SYV-10 bounds-port test coverage · [#20](../../issues/20)
+
+The T4-2 suite first ran 2026-10-05 and reported **40 passed, 4 failed**, all four
+failures in the new `test_spec_invalid_accepted_count_zero_fills`, read at the time
+as `fused_sigmoid_gating` failing to zero-fill an out-of-range accepted count.
+
+**It does zero-fill; the test sliced the wrong axis.** Both entry points return
+`(B, T, HV, V)` with `B == 1`, and the test asserted on `out[invalid]` — the
+length-1 *batch* axis — so the "invalid" assertion counted the whole tensor (16384
+nonzero == the four valid tokens' output) and the "valid" assertion was that same
+tensor. Indexing the sequence axis (`out[0, invalid]`) turns all four params green:
+**44 passed, 3 skipped** across the four deferred files.
+
+The four paths the deliverable names are gated, proven by mutation — each guard's
+bound dropped to the always-valid form and the suite re-run:
+
+| path | bound removed | result |
+|---|---|---|
+| `fused_sigmoid_gating` | `i_t < stride_indices_seq` | 2 failed (`past_row`, fp32+bf16) |
+| `fused_recurrent` | `i_t < stride_indices_seq` | 2 failed (`past_row`, fp32+bf16) |
+| `causal_conv1d` | `num_accepted > seqlen` | `test_causal_conv1d_...` FAILED |
+| `mamba_ssm` | `init_token_idx < stride_state_indices_batch` | `test_selective_state_...` FAILED |
+
+So the T4 worry that `fused_recurrent` had "no gate" was a coverage gap, not a
+missing guard: the kernel has carried the same mask since `fd6895e789`.
+
+**Landed:** `b53c9b3f2f` — test-only (the indexing fix plus the new
+`tests/kernels/mamba/test_spec_decode_bounds.py`). Retires the last T4 "shipped
+without a runnable check" item.
+
 ## 2026-10-05 (QSA-FN-12 closed — the `qwen4_exp` cudagraph mode is settled by measurement)
 
 ### QSA-FN-12 — the `full → PIECEWISE` cudagraph downgrade stays · [#7](../../issues/7)
@@ -445,7 +477,7 @@ and moves parked work to `REFRIGERATOR.md`. Open items now live as issues #3–#
 - **SYV-10 — GDN spec-decode bounds checks (PORTED).** Upstream #50021 applied
   verbatim; the fork carried the pre-PR unmasked `i_t = num_accepted − 1` load in
   all four kernels. No runnable GPU test on ROCm (upstream is CUDA-gated) →
-  **GDN-1 test debt** in the roadmap.
+  **GDN-1 test debt**, closed 2026-10-06 (this file).
 - **SYV-13 — mamba/GDN chunked-prefill align fixes (CLOSED N/A).** Both patch
   parts diffed: the V1 `src_col` path already implements the same guards
   CPU-side; `chunk_o.py` is the faithful pre-patch upstream state and no NaN has
