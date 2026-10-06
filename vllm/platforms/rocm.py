@@ -654,6 +654,12 @@ class RocmPlatform(Platform):
         "auto_awq",
         "awq_marlin",  # will be overwritten with awq
         "gptq",
+        # "auto_gpt" was a typo for "auto_gptq" (it appears exactly once in the
+        # tree). AutoGPTQConfig.override_quantization_method() claims any
+        # checkpoint whose quant_method is "gptq", so "auto_gptq" is the name
+        # that actually reaches verify_quantization(); gfx906 already has a
+        # first-class WNA16 path for it. Mirrors xpu.py, which lists it.
+        "auto_gptq",
         "auto_gpt",
         "fp8",
         "deepseek_v4_fp8",
