@@ -946,7 +946,10 @@ class Platform:
                 attn_block_size,
             )
 
-        if cache_config.mamba_cache_mode == "align":
+        if (
+            cache_config.mamba_cache_mode == "align"
+            and not cache_config.user_specified_mamba_block_size
+        ):
             cache_config.mamba_block_size = cache_config.block_size
 
         # Pad mamba page size to exactly match attention page size

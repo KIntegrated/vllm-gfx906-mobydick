@@ -337,7 +337,13 @@ def chunked_prefill_paged_decode(
 
     if max_query_len > 1:
         prefill_handled = False
-        if on_gfx906():
+        # All host reads below (`.cpu()`) are illegal while a CUDA graph is being
+        # captured. can_use_torch_sdpa_prefill() already refuses the capture case,
+        # but it is consulted *after* q_lens_cpu/seq_lens_cpu are materialized, so
+        # the capture check must be evaluated first -- and no host read may run.
+        if on_gfx906() and not (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        ):
             q_dtype = query.dtype
             k_dtype = key_cache.dtype
             v_dtype = value_cache.dtype

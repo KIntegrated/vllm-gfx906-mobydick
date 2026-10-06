@@ -1137,6 +1137,30 @@ class RocmPlatform(Platform):
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
 
+        # ROCm: request a graceful engine shutdown so that KFD/VM resources
+        # are released while the sched entities are still alive. With
+        # shutdown_timeout=0 the process manager force-kills EngineCore
+        # mid-teardown; the destroyed "delayed" entity then makes every
+        # later KFD unmap (amdgpu_vm_clear_freed -> drm_suballoc_new ->
+        # dma_fence_wait) block forever, wedging the whole host in D state.
+        # Mirrors the XPU guard (platforms/xpu.py:380-384, value 5).
+        #
+        # Gate (per review): 0 is the documented *abort* mode and is what an
+        # explicit --shutdown-timeout 0 asks for, so the override is
+        # opt-out rather than unconditional. Set
+        # VLLM_ROCM_GRACEFUL_SHUTDOWN=0 to keep upstream behaviour,
+        # including a deliberate abort.
+        if (
+            os.environ.get("VLLM_ROCM_GRACEFUL_SHUTDOWN", "1") != "0"
+            and vllm_config.shutdown_timeout == 0
+        ):
+            vllm_config.shutdown_timeout = 60
+            logger.info(
+                "ROCm platform: set server shutdown_timeout=%d "
+                "(VLLM_ROCM_GRACEFUL_SHUTDOWN=0 to disable).",
+                vllm_config.shutdown_timeout,
+            )
+
         if (
             parallel_config.prefill_context_parallel_size > 1
             and parallel_config.data_parallel_size > 1

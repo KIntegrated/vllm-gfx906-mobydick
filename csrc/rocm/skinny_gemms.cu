@@ -292,6 +292,17 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
               ? K * 2 / 16
               : K * 2 / 16 + (WARP_SIZE - K * 2 / 16 % WARP_SIZE));
 
+  // Make a silent tail-row omission explicit.
+  //   When M is not a multiple of rows_per_block, NUM_BLOCKS = M / rows_per_block truncates silently:
+  //   the trailing (M % rows_per_block) rows are neither computed nor written back, so
+  //   those rows of out_c stay uninitialized or stale and the caller sees nothing wrong.
+  //   This check turns a silent omission into an explicit error; it is the first
+  //   item of the LLMM1 silent-truncation fixes.
+  TORCH_CHECK(
+      M % rows_per_block == 0,
+      "LLMM1: M (", M, ") must be a multiple of rows_per_block (",
+      rows_per_block, "); the last ", M % rows_per_block,
+      " row(s) would be silently dropped.");
   int NUM_BLOCKS = M / rows_per_block;
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(in_b));
