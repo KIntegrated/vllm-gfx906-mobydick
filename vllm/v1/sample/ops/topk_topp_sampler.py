@@ -373,9 +373,6 @@ def apply_top_k_top_p(
     if p is None and k is None:
         return logits
 
-    if HAS_TRITON:
-        return apply_top_k_top_p_triton(logits, k, p)
-
     # SYV-4 (gfx906): small-batch top-k/top-p without the full-vocab sort.
     # Technique ported from syv-ai/qwen38-27b-rtx3090 (docs/optimizations.md,
     # fetched 2026-09-02; see docs/gfx906/RECON-syv-qwen38-27b-rtx3090.md
@@ -388,6 +385,9 @@ def apply_top_k_top_p(
         and _can_use_sort_free_small_k(logits, k)
     ):
         return apply_top_k_top_p_sort_free(logits, k, p)
+
+    if HAS_TRITON:
+        return apply_top_k_top_p_triton(logits, k, p)
 
     # Use pytorch sort implementation for small batch sizes.
     is_cpu = current_platform.is_cpu()
