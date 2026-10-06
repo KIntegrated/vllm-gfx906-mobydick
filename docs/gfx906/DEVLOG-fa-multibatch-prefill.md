@@ -158,3 +158,93 @@ touching the tree; (2) a same-boot A/B against the pre-0.30.0 tip for the code s
 Raw: `/local/tmp/mbt1r/bench_27b_64k_noplugin.out`,
 `/local/tmp/lcbench_mbt1r-np_server.log` (ready in ~695 s),
 `/local/tmp/mbt1r/phase1-rootcause.md`.
+
+---
+
+## 2026-10-06 — the 800 MHz mclk share, priced: ~8.4 % of the 64k prefill wall, about half the gap
+
+**VERDICT: OPEN** (the re-anchor question, one candidate down) · **GATE:** serving
+wall-clock, the 2026-08-29 recipe replayed on `gfx906/v0.30.0` @ `e1bffdd742`,
+one point per client invocation (`_bench_serve_grid_gfx906.py '[[<pp>,128]]' 1`),
+**32k bracketing the 64k pair in the same session**, canary-gated first
+(38.6 t/s), `VLLM_PLUGINS=` so the syv9phase instrument cannot kill the V1
+fullgraph compile (see the 2026-10-05 entry / `phase1-rootcause.md`).
+
+### HYPOTHESIS
+
+If the DPPM 800 MHz memory-clock down-shift is what moved the published 64k point
+from 364.8 to ~308.9 t/s, then (a) a continuous trace of a whole 64k prefill
+shows a large 800 MHz share of the loaded wall, and (b) a 32k point in the same
+session — the control the 2026-10-05 entry read as 800-free — shows little.
+
+### What was done
+
+One **1 Hz** `pp_dpm_mclk` trace over the entire session, read from
+`/sys/class/drm/card*/device/pp_dpm_mclk` (sysfs, never `rocm-smi --showclocks`,
+which blocks under load), one point per client invocation so each sample carries
+its own absolute start epoch, split prefill/decode at the client's own `ttft_s`,
+and the 800 MHz share taken **of loaded time** (350 MHz idle excluded).
+Tools and raw traces: `/local/tmp/mclk/` (`driver3.sh`, `sample.sh`,
+`report.py`, `pricing.py`, `trace_session.txt`, `windows.txt`). Order: 32k, 64k,
+64k, 32k.
+
+### Evidence FOR
+
+| point | prefill t/s | TTFT s | decode t/s | 800 MHz share of loaded prefill (card1/card2) | factor |
+|---|---|---|---|---|---|
+| ctrl 32k (a) | 353.2 | 87.33 | 25.45 | 30.2 % / 25.0 % | 0.940 / 0.950 |
+| 64k (a) | 308.9 | 205.39 | 21.51 | 43.6 % / 40.5 % | 0.913 / 0.919 |
+| 64k (b) | 308.9 | 205.38 | 21.51 | 41.5 % / 42.0 % | 0.917 / 0.916 |
+| ctrl 32k (b) | 354.6 | 86.95 | 25.44 | 29.1 % / 23.8 % | 0.942 / 0.952 |
+
+`factor = 1 − 0.2 × share(800)` — the bandwidth-bound wall scaled by 800/1000 for
+the down-shifted share. Whole session: 669 s wall, 662 samples, 605.7 s loaded
+per card, 800 MHz for **36.9 / 34.6 % of loaded time**.
+
+* **The down-shift is real, reproducible and now priced.** Both 64k samples,
+  both cards: factor **0.913–0.919**. Holding 1000 MHz across the 64k prefill
+  would recover ~**8.4 %** of its wall.
+* The gap to the record is −15.3 % (308.9 vs 364.8), so mclk accounts for
+  **about half** of it: 308.9 / 0.916 = **~337 t/s**, still ~7.6 % under the
+  record. The tree/box A/B (below) remains the live candidate.
+* Stability: the 32k pair agrees to 0.4 % (353.2 / 354.6) and the 64k pair to
+  0.03 % — the effect is not sampling noise, and the session did not drift.
+
+### Evidence AGAINST / corrections to the previous entry
+
+* **(b) is falsified as stated.** The 32k control also ran 24–30 % of its loaded
+  prefill at 800 MHz. "A 32k arm does not down-shift" was an artifact of the
+  instrument: the campaign-1 traces sampled every **5 s** (~140 samples) and were
+  taken on a *different model* (Whittle/qwen4_exp, not the 27B). At 1 Hz the
+  down-shift is there at 32k too, just smaller (factor 0.945 vs 0.916). The
+  load-pattern claim survives as a **magnitude**, not as an on/off.
+* The 0.8 factor is an upper-ish bound: it assumes the whole wall is
+  bandwidth-bound and that only mclk moved. The 64k over 32k drop is otherwise
+  physically expected (attention cost grows with context), so the intrinsic
+  32k→64k step is not attributable to the clock.
+* Decode follows the same shape (25.45 → 21.51 t/s from 32k to 64k), consistent
+  with the KV side being bandwidth-bound too.
+* Coincidence guard: today's 32k point (353.2 / 354.6) is numerically close to
+  the 2026-09-24 note's 354 t/s, but that note reads a **64k** point. Not the
+  same datum; do not pair them.
+* Not implicated: the wedge family — `journalctl -k` from 03:40 has no
+  `GPU reset` / `wedged`, the box was canary-healthy at 38.6 t/s before and back
+  to 350 MHz idle after (VRAM 10 / 18 MiB).
+
+### Why it matters for the gate
+
+The house DVFS gate reads mclk through `_bench_gfx906.py::_MclkSampler`, which
+polls `rocm-smi --showclocks` and reports the **median** (of the max across
+cards). A 40 % 800 MHz share collapses to a median of 1000, so the gate passes a
+run that today's trace shows is materially down-shifted. The gate needs the
+*share*, sampled from sysfs per card — the instrument is fixed in the same
+commit as this entry.
+
+### Interactions / open
+
+* Remaining candidate: a same-boot A/B against the pre-0.30.0 tip (the tree has
+  moved a lot since the 08-29 record: 0.30.0 base, the PLE/GDN train, the
+  fork-switch registration).
+* Residual open question from 2026-10-05 (prompt drift: the record's filler
+  ended `out=1` (EOS), tonight's generated 128 tokens) is untouched by this run.
+* The README's published row stays untouched until the A/B runs.

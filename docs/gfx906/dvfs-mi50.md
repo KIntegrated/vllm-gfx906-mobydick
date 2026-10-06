@@ -78,11 +78,19 @@ standard — needs validation at 2–3 context lengths before that.
    warmup iters; report p05/p25/median/p75/p95 of per-call CUDA-event times
    (block-of-10 event pairs amortize event overhead). Median hides bimodality
    (autotune re-triggers, prefill/decode mix) — the decile spread is the canary.
-3. **Concurrent mclk sampling with a HARD gate.** Sample `rocm-smi --showclocks`
-   every 0.25 s during each timed window (regex: `mclk clock level.*?\((\d+)\s*Mhz\)`)
-   and FAIL LOUDLY if median mclk < 900 MHz — cold-clock data must not be
-   silently reusable. (Discipline-only mitigation is how the ~3× cold artifact
-   almost poisoned SYV-3.)
+3. **Concurrent mclk sampling with a HARD gate.** Read
+   `/sys/class/drm/card*/device/pp_dpm_mclk` every 0.25 s during each timed
+   window — the active level is the line carrying `*`. **Per card, and not via
+   `rocm-smi --showclocks`**: that call blocks while a deck is under load, its
+   max-across-cards hides one deck's down-shift, and any single median hides the
+   excursion that matters. Gate on a **time share**, not a median: FAIL LOUDLY
+   if the median is < 900 MHz, **and** warn when ≥ 10 % of *loaded* time
+   (≥ 400 MHz; the 350 MHz idle state excluded) is held at 800 MHz — a
+   sustained 64k prefill measured **41–44 %** there while its median still read
+   a clean 1000 (DEVLOG-fa-multibatch-prefill.md, 2026-10-06). Cold-clock data
+   must not be silently reusable. (Discipline-only mitigation is how the ~3×
+   cold artifact almost poisoned SYV-3.)
+   Reference implementation: `_bench_gfx906.py::_MclkSampler`.
 4. **Cross-validate against ≥2 independent anchors** before trusting: an
    in-context CUDA-event number and/or a prior audit figure. Agreement within
    ~1–2% across instruments = floor confirmed; disagreement = investigate

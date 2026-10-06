@@ -9,10 +9,10 @@ Measures one pp-prefill + tg-decode request (after an untimed warmup).
 Prints "BENCH: {json}". Robust to cross-version SamplingParams differences.
 """
 
+import glob
 import json
 import os
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -22,27 +22,39 @@ SAMPLES = int(os.environ.get("BENCH_SAMPLES", "1"))
 
 # DVFS gate (docs/gfx906/dvfs-mi50.md): idle mclk is 350 MHz and cold-clock
 # benches are inflated ~3x. Sample mclk concurrently with the timed windows and
-# report the median per sample; a median < 900 MHz invalidates the number.
+# report it per card; a median < 900 MHz invalidates the number.
+#
+# Read it from sysfs, not `rocm-smi --showclocks`: that call blocks while a deck
+# is under load, and a single median hides exactly the case this gate exists for
+# -- a sustained bandwidth-bound prefill holds 1000 MHz but dips to 800 for a
+# large share of the wall (measured 41-44 % of loaded prefill time at 64k/27B,
+# DEVLOG-fa-multibatch-prefill.md 2026-10-06), which a per-sample median reports
+# as a clean 1000.
 class _MclkSampler:
+    # pp_dpm_mclk lines look like "1: 800Mhz *" -- level, clock, active marker.
+    _ACTIVE = re.compile(r"^\s*\d+:\s*(\d+)\s*Mhz\s*\*", re.M)
+
     def __init__(self, period=0.3):
         self.period, self.samples, self._stop = period, [], threading.Event()
+        self.cards = sorted(glob.glob("/sys/class/drm/card*/device/pp_dpm_mclk"))
         self._t = threading.Thread(target=self._run, daemon=True)
 
-    @staticmethod
-    def _read():
-        try:
-            out = subprocess.run(
-                ["rocm-smi", "--showclocks"], capture_output=True, text=True, timeout=5
-            ).stdout
-        except Exception:
-            return None
-        vals = [int(v) for v in re.findall(r"mclk clock level.*?\((\d+)\s*Mhz\)", out)]
-        return max(vals) if vals else None
+    def _read(self):
+        out = {}
+        for path in self.cards:
+            try:
+                with open(path) as fh:
+                    m = self._ACTIVE.search(fh.read())
+            except OSError:
+                continue
+            if m:
+                out[path.split("/")[4]] = int(m.group(1))
+        return out
 
     def _run(self):
         while not self._stop.is_set():
             v = self._read()
-            if v is not None:
+            if v:
                 self.samples.append((time.time(), v))
             self._stop.wait(self.period)
 
@@ -53,9 +65,30 @@ class _MclkSampler:
     def stop(self):
         self._stop.set()
 
+    def _span(self, t0, t1):
+        """(t, {card: mhz}, held_seconds) for samples overlapping [t0, t1]."""
+        hi = min(t1, self.samples[-1][0]) if self.samples else t1
+        for i, (t, clocks) in enumerate(self.samples):
+            if t > t1:
+                break
+            nxt = self.samples[i + 1][0] if i + 1 < len(self.samples) else hi
+            held = min(nxt, hi) - max(t, t0)
+            if held > 0:
+                yield t, clocks, held
+
+    def share_between(self, t0, t1):
+        """{card: {mhz: seconds}} -- time-weighted, not per-sample."""
+        out = {}
+        for _, clocks, held in self._span(t0, t1):
+            for card, mhz in clocks.items():
+                out.setdefault(card, {})
+                out[card][mhz] = out[card].get(mhz, 0.0) + held
+        return out
+
     def median_between(self, t0, t1):
-        vals = [v for t, v in self.samples if t0 <= t <= t1]
-        return (sorted(vals)[len(vals) // 2], len(vals)) if vals else (None, 0)
+        spans = list(self._span(t0, t1))
+        vals = [v for _, clocks, _ in spans for v in clocks.values()]
+        return (sorted(vals)[len(vals) // 2], len(spans)) if vals else (None, 0)
 
 
 def model_arg():
@@ -241,6 +274,21 @@ def main():
         if mclk is not None and mclk < 900:
             print(f"BENCH WARNING: sample {s} median mclk {mclk} MHz < 900 "
                   f"(cold-clock; number INVALID) - see dvfs-mi50.md", flush=True)
+        # A clean median is not a clean clock: report the per-card time share
+        # held at <= 800 MHz of the loaded (>= 400 MHz) wall as well.
+        shares = sampler.share_between(t0, t1)
+        down = {}
+        for card, secs in shares.items():
+            loaded = sum(v for k, v in secs.items() if k >= 400)
+            low = sum(v for k, v in secs.items() if 400 <= k < 900)
+            if loaded > 0:
+                down[card] = round(low / loaded, 4)
+        worst = max(down.values()) if down else 0.0
+        if worst > 0.10:
+            worst_card = max(down, key=lambda c: down[c])
+            print(f"BENCH WARNING: sample {s} held 800 MHz for {worst:.0%} of "
+                  f"loaded time by card {worst_card} - the median "
+                  f"({mclk} MHz) hides it; see dvfs-mi50.md", flush=True)
         results.append(
             {
                 "sample": s,
@@ -250,6 +298,7 @@ def main():
                 "tokens_per_s": round(n_out / elapsed, 3) if elapsed else 0.0,
                 "mclk_median_mhz": mclk,
                 "mclk_n": nsamp,
+                "mclk_800_share_of_loaded": down,
             }
         )
     sampler.stop()
