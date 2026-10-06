@@ -242,9 +242,90 @@ commit as this entry.
 
 ### Interactions / open
 
-* Remaining candidate: a same-boot A/B against the pre-0.30.0 tip (the tree has
-  moved a lot since the 08-29 record: 0.30.0 base, the PLE/GDN train, the
-  fork-switch registration).
+* ~~Remaining candidate: a same-boot A/B against the pre-0.30.0 tip~~ → **run,
+  and it is not the tree** (entry below).
 * Residual open question from 2026-10-05 (prompt drift: the record's filler
   ended `out=1` (EOS), tonight's generated 128 tokens) is untouched by this run.
 * The README's published row stays untouched until the A/B runs.
+
+## 2026-10-06 (2) — the tree A/B, run: pre-0.30.0 tip vs current tip, same boot
+
+**VERDICT: the 0.30.0 base is NOT the cause.** Current tip and pre-0.30.0 tip are
+identical to **0.1 % at 64k** and 0.3 % at 32k, with the same-session drift control
+bracketing them at 0.13 %. The 08-29 record's 364.8 t/s is not a post-0.30.0
+regression in the code.
+
+**GATE:** serving (canary 38.5–38.8 t/s before every arm; zero `GPU reset` /
+`wedged` in any window; tree restored clean, `dirty_files=0`).
+
+### Method
+
+Three arms, one session, one box, identical recipe (27B, 256k, KV 10 GiB, prefix
+caching OFF, `VLLM_PLUGINS=`, bt 4096, max-seqs 4, capture `[1,2,3,4]`, fp16),
+canary-gated before each, 1 Hz `pp_dpm_mclk` trace throughout, points
+32k / 64k / 64k / 32k (the bracketing control from the mclk run):
+
+* **A** = `gfx906/v0.30.0` (current tip) — *rebuilt first, not assumed*;
+* **B** = `524ac6f2d6` (`gfx906/v0.29.0-final`, 2026-09-18) — rebuilt in place;
+* **A2** = current tip again — drift control (house A,B,A discipline).
+
+The checkout is in place by necessity: the editable install resolves `vllm`
+through a *meta-path finder* pinned to the repo path, and `_serve_tp2_gfx906.sh`
+`cd`s to the absolute repo path, so a second worktree cannot be shadowed with
+`PYTHONPATH`. The driver therefore restores the tree on every exit path (trap +
+explicit call), verified by branch ref, clean status and a canary.
+
+| point | A (current) | B (pre-0.30.0) | A2 (drift ctl) | B/A | A2/A |
+|---|---:|---:|---:|---:|---:|
+| 64k prefill t/s | **309.9** | **310.1** | 309.4 | **1.0010** | 0.9987 |
+| 32k prefill t/s | 352.6 | 353.6 | 353.6 | 1.0027 | 1.0028 |
+| 64k TTFT s | 204.8 | 204.5 | 205.0 | — | — |
+| 64k decode t/s | 21.53 | 21.30 | 21.51 | — | — |
+
+800 MHz share of loaded time, whole session: A 32.6 / 30.8 %, B 39.9 / 37.4 %,
+A2 35.4 / 32.6 % (card1 / card2). So B ran *more* down-shifted than A and still
+matched it — the contrast is not a clock artefact in either direction.
+
+### What this eliminates, and what it does not
+
+* **Stale kernels: eliminated.** Arm A rebuilt and produced a **byte-identical**
+  `_C.abi3.so` (`2a5e77b1bb862974`, mtime unchanged at 2026-09-24 21:03), despite
+  two post-2026-09-24 commits touching `csrc/`. The re-anchor's numbers were taken
+  on current binaries.
+* **Recipe/config: eliminated.** The record-era 64k session
+  (`lcbench_qwen38_server.log`, 2026-08-29 10:45) ran `max_model_len 262144`,
+  `kv_cache_memory_bytes 10 GiB`, bt 4096, max-seqs 4, capture `[1,2,3,4]`, fp16 —
+  the *engine config diff against today's arm A is cosmetic only*
+  (`served_model_name`, `tool_call_parser`).
+* **The tree: eliminated** (table above).
+* **Not eliminated, and this is the campaign's own blind spot:** the record is
+  2026-08-29 and `GFX906_FA_LEGACY` only *defaulted* to 0 on **2026-09-16**. Both
+  arms of this A/B therefore ran the post-flip KV-read path, so the campaign could
+  not have seen the flip — see 2b below. The README's flag table calls `LEGACY=1`
+  the winner in exactly one regime: B=1 (2026-08-29, the record's).
+
+### Cost / process
+
+Arm A's second boot took a load-lottery wedge (**#112**, `degradation.md`) and the
+driver exited leaving the run resumable — correct, but nothing revived it until the
+next scheduled queue drain 2 h later, so half the campaign's wall was idle. Fix in
+place from 2b on: the driver retries a wedge-killed boot **once itself**, and the
+queue gained an idempotent `ensure` job (`07-ab030-ensure`) because a job that
+removes itself on launch cannot revive a campaign that dies after launching.
+
+### Interactions / open
+
+* **2b in flight**: `GFX906_FA_LEGACY=1` (the record's path) vs the current default,
+  same recipe and points, plus a 1 Hz `sclk`/power/cap/temperature sampler.
+* **The 32k control is now the bigger anomaly**: record 442.1/445.7 vs today 352.6
+  = **−20.6 %**, and mclk prices only ~5 % of it (20–29 % share at 32k). The shader
+  clock / power-cap axis is where the rest has to live — measured `pp_dpm_sclk`
+  ladder reaches 1800 MHz, `power1_cap` = 178 W = `power1_cap_max`, OD 0/0, profile
+  `BOOTUP_DEFAULT`, and the amdgpu DKMS *source* predates the record (2026-08-21)
+  though the module was rebuilt 2026-09-22.
+* **Arm R not run**: the record's *own* revision (the 0.29 line as of 08-29). This
+  A/B brackets 2026-09-18 → now; a regression introduced between 08-29 and 09-18
+  (the LEGACY flip is one) would sit outside both arms.
+* Prompt drift (`out=1` EOS on the record's filler vs our 128 tokens) still
+  untouched; TTFT should be insensitive to it, and 2b adds nothing that tests it.
+
