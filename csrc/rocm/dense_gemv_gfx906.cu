@@ -40,6 +40,39 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
+#include <hip/hip_fp16.h>
+#include <stdint.h>
+
+namespace {
+__device__ inline __half atomicAdd(__half* address, __half val) {
+  unsigned short* addr_ptr = reinterpret_cast<unsigned short*>(address);
+  unsigned short old = *addr_ptr;
+  unsigned short assumed;
+
+  do {
+    assumed = old;
+
+    // Create __half from raw bits - DIRECT ASSIGNMENT (no narrowing)
+    __half_raw old_raw;
+    old_raw.x = assumed;  // or old_raw.data = assumed; depending on HIP version
+    __half old_half = __half(old_raw);
+
+    __half sum = old_half + val;
+
+    // Get back raw bits
+    __half_raw sum_raw = __half_raw{sum};
+    unsigned short sum_bits = sum_raw.x;  // or sum_raw.data
+
+    old = atomicCAS(addr_ptr, assumed, sum_bits);
+  } while (assumed != old);
+
+  // Return old value
+  __half_raw old_final;
+  old_final.x = old;
+  return __half(old_final);
+}
+}  // anonymous namespace
+
 namespace vllm {
 namespace dense_gemv_gfx906 {
 
@@ -83,22 +116,20 @@ __forceinline__ __device__ void atomic_add_pk4_f16(half* addr, half2 v01,
 __forceinline__ __device__ float dot8_f32(const half2 (&w)[4],
                                           const half2 (&a)[4]) {
   float r = 0.0f;
-  #pragma unroll
-  for (int i = 0; i < 4; i++)
-    r = __ockl_fdot2(w[i], a[i], r, true);
+#pragma unroll
+  for (int i = 0; i < 4; i++) r = __ockl_fdot2(w[i], a[i], r, true);
   return r;
 }
 
 template <int RPT, int KCHUNK>
 __global__ void __launch_bounds__(KCHUNK / 8)
-    dense_gemv_kernel(const half* __restrict__ x,   // [K]
-                      const half* __restrict__ w,   // [N, K] row-major
-                      half* __restrict__ out,       // [N], pre-zeroed if KSPLIT>1
-                      const int N, const int K,
-                      const int ksplit) {
-  static_assert(KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 ||
-                    KCHUNK == 4096,
-                "KCHUNK must be 512, 1024, 2048 or 4096");
+    dense_gemv_kernel(const half* __restrict__ x,  // [K]
+                      const half* __restrict__ w,  // [N, K] row-major
+                      half* __restrict__ out,  // [N], pre-zeroed if KSPLIT>1
+                      const int N, const int K, const int ksplit) {
+  static_assert(
+      KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 || KCHUNK == 4096,
+      "KCHUNK must be 512, 1024, 2048 or 4096");
   static_assert(RPT == 1 || RPT == 2 || RPT == 4, "RPT must be 1, 2 or 4");
   constexpr int THREADS = KCHUNK / 8;
   constexpr int WARPS = THREADS / 64;
@@ -114,7 +145,7 @@ __global__ void __launch_bounds__(KCHUNK / 8)
   xa.u = *(const uint4*)(x + k0 + t * 8);
 
   float acc[RPT];
-  #pragma unroll
+#pragma unroll
   for (int r = 0; r < RPT; ++r) {
     const int row = row0 + r;
     if (row >= N) {
@@ -129,12 +160,11 @@ __global__ void __launch_bounds__(KCHUNK / 8)
     acc[r] = dot8_f32(wa.h2, xa.h2);
   }
 
-  // Reduce the K-split within this block (THREADS/64 wavefronts).
-  #pragma unroll
+// Reduce the K-split within this block (THREADS/64 wavefronts).
+#pragma unroll
   for (int mask = 32; mask >= 1; mask /= 2) {
-    #pragma unroll
-    for (int r = 0; r < RPT; ++r)
-      acc[r] += __shfl_xor(acc[r], mask);
+#pragma unroll
+    for (int r = 0; r < RPT; ++r) acc[r] += __shfl_xor(acc[r], mask);
   }
 
   if constexpr (WARPS == 1) {
@@ -147,17 +177,17 @@ __global__ void __launch_bounds__(KCHUNK / 8)
       } else if constexpr (RPT == 4) {
         // One 64-bit CAS per block covering rows row0..row0+3.
         if (t == 0) {
-          half2 h01 = __halves2half2(__float2half_rn(acc[0]),
-                                     __float2half_rn(acc[1]));
-          half2 h23 = __halves2half2(__float2half_rn(acc[2]),
-                                     __float2half_rn(acc[3]));
+          half2 h01 =
+              __halves2half2(__float2half_rn(acc[0]), __float2half_rn(acc[1]));
+          half2 h23 =
+              __halves2half2(__float2half_rn(acc[2]), __float2half_rn(acc[3]));
           atomic_add_pk4_f16(out + row0, h01, h23);
         }
       } else if constexpr (RPT == 2) {
         // One 32-bit CAS per block covering rows row0..row0+1.
         if (t == 0) {
-          half2 h01 = __halves2half2(__float2half_rn(acc[0]),
-                                     __float2half_rn(acc[1]));
+          half2 h01 =
+              __halves2half2(__float2half_rn(acc[0]), __float2half_rn(acc[1]));
           atomic_add_pk2_f16(out + row0, h01);
         }
       }
@@ -174,7 +204,7 @@ __global__ void __launch_bounds__(KCHUNK / 8)
       const int row = row0 + lane;
       if (row >= N) return;
       float s = 0.0f;
-      #pragma unroll
+#pragma unroll
       for (int wp = 0; wp < WARPS; ++wp) s += red_smem[lane][wp];
       if (ksplit == 1) {
         out[row] = __float2half_rn(s);
@@ -182,26 +212,23 @@ __global__ void __launch_bounds__(KCHUNK / 8)
         // One 64-bit CAS per block covering rows row0..row0+3.
         if (lane == 0) {
           float s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-          #pragma unroll
+#pragma unroll
           for (int wp = 0; wp < WARPS; ++wp) {
             s1 += red_smem[1][wp];
             s2 += red_smem[2][wp];
             s3 += red_smem[3][wp];
           }
-          half2 h01 = __halves2half2(__float2half_rn(s),
-                                     __float2half_rn(s1));
-          half2 h23 = __halves2half2(__float2half_rn(s2),
-                                     __float2half_rn(s3));
+          half2 h01 = __halves2half2(__float2half_rn(s), __float2half_rn(s1));
+          half2 h23 = __halves2half2(__float2half_rn(s2), __float2half_rn(s3));
           atomic_add_pk4_f16(out + row0, h01, h23);
         }
       } else if constexpr (RPT == 2) {
         // One 32-bit CAS per block covering rows row0..row0+1.
         if (lane == 0) {
           float s1 = 0.0f;
-          #pragma unroll
+#pragma unroll
           for (int wp = 0; wp < WARPS; ++wp) s1 += red_smem[1][wp];
-          half2 h01 = __halves2half2(__float2half_rn(s),
-                                     __float2half_rn(s1));
+          half2 h01 = __halves2half2(__float2half_rn(s), __float2half_rn(s1));
           atomic_add_pk2_f16(out + row0, h01);
         }
       }
@@ -230,14 +257,14 @@ __global__ void __launch_bounds__(KCHUNK / 8)
 
 template <int RPT, int KCHUNK, int M>
 __global__ void __launch_bounds__(KCHUNK / 8)
-    dense_gemv_m_kernel(const half* __restrict__ x,   // [M, K]
-                       const half* __restrict__ w,   // [N, K]
-                       half* __restrict__ out,       // [M, N], pre-zeroed
-                       // if KSPLIT>1
-                       const int N, const int K, const int ksplit) {
-  static_assert(KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 ||
-                    KCHUNK == 4096,
-                "KCHUNK must be 512, 1024, 2048 or 4096");
+    dense_gemv_m_kernel(const half* __restrict__ x,  // [M, K]
+                        const half* __restrict__ w,  // [N, K]
+                        half* __restrict__ out,      // [M, N], pre-zeroed
+                        // if KSPLIT>1
+                        const int N, const int K, const int ksplit) {
+  static_assert(
+      KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 || KCHUNK == 4096,
+      "KCHUNK must be 512, 1024, 2048 or 4096");
   static_assert(RPT == 2 || RPT == 4, "RPT must be 2 or 4");
   static_assert(M >= 1 && M <= 4, "M must be 1..4");
   constexpr int THREADS = KCHUNK / 8;
@@ -256,15 +283,15 @@ __global__ void __launch_bounds__(KCHUNK / 8)
     uint4 u;
     half2 h2[4];
   } xa[M];
-  #pragma unroll
+#pragma unroll
   for (int m = 0; m < M; ++m)
     xa[m].u = *(const uint4*)(x + (int64_t)m * K + k0 + t * 8);
 
   float acc[RPT][M];
-  #pragma unroll
+#pragma unroll
   for (int r = 0; r < RPT; ++r) {
     const int row = row0 + r;
-    #pragma unroll
+#pragma unroll
     for (int m = 0; m < M; ++m) acc[r][m] = 0.0f;
     if (row >= N) continue;
     union {
@@ -272,26 +299,24 @@ __global__ void __launch_bounds__(KCHUNK / 8)
       half2 h2[4];
     } wa;
     wa.u = *(const uint4*)(w + (int64_t)row * K + k0 + t * 8);
-    #pragma unroll
+#pragma unroll
     for (int m = 0; m < M; ++m) acc[r][m] = dot8_f32(wa.h2, xa[m].h2);
   }
 
-  // In-place shfl reduction of the RPT*M values (lanes < NV).
-  #pragma unroll
+// In-place shfl reduction of the RPT*M values (lanes < NV).
+#pragma unroll
   for (int mask = 32; mask >= 1; mask /= 2)
-    #pragma unroll
+#pragma unroll
     for (int r = 0; r < RPT; ++r)
-      #pragma unroll
-      for (int m = 0; m < M; ++m)
-        acc[r][m] += __shfl_xor(acc[r][m], mask);
+#pragma unroll
+      for (int m = 0; m < M; ++m) acc[r][m] += __shfl_xor(acc[r][m], mask);
 
   if constexpr (WARPS == 1) {
     // Lane i < RPT*M holds (r=i/M, m=i%M)'s full sum.
     if (ksplit == 1) {
       if (t < NV) {
         const int r = t / M, m = t % M, row = row0 + r;
-        if (row < N)
-          out[(int64_t)m * N + row] = __float2half_rn(acc[r][m]);
+        if (row < N) out[(int64_t)m * N + row] = __float2half_rn(acc[r][m]);
       }
     } else {
       // CAS packs the RPT adjacent rows of each out[m]; lane 0 issues the
@@ -304,23 +329,21 @@ __global__ void __launch_bounds__(KCHUNK / 8)
       // for M=2/3; see DEVLOG-spec-decode).
       if (t == 0) {
         float s[NV];
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < NV; ++i) s[i] = acc[i / M][i % M];
-        #pragma unroll
+#pragma unroll
         for (int m = 0; m < M; ++m) {
           if (row0 + RPT - 1 >= N) continue;  // ragged tail: RPT rows valid
           if constexpr (RPT == 4)
-            atomic_add_pk4_f16(
-                out + (int64_t)m * N + row0,
-                __halves2half2(__float2half_rn(s[0 * M + m]),
-                               __float2half_rn(s[1 * M + m])),
-                __halves2half2(__float2half_rn(s[2 * M + m]),
-                               __float2half_rn(s[3 * M + m])));
+            atomic_add_pk4_f16(out + (int64_t)m * N + row0,
+                               __halves2half2(__float2half_rn(s[0 * M + m]),
+                                              __float2half_rn(s[1 * M + m])),
+                               __halves2half2(__float2half_rn(s[2 * M + m]),
+                                              __float2half_rn(s[3 * M + m])));
           else
-            atomic_add_pk2_f16(
-                out + (int64_t)m * N + row0,
-                __halves2half2(__float2half_rn(s[0 * M + m]),
-                               __float2half_rn(s[1 * M + m])));
+            atomic_add_pk2_f16(out + (int64_t)m * N + row0,
+                               __halves2half2(__float2half_rn(s[0 * M + m]),
+                                              __float2half_rn(s[1 * M + m])));
         }
       }
     }
@@ -335,34 +358,32 @@ __global__ void __launch_bounds__(KCHUNK / 8)
         if (lane < NV) {
           const int r = lane / M, m = lane % M, row = row0 + r;
           float s = 0.0f;
-          #pragma unroll
+#pragma unroll
           for (int wp = 0; wp < WARPS; ++wp) s += red_smem[lane][wp];
           if (row < N) out[(int64_t)m * N + row] = __float2half_rn(s);
         }
       } else {
         if (lane == 0) {
           float s[NV];
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < NV; ++i) {
             s[i] = 0.0f;
-            #pragma unroll
+#pragma unroll
             for (int wp = 0; wp < WARPS; ++wp) s[i] += red_smem[i][wp];
           }
-          #pragma unroll
+#pragma unroll
           for (int m = 0; m < M; ++m) {
             if (row0 + RPT - 1 >= N) continue;  // ragged tail
             if constexpr (RPT == 4)
-              atomic_add_pk4_f16(
-                  out + (int64_t)m * N + row0,
-                  __halves2half2(__float2half_rn(s[0 * M + m]),
-                                 __float2half_rn(s[1 * M + m])),
-                  __halves2half2(__float2half_rn(s[2 * M + m]),
-                                 __float2half_rn(s[3 * M + m])));
+              atomic_add_pk4_f16(out + (int64_t)m * N + row0,
+                                 __halves2half2(__float2half_rn(s[0 * M + m]),
+                                                __float2half_rn(s[1 * M + m])),
+                                 __halves2half2(__float2half_rn(s[2 * M + m]),
+                                                __float2half_rn(s[3 * M + m])));
             else
-              atomic_add_pk2_f16(
-                  out + (int64_t)m * N + row0,
-                  __halves2half2(__float2half_rn(s[0 * M + m]),
-                                 __float2half_rn(s[1 * M + m])));
+              atomic_add_pk2_f16(out + (int64_t)m * N + row0,
+                                 __halves2half2(__float2half_rn(s[0 * M + m]),
+                                                __float2half_rn(s[1 * M + m])));
           }
         }
       }
@@ -377,15 +398,15 @@ __global__ void __launch_bounds__(KCHUNK / 8)
 
 template <int RPT, int KCHUNK>
 __global__ void __launch_bounds__(KCHUNK / 8)
-    dense_gemv_m_kernel_rt(const half* __restrict__ x,   // [M, K]
-                       const half* __restrict__ w,   // [N, K]
-                       half* __restrict__ out,       // [M, N], pre-zeroed
-                       // if KSPLIT>1
-                       const int M, const int N, const int K,
-                       const int ksplit) {
-  static_assert(KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 ||
-                    KCHUNK == 4096,
-                "KCHUNK must be 512, 1024, 2048 or 4096");
+    dense_gemv_m_kernel_rt(const half* __restrict__ x,  // [M, K]
+                           const half* __restrict__ w,  // [N, K]
+                           half* __restrict__ out,      // [M, N], pre-zeroed
+                           // if KSPLIT>1
+                           const int M, const int N, const int K,
+                           const int ksplit) {
+  static_assert(
+      KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 || KCHUNK == 4096,
+      "KCHUNK must be 512, 1024, 2048 or 4096");
   static_assert(RPT == 2 || RPT == 4, "RPT must be 2 or 4");
   constexpr int THREADS = KCHUNK / 8;
   constexpr int WARPS = THREADS / 64;
@@ -399,15 +420,15 @@ __global__ void __launch_bounds__(KCHUNK / 8)
     uint4 u;
     half2 h2[4];
   } xa[4];
-  #pragma unroll
+#pragma unroll
   for (int m = 0; m < 4; ++m)
     if (m < M) xa[m].u = *(const uint4*)(x + (int64_t)m * K + k0 + t * 8);
 
   float acc[RPT][4];
-  #pragma unroll
+#pragma unroll
   for (int r = 0; r < RPT; ++r) {
     const int row = row0 + r;
-    #pragma unroll
+#pragma unroll
     for (int m = 0; m < 4; ++m) acc[r][m] = 0.0f;
     if (row >= N) continue;
     union {
@@ -415,22 +436,23 @@ __global__ void __launch_bounds__(KCHUNK / 8)
       half2 h2[4];
     } wa;
     wa.u = *(const uint4*)(w + (int64_t)row * K + k0 + t * 8);
-    #pragma unroll
+#pragma unroll
     for (int m = 0; m < 4; ++m)
       if (m < M) acc[r][m] = dot8_f32(wa.h2, xa[m].h2);
   }
 
   // Flatten to acc_flat[r*4+m] for the reduction (lanes < RPT*4).
   float acc_flat[RPT * 4];
-  #pragma unroll
+#pragma unroll
   for (int r = 0; r < RPT; ++r)
-    #pragma unroll
+#pragma unroll
     for (int m = 0; m < 4; ++m) acc_flat[r * 4 + m] = acc[r][m];
 
-  #pragma unroll
+#pragma unroll
   for (int mask = 32; mask >= 1; mask /= 2)
-    #pragma unroll
-    for (int i = 0; i < RPT * 4; ++i) acc_flat[i] += __shfl_xor(acc_flat[i], mask);
+#pragma unroll
+    for (int i = 0; i < RPT * 4; ++i)
+      acc_flat[i] += __shfl_xor(acc_flat[i], mask);
 
   if constexpr (WARPS == 1) {
     // Lane i < RPT*4 holds (r=i/4, m=i%4)'s full sum.
@@ -447,24 +469,22 @@ __global__ void __launch_bounds__(KCHUNK / 8)
       // have returned index 0's sum for all i).
       if (t == 0) {
         float s[RPT * 4];
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < RPT * 4; ++i) s[i] = acc_flat[i];
-        #pragma unroll
+#pragma unroll
         for (int m = 0; m < 4; ++m) {
           if (m >= M) continue;
           if (row0 + RPT - 1 >= N) continue;  // ragged tail: RPT rows valid
           if constexpr (RPT == 4)
-            atomic_add_pk4_f16(
-                out + (int64_t)m * N + row0,
-                __halves2half2(__float2half_rn(s[0 * 4 + m]),
-                               __float2half_rn(s[1 * 4 + m])),
-                __halves2half2(__float2half_rn(s[2 * 4 + m]),
-                               __float2half_rn(s[3 * 4 + m])));
+            atomic_add_pk4_f16(out + (int64_t)m * N + row0,
+                               __halves2half2(__float2half_rn(s[0 * 4 + m]),
+                                              __float2half_rn(s[1 * 4 + m])),
+                               __halves2half2(__float2half_rn(s[2 * 4 + m]),
+                                              __float2half_rn(s[3 * 4 + m])));
           else
-            atomic_add_pk2_f16(
-                out + (int64_t)m * N + row0,
-                __halves2half2(__float2half_rn(s[0 * 4 + m]),
-                               __float2half_rn(s[1 * 4 + m])));
+            atomic_add_pk2_f16(out + (int64_t)m * N + row0,
+                               __halves2half2(__float2half_rn(s[0 * 4 + m]),
+                                              __float2half_rn(s[1 * 4 + m])));
         }
       }
     }
@@ -479,35 +499,33 @@ __global__ void __launch_bounds__(KCHUNK / 8)
         if (lane < RPT * 4) {
           const int r = lane / 4, m = lane % 4, row = row0 + r;
           float s = 0.0f;
-          #pragma unroll
+#pragma unroll
           for (int wp = 0; wp < WARPS; ++wp) s += red_smem[lane][wp];
           if (m < M && row < N) out[(int64_t)m * N + row] = __float2half_rn(s);
         }
       } else {
         if (lane == 0) {
           float s[RPT * 4];
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < RPT * 4; ++i) {
             s[i] = 0.0f;
-            #pragma unroll
+#pragma unroll
             for (int wp = 0; wp < WARPS; ++wp) s[i] += red_smem[i][wp];
           }
-          #pragma unroll
+#pragma unroll
           for (int m = 0; m < 4; ++m) {
             if (m >= M) continue;
             if (row0 + RPT - 1 >= N) continue;  // ragged tail
             if constexpr (RPT == 4)
-              atomic_add_pk4_f16(
-                  out + (int64_t)m * N + row0,
-                  __halves2half2(__float2half_rn(s[0 * 4 + m]),
-                                 __float2half_rn(s[1 * 4 + m])),
-                  __halves2half2(__float2half_rn(s[2 * 4 + m]),
-                                 __float2half_rn(s[3 * 4 + m])));
+              atomic_add_pk4_f16(out + (int64_t)m * N + row0,
+                                 __halves2half2(__float2half_rn(s[0 * 4 + m]),
+                                                __float2half_rn(s[1 * 4 + m])),
+                                 __halves2half2(__float2half_rn(s[2 * 4 + m]),
+                                                __float2half_rn(s[3 * 4 + m])));
             else
-              atomic_add_pk2_f16(
-                  out + (int64_t)m * N + row0,
-                  __halves2half2(__float2half_rn(s[0 * 4 + m]),
-                                 __float2half_rn(s[1 * 4 + m])));
+              atomic_add_pk2_f16(out + (int64_t)m * N + row0,
+                                 __halves2half2(__float2half_rn(s[0 * 4 + m]),
+                                                __float2half_rn(s[1 * 4 + m])));
           }
         }
       }
@@ -531,15 +549,14 @@ __global__ void __launch_bounds__(KCHUNK / 8)
 // violation on an odd 32-bit CAS was observed, 2026-08-23).
 template <int KCHUNK, int M>
 __global__ void __launch_bounds__(KCHUNK / 8)
-    dense_gemv_m_kernel_m16(const half* __restrict__ x,   // [M, K]
-                            const half* __restrict__ w,   // [N, K]
-                            half* __restrict__ out,       // [M, N], pre-zeroed
-                                                            // if KSPLIT>1
-                            const int N, const int K,
-                            const int ksplit) {
-  static_assert(KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 ||
-                    KCHUNK == 4096,
-                "KCHUNK must be 512, 1024, 2048 or 4096");
+    dense_gemv_m_kernel_m16(const half* __restrict__ x,  // [M, K]
+                            const half* __restrict__ w,  // [N, K]
+                            half* __restrict__ out,      // [M, N], pre-zeroed
+                                                         // if KSPLIT>1
+                            const int N, const int K, const int ksplit) {
+  static_assert(
+      KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 || KCHUNK == 4096,
+      "KCHUNK must be 512, 1024, 2048 or 4096");
   static_assert(M >= 5 && M <= 16, "M must be 5..16");
   constexpr int THREADS = KCHUNK / 8;
   constexpr int WARPS = THREADS / 64;
@@ -551,7 +568,7 @@ __global__ void __launch_bounds__(KCHUNK / 8)
     uint4 u;
     half2 h2[4];
   } xa[M];
-  #pragma unroll
+#pragma unroll
   for (int m = 0; m < M; ++m)
     xa[m].u = *(const uint4*)(x + (int64_t)m * K + k0 + t * 8);
 
@@ -561,15 +578,15 @@ __global__ void __launch_bounds__(KCHUNK / 8)
     half2 h2[4];
   } wa;
   wa.u = *(const uint4*)(w + (int64_t)row * K + k0 + t * 8);
-  #pragma unroll
+#pragma unroll
   for (int m = 0; m < M; ++m) acc[m] = dot8_f32(wa.h2, xa[m].h2);
 
-  // Full 64-lane wavefront butterfly (masks 32..1 - mask 32 is the
-  // cross-32-lane-half exchange on gfx906; house pattern, see
-  // dense_gemv_m_kernel), then cross-warp in shared memory.
-  #pragma unroll
+// Full 64-lane wavefront butterfly (masks 32..1 - mask 32 is the
+// cross-32-lane-half exchange on gfx906; house pattern, see
+// dense_gemv_m_kernel), then cross-warp in shared memory.
+#pragma unroll
   for (int mask = 32; mask >= 1; mask /= 2)
-    #pragma unroll
+#pragma unroll
     for (int m = 0; m < M; ++m) acc[m] += __shfl_xor(acc[m], mask);
 
   __shared__ float red_smem[M][WARPS];  // WARPS <= 8 (KCHUNK <= 4096)
@@ -579,7 +596,7 @@ __global__ void __launch_bounds__(KCHUNK / 8)
   __syncthreads();
   if (warp == 0 && lane < M) {
     float s = 0.0f;
-    #pragma unroll
+#pragma unroll
     for (int wp = 0; wp < WARPS; ++wp) s += red_smem[lane][wp];
     if (ksplit == 1) {
       out[(int64_t)lane * N + row] = __float2half_rn(s);
@@ -636,34 +653,34 @@ __global__ void __launch_bounds__(KCHUNK / 8)
 // Signed two's-complement byte -> int (bytes >= 0x80 read as -128..-1; the
 // scheme stores pre-shifted signed int8, so a plain (short)(b) cast would
 // sign-extend from the wrong width).
-__forceinline__ __device__ int i8_byte(int b) { return b >= 0x80 ? b - 256 : b; }
+__forceinline__ __device__ int i8_byte(int b) {
+  return b >= 0x80 ? b - 256 : b;
+}
 
 __forceinline__ __device__ void dequant_i8_to_h2(const uint4 u, half2 (&h)[8]) {
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     const unsigned word = ((const unsigned*)&u)[i];
-    h[2 * i] = __halves2half2(
-        __int2half_rn(i8_byte((word >> 0) & 0xff)),
-        __int2half_rn(i8_byte((word >> 8) & 0xff)));
-    h[2 * i + 1] = __halves2half2(
-        __int2half_rn(i8_byte((word >> 16) & 0xff)),
-        __int2half_rn(i8_byte((word >> 24) & 0xff)));
+    h[2 * i] = __halves2half2(__int2half_rn(i8_byte((word >> 0) & 0xff)),
+                              __int2half_rn(i8_byte((word >> 8) & 0xff)));
+    h[2 * i + 1] = __halves2half2(__int2half_rn(i8_byte((word >> 16) & 0xff)),
+                                  __int2half_rn(i8_byte((word >> 24) & 0xff)));
   }
 }
 
 template <int RPT, int KC>
 __global__ void __launch_bounds__(KC / 16)
-    dense_gemv_i8_kernel(const half* __restrict__ x,   // [K]
+    dense_gemv_i8_kernel(const half* __restrict__ x,         // [K]
                          const signed char* __restrict__ w,  // [N, K]
-                         const half* __restrict__ s,   // [N]
-                         half* __restrict__ out,       // [N], pre-zeroed if KSPLIT>1
-                         const int N, const int K,
-                         const int ksplit) {
+                         const half* __restrict__ s,         // [N]
+                         half* __restrict__ out,  // [N], pre-zeroed if KSPLIT>1
+                         const int N, const int K, const int ksplit) {
   static_assert(KC == 1024 || KC == 2048 || KC == 4096,
                 "KC must be 1024, 2048 or 4096 (whole wavefronts)");
   static_assert(RPT == 2 || RPT == 4, "RPT must be 2 or 4");
   constexpr int THREADS = KC / 16;
-  static_assert(THREADS % 64 == 0, "KC/16 must be a whole number of wavefronts");
+  static_assert(THREADS % 64 == 0,
+                "KC/16 must be a whole number of wavefronts");
   constexpr int WARPS = THREADS / 64;
   const int t = threadIdx.x;
   const int row0 = blockIdx.x * RPT;
@@ -707,8 +724,7 @@ __global__ void __launch_bounds__(KC / 16)
 #pragma unroll
   for (int mask = 32; mask >= 1; mask /= 2) {
 #pragma unroll
-    for (int r = 0; r < RPT; ++r)
-      acc[r] += __shfl_xor(acc[r], mask);
+    for (int r = 0; r < RPT; ++r) acc[r] += __shfl_xor(acc[r], mask);
   }
 
   if constexpr (WARPS == 1) {
@@ -765,9 +781,8 @@ __global__ void __launch_bounds__(KC / 16)
           float s1 = 0.0f;
 #pragma unroll
           for (int wp = 0; wp < WARPS; ++wp) s1 += red_smem[1][wp];
-          atomic_add_pk2_f16(
-              out + row0,
-              __halves2half2(__float2half_rn(sum), __float2half_rn(s1)));
+          atomic_add_pk2_f16(out + row0, __halves2half2(__float2half_rn(sum),
+                                                        __float2half_rn(s1)));
         }
       }
     }
@@ -775,13 +790,12 @@ __global__ void __launch_bounds__(KC / 16)
 }
 
 template <int RPT, int KC, int M>
-__global__ void __launch_bounds__(KC / 16)
-    dense_gemv_i8_m_kernel(const half* __restrict__ x,   // [M, K]
-                           const signed char* __restrict__ w,  // [N, K]
-                           const half* __restrict__ s,   // [N]
-                           half* __restrict__ out,       // [M, N], pre-zeroed if KSPLIT>1
-                           const int N, const int K,
-                           const int ksplit) {
+__global__ void __launch_bounds__(KC / 16) dense_gemv_i8_m_kernel(
+    const half* __restrict__ x,         // [M, K]
+    const signed char* __restrict__ w,  // [N, K]
+    const half* __restrict__ s,         // [N]
+    half* __restrict__ out,             // [M, N], pre-zeroed if KSPLIT>1
+    const int N, const int K, const int ksplit) {
   static_assert(KC == 1024 || KC == 2048 || KC == 4096,
                 "KC must be 1024, 2048 or 4096 (whole wavefronts)");
   static_assert(RPT == 2 || RPT == 4, "RPT must be 2 or 4");
@@ -793,14 +807,15 @@ __global__ void __launch_bounds__(KC / 16)
   // traffic is M-invariant and HALVED vs the fp16 path, so it still wins.
   static_assert(M >= 1 && M <= 8, "M must be 1..8");
   constexpr int THREADS = KC / 16;
-  static_assert(THREADS % 64 == 0, "KC/16 must be a whole number of wavefronts");
+  static_assert(THREADS % 64 == 0,
+                "KC/16 must be a whole number of wavefronts");
   constexpr int WARPS = THREADS / 64;
   constexpr int NV = RPT * M;  // values per thread (flattened r*M+m)
   const int t = threadIdx.x;
   const int row0 = blockIdx.x * RPT;
   const int k0 = blockIdx.y * KC;
 
-  // x slices for all M rows, each 16 halfs (two uint4s). x is small
+  // x slices for all M rows, each 16 halves (two uint4s). x is small
   // (M*K*2B <= 64 KB, L2-resident); every block re-reads its k-chunk.
   const bool inb = (k0 + t * 16) < K;
   union {
@@ -835,11 +850,10 @@ __global__ void __launch_bounds__(KC / 16)
 
 #pragma unroll
   for (int mask = 32; mask >= 1; mask /= 2)
-    #pragma unroll
+#pragma unroll
     for (int r = 0; r < RPT; ++r)
-      #pragma unroll
-      for (int m = 0; m < M; ++m)
-        acc[r][m] += __shfl_xor(acc[r][m], mask);
+#pragma unroll
+      for (int m = 0; m < M; ++m) acc[r][m] += __shfl_xor(acc[r][m], mask);
 
   if constexpr (WARPS == 1) {
     // Lane i < RPT*M holds (r=i/M, m=i%M)'s full sum. After the butterfly
@@ -941,7 +955,8 @@ __global__ void dense_gemv_i8_scale_kernel(half* __restrict__ out,
                                            const half* __restrict__ s,
                                            const int N) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < N) out[i] = __float2half_rn(__half2float(out[i]) * __half2float(s[i]));
+  if (i < N)
+    out[i] = __float2half_rn(__half2float(out[i]) * __half2float(s[i]));
 }
 
 }  // namespace dense_gemv_gfx906
@@ -978,9 +993,9 @@ torch::Tensor dense_gemv_m4_gfx906(torch::Tensor weight, torch::Tensor x,
   TORCH_CHECK(M >= 1 && M <= 16, "M must be 1..16 (got ", M, ")");
   TORCH_CHECK(x.size(1) == K, "x/weight K mismatch");
   TORCH_CHECK(K % 8 == 0, "K must be a multiple of 8");
-  TORCH_CHECK(kchunk == 512 || kchunk == 1024 || kchunk == 2048 ||
-                  kchunk == 4096,
-              "kchunk must be 512, 1024, 2048 or 4096");
+  TORCH_CHECK(
+      kchunk == 512 || kchunk == 1024 || kchunk == 2048 || kchunk == 4096,
+      "kchunk must be 512, 1024, 2048 or 4096");
   TORCH_CHECK(K % kchunk == 0, "K must be divisible by kchunk");
 
   // RPT is 2 or 4 (the packed CAS epilogue needs adjacent rows); env
@@ -1002,65 +1017,63 @@ torch::Tensor dense_gemv_m4_gfx906(torch::Tensor weight, torch::Tensor x,
   const half* xp = (const half*)x.data_ptr();
   half* op = (half*)out.data_ptr();
 
-  #define LAUNCHM(MVAL, RPT, KC)                                          \
-    {                                                                     \
-      dim3 grid(N / RPT, ksplit);                                         \
-      vllm::dense_gemv_gfx906::dense_gemv_m_kernel<RPT, KC, MVAL>         \
-          <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)N, (int)K,       \
-                                        ksplit);                          \
-    }
-  #define LAUNCHM_RT(RPT, KC)                                             \
-    {                                                                     \
-      dim3 grid(N / RPT, ksplit);                                         \
-      vllm::dense_gemv_gfx906::dense_gemv_m_kernel_rt<RPT, KC>            \
-          <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)M, (int)N,       \
-                                        (int)K, ksplit);                  \
-    }
-  #define LAUNCHM_RT_BY_RPT(KCVAL)                                        \
-    do {                                                                  \
-      if (rpt == 4)                                                       \
-        LAUNCHM_RT(4, KCVAL)                                              \
-      else                                                                \
-        LAUNCHM_RT(2, KCVAL)                                              \
-    } while (0)
-  #define LAUNCHM_BY_RPT(MVAL, KCVAL)                                     \
-    do {                                                                  \
-      if (rpt == 4)                                                       \
-        LAUNCHM(MVAL, 4, KCVAL)                                           \
-      else                                                                \
-        LAUNCHM(MVAL, 2, KCVAL)                                           \
-    } while (0)
-  #define LAUNCHM_BY_KC(MVAL)                                             \
-    do {                                                                  \
-      if (kchunk == 4096)                                                 \
-        LAUNCHM_BY_RPT(MVAL, 4096);                                       \
-      else if (kchunk == 2048)                                            \
-        LAUNCHM_BY_RPT(MVAL, 2048);                                       \
-      else if (kchunk == 1024)                                            \
-        LAUNCHM_BY_RPT(MVAL, 1024);                                       \
-      else                                                                \
-        LAUNCHM_BY_RPT(MVAL, 512);                                        \
-    } while (0)
-  // M=5..16: RPT=1 exact-M m16 kernel (W4; see the kernel above for the
-  // measured win/gate rationale).
-  #define LAUNCHM16(MVAL, KC)                                             \
-    {                                                                     \
-      dim3 grid(N, ksplit);                                               \
-      vllm::dense_gemv_gfx906::dense_gemv_m_kernel_m16<KC, MVAL>          \
-          <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)N, (int)K,       \
-                                        ksplit);                          \
-    }
-  #define LAUNCHM16_BY_KC(MAXM)                                           \
-    do {                                                                  \
-      if (kchunk == 4096)                                                 \
-        LAUNCHM16(MAXM, 4096)                                             \
-      else if (kchunk == 2048)                                            \
-        LAUNCHM16(MAXM, 2048)                                             \
-      else if (kchunk == 1024)                                            \
-        LAUNCHM16(MAXM, 1024)                                             \
-      else                                                                \
-        LAUNCHM16(MAXM, 512)                                              \
-    } while (0)
+#define LAUNCHM(MVAL, RPT, KC)                                             \
+  {                                                                        \
+    dim3 grid(N / RPT, ksplit);                                            \
+    vllm::dense_gemv_gfx906::dense_gemv_m_kernel<RPT, KC, MVAL>            \
+        <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)N, (int)K, ksplit); \
+  }
+#define LAUNCHM_RT(RPT, KC)                                               \
+  {                                                                       \
+    dim3 grid(N / RPT, ksplit);                                           \
+    vllm::dense_gemv_gfx906::dense_gemv_m_kernel_rt<RPT, KC>              \
+        <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)M, (int)N, (int)K, \
+                                      ksplit);                            \
+  }
+#define LAUNCHM_RT_BY_RPT(KCVAL) \
+  do {                           \
+    if (rpt == 4)                \
+      LAUNCHM_RT(4, KCVAL)       \
+    else                         \
+      LAUNCHM_RT(2, KCVAL)       \
+  } while (0)
+#define LAUNCHM_BY_RPT(MVAL, KCVAL) \
+  do {                              \
+    if (rpt == 4)                   \
+      LAUNCHM(MVAL, 4, KCVAL)       \
+    else                            \
+      LAUNCHM(MVAL, 2, KCVAL)       \
+  } while (0)
+#define LAUNCHM_BY_KC(MVAL)       \
+  do {                            \
+    if (kchunk == 4096)           \
+      LAUNCHM_BY_RPT(MVAL, 4096); \
+    else if (kchunk == 2048)      \
+      LAUNCHM_BY_RPT(MVAL, 2048); \
+    else if (kchunk == 1024)      \
+      LAUNCHM_BY_RPT(MVAL, 1024); \
+    else                          \
+      LAUNCHM_BY_RPT(MVAL, 512);  \
+  } while (0)
+// M=5..16: RPT=1 exact-M m16 kernel (W4; see the kernel above for the
+// measured win/gate rationale).
+#define LAUNCHM16(MVAL, KC)                                                \
+  {                                                                        \
+    dim3 grid(N, ksplit);                                                  \
+    vllm::dense_gemv_gfx906::dense_gemv_m_kernel_m16<KC, MVAL>             \
+        <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)N, (int)K, ksplit); \
+  }
+#define LAUNCHM16_BY_KC(MAXM) \
+  do {                        \
+    if (kchunk == 4096)       \
+      LAUNCHM16(MAXM, 4096)   \
+    else if (kchunk == 2048)  \
+      LAUNCHM16(MAXM, 2048)   \
+    else if (kchunk == 1024)  \
+      LAUNCHM16(MAXM, 1024)   \
+    else                      \
+      LAUNCHM16(MAXM, 512)    \
+  } while (0)
   if (M == 1)
     LAUNCHM_BY_KC(1);
   else if (M == 2)
@@ -1118,9 +1131,9 @@ torch::Tensor dense_gemv_gfx906(torch::Tensor weight, torch::Tensor x,
   TORCH_CHECK(x.size(0) == 1, "x must be [1, K] (M=1 only)");
   TORCH_CHECK(x.size(1) == K, "x/weight K mismatch");
   TORCH_CHECK(K % 8 == 0, "K must be a multiple of 8");
-  TORCH_CHECK(kchunk == 512 || kchunk == 1024 || kchunk == 2048 ||
-                  kchunk == 4096,
-              "kchunk must be 512, 1024, 2048 or 4096");
+  TORCH_CHECK(
+      kchunk == 512 || kchunk == 1024 || kchunk == 2048 || kchunk == 4096,
+      "kchunk must be 512, 1024, 2048 or 4096");
   TORCH_CHECK(K % kchunk == 0, "K must be divisible by kchunk");
 
   // Rows per thread: env override (micro-bench sweeps), else the
@@ -1130,12 +1143,11 @@ torch::Tensor dense_gemv_gfx906(torch::Tensor weight, torch::Tensor x,
   int rpt = -1;
   if (const char* e = getenv("VLLM_GFX906_GEMV_RPT")) {
     rpt = atoi(e);
-    TORCH_CHECK(rpt != 0,
-                "VLLM_GFX906_GEMV_RPT must be 1, 2 or 4 (got 0)");
+    TORCH_CHECK(rpt != 0, "VLLM_GFX906_GEMV_RPT must be 1, 2 or 4 (got 0)");
     if (rpt != 1 && rpt != 2 && rpt != 4) {
-      TORCH_WARN_ONCE(
-          "VLLM_GFX906_GEMV_RPT (", rpt, ") is not one of 1/2/4; using the "
-          "default rule instead.");
+      TORCH_WARN_ONCE("VLLM_GFX906_GEMV_RPT (", rpt,
+                      ") is not one of 1/2/4; using the "
+                      "default rule instead.");
       rpt = -1;
     }
   }
@@ -1169,21 +1181,21 @@ torch::Tensor dense_gemv_gfx906(torch::Tensor weight, torch::Tensor x,
   const half* xp = (const half*)x.data_ptr();
   half* op = (half*)out.data_ptr();
 
-  #define LAUNCH(RPT, KC)                                                   \
-    {                                                                       \
-      dim3 grid((N + RPT - 1) / RPT, ksplit);                               \
-      vllm::dense_gemv_gfx906::dense_gemv_kernel<RPT, KC>                   \
-          <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)N, (int)K, ksplit);\
-    }
-  #define LAUNCH_BY_RPT(KCVAL)                                              \
-    do {                                                                    \
-      if (rpt == 4)                                                         \
-        LAUNCH(4, KCVAL)                                                    \
-      else if (rpt == 2)                                                    \
-        LAUNCH(2, KCVAL)                                                    \
-      else                                                                  \
-        LAUNCH(1, KCVAL)                                                    \
-    } while (0)
+#define LAUNCH(RPT, KC)                                                    \
+  {                                                                        \
+    dim3 grid((N + RPT - 1) / RPT, ksplit);                                \
+    vllm::dense_gemv_gfx906::dense_gemv_kernel<RPT, KC>                    \
+        <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)N, (int)K, ksplit); \
+  }
+#define LAUNCH_BY_RPT(KCVAL) \
+  do {                       \
+    if (rpt == 4)            \
+      LAUNCH(4, KCVAL)       \
+    else if (rpt == 2)       \
+      LAUNCH(2, KCVAL)       \
+    else                     \
+      LAUNCH(1, KCVAL)       \
+  } while (0)
 
   if (kchunk == 4096)
     LAUNCH_BY_RPT(4096);
@@ -1246,8 +1258,8 @@ torch::Tensor dense_gemv_i8_gfx906(torch::Tensor weight, torch::Tensor scale,
   TORCH_CHECK(x.size(0) == K, "x/weight K mismatch");
   TORCH_CHECK(scale.numel() == N, "scale must have N elements");
   TORCH_CHECK(K % 16 == 0, "K (", K, ") must be a multiple of 16");
-  TORCH_CHECK(i8_kchunk_ok(kchunk),
-              "kchunk must be 1024, 2048 or 4096 (got ", kchunk, ")");
+  TORCH_CHECK(i8_kchunk_ok(kchunk), "kchunk must be 1024, 2048 or 4096 (got ",
+              kchunk, ")");
 
   const int ksplit = (int)((K + kchunk - 1) / kchunk);  // ceil; tail masked
   if (ksplit > 1)
@@ -1269,20 +1281,20 @@ torch::Tensor dense_gemv_i8_gfx906(torch::Tensor weight, torch::Tensor scale,
   const half* xp = (const half*)x.data_ptr();
   half* op = (half*)out.data_ptr();
 
-#define LAUNCH_I8(RPT, KC)                                                  \
-  {                                                                         \
-    dim3 grid((N + RPT - 1) / RPT, ksplit);                                 \
-    vllm::dense_gemv_gfx906::dense_gemv_i8_kernel<RPT, KC>                  \
-        <<<grid, KC / 16, 0, stream>>>(xp, wp, sp, op, (int)N, (int)K,      \
-                                       ksplit);                             \
+#define LAUNCH_I8(RPT, KC)                                             \
+  {                                                                    \
+    dim3 grid((N + RPT - 1) / RPT, ksplit);                            \
+    vllm::dense_gemv_gfx906::dense_gemv_i8_kernel<RPT, KC>             \
+        <<<grid, KC / 16, 0, stream>>>(xp, wp, sp, op, (int)N, (int)K, \
+                                       ksplit);                        \
   }
 
-#define LAUNCH_I8_BY_RPT(KCVAL)                                             \
-  do {                                                                      \
-    if (rpt == 4)                                                           \
-      LAUNCH_I8(4, KCVAL)                                                   \
-    else                                                                    \
-      LAUNCH_I8(2, KCVAL)                                                   \
+#define LAUNCH_I8_BY_RPT(KCVAL) \
+  do {                          \
+    if (rpt == 4)               \
+      LAUNCH_I8(4, KCVAL)       \
+    else                        \
+      LAUNCH_I8(2, KCVAL)       \
   } while (0)
 
   if (kchunk == 4096)
@@ -1298,8 +1310,9 @@ torch::Tensor dense_gemv_i8_gfx906(torch::Tensor weight, torch::Tensor scale,
   if (ksplit > 1) {
     const int threads = 256;
     const int blocks = (int)((N + threads - 1) / threads);
-    vllm::dense_gemv_gfx906::dense_gemv_i8_scale_kernel<<<blocks, threads, 0, stream>>>(
-        op, sp, (int)N);
+    vllm::dense_gemv_gfx906::
+        dense_gemv_i8_scale_kernel<<<blocks, threads, 0, stream>>>(op, sp,
+                                                                   (int)N);
   }
   return out;
 }
@@ -1321,8 +1334,8 @@ torch::Tensor dense_gemv_i8_m4_gfx906(torch::Tensor weight, torch::Tensor scale,
   TORCH_CHECK(x.size(1) == K, "x/weight K mismatch");
   TORCH_CHECK(scale.numel() == N, "scale must have N elements");
   TORCH_CHECK(K % 16 == 0, "K (", K, ") must be a multiple of 16");
-  TORCH_CHECK(i8_kchunk_ok(kchunk),
-              "kchunk must be 1024, 2048 or 4096 (got ", kchunk, ")");
+  TORCH_CHECK(i8_kchunk_ok(kchunk), "kchunk must be 1024, 2048 or 4096 (got ",
+              kchunk, ")");
 
   const int ksplit = (int)((K + kchunk - 1) / kchunk);  // ceil; tail masked
   int rpt = (N % 4 == 0) ? 4 : (N % 2 == 0 ? 2 : -1);
@@ -1341,30 +1354,30 @@ torch::Tensor dense_gemv_i8_m4_gfx906(torch::Tensor weight, torch::Tensor scale,
   const half* xp = (const half*)x.data_ptr();
   half* op = (half*)out.data_ptr();
 
-#define LAUNCHM_I8(MVAL, RPT, KC)                                           \
-  {                                                                         \
-    dim3 grid((N + RPT - 1) / RPT, ksplit);                                 \
-    vllm::dense_gemv_gfx906::dense_gemv_i8_m_kernel<RPT, KC, MVAL>          \
-        <<<grid, KC / 16, 0, stream>>>(xp, wp, sp, op, (int)N, (int)K,      \
-                                       ksplit);                             \
+#define LAUNCHM_I8(MVAL, RPT, KC)                                      \
+  {                                                                    \
+    dim3 grid((N + RPT - 1) / RPT, ksplit);                            \
+    vllm::dense_gemv_gfx906::dense_gemv_i8_m_kernel<RPT, KC, MVAL>     \
+        <<<grid, KC / 16, 0, stream>>>(xp, wp, sp, op, (int)N, (int)K, \
+                                       ksplit);                        \
   }
 
-#define LAUNCHM_I8_BY_RPT(MVAL, KCVAL)                                      \
-  do {                                                                      \
-    if (rpt == 4)                                                           \
-      LAUNCHM_I8(MVAL, 4, KCVAL)                                            \
-    else                                                                    \
-      LAUNCHM_I8(MVAL, 2, KCVAL)                                            \
+#define LAUNCHM_I8_BY_RPT(MVAL, KCVAL) \
+  do {                                 \
+    if (rpt == 4)                      \
+      LAUNCHM_I8(MVAL, 4, KCVAL)       \
+    else                               \
+      LAUNCHM_I8(MVAL, 2, KCVAL)       \
   } while (0)
 
-#define LAUNCHM_I8_BY_KC(MVAL)                                              \
-  do {                                                                      \
-    if (kchunk == 4096)                                                     \
-      LAUNCHM_I8_BY_RPT(MVAL, 4096);                                        \
-    else if (kchunk == 2048)                                                \
-      LAUNCHM_I8_BY_RPT(MVAL, 2048);                                        \
-    else                                                                    \
-      LAUNCHM_I8_BY_RPT(MVAL, 1024);                                        \
+#define LAUNCHM_I8_BY_KC(MVAL)       \
+  do {                               \
+    if (kchunk == 4096)              \
+      LAUNCHM_I8_BY_RPT(MVAL, 4096); \
+    else if (kchunk == 2048)         \
+      LAUNCHM_I8_BY_RPT(MVAL, 2048); \
+    else                             \
+      LAUNCHM_I8_BY_RPT(MVAL, 1024); \
   } while (0)
 
   // T-1.5 (2026-09-05): explicit cases — the macro needs a compile-time M
