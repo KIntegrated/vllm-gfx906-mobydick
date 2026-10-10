@@ -254,6 +254,269 @@ def enable_qk_norm_rope_kvcache(cfg: "VllmConfig") -> bool:
     return cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
 
 
+ENV_ALLOW_ASYNC_GDN = "VLLM_GFX906_ALLOW_ASYNC_GDN"
+_GDN_LAYER_TYPE = "linear_attention"
+
+ENV_PLE_HOSTIDS = "VLLM_GFX906_PLE_HOSTIDS"
+"""Mirror each step's draft tokens into pinned host memory so the next step's PLE
+n-gram ids can be computed on the host (docs/d1-host-ids-design.md). Named here
+because two places read it -- config validation, and the worker that does the
+staging -- and a typo in either one is a knob that silently never engages.
+"""
+
+
+def ple_hostids_async_conflict(
+    async_scheduling: bool, environ: dict[str, str] | None = None
+) -> str | None:
+    """Return why ``VLLM_GFX906_PLE_HOSTIDS`` cannot be correct here, or None.
+
+    The host only ever has a decode step's drafted rows because sync scheduling
+    parks it at the end of every step: ``DraftTokensHandler`` mirrors
+    ``req_states.draft_tokens`` on a copy stream, and the wait that makes the
+    mirror usable is the ``copy_event.synchronize()`` in
+    ``v1/worker/gpu/async_utils.py`` that sync scheduling pays anyway. Turn
+    async scheduling on and that wait disappears, so the mirror serves step N+1
+    drafts captured a step late. Nothing raises: the ids are still in range, the
+    n-gram hashes still land on real rows of a 20-million-row table, and the
+    model receives an embedding computed from the wrong context. That is the
+    same class of failure as a captured CUDA graph replaying a stale PLE
+    embedding (mtp-cudagraph-profile-crash.md 13.2), which ran on this box for
+    hours before anyone noticed.
+
+    The check is a function rather than inline so it can be tested against both
+    answers; a guard that has never been observed to pass is not a guard.
+    """
+    env = os.environ if environ is None else environ
+    # Any non-zero value, not just "1": "2" (differential) reads the same mirror,
+    # so the same one-step lag applies -- it would only produce spurious mismatches
+    # instead of wrong ids, which is still a knob that cannot be evaluated.
+    if not async_scheduling or env.get(ENV_PLE_HOSTIDS, "0") in ("0", ""):
+        return None
+    return (
+        f"{ENV_PLE_HOSTIDS} requires synchronous scheduling: the host copy of "
+        "this step's draft tokens is only complete because the engine waits for "
+        "them at the end of every step (async_utils.py get_output). With async "
+        "scheduling the mirror lags one step, which yields a plausible ngram id "
+        "built from stale context rather than an error. Run with "
+        "--no-async-scheduling, or unset the variable."
+    )
+
+
+ENV_ALLOW_HOSTIDS_MTP = "VLLM_GFX906_ALLOW_HOSTIDS_MTP"
+"""Set to 1 to run the PLE host-ids knob under speculative decoding.
+
+It opens both modes, and what it concedes differs by mode. ``HOSTIDS=2`` compares
+and never serves, so the override there says a question can be asked. ``HOSTIDS=1``
+serves the host's rows to the model, so the override there says the configuration
+has never run on this hardware and the operator has weighed that -- see
+:func:`ple_hostids_mtp_conflict` for what is and is not established, and
+``docs/ple-multipass-verdict.md`` for why the reason this guard first printed
+("the PLE op runs k+1 times per step, a patchwork of passes") is false.
+"""
+
+
+def ple_hostids_mtp_conflict(
+    num_speculative_tokens: int, environ: dict[str, str] | None = None
+) -> str | None:
+    """Return why ``VLLM_GFX906_PLE_HOSTIDS`` needs an override under MTP, or None.
+
+    What this guard is for has not changed: host ids and a drafter do not combine
+    by inspection, and someone has to say out loud what the combination costs.
+    What it *says* had to be rewritten, because the mechanism it originally
+    refused on was false.
+
+    **The mechanism it printed was wrong.** It claimed that with
+    ``num_speculative_tokens = k`` the PLE op runs ``k + 1`` times per step, each
+    pass writing only its own rows into one static ids buffer, so the buffer is a
+    patchwork of passes -- and it cited the 2026-10-01 22:20:51 mismatch across all
+    four TP workers (``vllm.log.20261001-215123``, inverted by
+    ``scripts/invert-mismatch-2220b.py``) as the measurement. Four independent lines
+    say that is not how this tree works (**``docs/ple-multipass-verdict.md``**):
+
+    * the drafter builds no PLE module at all -- ``mtp.py:8`` turns it off and
+      ``mtp.py:314-322`` passes ``input_ids=None``, which ``model.py:296`` would
+      raise on if a PLE layer existed, and that string appears in zero logs from
+      this box,
+    * one PLE op call per step, measured: boot #14's TP0 compared at 14.4/s while
+      the engine ran 15.0 steps/s (49.0 tok/s / 3.27 acceptance), where the
+      multi-pass story predicts ~25,000 gate-skips per worker and 8 happened,
+    * ``[0, 2, 2, 2]`` -- the qsl the mismatch reported -- is arithmetically
+      impossible as a pass of a 3-request step, and is exactly the padded form of
+      an earlier B=1 2-token step (``input_batch.py:159``), and
+    * the mismatch itself disappeared when ``18c119f010`` fixed the non-monotone
+      ``ple_query_start_loc`` that made the workspace scatter's ``searchsorted()``
+      undefined: boot #14, 55,921 comparisons, 0 mismatches, 0 DISABLED, against
+      the cited boot's 4 mismatches and 4 DISABLED after **0** staged steps.
+
+    The rows that looked authored by another pass were rows **misplaced** into the
+    wrong workspace row. The host column is reproduced exactly by
+    ``f(2640, 1156)``: the host was right.
+
+    **What is left is the thing no amount of code-reading settles:** whether
+    ``HOSTIDS=1`` under MTP is correct has never been run on this hardware. Mode 1's
+    rows are attributable only while the step's device arrays agree with the host
+    mirror; that is now checked in the staging path (``stage_inputs_agree``, which is
+    where it belongs -- as a mode-2-only gate it guarded a comparison while the
+    serving path staged anything it was handed), and boot #14 measured the
+    disagreement rate at about 2 steps per worker per 40,500. The open question is
+    what a *refused* step does under a captured graph: piecewise is safe by
+    construction (the op falls through to the device path), FULL is not (the op body
+    does not run at replay, so the step ships the previous step's rows). That is what
+    ``Qwen4ExpModelState._ple_host_stale_steps`` exists to count, and it is a
+    measured cliff rather than a hypothetical one.
+
+    So ``VLLM_GFX906_ALLOW_HOSTIDS_MTP=1`` now opens both modes, which is not the
+    same concession in either. Mode 2 returns from
+    ``stage_host_step(gather=False)`` before ``_host_stage_rows``, ``_pinned_output``
+    and the generation counter are touched, so it cannot take the staged branch: it
+    compares, and the gate refuses steps whose arrays do not describe the same work.
+    Mode 1 serves the host's rows to the model, and the override says that has never
+    been booted here and the risk was weighed. Neither mode runs without the
+    override: a knob that silently fails to engage is indistinguishable from one that
+    worked, and refusing is the house pattern (``ple_hostids_async_conflict``).
+
+    Do not "fix" this by dropping ``--speculative-config``, which is what this guard
+    used to advise. Measured wrong on 2026-10-02, and a guard's remedy is part of the
+    guard: it cost five boot attempts across two boots (``234242``, ``065905``), all
+    dying at the same line. A drafter-off boot cannot answer the question, twice over.
+    (1) It compares nothing: the mirror's only window into the token stream is
+    ``draft_tokens_handler`` (``gpu/model_runner.py`` binds ``_host_drafts`` from it,
+    because P1.6 reuses the one per-step host copy already being paid), so with no
+    drafter every step refuses with ``no-draft-source`` -- ``vllm.log.20261002-065905``,
+    all four TP workers, during ``profile_run``. (2) It does not compile:
+    ``ConstraintViolationError: L['input_ids'].size()[0] ... specialized to be a
+    constant (4096)`` at ``profile_run`` -> ``aot_compile`` -> ``build_guards``; the
+    only two logs in this box's corpus containing that exception at all are the two
+    drafter-off ``HOSTIDS=2`` boots, and it is deterministic, so retrying does not
+    help.
+    """
+
+    env = os.environ if environ is None else environ
+    mode = env.get(ENV_PLE_HOSTIDS, "0")
+    if num_speculative_tokens < 1 or mode in ("0", ""):
+        return None
+    if mode not in ("1", "2"):
+        # An unrecognised value is not a mode the guard can reason about, and the
+        # override permits a *named* risk -- so it does not permit this one. Keep
+        # this check ahead of the override or a typo becomes a silent green light.
+        return (
+            f"{ENV_PLE_HOSTIDS}={mode!r} is neither 1 (serve host rows) nor 2 "
+            "(compare only), so which path this config takes is unknown. The "
+            f"{ENV_ALLOW_HOSTIDS_MTP} override permits a named risk; this is not "
+            "one. Set the variable to 1, 2, or unset it."
+        )
+    if env.get(ENV_ALLOW_HOSTIDS_MTP, "0") == "1":
+        if mode == "1":
+            # The override concedes an unmeasured configuration, not a measured
+            # defect, and the boot log should record which -- otherwise the next
+            # reader of this boot finds a knob on with no note of what was
+            # accepted by turning it on.
+            logger.warning_once(
+                "%s=1 under MTP with %s=1: host-staged PLE rows are SERVED to the "
+                "model, a combination this hardware has never booted. The staging "
+                "path refuses a step whose device arrays and host mirror disagree "
+                "(~5e-5 of steps measured on boot #14); under a captured CUDA graph "
+                "a refused step replays the PREVIOUS step's rows. Read "
+                "'captured-graph refusals' in the log before calling this arm "
+                "shippable.",
+                ENV_PLE_HOSTIDS,
+                ENV_ALLOW_HOSTIDS_MTP,
+            )
+        return None
+    headline = (
+        f"{ENV_PLE_HOSTIDS}={mode} with num_speculative_tokens="
+        f"{num_speculative_tokens} has not been measured on this hardware"
+    )
+    # The two modes do not concede the same thing, so they must not read the same
+    # paragraph. One message for both would be wrong about one of them.
+    if mode == "1":
+        concession = (
+            "What the override concedes here: mode 1 SERVES the host's rows to the "
+            "model, and this hardware has never booted that combination. The staging "
+            "path refuses a step whose device arrays and host mirror disagree (about "
+            "2 steps per worker per 40,500, measured on boot #14); under piecewise "
+            "graphs a refused step goes to the device path and that is safe, while "
+            "under a captured graph it replays the previous step's rows -- the cliff "
+            "the captured-refusal counter measures."
+        )
+    else:
+        concession = (
+            "What the override concedes here: mode 2 only compares. "
+            "stage_host_step(gather=False) returns before the staged rows, the pinned "
+            "output and the generation counter are touched, so it cannot take the "
+            "staged branch -- a mistake in this arm is a wrong verdict, not a wrong "
+            "token, and boot #14 is this arm already run: 55,921 comparisons, 0 "
+            "mismatches."
+        )
+    return (
+        f"{headline}. Set {ENV_ALLOW_HOSTIDS_MTP}=1 to run it anyway.\n"
+        "The reason this guard used to refuse -- \"the PLE op runs "
+        f"{num_speculative_tokens + 1} times per step and each pass overwrites only "
+        "the rows it computed, so the ids buffer is a patchwork of passes\" -- is "
+        "FALSE on this tree: the drafter builds no PLE module (mtp.py:8, "
+        "mtp.py:314-322 + model.py:296, which has never raised in any log from this "
+        "box), boot #14 measured one PLE op call per step (14.4 comparisons/s vs "
+        "15.0 steps/s), and the mismatch it cited vanished once 18c119f010 made "
+        "ple_query_start_loc monotone (55,921 comparisons, 0 mismatches). See "
+        "docs/ple-multipass-verdict.md.\n"
+        f"{concession}\n"
+        "Do NOT drop --speculative-config instead (measured 2026-10-02): with no "
+        "drafter the host has no token source, so every step refuses with "
+        "'no-draft-source', and drafter-off boots do not compile "
+        "(ConstraintViolationError: input_ids specialized to 4096). "
+        "logs/vllm.log.20261001-234242, logs/vllm.log.20261002-065905."
+    )
+
+
+def gdn_async_ordering_risk(cfg: "VllmConfig") -> str | None:
+    """Return why async scheduling is unsafe for this config, or None.
+
+    The V2 model runner orders batch rows by *planned* token count
+    (`sort_batch_req_ids` in vllm/v1/worker/gpu/model_runner.py), while the GDN
+    metadata builder counts decodes with `query_len == 1` and then asserts that
+    the non-spec decodes occupy the front slice of the batch
+    (vllm/v1/attention/backends/gdn_attn.py). The two predicates agree as long
+    as the scheduler knows each request's next chunk exactly. Under async
+    scheduling a step is built before the previous step's sampled tokens have
+    settled, so a chunked prefill can arrive with a 1-token final chunk that was
+    planned as larger: the runner sorts that row as a prefill, the builder counts
+    it as a decode, and the front slice the builder peels is the wrong set of
+    rows. That is not a slow path -- it is recurrent state written for the wrong
+    request. On this box it took out all four TP workers ~40 minutes into a boot,
+    which is the worst possible failure shape for a serving host.
+
+    Detection is by the `layer_types` marker rather than by importing a model
+    class, because config validation runs before any model code is loaded. It
+    therefore also matches a model that labels its layers `linear_attention` but
+    is served by a different linear-attention kernel; there the cost is only the
+    async optimization, and VLLM_GFX906_ALLOW_ASYNC_GDN=1 turns the guard off for
+    a boot. Only the V2 runner is covered, because that is where the sort
+    predicate lives and where this was observed.
+    """
+    if os.environ.get(ENV_ALLOW_ASYNC_GDN, "0") == "1":
+        return None
+    model_config = cfg.model_config
+    if model_config is None or not cfg.use_v2_model_runner:
+        return None
+    # hf_text_config first: a composite config (VL / audio wrappers) keeps
+    # layer_types on the text sub-config, where the top-level one has none.
+    for level in (
+        getattr(model_config, "hf_text_config", None),
+        getattr(model_config, "hf_config", None),
+    ):
+        layer_types = getattr(level, "layer_types", None)
+        if isinstance(layer_types, (list, tuple)):
+            if _GDN_LAYER_TYPE in layer_types:
+                return (
+                    "this model has linear-attention (GDN) layers, whose metadata "
+                    "builder requires non-speculative decodes to be the first rows "
+                    "of the batch, and async scheduling builds a step before the "
+                    "previous step has settled"
+                )
+            return None
+    return None
+
+
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -1462,6 +1725,13 @@ class VllmConfig:
                 raise ValueError(
                     f"`{executor_backend}` does not support async scheduling yet."
                 )
+            risk = gdn_async_ordering_risk(self)
+            if risk is not None:
+                raise ValueError(
+                    f"Async scheduling is not safe here: {risk}. Start with "
+                    "--no-async-scheduling, or set "
+                    "VLLM_GFX906_ALLOW_ASYNC_GDN=1 to run it anyway."
+                )
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling unless there is an incompatible option.
             if (
@@ -1510,8 +1780,46 @@ class VllmConfig:
                     "DP+EP generation accuracy."
                 )
                 self.scheduler_config.async_scheduling = False
+            elif (gdn_risk := gdn_async_ordering_risk(self)) is not None:
+                logger.warning_once(
+                    "Async scheduling is disabled by default: %s. Set %s=1 "
+                    "to enable it anyway.",
+                    gdn_risk,
+                    ENV_ALLOW_ASYNC_GDN,
+                )
+                self.scheduler_config.async_scheduling = False
             else:
                 self.scheduler_config.async_scheduling = True
+
+        # GFX906: VLLM_GFX906_PLE_HOSTIDS mirrors each step's draft tokens into a
+        # pinned host buffer so the *next* step's PLE n-gram ids can be computed
+        # on the host instead of by a device kernel plus a blocking D2H. It only
+        # works because sync scheduling parks the host at the end of every step
+        # (async_utils.py get_output -> copy_event.synchronize); under async
+        # scheduling that wait is gone, the mirror lags one step, and the result
+        # is a plausible ngram id built from stale context -- a wrong answer, not
+        # a crash, and the same silent-freeze class as a captured graph replaying
+        # a stale PLE embedding (mtp-cudagraph-profile-crash.md 13.2). Refusing
+        # rather than quietly dropping the knob is deliberate: a knob that fails
+        # to engage is indistinguishable from one that worked.
+        if (
+            hostids_conflict := ple_hostids_async_conflict(
+                self.scheduler_config.async_scheduling
+            )
+        ) is not None:
+            raise ValueError(hostids_conflict)
+
+        # GFX906: and it needs an override under MTP too. The reason is NOT the
+        # per-pass ids buffer this comment used to give -- the drafter never runs a
+        # PLE op (docs/ple-multipass-verdict.md) -- it is that the combination has
+        # never been booted, and a refused step under a captured graph has no device
+        # path to fall back to. Same shape of refusal: say it, do not drop the knob.
+        if self.speculative_config is not None:
+            mtp_conflict = ple_hostids_mtp_conflict(
+                self.speculative_config.num_speculative_tokens or 0
+            )
+            if mtp_conflict is not None:
+                raise ValueError(mtp_conflict)
 
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:
