@@ -14,7 +14,7 @@ DEVLOG). Pattern: **hypothesis → gate → verdict → commit/revert → commen
 ## DEAD-ENDS / REJECTED
 
 | Hyp | Gate | Verdict | Commit/revert | Comment | Refs |
-|-----|------|---------|---------------|---------|------|
+| --- | --- | --- | --- | --- | --- |
 | gemm1 V1 full-K single-wave direct store | standalone harness | **REJECTED** (2.2× slower; N-split 128/256/512 blocks all slower than v1b's 59.0 µs, best 74.8) | — | Kills atomics but loses all transfer. N-split axis closed 2026-08-31 (C2 finish): every block count ≥2.1× off current; adding blocks to shorten the per-block stream buys nothing (v1a-vs-v1b isolates wavefront config ~2×; N-split confounds stream length with wavefront count — mechanism not cleanly isolated). Residual family cost: per-block full-K loop caps memory-level parallelism. **FULLY DEAD** (DE-1: structural; not registers) — `DEVLOG-moe-c2v.md` | G1 |
 | gemm1 NPT=2 (z-split best point) | serving graph, +0.08 t/s | **DEAD-END** (neutral) | `reverted`, flag `VLLM_GFX906_MOE_G1NPT2` removed | census said −186 µs/step; wall-clock neutral in *both* eager & graph — 3rd consecutive transfer failure. **FULLY DEAD** (DE-1: isolated→serving flip; re-tile family 79 VGPR, 0 spills) | G1 |
 | gemm1 V3 fp32-scratch K-split | — (closed w/o build) | **DEAD-END** | — | adds ~184 µs/step scratch+launch on top of a design whose best point doesn't transfer. **FULLY DEAD** (DE-1: structural; never built) | G1 |
@@ -55,7 +55,7 @@ DEVLOG) + `DEVLOG-int8-transfer.md` (the P1/P2 session record).
 ## OPEN / IN-FLIGHT (verdict not yet recorded)
 
 | Hyp | Gate | Status | Refs |
-|-----|------|--------|------|
+| --- | --- | --- | --- |
 | gemm1 activation-fusion (fold SiLU·mul into epilogue) | serving wall-clock | low transfer expectation (see §interactions in G1) | G1, roadmap C2 |
 | Spec-decode MTP k=2 | serving graph | **SHIPPED** 39.4 t/s (1.41×; 1.50× no-max build), 1.82 tok/step | S |
 | Dense W16A16 long-K GEMV (K=17408 down_proj) | serving | **SHIPPED**, at HBM floor (227.6 vs 795 µs, 101% floor) | D |
@@ -77,7 +77,7 @@ DEVLOG) + `DEVLOG-int8-transfer.md` (the P1/P2 session record).
 ## Branch gfx906/fa-decode-fp16 (2026-09-10 → 2026-09-12) — rows added at branch closure
 
 | Hyp | Gate | Verdict | Commit/revert | Comment | Refs |
-|-----|------|---------|---------------|---------|------|
+| --- | --- | --- | --- | --- | --- |
 | T-1 int8-mass: int8 W8A16 the unquantized drafter fp16 mass | serving k=4 A/B | **NOT PASS** (final k=4 re-test parity −1%; earlier +15-18% was a cold-start misread) | code stays env-gated `T1_INT8_MASS=1` default OFF; archive candidate | quality gate was clean (0/120 argmax flips) — speed didn't transfer | DEVLOG-t1-int8-fp16-mass.md |
 | SYV-12 context-lookup verify (MTP k=2 + fill) | production A/B @120k/64k | **DEAD-END** (v1 net loss; v2 payload-conditional; 2026-09-12 corpus agent: not workable in the current shape, corpus-independent) | deep-scrubbed; code grouped on `archive/syv12` | revival only if the fill/verify SHAPE changes | DEVLOG-syv12.md |
 | FA ncols1=5/6 native tiles for Sq=5 verify | standalone VGPR/spill + wall @120k | **NO-WIN** (VGPR=128, spill 171/167; wall flat) | experiment code reverted | occupancy needs a build; config levers exhausted for Sq=5 | DEVLOG-fa-verify-sq8.md |

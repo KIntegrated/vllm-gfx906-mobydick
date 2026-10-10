@@ -150,9 +150,50 @@ gc.collect()`) was the tester's crash site on 0.29; 0.30's release gates ran it 
 local delta retained); the implementation decision behind the guard — their mmap host table
 vs upstream's pinned/UVA offload — stays `OPEN` (QSA-FN-11).
 
+<!-- merged 2026-10-09: both the 0.30 line and gfx906/ple-known-good added to this region; both kept -->
 **GATE:** `test_ple_mmap_shards.py` (24) + `tests/v1/worker/test_gfx906_gc_freeze.py` (28)
 + `test_qsa_amd.py` (22) = **74 passed**; the tiny rig boots with MTP k=1 and k=3 and logs
 **no** out-of-range id.
+| dtype | dispatch (tiled) | per-row, op | per-row, kernel | speedup | top-2048 | NRMSE |
+| --- | --- | --- | --- | --- | --- | --- |
+| fp16 | **4061 / 4084 µs** | 5424 µs | 5465 / 5439 µs | **1.35× / 1.33×** | **1.00000** | 1.28e-07 |
+| bf16 | 6961 µs | 6747 µs | 6962 µs | 1.00× | 1.00000 | 0.0 |
+
+That bf16 row *is* the gate evidence: the “tiled” arm (a uniform mapping, which
+would take the tiled route if the gate allowed it) is the per-row kernel time to
+within 0.02 %; the same shape through the ungated CDNA kernel was 16648 µs
+(0.42×, recon §5). fp16 reproduces the recon's ~1.3× at NRMSE 1.3e-7.
+
+**Tests** (`tests/models/qwen4_exp/test_qsa_amd.py`, 22 passed):
+
+- the scoring test is now parametrized over the **route** as well as the dtype
+  (uniform mapping → tiled, mixed → per-row); both must match the torch
+  reference;
+- new `test_qsa_mqa_paged_route_selection` pins the gate with recording kernel
+  stand-ins: fp16+uniform+64 rows → tiled; fp16 at 32 rows → per-row;
+  fp16+mixed requests → per-row; **bf16+uniform+64 rows → per-row** on gfx906
+  (asserted against `supports_native_bf16`).
+
+**QSA-FN-7 / FN-1 non-regression (one boot):** `test_qsa_amd.py` 16 → **22
+passed**; `test_qsa_reference.py` **19**; `test_config.py` **7**; `test_ple.py`
+**10**; `tests/kernels/attention/test_gfx906_fa.py` **104 passed**; PPL
+(Qwen3.8-27B-AWQ-INT4, fp16, 359 tokens) **10.5472 / 0 top-20 misses** = the value
+recorded for this build; MoE 35B reference workload (`_bench_gfx906.py`,
+pp2048/tg256, `BENCH_MAX_SEQS=32`, util 0.95, mclk 1000) **58.40 / 58.40 / 58.38
+/ 58.41 t/s** — mean 58.40, i.e. at the top of the recorded 57.97–58.36 band
+(that model is now only at `/data/models/QuantTrio/Qwen3.5-35B-A3B-AWQ`; the
+`/local/models/...` path in the recipe is stale and makes vLLM treat the path as
+an HF repo id).
+
+### Evidence AGAINST / limits
+
+- **Launch-regime only.** The indexer is ~23 % of prefill on the CDNA author's
+  30 k-token measurement; nothing here re-measures the *serving* share, and the
+  tiny rig cannot (dims are 10–24× off the real model — FN-3's standing limit).
+  The dispatch's own cost when the route is *not* taken is one extra device sync
+  (`(token_to_req == token_to_req[0]).all()`) on each prefill call ≥ 64 rows.
+- The gate is dtype- *and* platform-based, not measured on CDNA: gfx906 fp16 is
+  measured here, the CDNA bf16 number is the author's.
 
 ### Why the guard changed shape
 

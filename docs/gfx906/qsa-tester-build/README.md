@@ -15,7 +15,7 @@ version of this file with just the steps, the gates and what to send back.
 ## What is included
 
 | file | what / why |
-|---|---|
+| --- | --- |
 | `patches/0001-qsa-fp16-enablement.patch` | **the fix for the reported error.** QSA's guards only accepted bf16; gfx906 has no bf16 instruction, so models run fp16 and the guards rejected it. Also a 4.4× kernel win (bf16 `tl.dot` is emulated per-scalar, fp16 lowers to `v_dot2_f32_f16`) |
 | `patches/0002-v2-mamba-align-seed.patch` | crash fix needed for **prefix caching** (which the V2 runner turns on by default for hybrid models): the mamba align pre-copy was seeded with the wrong block size and faulted on any prefix-cache hit |
 | `patches/0003-qsa-tiled-indexer.patch` | the indexer scoring kernel's tiled route: **1.33–1.35×** on the indexer in fp16, gated off for bf16 (where it is 2.4× slower on gfx906) |
@@ -35,6 +35,7 @@ do not need, and the int8-QK path faults at the profile every real prefill uses.
 git fetch <remote> gfx906/qsa-fn        # or start from gfx906/v0.29.0
 git checkout gfx906/qsa-fn              # nothing to apply — this IS the result
 ```
+
 Equivalently, from `gfx906/v0.29.0`: `git apply patches/000{1,2,3,4}-*.patch` in
 order — that was validated here and reproduces the branch's 63 shipped files
 byte-for-byte.

@@ -44,7 +44,7 @@ gfx906-side is judged on serving wall-clock.
 The checkpoint is `bfloat16` (`Qwen/Qwen3.8-Flash-Next` `text_config.dtype`).
 On gfx906 that is silently rewritten to fp16 at startup:
 
-```
+```bash
 vllm/platforms/rocm.py:645   supports_native_bf16 -> not _ON_GFX906   (False)
 vllm/config/model.py:2294    "Checkpoint dtype is bfloat16, but this device has no
                               native bfloat16 support; auto-selecting float16"
@@ -63,7 +63,7 @@ are all in `vllm/models/qwen4_exp/`: See
 (QSA-FN-1, landed 2026-09-17) — the table below is the pre-edit inventory.
 
 | file | line | guard |
-|---|---|---|
+| --- | --- | --- |
 | `amd/qsa.py` | 70 | `supported_dtypes = [torch.bfloat16]` (backend) |
 | | 71 | `supported_kv_cache_dtypes = ["auto","bfloat16"]` |
 | | 113 | Impl: `kv_cache_dtype not in ("auto","bfloat16")` |
@@ -97,7 +97,7 @@ The CDNA launcher recipe, mapped onto our tree (all flags exist here except the
 int8 KV, which is §5.3):
 
 | CDNA prod launch | gfx906 delta |
-|---|---|
+| --- | --- |
 | `--dtype bfloat16` | fp16 (auto-fallback) — QSA-FN-1/FN-2 |
 | `--kv-cache-dtype int8_per_token_head` | not ported; capacity-only on gfx906 (§5.3) |
 | `--mamba-cache-dtype bfloat16` | drop / auto (gfx906 stack is fp16) |
@@ -110,7 +110,7 @@ int8 KV, which is §5.3):
 Yes, both patches apply **cleanly and unmodified** (`patch -p0 --dry-run` prints
 only `checking file`, i.e. every hunk matches at zero offset):
 
-```
+```text
 scripts/…  cd /tmp && cp $REPO/vllm/models/qwen4_exp/amd/{qsa.py,} …   # see §9
 patch -p0 --dry-run < ../qsa-cdna2-vllm-patches/patches/qsa.py.patch       # clean
 patch -p0 --dry-run < ../qsa-cdna2-vllm-patches/patches/ops_qsa.py.patch   # clean
@@ -130,7 +130,7 @@ it in review as version-brittle, not as wrong.
 What the three changes are, and what survives gfx906:
 
 | change | CDNA claim (MI210) | gfx906 verdict |
-|---|---|---|
+| --- | --- | --- |
 | tiled row-tiled indexer (`_qsa_mqa_paged_tiled_kernel`, `BLOCK_M=16`, `tl.dot` scoring, uniform-request prefill only) | 6.57× kernel | **ports — 1.39× in fp16, must be dtype-gated** (§5.2) |
 | `int8_per_token_head` KV (`customize_spec` + scale views + inline dequant in the read kernels) | 1.67× capacity, prefill faster with int8-QK | **ports as capacity-only: 2.5–2.7× prefill cost, decode-neutral** (§5.3) |
 | int8-QK (`tl.dot(q_i8, keys_i8) -> int32`, `QSA_INT8_QK=1`) | 30 K prefill 30.8 s → 18.6 s | **does not port: faults at the production dispatch profile, and is not faster where it runs** (§5.4, §6) |
@@ -141,7 +141,7 @@ Compiled with the venv's Triton (stock v3.8.0 `GCN5_1`), dumped from
 `kernel.asm['amdgcn']`:
 
 | `tl.dot` operand dtype | lowering on gfx906 | instruction count for a 16×16×16 dot |
-|---|---|---|
+| --- | --- | --- |
 | fp16 × fp16 → fp32 | `v_dot2_f32_f16` | 32 |
 | **bf16 × bf16 → fp32** | **scalar `v_fmac_f32` (upcast, no bf16 instruction)** | 60 `v_fmac_f32` + 4 `v_fma_f32` |
 | int8 × int8 → int32 | `v_dot4_i32_i8` (+`v_perm_b32` packing) | 16 |
@@ -161,7 +161,7 @@ transfer but their matrix-core rationale does not.
 PAGE=64, BUDGET=2048, `num_warps=4` (the CDNA author's own test shapes):
 
 | dtype | per-row kernel | tiled kernel | speedup | tiled vs bf16 per-row |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | **fp16** | 5426 µs | **3902 µs** | **1.39×** | 0.56× |
 | bf16 | 6928 µs | 16648 µs | **0.42×** | 2.40× |
 
@@ -179,7 +179,7 @@ route on the operand dtype, not just on `q.shape[0] >= 64`.
 default dispatch profile, arms interleaved, 3 reps:
 
 | K/V cache dtype | kernel | vs fp16 |
-|---|---|---|
+| --- | --- | --- |
 | fp16 | **26.5 ms** | 1.00× |
 | bf16 | 116.5 ms | **4.39×** |
 
@@ -195,7 +195,7 @@ kernel writing at all — only the guard edits in §1.
 inline dequant, identical shapes (L=65536, NBLK=1024, TOPK=2048, G=12, HS=256):
 
 | query rows T | fp16 cache | int8 + dequant | ratio |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 (decode) | 100.7 µs | 100.3 µs | **0.99×** |
 | 4 | 115.4 | 165.5 | 1.43× |
 | 16 | 322.4 | 546.1 | 1.69× |
@@ -228,7 +228,7 @@ large prefill cost.)
 the same shapes:
 
 | T | fp16 | int8-QK | ratio |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | 100.7 | 103.5 | 1.03× |
 | 4 | 117.7 | 150.6 | 1.28× |
 | 16 | 325.3 | 430.2 | 1.32× |
@@ -246,7 +246,7 @@ fine — the value is not there.
 
 The int8-QK branch faults in `_qsa_sparse_paged_gqa_splitk_kernel`:
 
-```
+```text
 env P_GROUP=12 P_T=1024 P_TOPK=2048 P_L=65536 P_ONLYQK=1 HIP_VISIBLE_DEVICES=0 \
     .venv/bin/python /local/tmp/qsaprobe/probe_attn2.py
   → Memory Fault Error … kernel: _qsa_sparse_paged_gqa_splitk_kernel
@@ -269,7 +269,7 @@ chunk over 512 tokens, which is every real prefill** — it picks
 BLOCK_M = `next_power_of_2(group_size)`, forced via the probe's `QSA_FORCE_BM`:
 
 | BLOCK_M | w=2 | w=4 | w=8 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 4 | IMA | IMA | OK |
 | 8 | OK | OK | OK |
 | 16 | IMA | OK | OK |
@@ -344,7 +344,7 @@ Repro scratch (this session, all under `/local/tmp/qsaprobe/`); the QSA-dependen
 probes move into `benchmarks/kernels/gfx906/` when QSA-FN-4 lands the patched
 `ops/qsa.py` in-tree (they need it):
 
-```
+```text
 dot_probe.py          # §4 ISA scan (fp16/bf16/int8 tl.dot → asm)
 probe_indexer.py      # §5.1 (uses scratch/ops/qsa.py)
 probe_attn5.py        # §5.2 fp16-vs-bf16 sparse attention

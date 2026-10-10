@@ -109,10 +109,11 @@ start)
                                       --cpu-offload-params "$OFFLOAD_PARAMS")
   spec_args=(); [ -n "$SPEC" ] && spec_args=(--speculative-config "$SPEC")
 
+# shellcheck disable=SC2086  # EXTRA_ARGS is an intentional word-split arg bag
   env HIP_VISIBLE_DEVICES=$(seq -s, 0 $((TP - 1))) \
       FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE HF_HUB_OFFLINE=1 \
       VLLM_USE_V2_MODEL_RUNNER=1 VLLM_PLUGINS= \
-    setsid nohup .venv/bin/vllm serve "$MODEL" \
+      setsid nohup .venv/bin/vllm serve "$MODEL" \
       --served-model-name q38fn --port "$PORT" \
       --tensor-parallel-size "$TP" --enable-expert-parallel \
       --dtype float16 --gpu-memory-utilization "$GPUTIL" \

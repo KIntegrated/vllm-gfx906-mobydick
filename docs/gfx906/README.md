@@ -5,6 +5,8 @@ This fork optimizes vLLM for AMD **gfx906 (Vega 20)** — MI50/MI60, 60 CUs,
 measured on a single MI50 with ROCm 7.14, torch 2.13, single request,
 `pp=2048`/`tg=256`, `cudagraph_mode=FULL_DECODE_ONLY`.
 
+<!-- merged 2026-10-09: both lines added a bullet to this section; hand-merged
+     (union would duplicate the heading and the 0.29 bullet) -->
 ## Release snapshots
 
 - **[`0.30.0-final`](RELEASE-0.30.0-final.md)** (2026-09-26) — the first release on
@@ -15,7 +17,8 @@ measured on a single MI50 with ROCm 7.14, torch 2.13, single request,
 - **[`0.29.0-final`](RELEASE-0.29.0-final.md)** (2026-09-18) — the last snapshot of
   the 0.29.0 line: the V2 mamba `align` fix, `SKINNY_M16` and C4 default-on, the
   0.30.0 conflict review, and the merge-prep sweep rule. The Qwen3.8-Flash-Next /
-  QSA work continues on `gfx906/qsa-fn`.
+  QSA work continues on `gfx906/qsa-fn` *(since merged to `main`; the QSA-FN
+  entries in [`CHANGELOG.md`](CHANGELOG.md) are the record)*.
 
 ## Fork heritage
 
@@ -41,7 +44,7 @@ Reference point: llama.cpp (Q4_K_XL GGUF, full offload) — **70.3 t/s decode,
 ## Headline results
 
 | workload | fork base (`gfx906/main`) | now | Δ | reference |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | MoE serving decode | 3.49 t/s | **67.39 t/s** | 19.3× | llama.cpp 70.3 (1.04× gap) |
 | MoE prefill (pp=2048) | ~450 t/s | **~2140 t/s** | 4.7× | llama.cpp 806.5 (2.7× ahead) |
 | Dense serving decode | 18.89 t/s | **25.60 t/s** | +35% | — |
@@ -86,7 +89,7 @@ same way (raw text: 362/363 misses; templated: correct). The Gemma-4 row below a
 carried this caveat; it is now *enforced* by the harnesses.
 
 | model class | raw-text probe / generation | chat template |
-|---|---|---|
+| --- | --- | --- |
 | Qwen3.5/3.8 dense + MoE, Nemotron 3.5 Lightning, Ornith | **valid** — the recorded reference bands were measured this way | fine (and correct for real traffic) |
 | **Gemma-4-*-it, Muse-Glimmer** | **invalid: garbage that is not a defect** | **required** |
 
@@ -106,7 +109,7 @@ checkpoints;
 survived.
 
 | model | status | decode t/s | prefill t/s | notes |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | **Qwen3.5-35B-A3B-AWQ** (MoE) | **flagship, optimized** | **67.39** (record; band 65.3–67.0; final-build restamp 66.1, 2026-08-24) | **~2140** | full custom stack (W4A16 MoE GEMM + Q8 FA); 19.3× over fork base; llama.cpp parity on decode, 2.7× ahead on prefill |
 | ↳ same, **N=8 concurrent decode** | W4 (`VLLM_GFX906_SKINNY_M16=1`, soak-verified) | 191.0 (baseline 166.9; **+14.5 %**; soak 189.9 ± 0.4; final-build restamp 192.9/194.0, 2026-08-24) | — | first N=8 record for this model (off arm = C2-V t1n8 steady); skinny fp16 M=5..16 kernel, M-dependent gate |
 | ↳ same, **MTP k=2 spec decode** | recommended spec config (35B, W2) | 88.6 (1.16× vs 76.7 greedy graph; 1.83× vs eager 44.9) | — | **final-build restamp 2026-08-24** (the pre-W4 re-measure debt): 78.7 % acceptance, 1.57 tok/step; record 89.9 (1.18× vs 76.2; 80.4 % / 1.61 tok/step, pre-W4 build) |
@@ -121,11 +124,10 @@ survived.
 | **Qwen3.6-27B / 3.6-35B-A3B** (fp16) | **not supported** | — | — | 52/67 GB fp16 checkpoints do not fit a 32 GB card; 3.6 GGUF only used as a llama.cpp reference point |
 | small AWQ models (e.g. Qwen3.5-9B-AWQ, 0.8B) | supported | — | 590–1483 (9B, eager) | fine on ≤0.85 util; FA prefill benchmarks in top-level README |
 
-
 ## Contents of this directory
 
 | file | what it is |
-|---|---|
+| --- | --- |
 | `README.md` | this hub: changes, numbers, recipes, knobs |
 | `CHANGELOG.md` | chronological record of completed roadmap work and release merges |
 | `DEAD-ENDS.md` | one-pass index: hypothesis → gate → verdict → commit for what was tried (grep-able) |
@@ -143,6 +145,7 @@ survived.
 ## What changed vs `gfx906/main`
 
 ### 1. Custom Q8 FlashAttention backend (`CUSTOM`)
+
 `vllm/gfx906_fa/`, `csrc/gfx906_fa/` — vendored from
 `cassettesgoboom/gfx906-fa-vllm`, built into the wheel when gfx906 is a
 target arch (`CMakeLists.txt`, `setup.py`), and the **default** attention
@@ -165,13 +168,16 @@ backend on gfx906 (`vllm/platforms/rocm.py`). Escape hatch:
   `UNIFORM_SINGLE_TOKEN_DECODE` (this flip alone: 22.44 → 52.90 t/s MoE).
 
 ### 2. Custom W4A16 MoE grouped GEMM
+
 `csrc/rocm/moe_q_gemm_gfx906.cu` + `vllm/.../fused_moe/experts/gfx906_w4a16_moe.py`
-+ oracle entry in `fused_moe/oracle/int_wna16.py`. Fixes the upstream modular
+
+- oracle entry in `fused_moe/oracle/int_wna16.py`. Fixes the upstream modular
 pipeline's −71% MoE regression (3.49 t/s) on gfx906. AWQ int4, 128-group,
 load-time repack (~65 s). Handles both MoeWNA16 (N-first uint8) and AutoAWQ
 (K-first int32) layouts.
 
 ### 3. Dense M≤16 W16A16 GEMV family
+
 `csrc/rocm/dense_gemv_gfx906.cu`, dispatched from
 `vllm/model_executor/layers/utils.py` (`_llmm1_tiny_m`, `_gfx906_gemv_long_k`,
 `_gfx906_spec_gemv_m4`; kill switch `VLLM_GFX906_DENSE_GEMV=0`):
@@ -191,6 +197,7 @@ load-time repack (~65 s). Handles both MoeWNA16 (N-first uint8) and AutoAWQ
   35B / +6.1 % 27B at N=8; flag-on 30-rep soak passed. `DEVLOG-fp16-skinny.md`.
 
 ### 4. Other landed fixes
+
 - **GemmaRMSNorm fused-kernel dispatch** (`layernorm.py`): Gemma's `(1+w)`
   factorization dispatches the fused RMS-norm kernel with `w' = 1+w` in the
   input dtype instead of an fp32 decomposition.
@@ -209,7 +216,6 @@ load-time repack (~65 s). Handles both MoeWNA16 (N-first uint8) and AutoAWQ
   (+1.15%), attributed the rest (MoE gemm zeroings are required by grid.z
   atomic K-splits; runner H2D micro-copies are upstream).
 
-
 **Spec-decode recommendation (2026-09-13, Kevin).** All local models use **MTP**
 (MTP k=3 where available, e.g. the Qwen3.5/3.8 family; Muse-Glimmer included).
 The `ngram` configs still shown in some rows above — and the "+15 % at tg256"
@@ -217,6 +223,7 @@ and Muse-Glimmer "100 % filler acceptance" figures — are the historical
 filler-corpus measurements (acceptance ceilings, not real-payload results);
 ngram is **deprecated for now**, with a Muse-Glimmer MTP re-measure tracked as
 MUSE-1 in `ROADMAP.md`.
+
 ## Performance history (serving, pp=2048/tg=256)
 
 ### MoE — Qwen3.5-35B-A3B-AWQ
@@ -229,7 +236,7 @@ cold). Agentic TP=2 dense (3 reps, V2): greedy **20.37/13.27**, MTP k=3
 (VIT-1): image-prompt TTFT −11.5 % @1024×1024, fresh-boot −55 s.
 
 | milestone | t/s | commit |
-|---|---|---|
+| --- | --- | --- |
 | fork base (upstream modular pipeline, Triton WNA16) | 3.49 | — |
 | custom W4A16 MoE kernel (eager 18.88; prefill 2140) | 41.5 (graphs) | `85eacaeed9`…`f770b9f446` |
 | P3-1 tiny-m gemv routing | 44.09 | `3e7c4f2252` |
@@ -246,7 +253,7 @@ cold). Agentic TP=2 dense (3 reps, V2): greedy **20.37/13.27**, MTP k=3
 ### Dense — Qwen3.5-27B-AWQ
 
 | milestone | t/s | decode-only t/s |
-|---|---|---|
+| --- | --- | --- |
 | baseline (Triton FA, GEMV off) | 18.89 | 22.55 |
 | CUSTOM FA (NC2=1 fallback) | 23.15 | 28.10 |
 | NC2=2 for ratio-6 GQA | 23.55 | 28.69 |
@@ -257,7 +264,7 @@ cold). Agentic TP=2 dense (3 reps, V2): greedy **20.37/13.27**, MTP k=3
 ### Concurrent decode (N=8, graph, Δ-metric A/B — W4, 2026-08-23)
 
 | model | shape | W4 off | W4 on | Δ |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | Qwen3.5-35B-A3B-AWQ (MoE) | pp=2048/tg=256 | 166.9 | **191.0** (soak 189.9 ± 0.4; final-build restamp 192.9/194.0) | **+14.5 %** |
 | Qwen3.8-27B-AWQ-INT4 (dense) | pp=1024/tg=160 (KV cap, util 0.90) | 98.2 | **104.2** | **+6.1 %** |
 
@@ -275,7 +282,7 @@ hygiene, bit-identical). Harness: `_serve_tp2_gfx906.sh` +
 `_bench_serve_grid_gfx906.py` (`'[[32768,128],[65536,128],[112640,128]]' 2`).
 
 | model | pp | prefill t/s (s0 / s1) | TTFT (s0 / s1) | decode t/s |
-|---|---:|---|---|---:|
+| --- | ---: | --- | --- | ---: |
 | Qwen3.8-27B (256k) | 32768 | 442.1 / 445.7 | 74.12 / 73.52 | 25.5 / 25.8 |
 | Qwen3.8-27B (256k) | 65536 | 365.1 / 364.5 | 179.49 / 179.78 | — (out=1, EOS on filler) |
 | Qwen3.8-27B (256k) | 112640 | 289.0 / 289.0 | 389.70 / 389.80 | 13.3 / 13.3 |
@@ -312,7 +319,7 @@ Qwen3.8-27B-AWQ-INT4, TP=2 (util 0.85, bt 1024, max-seqs 4, capture
 tg=256, temp 0, n=3 reps, filler corpus s9.
 
 | ctx (pp) | MTP k=2 pre-fix (clamp) | **MTP k=2 post-fix** | greedy TP=2 | fix gain | MTP vs greedy |
-|---:|---:|---:|---:|---:|---:|
+| ---: | ---: | ---: | ---: | ---: | ---: |
 | 65,536 | 15.95 t/s | **37.95 t/s** | 18.86 | **2.38×** | 2.01× |
 | 98,304 | 11.19 t/s | **29.88 t/s** | 14.80 | **2.67×** | 2.02× |
 | 122,880 | 9.18 t/s | **25.70 t/s** | 12.74 | **2.80×** | 2.02× |
@@ -350,7 +357,7 @@ off so every rep pays its full prefill, 2 reps per cell (boot f27e8058, mclk
 verified 1000 MHz):
 
 | ctx | prefill | greedy | MTP k=3 | **MTP k=3 + CAT-1** | uplift |
-|---|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: |
 | 64k | 277 t/s | 19.80 | 33.28 | **33.26** | **1.68×** vs greedy |
 | 120k | 226 t/s | 13.17 | 24.74 | **24.95** | **1.89×** vs greedy |
 
@@ -440,7 +447,7 @@ targets matrix cores; gfx906 has none).
 ## Environment knobs
 
 | env | default | effect |
-|---|---|---|
+| --- | --- | --- |
 | `GFX906_FA_VIT` | 1 | **VIT-1** (0.29.0): custom Q8 FA for the Qwen3.5/3.8 VL **vision tower**; `0` = kill switch back to the upstream flash-attn ViT path |
 | `GFX906_FA_VIT_AUTO` | 1 | whether the ViT path is chosen *automatically*; `0` opts out of auto-selection only (an explicit `--mm-encoder-attn-backend custom` still selects CUSTOM) |
 | `VLLM_USE_V2_MODEL_RUNNER` | (upstream) | `0` forces the V1 runner; **no model needs it any more** (Muse-Glimmer was the last pin, lifted 2026-09-16; V1 is removed upstream in 0.32.0) |

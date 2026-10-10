@@ -22,6 +22,7 @@ and not an ISA reference.
 ## The searchability contract
 
 Every experiment/session entry must be queryable with a single grep, so:
+
 - **Every entry ends with `VERDICT:`** using a fixed vocabulary:
   `DEAD-END` | `SHIPPED` | `NEUTRAL` | `SUPERSEDED` | `OPEN`.
 - **Every hypothesis is a `## HYPOTHESIS` section** written falsifiably
