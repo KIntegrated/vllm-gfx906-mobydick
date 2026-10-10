@@ -141,8 +141,14 @@ class DefaultModelState(ModelState):
         return mm_embeds, is_mm_embed
 
     def prepare_inputs(
-        self, input_batch: InputBatch, req_states: RequestState
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        cudagraph_mode: CUDAGraphMode | None = None,
     ) -> dict[str, torch.Tensor | None]:
+        # ``cudagraph_mode`` is accepted for interface parity and deliberately
+        # unused here: nothing in the default state's inputs differs between a
+        # replayed FULL graph and an eager build. See ModelState.prepare_inputs.
         if self.rope_state is None:
             return {}  # Common case (1D positions).
 
