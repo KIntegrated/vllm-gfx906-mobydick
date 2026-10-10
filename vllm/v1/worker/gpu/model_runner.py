@@ -618,13 +618,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         # GFX906: the host PLE id producer needs the draft mirror staged by the
-        # handler above. Wired once here rather than passed per step, and only
-        # when staging is actually on; model states that do not consume it (every
-        # other model) are not asked.
-        if getattr(self.draft_tokens_handler, "host_draft_staging", False) and hasattr(
-            self.model_state, "set_host_draft_source"
+        # handler built in __init__. Wired once here rather than passed per step,
+        # and only when staging is actually on; model states that do not consume
+        # it (every other model) are not asked.
+        #
+        # Read through getattr, not self.draft_tokens_handler, because a runner
+        # built without __init__ exists: the EPLB unit test constructs one with
+        # GPUModelRunner.__new__() and calls load_model on it. Upstream's
+        # load_model never touched this attribute, so that construction was
+        # harmless until this block landed here. A missing handler and a handler
+        # with staging off have to mean the same thing -- nothing to wire -- so
+        # the guard is correct rather than merely quiet: it changes behaviour
+        # only for an object that has no mirror to wire in the first place.
+        draft_handler = getattr(self, "draft_tokens_handler", None)
+        if (
+            getattr(draft_handler, "host_draft_staging", False)
+            and hasattr(self.model_state, "set_host_draft_source")
         ):
-            self.model_state.set_host_draft_source(self.draft_tokens_handler)
+            self.model_state.set_host_draft_source(draft_handler)
 
         # P1.6: the same producer also needs the epilogue's accepted-token handoff.
         # Resolved to a bound method once rather than looked up per step, and left
