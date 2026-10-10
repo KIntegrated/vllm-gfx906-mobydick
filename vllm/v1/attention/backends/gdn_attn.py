@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+import os
+import time
 from dataclasses import dataclass
 from typing import Literal
 
 import torch
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -22,6 +25,117 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+logger = init_logger(__name__)
+
+
+ENV_BATCH_PROF = "VLLM_GFX906_BATCH_PROF"
+_BATCH_PROF_EVERY = 200
+_BATCH_PROF_SECS = 30.0
+
+
+class _BatchWindow:
+    """Throttled per-step batch composition log (VLLM_GFX906_BATCH_PROF=1).
+
+    The point of counting inside the builder rather than outside: the only way
+    to know whether the mixed prefill+decode path -- the one the decode-first
+    peel below protects -- was actually reached is to count it from the code
+    that peels. A clean startup log says nothing about which steps ran, so "it
+    booted, therefore the invariant held" is a false negative. `peeled` counts
+    the steps where that assert actually executed; `mixed` counts the steps
+    where a prefill and a decode shared the batch at all.
+
+    Two triggers, count or age, so a 3-request server still reports. Errors are
+    swallowed: this must never be the reason a step fails.
+    """
+
+    __slots__ = (
+        "calls",
+        "mixed",
+        "peeled",
+        "decode_only",
+        "prefill_only",
+        "with_spec",
+        "max_prefills",
+        "t0",
+    )
+
+    def __init__(self) -> None:
+        self._reset()
+
+    def _reset(self) -> None:
+        self.calls = 0
+        self.mixed = 0
+        self.peeled = 0
+        self.decode_only = 0
+        self.prefill_only = 0
+        self.with_spec = 0
+        self.max_prefills = 0
+        self.t0 = time.perf_counter()
+
+    def record(
+        self, *, num_decodes: int, num_prefills: int, num_spec_decodes: int
+    ) -> None:
+        try:
+            self.calls += 1
+            if num_spec_decodes > 0:
+                self.with_spec += 1
+            if num_prefills > 0:
+                self.max_prefills = max(self.max_prefills, num_prefills)
+            if num_decodes > 0:
+                self.peeled += 1
+            if num_decodes > 0 and num_prefills > 0:
+                self.mixed += 1
+            elif num_decodes > 0:
+                self.decode_only += 1
+            elif num_prefills > 0:
+                self.prefill_only += 1
+            if (
+                self.calls >= _BATCH_PROF_EVERY
+                or time.perf_counter() - self.t0 >= _BATCH_PROF_SECS
+            ):
+                logger.info(
+                    "GDN batch prof: %d builder calls | mixed=%d decode-only=%d "
+                    "prefill-only=%d | decode-first peel executed on %d calls | "
+                    "%d calls carried spec decodes | max num_prefills=%d",
+                    self.calls,
+                    self.mixed,
+                    self.decode_only,
+                    self.prefill_only,
+                    self.peeled,
+                    self.with_spec,
+                    self.max_prefills,
+                )
+                self._reset()
+        except Exception as exc:  # pragma: no cover
+            logger.debug("GDN batch prof ignored an error: %r", exc)
+
+
+_batch_window = _BatchWindow()
+_batch_prof_enabled: bool | None = None
+
+
+def _batch_prof_record(
+    *, num_decodes: int, num_prefills: int, num_spec_decodes: int
+) -> None:
+    """Record one builder call, logging if the window is due. No-op by default."""
+    global _batch_prof_enabled
+    if _batch_prof_enabled is None:
+        _batch_prof_enabled = os.environ.get(ENV_BATCH_PROF, "0") == "1"
+        if _batch_prof_enabled:
+            logger.info(
+                "GDN batch profiler active (%s=1): one line per %d builder calls "
+                "or %g s.",
+                ENV_BATCH_PROF,
+                _BATCH_PROF_EVERY,
+                _BATCH_PROF_SECS,
+            )
+    if _batch_prof_enabled:
+        _batch_window.record(
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            num_spec_decodes=num_spec_decodes,
+        )
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -402,6 +516,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 f"ramp={non_spec_query_start_loc_cpu.tolist()}, "
                 f"decode_lens={non_spec_decode_lens.tolist()})"
             )
+
+        _batch_prof_record(
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            num_spec_decodes=num_spec_decodes,
+        )
 
         if num_prefills > 0:
             # In a mixed non-spec batch (spec-mixed or not), decodes are peeled

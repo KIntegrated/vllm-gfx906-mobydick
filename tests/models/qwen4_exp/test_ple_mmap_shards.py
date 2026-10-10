@@ -40,6 +40,7 @@ import mmap
 
 import numpy as np
 import pytest
+import regex as re
 import torch
 
 ple = pytest.importorskip(
@@ -50,6 +51,7 @@ ple = pytest.importorskip(
 NUM_SHARDS = 3
 CAPACITY = 8  # rows per shard
 DIM = 5
+_4K = 4096
 
 
 def _shard(base: int, dtype=torch.float16, n: int = CAPACITY) -> torch.Tensor:
@@ -315,7 +317,14 @@ class _Stub:
     Constructing the real module means running the prime search over
     `ngram_vocab_size_base`, which is not what is under test here; `load_weights`
     only ever touches the attributes below, so it is called unbound against this.
+    The list of things it touches is the contract: when ``load_weights`` grows a
+    new responsibility the stub has to grow it too, which is how the P1.5 scratch
+    allocation below is exercised rather than worked around.
     """
+
+    # Real method, not a no-op: load_weights allocates the generation tripwire's
+    # device mirror, and that allocation is a claim worth testing behaviourally.
+    _alloc_gen_scratch = ple.Qwen4ExpNGramEmbedding._alloc_gen_scratch
 
     def __init__(self, split_ngram_parts=NUM_SHARDS, dim=DIM):
         self.split_ngram_parts = split_ngram_parts
@@ -325,6 +334,8 @@ class _Stub:
         self.ngram_embedding = ple.MmapShardedNGramEmbedding(
             split_ngram_parts, CAPACITY, dim
         )
+        # Production __init__ sets this to None; load_weights is what fills it in.
+        self._gen_device: torch.Tensor | None = None
 
 
 def _load(stub, weights):
@@ -368,6 +379,25 @@ def test_load_weights_fills_persistent_buffers():
     loaded = _load(stub, [("ngram_heads_offsets", vals)])
     assert "ngram_heads_offsets" in loaded
     assert torch.equal(stub.ngram_heads_offsets, vals)
+
+
+def test_load_weights_allocates_the_generation_scratch():
+    """P1.5: the tripwire's device mirror must exist before the first capture.
+
+    Asserted behaviourally rather than by grepping for the call: a formatter is
+    free to reflow source, and a missing allocation is not free. The scratch's
+    first value is the whole difference between "the graph has never run the
+    staged branch" and a generation the host will accept as fresh.
+    """
+    stub = _Stub()
+    assert getattr(stub, "_gen_device", None) is None
+    _load(stub, [("ngram_heads_offsets", torch.zeros(2, dtype=torch.long))])
+    scratch = stub._gen_device
+    assert isinstance(scratch, torch.Tensor), "load_weights did not allocate it"
+    assert scratch.dtype == torch.long
+    assert scratch.numel() == 1
+    assert int(scratch[0]) == 0, "the scratch must start as 'never written'"
+    assert scratch.device == stub.layer_multipliers.device
 
 
 def test_load_weights_rejects_buffer_shape_mismatch():
@@ -565,3 +595,130 @@ def test_load_weights_refuses_a_split_that_does_not_match_the_id_space():
     weights = shards + [("ngram_heads_offsets", torch.tensor([0], dtype=torch.long))]
     with pytest.raises(ValueError, match="id space"):
         _load(stub, weights)
+
+
+
+
+# --------------------------------------------------------------------------
+# VLLM_GFX906_PLE_MADV_RANDOM -- opt-in read-ahead suppression
+#
+# The table is ~99 GiB of randomly-gathered rows, larger than the node's page
+# cache, so every fault pulls a 128 KiB window that the next (different-shard)
+# touch throws away: measured 1.03 MB of NVMe per prefill token at ~28x
+# amplification, with the GPUs idle ~60 % of the wall clock
+# (docs/prefill-io-wall.md). MADV_RANDOM sets VM_RAND_READ, which makes the
+# kernel fetch one page per fault.
+#
+# These assert the *observable kernel state* (`rr` in /proc/self/smaps
+# VmFlags) rather than timings, so they are deterministic.
+# --------------------------------------------------------------------------
+
+
+def _rand_read_flag_is_set(tensor: torch.Tensor) -> bool:
+    """True if the VMA backing ``tensor`` carries VM_RAND_READ ('rr')."""
+    addr = tensor.data_ptr()
+    rng = None
+    with open("/proc/self/smaps") as fh:
+        for line in fh:
+            if re.match(r"^[0-9a-f]+-", line):
+                start, end = line.split()[0].split("-")
+                rng = (int(start, 16), int(end, 16))
+            elif line.startswith("VmFlags") and rng and rng[0] <= addr < rng[1]:
+                return "rr" in line.split(":")[1].split()
+    raise AssertionError("no VMA found for the tensor's data_ptr")
+
+
+def test_madv_random_is_off_by_default(monkeypatch):
+    """Unset env => the mapping is left exactly as the kernel configured it."""
+    monkeypatch.delenv("VLLM_GFX906_PLE_MADV_RANDOM", raising=False)
+    calls: list[torch.Tensor] = []
+
+    def spy(tensor):
+        calls.append(tensor)
+        return True, 1, "stub"
+
+    monkeypatch.setattr(ple, "_advise_random", spy)
+    e = ple.MmapShardedNGramEmbedding(NUM_SHARDS, CAPACITY, DIM)
+    for i in range(NUM_SHARDS):
+        e.set_shard(i, _shard(i * 100))
+    assert calls == [], "the default must not touch the mapping"
+    assert e._advised_bytes == 0
+
+
+def test_madv_random_applies_once_per_shard_when_opted_in(monkeypatch):
+    monkeypatch.setenv("VLLM_GFX906_PLE_MADV_RANDOM", "1")
+    calls: list[torch.Tensor] = []
+
+    def spy(tensor):
+        calls.append(tensor)
+        return True, 7 * 2**20, "stub"
+
+    monkeypatch.setattr(ple, "_advise_random", spy)
+    e = ple.MmapShardedNGramEmbedding(NUM_SHARDS, CAPACITY, DIM)
+    for i in range(NUM_SHARDS):
+        e.set_shard(i, _shard(i * 100))
+    assert len(calls) == NUM_SHARDS
+    assert e._advised_bytes == 3 * 7 * 2**20  # bytes, not rounded MiB
+
+
+def test_madv_random_reaches_the_real_file_mapping(monkeypatch, tmp_path):
+    """The load-bearing property: madvise() lands on the mmap the gather reads.
+
+    If the loader ever starts handing over a copy instead of a view, this fails
+    loudly instead of the knob silently doing nothing in production.
+    """
+    monkeypatch.setenv("VLLM_GFX906_PLE_MADV_RANDOM", "1")
+    rows = 64
+    payload = _shard(0, n=rows)
+    path = tmp_path / "shard0.safetensors-like"
+    path.write_bytes(payload.numpy().tobytes())
+    nbytes = payload.numel() * payload.element_size()
+    with open(path, "rb") as fh:
+        mm = mmap.mmap(fh.fileno(), nbytes, access=mmap.ACCESS_READ)
+        tensor = torch.frombuffer(mm, dtype=torch.float16, count=payload.numel())
+        tensor = tensor.reshape(rows, DIM)
+        try:
+            assert not _rand_read_flag_is_set(tensor), "test premise: rr unset"
+            ok, advised, detail = ple._advise_random(tensor)
+            assert ok, detail
+            # The span covers the tensor plus the partial page in front of it.
+            assert nbytes <= advised < _4K + nbytes
+            assert _rand_read_flag_is_set(tensor), "VM_RAND_READ ('rr') not set"
+        finally:
+            tensor = None  # release the export before unmapping
+            del payload
+            mm.close()
+
+
+def test_madv_random_failure_is_warned_once_and_never_fatal(monkeypatch, caplog):
+    """A refused madvise must not cost a boot -- the read path is correct without it."""
+    monkeypatch.setenv("VLLM_GFX906_PLE_MADV_RANDOM", "1")
+
+    def refuse(tensor):
+        return False, 0, "madvise failed: errno 22 (EINVAL)"
+
+    monkeypatch.setattr(ple, "_advise_random", refuse)
+    e = ple.MmapShardedNGramEmbedding(NUM_SHARDS, CAPACITY, DIM)
+    with caplog.at_level("WARNING"):
+        for i in range(NUM_SHARDS):
+            e.set_shard(i, _shard(i * 100))
+    assert [t.shape for t in e._shards] == [(CAPACITY, DIM)] * NUM_SHARDS
+    assert sum("could not be applied" in r.message for r in caplog.records) == 1, (
+        "the warning must fire once, not once per shard"
+    )
+
+
+def test_madv_random_cannot_change_lookup_results(monkeypatch):
+    """Why the knob is safe to try: it changes bytes *fetched*, not bytes *seen*."""
+    ids = torch.tensor([0, 3, 9, 14, 22])
+    monkeypatch.delenv("VLLM_GFX906_PLE_MADV_RANDOM", raising=False)
+    off = ple.MmapShardedNGramEmbedding(NUM_SHARDS, CAPACITY, DIM)
+    for i in range(NUM_SHARDS):
+        off.set_shard(i, _shard(i * 100))
+    baseline = off(ids)
+
+    monkeypatch.setenv("VLLM_GFX906_PLE_MADV_RANDOM", "1")
+    on = ple.MmapShardedNGramEmbedding(NUM_SHARDS, CAPACITY, DIM)
+    for i in range(NUM_SHARDS):
+        on.set_shard(i, _shard(i * 100))
+    assert torch.equal(on(ids), baseline)
