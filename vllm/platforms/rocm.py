@@ -42,6 +42,22 @@ try:
 except ImportError as e:
     logger.warning("Failed to import from amdsmi with %r", e)
 
+# amdsmi's python binding allocates the asic-info struct 356 B smaller than the
+# installed library writes, and the library returns rc=0 while overrunning it.
+# This module calls that function at module level (see _GCN_ARCH below), so the
+# overflow lands in whatever pymalloc cell follows -- an invisible corruption in
+# every process that imports vllm. Pad the struct before the first call.
+try:
+    import amdsmi.amdsmi_wrapper as _amdsmi_wrapper
+    from vllm.platforms.amdsmi_abi import install as _install_amdsmi_abi_shim
+
+    _AMDSMI_ABI_SHIM = _install_amdsmi_abi_shim(_amdsmi_wrapper)
+    if _AMDSMI_ABI_SHIM:
+        logger.debug("%s", _AMDSMI_ABI_SHIM)
+except Exception:  # a shim failure must never break platform detection
+    _AMDSMI_ABI_SHIM = None
+    logger.debug("amdsmi ABI shim not applied", exc_info=True)
+
 try:
     import vllm._C  # noqa: F401
 except ImportError as e:

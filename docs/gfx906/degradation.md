@@ -785,3 +785,75 @@ argv golden test, so the copy is the same launcher, not a paraphrase of it.
 **Process note:** the exporter nearly leaked nothing but nearly failed its own linter — a comment
 line that began `# shellcheck line and that one key line` was parsed by shellcheck as a directive
 (SC1073). A prose line that starts with a directive name *is* that directive.
+
+---
+
+## 2026-10-02 20:40 — the standing heap corruptor is `amdsmi_get_gpu_asic_info`: the library writes 356 B past the struct and returns `rc = 0`
+
+This one has cost the project several seven-minute boots and one full investigation arc. It is not in the
+model, not in the graph capture, not in the PLE gather, and not in the engine: **the python `amdsmi 6.3.3`
+binding allocates a 456-byte `amdsmi_asic_info_t`, the installed `libamd_smi.so.26.2.1` writes 812 bytes into
+it, and the call reports success.** `vllm/platforms/rocm.py` calls it at module level (`_GCN_ARCH =
+_get_gcn_arch()`), so every process that imports vllm -- every engine worker, and every benchmark, probe and
+test -- overruns a heap cell before the model is even loaded.
+
+| what | value | how it was established |
+| --- | --- | --- |
+| `ctypes.sizeof(amdsmi_asic_info_t)` | **456 B** | matches the debug allocator's "456 bytes originally requested" |
+| last byte the native call modified | **offset 812** | `tools/gfx906/probe-amdsmi-overflow.py --arm measure`: 512 B of `0xAA` poison behind a real struct, then read what changed |
+| **written past the end** | **356 B** | the difference |
+| return code | **`rc = 0`** | the library does not consider this an error |
+| which call | `amdsmi_get_gpu_asic_info` only | same process, same `amdsmi_init`: `handles` -> exit 0, `memory_total` -> exit 0, `asic_info` -> SIGABRT |
+
+**How it was finally caught, and why the cheap path won:** the previous entry in this ledger noted the
+host-only numpy probe segfaulted once and ran clean on an identical re-run, which demoted every "it must be
+the engine's allocator" theory and made `PYTHONMALLOC=debug` runnable against a 20-second process instead of a
+7-minute boot. It answered on the **first** run, in ~9 s, deterministically, at *import* time:
+`Fatal Python error: _PyMem_DebugRawFree: bad trailing pad byte`, frame
+`vllm/platforms/rocm.py:205 _query_gcn_arch_from_amdsmi`, and `PYTHONTRACEMALLOC=15` named the allocating line:
+`amdsmi/amdsmi_interface.py:1650`, `asic_info_struct = amdsmi_asic_info_t()`. The block's contents were
+`41 4d 44 20 49 6e 73 74` -- `"AMD Inst"`.
+
+**Why it is probabilistic, which is why it survived weeks:** the block comes from the pymalloc pool, so the
+overflow lands in the *adjacent 512-byte cell*. A free cell is invisible; a live object becomes a crash
+somewhere else, minutes later, with no frame pointing here. That single mechanism covers both the ~2-in-11
+MTP + CUDA-graph boot failures and the 1-in-N segfault of a host-only benchmark that merely imports `vllm`.
+The same ABI skew also silently corrupts the *decoded values*, which is how it was suspected before it was
+measured: on this box `market_name` decodes correctly (`'AMD Instinct MI50/MI60'`) while `device_id` and
+`asic_serial` come back `'N/A'`, `num_compute_units` comes back `0`, and `target_graphics_version` comes back
+`'gfx0'` -- so the arch query has been failing here all along and falling back to
+`torch.cuda.get_device_properties`, which also silently gave up the no-CUDA-init property that upstream PR
+#33941 introduced the amdsmi path to protect.
+
+**The fix, and why not the obvious one.** The tempting fix was to stop calling amdsmi and read the arch from
+`torch.cuda.get_device_properties(...).gcnArchName` or from `/sys/class/kfd/.../properties`
+(`gfx_target_version 90006`). Rejected: `get_device_name` calls the same function to build the name that
+tuned-kernel config lookups key on, so changing what those calls *return* is a serving-path behavior change --
+and returning early from the arch query re-initialises CUDA at platform-detection time, the exact bug #33941
+fixed. `vllm/platforms/amdsmi_abi.py` instead **appends 2048 B of slack to the struct** (`_fields_` in a ctypes
+subclass appends, so every field offset and every decoded value is unchanged -- asserted) and wraps the call
+with a watchdog that poisons the slack, reports the true overrun once at info level, and escalates to a
+warning only when a future library outgrows the pad. Containment plus detection, no semantic change.
+
+**Red/green, measured on this box:** without the shim `--arm control --call asicinfo` exits **134** with
+`bad trailing pad byte`; with it, `--arm shim` prints `padded 456 B -> 2504 B`, returns
+`market_name='AMD Instinct MI50/MI60' tgv='gfx0'` -- identical to the unpadded decode -- and exits **0**.
+`tests/platforms/test_amdsmi_abi_pad.py`: 10 passed, including a real-`libamd_smi` test that asserts the last
+64 bytes of the pad are still sentinel. Two test bugs found on the way and worth recording: `ctypes.addressof`
+**refuses a `ctypes.byref`**, which is exactly what the binding passes, so a watchdog written against instances
+silently does nothing on every real call; and the watchdog counts a *contiguous* sentinel run, so its 340 B is
+a lower bound on the 356 B the probe measures by last-modified offset.
+
+**Limits of this claim -- do not overstate.** This is the **bootability** line: E1 blocker #2 (MTP + graphs
+bootability). It is **not** shown to be the P1 ids defect. The boot #12 signature is *structured* -- a fill
+whose first query length was 2 -- and a 356-byte zeroing into one adjacent pymalloc cell is not known to
+produce that. Keep the two lines separate until a boot says otherwise. **Deployment is pending a restart**:
+the defect runs at import, so it cannot be hot-patched into the live server. Falsifiable prediction for the
+next boots: failure rate 2-in-11 -> ~0, and `PYTHONMALLOC=debug tools/gfx906/probe-amdsmi-overflow.py --arm
+import` goes green against the deployed tree.
+
+**Rules.** *A debug allocator is not a slow-mode switch, it is an oracle: run it against the smallest process
+that reproduces the symptom, not the biggest one.* *Poison the slack -- a library that writes zeros makes an
+unpoisoned tail look like containment.* *When a value decodes as `'N/A'`/`0`/`'gfx0'` while a neighbouring
+field decodes fine, suspect a layout disagreement before suspecting the hardware.* *Before replacing a call
+that returns garbage, check what its return value is used for: this one feeds a config-file name lookup.*
