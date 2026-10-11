@@ -183,10 +183,10 @@ def build_ple_shard_layout(
         canonical = canonical_ple_shard_rows(num_shards, shard_row_capacity, vocab_size)
         if list(rows) != canonical:
             logger.warning(
-                "PLE ngram shards are not vLLM's canonical split (%s rows, id space "
-                "%d, stride %d) but %s rows totalling %d ids. Serving the checkpoint's "
-                "own boundaries, which is correct for the rows on disk; a re-split "
-                "would restore the uniform layout.",
+                "PLE ngram shards are not vLLM's canonical split (%d shards, id space "
+                "%d, stride %d per shard) but per-shard row counts %s totalling %d ids. "
+                "Serving the checkpoint's own boundaries, which is correct for the rows "
+                "on disk; a re-split would restore the uniform layout.",
                 num_shards,
                 vocab_size,
                 shard_row_capacity,
