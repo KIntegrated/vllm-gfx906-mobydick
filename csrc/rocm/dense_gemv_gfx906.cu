@@ -1310,9 +1310,8 @@ torch::Tensor dense_gemv_i8_gfx906(torch::Tensor weight, torch::Tensor scale,
   if (ksplit > 1) {
     const int threads = 256;
     const int blocks = (int)((N + threads - 1) / threads);
-    vllm::dense_gemv_gfx906::
-        dense_gemv_i8_scale_kernel<<<blocks, threads, 0, stream>>>(op, sp,
-                                                                   (int)N);
+    vllm::dense_gemv_gfx906::dense_gemv_i8_scale_kernel<<<blocks, threads, 0, stream>>>(
+        op, sp, (int)N);
   }
   return out;
 }
