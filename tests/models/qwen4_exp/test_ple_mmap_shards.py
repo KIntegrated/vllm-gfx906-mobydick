@@ -48,6 +48,17 @@ ple = pytest.importorskip(
     reason="qwen4_exp AMD model code is not importable in this build",
 )
 
+# This file is about the shard-layout guard. Trees that predate it (the v0.29 pin,
+# site-packages, the prof-async-guard worktree) have the mmap-shard loader but no
+# `build_ple_shard_layout`, and there the import above succeeds while every test in
+# here would error on a missing attribute -- an error that reads as a regression in
+# the tree under test. Skip the module and say why instead.
+if not hasattr(ple, "build_ple_shard_layout"):
+    pytest.skip(
+        "this tree has no shard-layout guard (build_ple_shard_layout is absent)",
+        allow_module_level=True,
+    )
+
 NUM_SHARDS = 3
 CAPACITY = 8  # rows per shard
 DIM = 5
@@ -491,6 +502,47 @@ def test_layout_rejects_a_split_that_does_not_add_up_to_the_id_space():
         )
 
 
+def test_layout_accepts_a_checkpoint_padded_past_the_id_space(caplog):
+    """`Qwen3.8-Flash-Next-AwQ-INT4` verbatim, from the boot of 2026-10-10 23:01:
+    128 shards of 2,500,012 rows (320,001,536 total) against a head layout whose
+    last head ends at 320,001,446.
+
+    An exact `total == vocab_size` check refused this and the engine would not
+    boot. The two numbers are different kinds: `shard_row_capacity` is
+    `ceil(padded_vocab_size / parts)`, so the shards are built to the *padded*
+    vocab, while the id space is the end of the last head. The 90-row surplus is
+    padding that no id addresses -- both lookup paths keep every id below the id
+    space inside a shard that has its row -- so this must serve, with a note.
+    """
+    rows = [2500012] * 128
+    with caplog.at_level("WARNING"):
+        starts, out_rows = ple.build_ple_shard_layout(
+            rows,
+            num_shards=128,
+            shard_row_capacity=2500012,
+            vocab_size=320001446,
+        )
+    assert starts == [i * 2500012 for i in range(128)]
+    assert out_rows == rows
+    # The property that makes the surplus safe: the largest id still has a row.
+    assert 320001446 - 1 < starts[-1] + out_rows[-1]
+    warned = [r for r in caplog.records if "vocab padding" in r.getMessage()]
+    assert len(warned) == 1
+    assert "90 rows" in warned[0].getMessage()
+
+
+def test_layout_still_refuses_a_shortfall_past_the_last_row():
+    """The half of the check that is real: rows fewer than the id space strand the
+    tail ids off the end of the last shard. Kept as a refusal, not a warning."""
+    with pytest.raises(ValueError, match="refusing to serve"):
+        ple.build_ple_shard_layout(
+            [2500012] * 127 + [2499921],
+            num_shards=128,
+            shard_row_capacity=2500012,
+            vocab_size=320001446,
+        )
+
+
 def test_layout_rejects_a_non_positive_shard():
     with pytest.raises(ValueError, match="holds 0 rows"):
         ple.build_ple_shard_layout(
@@ -582,11 +634,13 @@ def test_load_weights_finalizes_the_layout_from_the_shards():
     assert torch.equal(emb(ids), _reference(emb._shards, ids, DIM))
 
 
-def test_load_weights_refuses_a_split_that_does_not_match_the_id_space():
-    """With the layout buffers present, a split that does not add up is refused at
-    load time instead of being served."""
+def test_load_weights_refuses_a_split_short_of_the_id_space():
+    """With the layout buffers present, a split that cannot cover the id space is
+    refused at load time. This is the half of the check that is real: NUM_SHARDS x
+    CAPACITY = 24 rows for an id space of 25 leaves id 24 with no row, and the
+    lookup would read past the end of the last shard instead of failing."""
     stub = _Stub()
-    stub.ngram_heads_vocab_sizes = torch.tensor([7], dtype=torch.long)
+    stub.ngram_heads_vocab_sizes = torch.tensor([NUM_SHARDS * CAPACITY + 1], dtype=torch.long)
     stub.ngram_heads_offsets = torch.tensor([0], dtype=torch.long)
     shards = [
         (f"ngram_embedding.shard_{index}.weight", _shard(index * 100))
@@ -595,6 +649,34 @@ def test_load_weights_refuses_a_split_that_does_not_match_the_id_space():
     weights = shards + [("ngram_heads_offsets", torch.tensor([0], dtype=torch.long))]
     with pytest.raises(ValueError, match="id space"):
         _load(stub, weights)
+
+
+def test_load_weights_serves_a_split_padded_past_the_id_space(caplog):
+    """The other direction, which is NOT a disagreement and must serve.
+
+    The shards are sized from the padded vocab (`shard_row_capacity` is
+    `ceil(padded_vocab_size / parts)`); the id space is the end of the last head.
+    24 rows for an id space of 7 is padding that no id addresses. The real
+    `Qwen3.8-Flash-Next-AwQ-INT4` checkpoint is this shape -- 128 x 2,500,012 =
+    320,001,536 rows for an id space of 320,001,446 -- and refusing it is what
+    stopped the v0.30 boot on 2026-10-10: an exact `total == vocab_size` test
+    compared a padded quantity against an unpadded one."""
+    stub = _Stub()
+    stub.ngram_heads_vocab_sizes = torch.tensor([7], dtype=torch.long)
+    stub.ngram_heads_offsets = torch.tensor([0], dtype=torch.long)
+    shards = [
+        (f"ngram_embedding.shard_{index}.weight", _shard(index * 100))
+        for index in range(NUM_SHARDS)
+    ]
+    weights = shards + [("ngram_heads_offsets", torch.tensor([0], dtype=torch.long))]
+    with caplog.at_level("WARNING"):
+        _load(stub, weights)  # must not raise
+    emb = stub.ngram_embedding
+    assert emb._shard_rows == [CAPACITY] * NUM_SHARDS
+    assert [r for r in caplog.records if "vocab padding" in r.getMessage()]
+    # every id below the id space resolves to the row the checkpoint stored there
+    ids = torch.tensor([0, 3, 4, 6])
+    assert torch.equal(emb(ids), _reference(emb._shards, ids, DIM))
 
 
 

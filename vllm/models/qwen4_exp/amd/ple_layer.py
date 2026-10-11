@@ -148,12 +148,37 @@ def build_ple_shard_layout(
 
     total = sum(rows)
     if vocab_size:
-        if total != vocab_size:
+        if total < vocab_size:
             raise ValueError(
                 f"PLE ngram shards hold {total} rows but the model's ngram id space "
                 f"is {vocab_size} (shards: {list(rows)}). The checkpoint's split and "
                 "its vocab layout disagree, so a lookup could not be mapped to a row "
                 "that the checkpoint meant to store there; refusing to serve."
+            )
+        if total > vocab_size:
+            # A surplus is not a disagreement, it is vocab padding, and the two
+            # quantities are not the same kind of number: the shards are stored at
+            # the full padded capacity (`shard_row_capacity` is
+            # `ceil(padded_vocab_size / parts)`, so 128 of them hold
+            # `padded_vocab_size` rows) while `vocab_size` here is
+            # `max(ngram_heads_offsets + ngram_heads_vocab_sizes)` -- the end of the
+            # last head, unpadded. They differ by whatever `padded_vocab_size` rounds
+            # the vocab up to, and the extra rows are simply never addressed: every
+            # id is < `vocab_size` <= `total`, and both lookup paths (the stride at
+            # :714 and the searchsorted boundaries at :720) put such an id in a shard
+            # that has the row. An exact `total == vocab_size` check refused healthy
+            # checkpoints -- 128 x 2,500,012 = 320,001,536 rows against an id space
+            # of 320,001,446 is 90 rows of padding, not 90 rows of wrong data. Only a
+            # *shortfall* can strand an id past the end of the rows, and that still
+            # refuses above.
+            logger.warning(
+                "PLE ngram shards hold %d rows for an ngram id space of %d: %d rows "
+                "past the last head's end. That is vocab padding (the shards are built "
+                "to the padded vocab, the id space is the end of the last head) and no "
+                "id addresses it. Serving the checkpoint's own boundaries.",
+                total,
+                vocab_size,
+                total - vocab_size,
             )
         canonical = canonical_ple_shard_rows(num_shards, shard_row_capacity, vocab_size)
         if list(rows) != canonical:
