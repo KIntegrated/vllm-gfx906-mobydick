@@ -263,6 +263,50 @@ def triton_matmul(a, b):
     return c if len(a_shape) == 2 else c.reshape(*a_shape[:-1], N)
 
 
+# --- gfx906 custom-kernel observability ------------------------------------
+# These switches are read from os.environ inside the WORKER, on every linear
+# layer, and "unset" means ON. That combination is easy to misread from the
+# outside: /proc/<pid>/environ is not trustworthy on a renamed process (vLLM
+# calls setproctitle, which overwrites the argv/environ region -- a snapshot of
+# a live EngineCore here shows thousands of entries with no '=' in them), and a
+# silently defaulted switch is indistinguishable from a honoured one. So log,
+# from the process that actually decides, (a) the switch values this pid sees
+# and (b) the first time each custom kernel is really entered. (b) absent while
+# (a) says "0" is a kill switch working. (b) present while (a) says "0" is a
+# bug in the gate. (a) saying "<unset>" when the operator did set it means the
+# value never reached this process.
+_GFX906_ENV_LOGGED = False
+_GFX906_KERNEL_LOGGED: set[str] = set()
+_GFX906_SWITCHES = (
+    "VLLM_GFX906_DENSE_GEMV",
+    "VLLM_GFX906_DOWN_GEMV",
+    "VLLM_GFX906_SKINNY_M16",
+    "VLLM_GFX906_SPEC_GEMM",
+)
+
+
+def _gfx906_kernel_env_log_once() -> None:
+    """Log once per process the kernel switches as THIS process sees them."""
+    global _GFX906_ENV_LOGGED
+    if _GFX906_ENV_LOGGED:
+        return
+    _GFX906_ENV_LOGGED = True
+    logger.info(
+        "gfx906 kernel switches as seen by pid %d: %s ('<unset>' means the "
+        "default, which is ON)",
+        os.getpid(),
+        {k: os.environ.get(k, "<unset>") for k in _GFX906_SWITCHES},
+    )
+
+
+def _gfx906_kernel_hit_log(kernel: str) -> None:
+    """Log once per process the first time a custom kernel is actually used."""
+    if kernel in _GFX906_KERNEL_LOGGED:
+        return
+    _GFX906_KERNEL_LOGGED.add(kernel)
+    logger.info("gfx906 custom kernel %s: first use in pid %d", kernel, os.getpid())
+
+
 def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor | None:
     """ops.LLMM1 requires weight rows % 4 == 0; zero-pad tiny m and slice
     the result back.
@@ -307,6 +351,7 @@ def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor | 
     )
     if gemv_ok:
         if weight.shape[1] == 2048 and (m == 1 or m == 256 or m >= 2048):
+            _gfx906_kernel_hit_log("dense_gemv_gfx906(k=2048)")
             return ops.dense_gemv_gfx906(weight, x_view, 2048)
         # Shared-expert down_proj (dense fp16): 5.6-5.7 us GEMV vs
         # 6.7-7.7 us LLMM1 rpb4 at kchunk=512/RPT=2 (measured).
@@ -317,7 +362,14 @@ def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor | 
             and m == 2048
             and os.environ.get("VLLM_GFX906_DOWN_GEMV", "1") != "0"
         ):
+            _gfx906_kernel_hit_log("dense_gemv_gfx906(k=512,down_proj)")
             return ops.dense_gemv_gfx906(weight, x_view, 512)
+    if on_gfx906():
+        # Report what this process sees even when the answer was "do not use the
+        # custom kernel", and even when the shapes never matched: a boot that
+        # prints no line must not be ambiguous between "switches off" and "gate
+        # never consulted".
+        _gfx906_kernel_env_log_once()
     if m % 4 == 0:
         return ops.LLMM1(weight, x_view, 4)
     out = ops.LLMM1(torch.nn.functional.pad(weight, (0, 0, 0, 4 - m)), x_view, 4)
@@ -383,6 +435,8 @@ def _gfx906_spec_gemv_m4(
     if k % 1024 != 0 and k % 512 != 0:
         return None
     kchunk = 2048 if k % 2048 == 0 else (1024 if k % 1024 == 0 else 512)
+    _gfx906_kernel_env_log_once()
+    _gfx906_kernel_hit_log(f"dense_gemv_m4_gfx906(m={m},k={k},kchunk={kchunk})")
     return ops.dense_gemv_m4_gfx906(weight, x_view.contiguous(), kchunk)
 
 
@@ -402,6 +456,8 @@ def _gfx906_gemv_long_k(
     """
     from vllm.platforms.rocm import on_gfx906
 
+    if on_gfx906():
+        _gfx906_kernel_env_log_once()
     if not (
         on_gfx906()
         and os.environ.get("VLLM_GFX906_DENSE_GEMV", "1") != "0"
@@ -412,8 +468,10 @@ def _gfx906_gemv_long_k(
     ):
         return None
     if weight.shape[1] == 17408:
+        _gfx906_kernel_hit_log("dense_gemv_gfx906(k=1024,long_k 17408)")
         return ops.dense_gemv_gfx906(weight, x_view, 1024)
     if weight.shape[1] == 10240:
+        _gfx906_kernel_hit_log("dense_gemv_gfx906(k=2048,long_k 10240)")
         return ops.dense_gemv_gfx906(weight, x_view, 2048)
     return None
 
