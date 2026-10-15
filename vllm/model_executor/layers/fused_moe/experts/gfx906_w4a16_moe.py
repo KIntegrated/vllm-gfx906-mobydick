@@ -314,6 +314,24 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
         block_size_m = _block_size_m_for(M, topk)
         em = M * topk
 
+        # VLLM_GFX906_DETERMINISTIC accumulates the expert contributions with exact
+        # integer atomics, and the last contributor converts the sum once every
+        # routed slot for that row has arrived. Under expert parallelism
+        # `expert_map` drops slots whose expert is not local, so those rows would
+        # never complete and would silently keep the zeroed output -- wrong answers
+        # with no error anywhere. Fail loudly instead. This box is TP-only, so
+        # expert_map is None in the shipped arm and the guard never fires.
+        if expert_map is not None and os.environ.get(
+            "VLLM_GFX906_DETERMINISTIC", "0"
+        ) == "1":
+            raise RuntimeError(
+                "gfx906 W4A16 MoE: VLLM_GFX906_DETERMINISTIC cannot be combined "
+                "with expert-parallel masking (expert_map is set). Masked slots "
+                "never arrive, so the deterministic accumulator would leave those "
+                "rows silently unwritten. Unset VLLM_GFX906_DETERMINISTIC, or run "
+                "without expert parallelism."
+            )
+
         if _use_fused_align_m1(
             topk_ids, block_size_m, global_num_experts, expert_map
         ):
