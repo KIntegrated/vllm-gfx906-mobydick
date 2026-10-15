@@ -261,7 +261,8 @@ __global__ void __launch_bounds__(KCHUNK / 8)
                         const half* __restrict__ w,  // [N, K]
                         half* __restrict__ out,      // [M, N], pre-zeroed
                         // if KSPLIT>1
-                        const int N, const int K, const int ksplit) {
+                        const int N, const int K, const int ksplit,
+                        const int shards_per_block) {
   static_assert(
       KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 || KCHUNK == 4096,
       "KCHUNK must be 512, 1024, 2048 or 4096");
@@ -272,7 +273,19 @@ __global__ void __launch_bounds__(KCHUNK / 8)
   constexpr int NV = RPT * M;  // values per thread (flattened r*M+m)
   const int t = threadIdx.x;
   const int row0 = blockIdx.x * RPT;
-  const int k0 = blockIdx.y * KCHUNK;
+  // Which k-shards this block folds. shards_per_block == 1 (grid.y == ksplit)
+  // is the fast path: one block per shard, fp16 shard partials CAS-added into
+  // a zeroed out[], so the order the adds happen in is the scheduler's. That
+  // makes the result run-to-run nondeterministic, which is what
+  // VLLM_GFX906_DETERMINISTIC exists to remove. shards_per_block == ksplit
+  // (grid.y == 1) makes this the only block for these rows: it folds every
+  // shard in fixed index order into one fp32 accumulator and stores once.
+  // Both paths then reduce across warps in the same fixed order below, so the
+  // deterministic path's result does not depend on scheduling at all.
+  const int sh_lo = blockIdx.y * shards_per_block;
+  int sh_hi = sh_lo + shards_per_block;
+  if (sh_hi > ksplit) sh_hi = ksplit;
+  const bool sole_block = (sh_hi - sh_lo) >= ksplit;
 
   // x slices for all M rows (x is small: M*K*2B <= 40 KB, L2-resident;
   // every block re-reads its k-chunk of it). M is a template parameter so
@@ -283,24 +296,30 @@ __global__ void __launch_bounds__(KCHUNK / 8)
     uint4 u;
     half2 h2[4];
   } xa[M];
-#pragma unroll
-  for (int m = 0; m < M; ++m)
-    xa[m].u = *(const uint4*)(x + (int64_t)m * K + k0 + t * 8);
 
   float acc[RPT][M];
 #pragma unroll
-  for (int r = 0; r < RPT; ++r) {
-    const int row = row0 + r;
+  for (int r = 0; r < RPT; ++r)
 #pragma unroll
     for (int m = 0; m < M; ++m) acc[r][m] = 0.0f;
-    if (row >= N) continue;
-    union {
-      uint4 u;
-      half2 h2[4];
-    } wa;
-    wa.u = *(const uint4*)(w + (int64_t)row * K + k0 + t * 8);
+
+  for (int sh = sh_lo; sh < sh_hi; ++sh) {
+    const int k0 = sh * KCHUNK;
 #pragma unroll
-    for (int m = 0; m < M; ++m) acc[r][m] = dot8_f32(wa.h2, xa[m].h2);
+    for (int m = 0; m < M; ++m)
+      xa[m].u = *(const uint4*)(x + (int64_t)m * K + k0 + t * 8);
+#pragma unroll
+    for (int r = 0; r < RPT; ++r) {
+      const int row = row0 + r;
+      if (row >= N) continue;
+      union {
+        uint4 u;
+        half2 h2[4];
+      } wa;
+      wa.u = *(const uint4*)(w + (int64_t)row * K + k0 + t * 8);
+#pragma unroll
+      for (int m = 0; m < M; ++m) acc[r][m] += dot8_f32(wa.h2, xa[m].h2);
+    }
   }
 
 // In-place shfl reduction of the RPT*M values (lanes < NV).
@@ -313,7 +332,7 @@ __global__ void __launch_bounds__(KCHUNK / 8)
 
   if constexpr (WARPS == 1) {
     // Lane i < RPT*M holds (r=i/M, m=i%M)'s full sum.
-    if (ksplit == 1) {
+    if (sole_block) {
       if (t < NV) {
         const int r = t / M, m = t % M, row = row0 + r;
         if (row < N) out[(int64_t)m * N + row] = __float2half_rn(acc[r][m]);
@@ -354,7 +373,7 @@ __global__ void __launch_bounds__(KCHUNK / 8)
     if (lane < NV) red_smem[lane][warp] = acc[lane / M][lane % M];
     __syncthreads();
     if (warp == 0) {
-      if (ksplit == 1) {
+      if (sole_block) {
         if (lane < NV) {
           const int r = lane / M, m = lane % M, row = row0 + r;
           float s = 0.0f;
@@ -403,7 +422,7 @@ __global__ void __launch_bounds__(KCHUNK / 8)
                            half* __restrict__ out,      // [M, N], pre-zeroed
                            // if KSPLIT>1
                            const int M, const int N, const int K,
-                           const int ksplit) {
+                           const int ksplit, const int shards_per_block) {
   static_assert(
       KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 || KCHUNK == 4096,
       "KCHUNK must be 512, 1024, 2048 or 4096");
@@ -412,7 +431,13 @@ __global__ void __launch_bounds__(KCHUNK / 8)
   constexpr int WARPS = THREADS / 64;
   const int t = threadIdx.x;
   const int row0 = blockIdx.x * RPT;
-  const int k0 = blockIdx.y * KCHUNK;
+  // Split-K order: see dense_gemv_m_kernel. This is the kernel the decoder
+  // actually runs at M=4 (the MTP pass width), so it is the one whose fp16
+  // shard atomics were convicted of the run-to-run logit jitter.
+  const int sh_lo = blockIdx.y * shards_per_block;
+  int sh_hi = sh_lo + shards_per_block;
+  if (sh_hi > ksplit) sh_hi = ksplit;
+  const bool sole_block = (sh_hi - sh_lo) >= ksplit;
 
   // x slices for all M rows (x is small: M*K*2B <= 40 KB, L2-resident;
   // every block re-reads its k-chunk of it).
@@ -420,25 +445,31 @@ __global__ void __launch_bounds__(KCHUNK / 8)
     uint4 u;
     half2 h2[4];
   } xa[4];
-#pragma unroll
-  for (int m = 0; m < 4; ++m)
-    if (m < M) xa[m].u = *(const uint4*)(x + (int64_t)m * K + k0 + t * 8);
 
   float acc[RPT][4];
 #pragma unroll
-  for (int r = 0; r < RPT; ++r) {
-    const int row = row0 + r;
+  for (int r = 0; r < RPT; ++r)
 #pragma unroll
     for (int m = 0; m < 4; ++m) acc[r][m] = 0.0f;
-    if (row >= N) continue;
-    union {
-      uint4 u;
-      half2 h2[4];
-    } wa;
-    wa.u = *(const uint4*)(w + (int64_t)row * K + k0 + t * 8);
+
+  for (int sh = sh_lo; sh < sh_hi; ++sh) {
+    const int k0 = sh * KCHUNK;
 #pragma unroll
     for (int m = 0; m < 4; ++m)
-      if (m < M) acc[r][m] = dot8_f32(wa.h2, xa[m].h2);
+      if (m < M) xa[m].u = *(const uint4*)(x + (int64_t)m * K + k0 + t * 8);
+#pragma unroll
+    for (int r = 0; r < RPT; ++r) {
+      const int row = row0 + r;
+      if (row >= N) continue;
+      union {
+        uint4 u;
+        half2 h2[4];
+      } wa;
+      wa.u = *(const uint4*)(w + (int64_t)row * K + k0 + t * 8);
+#pragma unroll
+      for (int m = 0; m < 4; ++m)
+        if (m < M) acc[r][m] += dot8_f32(wa.h2, xa[m].h2);
+    }
   }
 
   // Flatten to acc_flat[r*4+m] for the reduction (lanes < RPT*4).
@@ -456,7 +487,7 @@ __global__ void __launch_bounds__(KCHUNK / 8)
 
   if constexpr (WARPS == 1) {
     // Lane i < RPT*4 holds (r=i/4, m=i%4)'s full sum.
-    if (ksplit == 1) {
+    if (sole_block) {
       if (t < RPT * 4) {
         const int r = t / 4, m = t % 4, row = row0 + r;
         if (m < M && row < N)
@@ -495,7 +526,7 @@ __global__ void __launch_bounds__(KCHUNK / 8)
     if (lane < RPT * 4) red_smem[lane][warp] = acc_flat[lane];
     __syncthreads();
     if (warp == 0) {
-      if (ksplit == 1) {
+      if (sole_block) {
         if (lane < RPT * 4) {
           const int r = lane / 4, m = lane % 4, row = row0 + r;
           float s = 0.0f;
@@ -553,7 +584,8 @@ __global__ void __launch_bounds__(KCHUNK / 8)
                             const half* __restrict__ w,  // [N, K]
                             half* __restrict__ out,      // [M, N], pre-zeroed
                                                          // if KSPLIT>1
-                            const int N, const int K, const int ksplit) {
+                            const int N, const int K, const int ksplit,
+                            const int shards_per_block) {
   static_assert(
       KCHUNK == 512 || KCHUNK == 1024 || KCHUNK == 2048 || KCHUNK == 4096,
       "KCHUNK must be 512, 1024, 2048 or 4096");
@@ -562,24 +594,36 @@ __global__ void __launch_bounds__(KCHUNK / 8)
   constexpr int WARPS = THREADS / 64;
   const int t = threadIdx.x;
   const int row = blockIdx.x;
-  const int k0 = blockIdx.y * KCHUNK;
+  // Split-K order: see dense_gemv_m_kernel. This variant serves M=5..16, i.e.
+  // decode batches of more than one MTP pass, and the plain atomicAdd below
+  // (not a packed CAS) is why the ragged-row case could not use pk2.
+  const int sh_lo = blockIdx.y * shards_per_block;
+  int sh_hi = sh_lo + shards_per_block;
+  if (sh_hi > ksplit) sh_hi = ksplit;
+  const bool sole_block = (sh_hi - sh_lo) >= ksplit;
 
   union {
     uint4 u;
     half2 h2[4];
   } xa[M];
-#pragma unroll
-  for (int m = 0; m < M; ++m)
-    xa[m].u = *(const uint4*)(x + (int64_t)m * K + k0 + t * 8);
 
   float acc[M];
+#pragma unroll
+  for (int m = 0; m < M; ++m) acc[m] = 0.0f;
   union {
     uint4 u;
     half2 h2[4];
   } wa;
-  wa.u = *(const uint4*)(w + (int64_t)row * K + k0 + t * 8);
+
+  for (int sh = sh_lo; sh < sh_hi; ++sh) {
+    const int k0 = sh * KCHUNK;
 #pragma unroll
-  for (int m = 0; m < M; ++m) acc[m] = dot8_f32(wa.h2, xa[m].h2);
+    for (int m = 0; m < M; ++m)
+      xa[m].u = *(const uint4*)(x + (int64_t)m * K + k0 + t * 8);
+    wa.u = *(const uint4*)(w + (int64_t)row * K + k0 + t * 8);
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] += dot8_f32(wa.h2, xa[m].h2);
+  }
 
 // Full 64-lane wavefront butterfly (masks 32..1 - mask 32 is the
 // cross-32-lane-half exchange on gfx906; house pattern, see
@@ -598,7 +642,7 @@ __global__ void __launch_bounds__(KCHUNK / 8)
     float s = 0.0f;
 #pragma unroll
     for (int wp = 0; wp < WARPS; ++wp) s += red_smem[lane][wp];
-    if (ksplit == 1) {
+    if (sole_block) {
       out[(int64_t)lane * N + row] = __float2half_rn(s);
     } else {
       atomicAdd(&out[(int64_t)lane * N + row], __float2half(s));
@@ -1008,8 +1052,30 @@ torch::Tensor dense_gemv_m4_gfx906(torch::Tensor weight, torch::Tensor x,
   TORCH_CHECK(N % rpt == 0, "N (", N, ") not divisible by RPT (", rpt, ")");
 
   const int ksplit = (int)(K / kchunk);
+  // VLLM_GFX906_DETERMINISTIC=1: one block per row tile folds all ksplit
+  // shards in fixed index order (fp32 accumulate, single plain store) instead
+  // of CAS-adding the fp16 shard partials into a zeroed out[]. Same kernels,
+  // same shapes, same hit-log keys -- only the addition order is pinned, so
+  // greedy decoding stops depending on which shard block wins the race. Costs
+  // ksplit-times-the-work-per-block parallelism, which is free when grid.x
+  // already saturates the CUs (the LM head: N/RPT = 31040 blocks) and a real
+  // cost only on the small-N shapes that split-K exists to widen.
+  static const bool gemv_det = [] {
+    const char* e = getenv("VLLM_GFX906_DETERMINISTIC");
+    return e != nullptr && e[0] == '1';
+  }();
+  const int spb = gemv_det ? ksplit : 1;
+  const int gy = gemv_det ? 1 : ksplit;
+  if (gemv_det) {
+    // Witness that the flag reached the C++ side and changed the tiling. The
+    // kernel hit-log key is the same either way, so "48 lines" proves the
+    // kernel ran, not which accumulation order it used.
+    TORCH_WARN_ONCE(
+        "gfx906 dense_gemv_m4: VLLM_GFX906_DETERMINISTIC=1 -- split-K folded "
+        "in fixed shard order (grid.y=1, shards_per_block=ksplit, no out.zero_)");
+  }
   auto out = torch::empty({M, N}, weight.options());
-  if (ksplit > 1) out.zero_();
+  if (ksplit > 1 && !gemv_det) out.zero_();
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(weight));
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -1019,16 +1085,17 @@ torch::Tensor dense_gemv_m4_gfx906(torch::Tensor weight, torch::Tensor x,
 
 #define LAUNCHM(MVAL, RPT, KC)                                             \
   {                                                                        \
-    dim3 grid(N / RPT, ksplit);                                            \
+    dim3 grid(N / RPT, gy);                                                \
     vllm::dense_gemv_gfx906::dense_gemv_m_kernel<RPT, KC, MVAL>            \
-        <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)N, (int)K, ksplit); \
+        <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)N, (int)K, ksplit,  \
+                                      spb);                                 \
   }
 #define LAUNCHM_RT(RPT, KC)                                               \
   {                                                                       \
-    dim3 grid(N / RPT, ksplit);                                           \
-    vllm::dense_gemv_gfx906::dense_gemv_m_kernel_rt<RPT, KC>              \
+    dim3 grid(N / RPT, gy);                                               \
+    vllm::dense_gemv_gfx906::dense_gemv_m_kernel_rt<RPT, KC>             \
         <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)M, (int)N, (int)K, \
-                                      ksplit);                            \
+                                      ksplit, spb);                       \
   }
 #define LAUNCHM_RT_BY_RPT(KCVAL) \
   do {                           \
@@ -1059,9 +1126,10 @@ torch::Tensor dense_gemv_m4_gfx906(torch::Tensor weight, torch::Tensor x,
 // measured win/gate rationale).
 #define LAUNCHM16(MVAL, KC)                                                \
   {                                                                        \
-    dim3 grid(N, ksplit);                                                  \
-    vllm::dense_gemv_gfx906::dense_gemv_m_kernel_m16<KC, MVAL>             \
-        <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)N, (int)K, ksplit); \
+    dim3 grid(N, gy);                                                     \
+    vllm::dense_gemv_gfx906::dense_gemv_m_kernel_m16<KC, MVAL>            \
+        <<<grid, KC / 8, 0, stream>>>(xp, wp, op, (int)N, (int)K, ksplit, \
+                                      spb);                               \
   }
 #define LAUNCHM16_BY_KC(MAXM) \
   do {                        \
