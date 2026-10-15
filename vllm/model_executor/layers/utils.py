@@ -282,6 +282,11 @@ _GFX906_SWITCHES = (
     "VLLM_GFX906_DOWN_GEMV",
     "VLLM_GFX906_SKINNY_M16",
     "VLLM_GFX906_SPEC_GEMM",
+    # Not a kill switch: the m4/m16 GEMV still runs and still logs its hit key
+    # with this on. It pins the split-K addition order (see
+    # csrc/rocm/dense_gemv_gfx906.cu), so the witness that it took effect is
+    # probe-determinism-where showing identical decode, not a log line.
+    "VLLM_GFX906_DETERMINISTIC",
 )
 
 

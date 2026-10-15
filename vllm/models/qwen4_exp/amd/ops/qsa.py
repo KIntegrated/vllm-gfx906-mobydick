@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.models.qwen4_exp.common.qsa_cache import QSA_ACTIVATION_DTYPES
 from vllm.platforms import current_platform
@@ -29,6 +31,108 @@ _TOPK_WORKSPACE_BYTES = 1024 * 1024
 # the ceiling is "verified working", not "documented maximum". Widths above it
 # take `_reference_block_ranks`.
 _TOPK_KERNEL_MAX_WIDTH = 8192
+
+_QSA_TOPK_REF: bool | None = None
+
+
+def _qsa_reference_topk_requested() -> bool:
+    """Honour ``--sparse-indexer-topk-backend=torch`` on this path.
+
+    Upstream's knob (``KernelConfig.sparse_indexer_topk_backend``, dispatched in
+    ``vllm/model_executor/layers/indexer_topk.py``) never reaches this file: the
+    branch in ``qsa_select_paged_tokens`` picks a compiled kernel from the device
+    capability, and gfx906 passes the capability-9.0 test by our own mapping, so
+    the reference selection is unreachable in any CUDA/ROCm run. Reading the same
+    knob here keeps the escape hatch a boot flag instead of a gfx906-only env var,
+    and -- unlike an env var -- it appears in the boot log's
+    ``sparse_indexer_topk_backend=`` line, so an arm can be verified after the fact.
+
+    Why we want the hatch at all: ``block_topk = indexer_budget / compress_ratio``
+    (2048/4 = 512 on this checkpoint), so a row with <= 2048 tokens of context sees
+    <= 512 blocks and the selection is a no-op. The first position whose context can
+    exclude anything is 2052, and that is precisely where prompt_logprobs stopped
+    being reproducible run to run -- measured 2026-10-12 at scored index 2052 for
+    both a 2,267-token and a 2,111-token prompt, on a boot whose MoE was already the
+    deterministic triton backend. The suspect is tie-breaking inside the top-k
+    kernels. The reference path cannot convict a kernel by itself; "reference
+    stable, kernel unstable" is what localises it.
+
+    Cached: the config cannot change after engine start, and this is on the
+    per-chunk selection path.
+    """
+    global _QSA_TOPK_REF
+    if _QSA_TOPK_REF is None:
+        cfg = get_current_vllm_config_or_none()
+        backend = getattr(
+            getattr(cfg, "kernel_config", None),
+            "sparse_indexer_topk_backend",
+            "auto",
+        )
+        _QSA_TOPK_REF = backend == "torch"
+        if _QSA_TOPK_REF:
+            logger.info(
+                "QSA selection: sparse_indexer_topk_backend='torch', using the "
+                "reference (torch.topk) selection instead of the tuned top-k "
+                "kernels. Debug reference: stable and correct, but untuned."
+            )
+    return _QSA_TOPK_REF
+
+
+def _qsa_topk_route(rows: int, logits_stride0: int) -> str:
+    """Return 'cooperative', 'persistent' or 'reference' for a chunk of ``rows``.
+
+    A pure function of its arguments, and the only place the three selection
+    kernels are chosen, so the decision is unit-testable without a GPU. That
+    matters because which kernel a boot runs is exactly what a determinism probe
+    needs to know: the kernels are free to break ties differently, and the
+    reference is not.
+    """
+    if _qsa_reference_topk_requested() or not current_platform.is_cuda():
+        return "reference"
+    if (
+        rows <= 32
+        and logits_stride0 % 4 == 0
+        and current_platform.has_device_capability(90)
+        and not current_platform.is_device_capability_family(120)
+    ):
+        return "cooperative"
+    return "persistent"
+
+
+# Rows per chunk when the reference selection is active.
+#
+# Overridable because this number is a KV-cache cost, not a speed knob. Measured
+# 2026-10-14 at max_model_len 200000 / --gpu-memory-utilization 0.95, same tree and same
+# weights (21.66 GiB both boots): backend='auto' gives 6.86 GiB of KV and backend='torch'
+# gives 5.87 GiB -- 479,704 tokens of KV down to 410,332, max concurrency 2.40x down to
+# 2.05x. That is the torch.topk radix temporaries landing in the memory-profile peak, and
+# it is the price the row cap below negotiates. Lower it and KV comes back; the selection
+# is untuned either way, so the extra launches cost nothing measurable (prefill at 131072
+# was 0.989 vs 0.990 ms/token between the two backends).
+_REF_TOPK_MAX_ROWS = int(os.environ.get("VLLM_GFX906_QSA_REF_ROWS", "256"))
+
+
+def _qsa_rows_per_chunk(columns: int, reference: bool) -> int:
+    """How many query rows to score and select in one chunk.
+
+    The workspace budget bounds the *logits* tile, which is what it was written
+    for. The reference selection needs a second, tighter bound on top of that:
+    torch.topk's multi-block radix path allocates temporaries proportional to
+    rows x columns in addition to the masked copy, and at max_model_len 200000 --
+    where columns is page_table width in BLOCKS (~12.5k), not tokens -- that added
+    ~0.88 GiB to the memory-profile peak. Measured 2026-10-12: the same arm went
+    3.39 GiB -> 2.51 GiB of available KV cache and the engine then refused to boot
+    ("2.86 GiB KV cache is needed ... estimated maximum model length is 172000").
+    The tuned kernels allocate none of this, so the cap is reference-only.
+
+    256 rows x 12.5k columns is 12.8 MiB of logits tile, and the temporaries scale
+    with it; the selection is untuned either way, so extra launches cost nothing
+    that matters.
+    """
+    rows = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
+    if reference:
+        rows = min(rows, _REF_TOPK_MAX_ROWS)
+    return rows
 
 
 @triton.jit
@@ -996,7 +1100,8 @@ def qsa_select_paged_tokens(
 
     columns = page_table.shape[1] * k_cache.shape[1]
     block_topk = token_topk // compress_ratio
-    rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
+    topk_reference = _qsa_reference_topk_requested()
+    rows_per_chunk = _qsa_rows_per_chunk(columns, topk_reference)
     chunk_rows = min(rows, rows_per_chunk)
     blocks_buffer = torch.empty(
         (chunk_rows, block_topk), dtype=torch.int32, device=q.device
@@ -1017,14 +1122,10 @@ def qsa_select_paged_tokens(
             compress_ratio,
         )
         blocks = blocks_buffer[: row_end - row_start]
-        use_cooperative_topk = (
-            current_platform.is_cuda()
-            and blocks.shape[0] <= 32
-            and logits.stride(0) % 4 == 0
-            and current_platform.has_device_capability(90)
-            and not current_platform.is_device_capability_family(120)
+        topk_route = (
+            "reference" if topk_reference else _qsa_topk_route(blocks.shape[0], logits.stride(0))
         )
-        if use_cooperative_topk:
+        if topk_route == "cooperative":
             torch.ops._C.cooperative_topk(
                 logits,
                 visible_blocks,
@@ -1033,7 +1134,7 @@ def qsa_select_paged_tokens(
                 block_topk,
                 columns,
             )
-        elif current_platform.is_cuda():
+        elif topk_route == "persistent":
             torch.ops._C.persistent_topk(
                 logits,
                 visible_blocks,
@@ -1043,7 +1144,11 @@ def qsa_select_paged_tokens(
                 columns,
             )
         else:
-            _select_qsa_block_ranks(logits, visible_blocks, blocks, block_topk)
+            # 'reference': the boot asked for it (--sparse-indexer-topk-backend=torch)
+            # or this is not a CUDA/ROCm run. Call the reference directly rather than
+            # _select_qsa_block_ranks, which sends any width <= _TOPK_KERNEL_MAX_WIDTH
+            # to ops.top_k_per_row_decode -- a third kernel, and not what was requested.
+            _reference_block_ranks(logits, visible_blocks, blocks, block_topk)
         expand_qsa_block_indices_cuda(
             blocks,
             query_positions[row_slice],
