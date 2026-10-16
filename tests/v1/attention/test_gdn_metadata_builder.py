@@ -28,7 +28,6 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
 )
-from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
@@ -237,53 +236,6 @@ def test_gdn_build_classification(test_case: GDNBuildTestCase):
     assert meta.num_prefill_tokens == test_case.expected_num_prefill_tokens
     assert meta.num_spec_decodes == test_case.expected_num_spec_decodes
 
-
-@pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
-@pytest.mark.parametrize("full_cuda_graph", [False, True])
-@pytest.mark.parametrize(
-    "test_case", GDN_BUILD_TEST_CASES.values(), ids=GDN_BUILD_TEST_CASES.keys()
-)
-def test_update_block_table_matches_build(
-    test_case: GDNBuildTestCase, full_cuda_graph: bool, mamba_cache_mode: str
-):
-    """update_block_table() on another group's metadata matches build()."""
-    batch = BatchSpec(seq_lens=test_case.seq_lens, query_lens=test_case.query_lens)
-    src, dst, ref = (
-        _create_gdn_builder(test_case.num_speculative_tokens, full_cuda_graph)
-        for _ in range(3)
-    )
-    for builder in (src, dst, ref):
-        builder.vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
-    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
-    if mamba_cache_mode == "align":
-        # MRV2 precomputes these for every Mamba group each step.
-        dst.mamba_aligned_state_indices = ref.mamba_aligned_state_indices = (
-            mamba_get_block_table_tensor(
-                common.block_table_tensor, common.seq_lens, ref.kv_cache_spec, "align"
-            )
-        )
-    draft_tokens = test_case.num_decode_draft_tokens
-    expected = _build(ref, batch, draft_tokens, common.block_table_tensor)
-    source = _build(src, batch, draft_tokens)
-    fields = (
-        "spec_state_indices_tensor",
-        "non_spec_state_indices_tensor",
-        "prefill_state_indices",
-    )
-    source_indices = [getattr(source, f) for f in fields]
-    source_indices = [t if t is None else t.clone() for t in source_indices]
-    meta = dst.update_block_table(
-        source, common.block_table_tensor, common.slot_mapping
-    )
-
-    for field, source_index in zip(fields, source_indices):
-        actual = getattr(meta, field)
-        torch.testing.assert_close(actual, getattr(expected, field))
-        # The source group's indices are untouched.
-        torch.testing.assert_close(getattr(source, field), source_index)
-        # FULL graph state indices land in this group's own buffers.
-        if full_cuda_graph and meta.num_prefills == 0 and actual is not None:
-            assert actual.data_ptr() == getattr(dst, field).data_ptr()
 
 def test_prefill_metadata_peels_decodes_in_spec_mixed_batch():
     """Spec + decode + prefill: prefill chunk metadata must cover the

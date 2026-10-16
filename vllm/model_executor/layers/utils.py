@@ -180,7 +180,7 @@ def triton_matmul_kernel(
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
-    c = accumulator.to(tl.float16) # acc in fp32 back to fp16
+    c = accumulator.to(c_ptr.dtype.element_ty)  # acc fp32 -> output dtype
 
     # -----------------------------------------------------------
     # Write back the block of the output matrix C with masks.

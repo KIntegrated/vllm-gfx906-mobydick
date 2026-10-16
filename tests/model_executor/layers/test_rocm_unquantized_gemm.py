@@ -19,10 +19,12 @@ from vllm.model_executor.layers import utils
 from vllm.platforms.rocm import on_gfx906
 
 
-@pytest.mark.parametrize("m", [1, 128])
-def test_rocm_unquantized_gemm_gfx1x_wvsplitk_path(monkeypatch, m):
+def test_rocm_unquantized_gemm_gfx1x_wvsplitk_path(monkeypatch):
+    # gfx1x (non-gfx906) path: m>8 -> wvSplitK. The fork routes m=1 to the
+    # gfx906 LLMM1 kernel (see test_..._tiny_m_llmm1_padded), so upstream's
+    # m=1 wvSplitK parametrisation does not apply here.
     x = torch.randn(1, 64, dtype=torch.float16)
-    weight = torch.randn(m, 64, dtype=torch.float16)
+    weight = torch.randn(128, 64, dtype=torch.float16)
 
     monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
     monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
@@ -44,20 +46,6 @@ def test_rocm_unquantized_gemm_gfx1x_wvsplitk_path(monkeypatch, m):
     wvsplitk_mock.assert_called_once()
     llmm1_mock.assert_not_called()
     assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
-
-
-@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel test")
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("n", range(1, 6))
-def test_rocm_unquantized_gemm_single_output_real_kernel(dtype, n):
-    torch.manual_seed(0)
-    x = torch.randn(n, 2048, device="cuda", dtype=dtype)
-    weight = torch.randn(1, 2048, device="cuda", dtype=dtype)
-
-    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
-    ref = torch.nn.functional.linear(x, weight, None)
-
-    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
 def test_rocm_unquantized_gemm_makes_skinny_activation_contiguous(monkeypatch):

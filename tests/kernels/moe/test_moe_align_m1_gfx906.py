@@ -105,8 +105,9 @@ def test_m1_fused_align_bit_equal_to_production(seed, shape):
 def test_m1_fused_align_dispatch_gate(monkeypatch):
     """The gate must fire only for the exact decode shapes (M=1, bsm=1,
     no expert_map, int32, flag on) AND (E, topk) in the supported pair
-    set: (256, 8) and (128, 6), AND the V1 runner (REL30-1: on V2 the op's
-    out-params come back uninitialized)."""
+    set: (256, 8) and (128, 6), AND the V1 runner (REL30-1: on V2, and now
+    also under graph capture, the op's out-params come back uninitialized).
+    Default OFF on v0.31.0; VLLM_GFX906_ALIGN_M1=1 opts in."""
     monkeypatch.setenv("VLLM_GFX906_ALIGN_M1", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     dev = "cuda"
@@ -136,11 +137,12 @@ def test_m1_fused_align_dispatch_gate(monkeypatch):
             f"gate={got} want={want} for "
             f"M={topk_ids.shape[0]} topk={topk_ids.shape[1]} E={ne} "
             f"bsm={bsm} map={emap is not None} dtype={topk_ids.dtype}")
-    # Default is ON (serving A/B PASS); the opt-out flag disables it.
+    # v0.31.0: default is OFF -- upstream's V1 graphs re-exposed the
+    # REL30-1 uninitialized out-params; =1 is the opt-in (asserted above).
     monkeypatch.delenv("VLLM_GFX906_ALIGN_M1")
-    assert _use_fused_align_m1(
+    assert not _use_fused_align_m1(
         torch.zeros(1, 8, device=dev, dtype=torch.int32), 1, 256, None)
-    assert _use_fused_align_m1(
+    assert not _use_fused_align_m1(
         torch.zeros(1, 6, device=dev, dtype=torch.int32), 1, 128, None)
     monkeypatch.setenv("VLLM_GFX906_ALIGN_M1", "0")
     assert not _use_fused_align_m1(

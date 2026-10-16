@@ -744,32 +744,14 @@ class VllmConfig:
                     ", ".join(v1_unsupported),
                 )
 
-        # gfx906 fork (0.29.0 merge): upstream now defaults V2 everywhere and
-        # decides the general case below via HAS_TRITON +
-        # `_get_v2_model_runner_unsupported_features()`, so the fork's old
-        # `_is_default_v2_model_runner_model()` gate is gone (upstream removed
-        # that helper). What stays are the *feature-driven* cases: dspark, mixed
-        # DFlash drafts and the DFlash2 selector exist only in the V2 runner and
-        # would degrade silently on V1. Until DFL2-2 brings V2 up on gfx906, the
-        # rest of the fork's models run V1 via `VLLM_USE_V2_MODEL_RUNNER=0`
-        # (the env override sits above this function and wins).
-        # getattr guards keep upstream's SimpleNamespace-based config tests
-        # working; every attribute exists on a real VllmConfig.
-        spec = getattr(self, "speculative_config", None)
-        if spec is not None and spec.method == "dspark":
-            return True
-
-        dflash_hook = getattr(self, "_dflash_needs_multi_kv_group", None)
-        if dflash_hook is not None and dflash_hook():
-            return True
-
-        dflash2_hook = getattr(self, "_is_dflash2_draft", None)
-        if dflash2_hook is not None and dflash2_hook():
-            return True
-
-        if model_config is not None and getattr(model_config, "is_diffusion", False):
-            return True
-
+        # v0.31.0 merge: the feature-driven early returns (dspark, mixed DFlash,
+        # the DFlash2 selector, diffusion) are gone -- upstream's
+        # `_get_v1_model_runner_unsupported_features()` already lists them and
+        # the general checks below decide V1 vs V2, so forcing V2 here would
+        # short-circuit the V2-unsupported yield (test_config
+        # `test_rocm_mrv1_default_yields_to_v1_unsupported_config`). The fork's
+        # serving recipes still pin V1 with `VLLM_USE_V2_MODEL_RUNNER=0`, which
+        # wins above this function.
         if not HAS_TRITON:
             logger.warning_once(
                 "Model Runner V2 requires Triton; using the V1 model runner instead."
