@@ -1764,6 +1764,26 @@ def _repack_w4a16_gfx906_expert(
     """
     if w.dtype == torch.uint8 and w.shape[1] == scales.shape[1]:
         return _repack_w4a16_wna16_layout(w, scales, qzeros)
+    # Upstream canonical N-first layout (compressed-tensors #52798):
+    # w [E, N, K/8] int32, scales [E, N, G], zps [E, N/8, G]. The gfx906
+    # kernel consumes the K-first GPTQ repack, so transpose and reuse it.
+    if (
+        w.dtype == torch.int32
+        and w.dim() == 3
+        and scales.dim() == 3
+        and w.shape[1] == scales.shape[1]
+        and w.shape[2] != scales.shape[2]
+    ):
+        N = w.shape[1]
+        qzeros_kfirst = (
+            qzeros.transpose(1, 2).contiguous() if qzeros is not None else None
+        )
+        return _repack_w4a16_gptq_kfirst_layout(
+            w.transpose(1, 2).contiguous(),
+            scales.transpose(1, 2).contiguous(),
+            qzeros_kfirst,
+            N,
+        )
     N = scales.shape[2]
     if w.shape[2] * 8 == N:
         return _repack_w4a16_awq_kfirst_layout(w, scales, qzeros, N)

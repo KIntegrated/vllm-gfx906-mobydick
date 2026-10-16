@@ -1022,3 +1022,30 @@ def test_compressed_tensors_wna16_moe_marlin_prep_with_unset_group_size():
     )
     assert layer.w13_weight_scale.shape == (num_experts, 1, 2 * intermediate_size)
     assert layer.w2_weight_scale.shape == (num_experts, 1, hidden_size)
+
+
+def test_gfx906_repack_accepts_ct_nfirst_int32_layout():
+    """Upstream canonical N-first CT layout (#52798) must repack identically
+    to the K-first presentation the gfx906 kernel was built against."""
+    from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+        _repack_w4a16_gfx906_expert,
+    )
+
+    torch.manual_seed(0)
+    num_experts, N, K8, G = 3, 16, 4, 2  # K = 32, group 16
+    w = torch.randint(-(2**31), 2**31 - 1, (num_experts, N, K8), dtype=torch.int32)
+    scales = torch.randn(num_experts, N, G, dtype=torch.float16)
+    qzeros = torch.randint(
+        -(2**31), 2**31 - 1, (num_experts, N // 8, G), dtype=torch.int32
+    )
+
+    out_nfirst = _repack_w4a16_gfx906_expert(w, scales, qzeros)
+    out_kfirst = _repack_w4a16_gfx906_expert(
+        w.transpose(1, 2).contiguous(),
+        scales.transpose(1, 2).contiguous(),
+        qzeros.transpose(1, 2).contiguous(),
+    )
+    for a, b in zip(out_nfirst, out_kfirst):
+        assert (a is None) == (b is None)
+        if a is not None:
+            assert torch.equal(a, b)
