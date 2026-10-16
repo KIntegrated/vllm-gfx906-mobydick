@@ -147,14 +147,6 @@ def test_moe_wna16_accepts_channelwise_gptq_activation_order():
             "MoeWNA16 checkpoint layout",
         ),
         (
-            WNA16MoEBackend.GFX906_HIP,
-            # Symmetric GPTQ has no stored zero points.
-            AutoGPTQConfig(4, 128, False, True, False, {}, {}),
-            False,
-            False,
-            "zero points are required",
-        ),
-        (
             WNA16MoEBackend.RDNA3,
             AutoGPTQConfig(4, 128, False, True, False, {}, {}),
             False,
@@ -211,6 +203,25 @@ def test_wna16_oracle_rejects_incompatible_quant_structures(
         return
     assert reason is not None
     assert expected in reason
+
+
+def test_gfx906_hip_oracle_accepts_symmetric_autogptq():
+    """Symmetric AutoGPTQ (GPTQ zp=8, no act-order) maps to the gfx906 kernel:
+    the repack consumes the K-first int32 layout and the kernel inlines 8."""
+    from tests.kernels.moe.utils import make_dummy_moe_config
+
+    quant_config = AutoGPTQConfig(4, 128, False, True, False, {}, {})
+    moe_config = make_dummy_moe_config(hidden_dim=1024, intermediate_size=2048)
+
+    reason = _backend_incompatibility_reason(
+        backend=WNA16MoEBackend.GFX906_HIP,
+        moe_config=moe_config,
+        quant_config=quant_config,
+        may_have_zp=False,
+        may_have_bias=False,
+        allow_tile_padding=True,
+    )
+    assert reason is None
 
 
 @pytest.mark.parametrize(

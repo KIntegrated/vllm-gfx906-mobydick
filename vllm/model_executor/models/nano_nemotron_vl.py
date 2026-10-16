@@ -988,7 +988,12 @@ class NemotronH_Nano_VL_V2(
                 hf_config=config.text_config,
                 prefix=maybe_prefix(prefix, "language_model"),
             )
-        llm_dtype = self.language_model.config.dtype
+        # Use the *resolved* runtime dtype (ModelConfig.dtype), not the HF
+        # config's dtype: a bf16 checkpoint served with --dtype float16 (e.g.
+        # on gfx906, which has no native bf16) would otherwise build the vision
+        # tower / projector in bf16 while the pipeline runs fp16 and fail with
+        # "expected mat1 and mat2 to have the same dtype".
+        llm_dtype = model_config.dtype
         assert isinstance(llm_dtype, torch.dtype)
         self.llm_dtype = llm_dtype
         with self._mark_tower_model(vllm_config, {"image", "video", "audio"}):
@@ -1094,7 +1099,7 @@ class NemotronH_Nano_VL_V2(
     ):
         """Dynamic resolution extract_feature for images."""
         _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
-        vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+        vit_embeds = vit_embeds.to(dtype=self.llm_dtype)
         vit_embeds = self.pixel_shuffle_dynamic_res(vit_embeds, imgs_sizes=imgs_sizes)
         vit_embeds = self.mlp1(vit_embeds)
         return vit_embeds
@@ -1126,7 +1131,7 @@ class NemotronH_Nano_VL_V2(
                 _, vit_embeds = self.vision_model(chunk, num_frames=chunk.shape[0])
             else:
                 _, vit_embeds = self.vision_model(chunk)
-            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+            vit_embeds = vit_embeds.to(dtype=self.llm_dtype)
             vit_embeds = vit_embeds.reshape(
                 vit_embeds.shape[0], H_patches, W_patches, -1
             )

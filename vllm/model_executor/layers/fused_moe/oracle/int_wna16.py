@@ -91,7 +91,32 @@ def _is_symmetric_no_zp(
     """Symmetric W4A16 with no stored zero points (compressed-tensors
     pack-quantized): dequant is (q - 8) * scale; the gfx906 kernel inlines
     the constant zero point 8 when the zp tensor is empty."""
-    return isinstance(quant_config, QuantizationArgs) and quant_config.symmetric
+    if isinstance(quant_config, QuantizationArgs):
+        return quant_config.symmetric
+    # AutoGPTQ/AutoAWQ MoE on gfx906 fall back to MoeWNA16 (uint8 N-first
+    # weights); has_zp=False is the symmetric no-zp layout whose constant
+    # zero point 8 the kernel inlines.
+    from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
+
+    if isinstance(quant_config, MoeWNA16Config):
+        return not quant_config.has_zp
+    return False
+
+
+def _is_symmetric_autogptq(
+    quant_config: QuantizationConfig | QuantizationArgs,
+) -> bool:
+    """Symmetric AutoGPTQ/GPTQ with the constant zero point 8 and no
+    activation ordering. The gfx906 kernel dequants (q - 8) * scale, so it
+    drops the stored qzeros (GPTQ stores zp as actual - 1, i.e. 7) and
+    inlines 8; the K-first GPTQ int32 layout is what its repack expects."""
+    from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
+
+    return (
+        isinstance(quant_config, AutoGPTQConfig)
+        and quant_config.is_sym
+        and not quant_config.desc_act
+    )
 
 
 def _gidx_actorder_reason(
@@ -129,6 +154,21 @@ def _gfx906_no_zp_reason(
     through to the Triton backend.
     """
     if not _is_symmetric_no_zp(quant_config):
+        return None
+    from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
+
+    if isinstance(quant_config, MoeWNA16Config):
+        if quant_config.weight_bits != 4:
+            return (
+                f"symmetric no-zp MoE requires 4-bit weights "
+                f"(got {quant_config.weight_bits}-bit)"
+            )
+        group_size = quant_config.group_size
+        if group_size is None or group_size <= 0 or group_size % 32 != 0:
+            return (
+                "symmetric no-zp MoE requires a positive group size that is "
+                f"a multiple of 32 (got {group_size})"
+            )
         return None
     if quant_config.num_bits != 4:
         return (
@@ -308,6 +348,7 @@ def _backend_incompatibility_reason(
         backend == WNA16MoEBackend.GFX906_HIP
         and not may_have_zp
         and not _is_symmetric_no_zp(quant_config)
+        and not _is_symmetric_autogptq(quant_config)
     ):
         return "zero points are required (AWQ-style checkpoints)"
 
@@ -335,9 +376,25 @@ def _backend_incompatibility_reason(
     if (
         backend == WNA16MoEBackend.GFX906_HIP
         and isinstance(quant_config, AutoGPTQConfig)
-        and not _is_symmetric_no_zp(quant_config)
+        and not _is_symmetric_autogptq(quant_config)
     ):
         return "GPTQ-style zero-point encoding is not supported"
+    # Symmetric AutoGPTQ is the one GPTQ layout the gfx906 kernel accepts:
+    # 4-bit group-quantized, static scales, no activation ordering.
+    if backend == WNA16MoEBackend.GFX906_HIP and _is_symmetric_autogptq(
+        quant_config
+    ):
+        if quant_config.weight_bits != 4:
+            return "symmetric AutoGPTQ MoE requires 4-bit weights"
+        if (
+            quant_config.group_size is None
+            or quant_config.group_size <= 0
+            or quant_config.group_size % 32 != 0
+        ):
+            return (
+                "symmetric AutoGPTQ MoE requires a positive group size that "
+                f"is a multiple of 32 (got {quant_config.group_size})"
+            )
     # compressed-tensors asymmetric (stored int32-packed zps): accept only
     # the pack-quantized contract; anything outside it falls through to
     # Triton instead of reaching the repack.
@@ -2246,6 +2303,11 @@ def convert_to_wna16_moe_kernel_format(
             w2_qzeros,
         )
     elif backend == WNA16MoEBackend.GFX906_HIP:
+        if _is_symmetric_autogptq(quant_config):
+            # GPTQ symmetric stores zp as (actual - 1) = 7 for the constant
+            # zero point 8; the kernel inlines 8 on the no-zp path.
+            w13_qzeros = None
+            w2_qzeros = None
         return _process_weights_gfx906(
             w13,
             w2,
