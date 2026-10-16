@@ -3544,3 +3544,18 @@ merge barely touches, the canary stall leaves the GPU completely idle, and the m
 same boot. **Consequence: the mamba/MiniMax suite runs, the canary verdict and the TP=2 serving gate are parked on a healthy
 boot; no spec-decode/TP=2 perf number was recorded from this boot.** No passwordless sudo this session (reboot is the
 operator's call).
+
+**Correction (2026-10-16, after the reboot).** #113 is **RETRACTED as host
+degradation.** On the fresh boot the same canary raised
+`TypeError: 'NoneType' object is not subscriptable` at
+`qwen_gdn_linear_attn.py:1417` (a real v0.31.0-merge GDN bug: upstream's new
+`warmup_kernels` / `update_block_table` leaves `non_spec_state_indices_tensor`
+None for W1 spec-mixed decodes; fixed in `d4a182edfb`). The apparent "stall"
+was the GDN/mamba **Triton 3.8 cold-compile + autotune** ahead of that
+exception -- `py-spy` showed the process inside
+`triton/backends/amd/compiler.py:make_amdgcn` / `do_bench`, not blocked.
+After the fix, on the same boot: **`CANARY: 256 tok / 6.6s = 38.7 t/s` rc=0**.
+`amdsmi` still raises "did not return valid GCN arch" across the reboot, so it
+is an environment property, not a degradation marker. No host reboot was
+actually required; the parked suites/canary/TP=2 gate were run on the fresh
+boot and the MTP path needed the code fix, not a reboot.
