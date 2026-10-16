@@ -76,18 +76,24 @@ def _use_fused_align_m1(
     are bit-equal to it for each (E, topk) in _ALIGN_M1_SHAPES at
     block_size=1 (see docs/gfx906/DEVLOG-moe-c1-routing-fusion.md and
     DEVLOG-nemotron-h.md NH-5). Serving A/B (Qwen3.5-35B): +1.18% to
-    +1.73% MoE decode t/s (207-301 us/step), so it is the default;
-    VLLM_GFX906_ALIGN_M1=0 to opt out. V1 only -- see the REL30-1 note in the
-    return below.
+    +1.73% MoE decode t/s (207-301 us/step) on the 0.30 line, where it was the
+    default. It is **default OFF on v0.31.0** (REL30-1, capture-unsafe -- see
+    the note in the return); `VLLM_GFX906_ALIGN_M1=1` re-enables it for an A/B.
+    V1 only.
     """
     return (
-        os.environ.get("VLLM_GFX906_ALIGN_M1", "1") == "1"
-        # REL30-1: under the V2 runner the align op's out-params come back
-        # uninitialized (the fused kernel's writes are not honoured on that
-        # compiled/captured path), so the M=1 GEMM indexes the expert tables
-        # with garbage ids. Only V1 -- which every serve recipe pins with
-        # VLLM_USE_V2_MODEL_RUNNER=0 -- may use it.
+        # REL30-1 on v0.31.0: default OFF. The fused kernel's out-params come
+        # back uninitialized on the compiled/captured path, so the M=1 GEMM
+        # indexes the expert tables with garbage ids and faults with
+        # HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION in
+        # moe_gemm_q4_kernel_gfx906. v0.30 gated it to V1, but v0.31's V1
+        # FULL decode graphs re-expose it (2/2 capture runs faulted); eager
+        # V1 is clean, so only `=1` re-enables it for A/B. The 0.31 base is
+        # faster without it anyway (house bench 61.44 t/s vs the 0.30 record
+        # 60.42 with it on). See docs/gfx906/degradation.md #REL30-1.
+        os.environ.get("VLLM_GFX906_ALIGN_M1", "0") == "1"
         and envs.VLLM_USE_V2_MODEL_RUNNER is False
+        and not torch.cuda.is_current_stream_capturing()
         and _has_gfx906_align_m1_op()
         and expert_map is None
         and topk_ids.size(0) == 1
@@ -292,6 +298,14 @@ class Gfx906WNA16Experts(FusedMoEExpertsModular):
         )
         if global_num_experts == -1:
             global_num_experts = E
+        if topk_ids.size(0) != M:
+            # REL30-1: the modular runner may pass a capture-padded topk_ids
+            # whose row count exceeds the activation's. The align buffer is
+            # sized from topk_ids.numel(), so unfilled rows build blocks with
+            # garbage expert ids and the GEMM reads far outside the expert
+            # tables (HSA aperture violation in moe_gemm_q4_kernel_gfx906).
+            # Trim to the token count the GEMM actually uses.
+            topk_ids = topk_ids[:M]
 
         assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
         assert hidden_states.dtype == torch.float16, (
