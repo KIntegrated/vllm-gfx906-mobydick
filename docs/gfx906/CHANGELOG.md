@@ -37,6 +37,12 @@ separate commit:
   opts in, eager V1 only) and `apply()` trims a capture-padded `topk_ids`
   to `M`. Eager V1 with the align is clean; the 0.31 base is faster
   without it anyway.
+- `d4a182edfb` — **GDN spec-decode crash under MTP**: upstream's new
+  `update_block_table` (#58762) only gathers the non-spec state indices when
+  `num_prefills > 0`, but W1 keeps non-spec 1-token decodes as decodes, so it
+  returned `non_spec_state_indices_tensor = None` and the forward raised
+  `TypeError` at `qwen_gdn_linear_attn.py:1417` (hit by upstream's new
+  `warmup_kernels` and by any MTP step; the canary failed 2/2).
 - `8c394235c8` — `use_v2_model_runner`'s fork feature-driven early returns
   (dspark / mixed DFlash / DFlash2 / diffusion) removed: upstream's
   `_get_v1_model_runner_unsupported_features()` already lists them and
@@ -62,24 +68,34 @@ separate commit:
   61.232) vs the 0.30.0 record 60.42; dense 27B (`Qwen3.5-27B-AWQ`,
   BENCH_MAX_SEQS=4, tg256) **16.49 t/s** (16.483 / 16.494 / 16.482 /
   16.503).
-- **Suites**: `test_gfx906_fa.py` 104 passed; `test_moe_wna16.py` 49
-  passed / 9 skipped; `test_config.py` + `test_rocm_unquantized_gemm.py` +
-  `test_gdn_metadata_builder.py` + `test_moe_align_m1_gfx906.py` green
+- **Canary** (27B, MTP k=2): **38.7 t/s**, rc=0.
+- **Suites**: `test_gfx906_fa.py` 104 passed; `kernels/mamba` **915 passed /
+  33 skipped**; `test_moe_wna16.py` 49 passed / 9 skipped;
+  `test_gdn_metadata_builder.py` 59 passed; `models/minimax_m3` 14 passed /
+  2 skipped; `kernels/attention/test_minimax_m3.py` 133 passed / 13 skipped
+  (4 failures are `ModuleNotFoundError: aiter` — the package is not installed
+  on this dev box); `test_gptq.py` 2 passed; `test_config.py` +
+  `test_rocm_unquantized_gemm.py` + `test_moe_align_m1_gfx906.py` green
   except two offline HF-download cases (`test_rope_customization`,
   `test_eagle_draft_model_config`).
+- **TP=2 serving gate** (Qwen3.8-27B-AWQ-INT4, MTP k=3, V1, maxlen 131072,
+  util 0.82, capture `[4,8,12,16]`, filler, prefix caching OFF): 2k decode
+  **79.35 t/s** (0.30 record 79.1), 64k **42.22 / 41.20 t/s** (0.30 record
+  42.0) at TTFT **187.2 / 187.4 s** (0.30 record 185.3); `stop_agreement`
+  true, teardown clean (VRAM back to baseline).
 
-**Parked on a healthy boot (degradation #113).** Mid-session the host
-entered the #110 state (amdsmi broken, sync-heavy mamba suite stalled at
-15 %, the MTP-k=2 canary stalled with the GPU idle) with no passwordless
-sudo to reboot. So the mamba / MiniMax-M3 suites, the canary and the
-**TP=2 serving gate were not run**, and no spec-decode/TP=2 number is
-recorded. Re-run them after the next reboot before promoting the branch.
+**Degradation #113 was retracted.** What looked like the #110 host state
+mid-session (the mamba suite "stalled" and the canary hung with the GPU
+idle) was Triton 3.8 AMD codegen + autotune (`py-spy` showed `make_amdgcn` /
+`do_bench`) ahead of the GDN crash above; after a reboot and the fix the same
+canary read 38.7 t/s. `amdsmi` still raises "did not return valid GCN arch"
+across the reboot, so that is an environment property here, not a
+degradation marker. All the previously parked gates were then run (above).
 
 **Open follow-ups**: QSA-FN-11 (adopt upstream's official PLE offload
-#57497 / `--engram-config`; the fork's mmap path was kept); MiniMax-M3
-`amd/ops` + `rocm_aiter_mla_sparse` fp16 re-validation on the merged
-tree; `_repack_qzeros_kfirst_for_triton` is now unused in production
-(kept, still tested); the MoE PPL point sits just below its recorded band.
+#57497 / `--engram-config`; the fork's mmap path was kept); the
+`test_minimax_m3.py` aiter cases need the `aiter` package; the MoE PPL point
+sits just below its recorded band (15.9122 vs 15.94–16.02).
 
 ## 2026-10-06 (GDN-1 closed — the "red" gate was the test's indexing, and all four guards are live)
 

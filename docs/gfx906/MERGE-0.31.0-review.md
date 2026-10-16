@@ -186,18 +186,20 @@ scoped above. The decisions in "Open questions" resolved as: base = the 0.30
 train (promote-then-cut); PLE = the fork's mmap kept (QSA-FN-11 follow-up);
 AllSpark = removal adopted.
 
-Three semantic fixes were needed beyond the conflict hunks (separate commits,
+Four semantic fixes were needed beyond the conflict hunks (separate commits,
 see [`CHANGELOG.md`](CHANGELOG.md) 2026-10-16): the N-first CT WNA16 repack
-(`36bd5a82d0`), REL30-1's fused M=1 align defaulting off (`427c445723`), and
-the `use_v2_model_runner` / `triton_matmul` dtype fixes + test adaptations
-(`8c394235c8`).
+(`36bd5a82d0`), REL30-1's fused M=1 align defaulting off (`427c445723`), the
+`use_v2_model_runner` / `triton_matmul` dtype fixes + test adaptations
+(`8c394235c8`), and the W1 GDN `update_block_table` / MTP crash
+(`d4a182edfb`).
 
 Gates run (all green): extension rebuild + op schemas; PPL dense 10.5472 /
 MoE 15.9122 / Nemotron 27.0612 (0 top-20 misses each); 35B house bench
 61.23 t/s and dense 27B 16.49 t/s (V1, graphs, mclk 1000); FA 104 passed;
-config/moe/gdn/rocm suites green (two offline HF cases fail).
+mamba 915 passed / 33 skipped; MiniMax-M3 kernels 133 passed (4 need the
+missing `aiter` package) and model 14 passed; canary 38.7 t/s; TP=2
+Qwen3.8-27B MTP k=3 79.35 t/s @2k / 42.2 t/s @64k.
 
-**Parked on degradation #113** (host entered the #110 state mid-session,
-amdsmi broken, no passwordless sudo): the mamba and MiniMax-M3 suites, the
-canary, and the TP=2 serving gate — re-run after the next reboot before
-promoting the branch.
+**#113 was retracted**: the mid-session "stall" was Triton 3.8 codegen +
+autotune ahead of the GDN crash, not host degradation (`amdsmi` stays broken
+across a reboot, so it is an environment property here).
