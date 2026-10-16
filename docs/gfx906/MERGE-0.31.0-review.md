@@ -177,7 +177,27 @@ consistency fixes + known follow-ups.
 - **`--trust-request-mm-kwargs`**: which local serving clients (if any) send
   per-request multimodal kwargs.
 
-## NOT YET DONE
+## Outcome (2026-10-16)
 
-No branch was cut and no merge was attempted. This sheet is the step-0 scope
-record for the `gfx906/v0.31.0` train.
+**Merged.** `main` was fast-forwarded to the 0.30 train tip (`8d050331fa`) and
+pushed; `gfx906/v0.31.0` was cut from it and merged with `v0.31.0`
+(`db9527a468`) as **`db60e2cbd9`** — 34 conflicted files, exactly the set
+scoped above. The decisions in "Open questions" resolved as: base = the 0.30
+train (promote-then-cut); PLE = the fork's mmap kept (QSA-FN-11 follow-up);
+AllSpark = removal adopted.
+
+Three semantic fixes were needed beyond the conflict hunks (separate commits,
+see [`CHANGELOG.md`](CHANGELOG.md) 2026-10-16): the N-first CT WNA16 repack
+(`36bd5a82d0`), REL30-1's fused M=1 align defaulting off (`427c445723`), and
+the `use_v2_model_runner` / `triton_matmul` dtype fixes + test adaptations
+(`8c394235c8`).
+
+Gates run (all green): extension rebuild + op schemas; PPL dense 10.5472 /
+MoE 15.9122 / Nemotron 27.0612 (0 top-20 misses each); 35B house bench
+61.23 t/s and dense 27B 16.49 t/s (V1, graphs, mclk 1000); FA 104 passed;
+config/moe/gdn/rocm suites green (two offline HF cases fail).
+
+**Parked on degradation #113** (host entered the #110 state mid-session,
+amdsmi broken, no passwordless sudo): the mamba and MiniMax-M3 suites, the
+canary, and the TP=2 serving gate — re-run after the next reboot before
+promoting the branch.

@@ -8,6 +8,79 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-16 (UP-3 — upstream v0.31.0 merged onto the fork line)
+
+`main` was promoted to the 0.30 train tip (`8d050331fa`, the 0.30.0-final
+snapshot plus the `MERGE-0.31.0-review.md` scope sheet) and
+`gfx906/v0.31.0` was cut from it, then merged with upstream **v0.31.0**
+(`db9527a468`) — merge commit **`db60e2cbd9`**, parents `8d050331fa` +
+`db9527a468`: 728 upstream commits, 3145 files, +155 574 / −46 482,
+**34 conflicted files** exactly as scoped in `MERGE-0.31.0-review.md`
+(21 live hand-merges, 13 upstream carries). `main` had fallen 83 commits
+behind the 0.30 train, so the branch point is the train tip, not `main`
+as the skill's default says.
+
+**Semantic (non-conflict) fixes found by building and running**, each a
+separate commit:
+
+- `36bd5a82d0` — the CT WNA16 oracle rejected upstream's canonical
+  **N-first** layout (#52798): `w [E, N, K/8] int32`. Added the N-first
+  branch to `_repack_w4a16_gfx906_expert` (transpose to the K-first GPTQ
+  repack, bit-identical) + a unit test. Without it every CT MoE
+  checkpoint (Nemotron-3.5-Lightning, Gemma-4, Ornith, MiniMax-M3) failed
+  to load.
+- `427c445723` — **REL30-1 re-exposed on V1**: upstream's V1 FULL decode
+  graphs now capture the fork's fused M=1 align, whose out-params come
+  back uninitialized, so `moe_gemm_q4_kernel_gfx906<1,2>` faults with
+  `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` (2/2 at util 0.95 and
+  0.93). The fused align now defaults **OFF** (`VLLM_GFX906_ALIGN_M1=1`
+  opts in, eager V1 only) and `apply()` trims a capture-padded `topk_ids`
+  to `M`. Eager V1 with the align is clean; the 0.31 base is faster
+  without it anyway.
+- `8c394235c8` — `use_v2_model_runner`'s fork feature-driven early returns
+  (dspark / mixed DFlash / DFlash2 / diffusion) removed: upstream's
+  `_get_v1_model_runner_unsupported_features()` already lists them and
+  the general checks decide, so forcing V2 short-circuited the
+  V2-unsupported yield; `triton_matmul_kernel` now emits
+  `c_ptr.dtype.element_ty` instead of hardcoded fp16 (bf16 fallback returned
+  fp16); test adaptations for the fork's dispatch (m=1 wvSplitK, the
+  W1-incompatible MRV2 `update_block_table` test, the default-off align gate).
+
+**Gates (one MI50 unless noted, mclk 1000):**
+
+- Extension rebuild `rc=0`; `vllm 0.31.0`; `gptq_gemm` 7-arg /
+  `gptq_shuffle` 2-arg schemas verified; `post-merge-sweep.sh` PASS.
+- **PPL probe** (fp16, eager): dense `cyankiwi/Qwen3.8-27B-AWQ-INT4`
+  **10.5472** (359 tok, 0 top-20 misses — the exact reference);
+  `QuantTrio/Qwen3.5-35B-A3B-AWQ` **15.9122** (0 misses; recorded band
+  15.94–16.02, run was allocator-tight at util 0.95);
+  `primitive-ai/Nemotron-3.5-Lightning-30B-A3B-mixed-INT4-INT8`
+  **27.0612** (365 tok, 0 misses; band 26.96–27.02) — the last one gates
+  the N-first repack fix.
+- **House bench** (`_bench_gfx906.py`, V1, graph mode, util 0.95,
+  pp2048/tg256): 35B MoE **61.23 t/s** (61.282 / 61.271 / 61.180 /
+  61.232) vs the 0.30.0 record 60.42; dense 27B (`Qwen3.5-27B-AWQ`,
+  BENCH_MAX_SEQS=4, tg256) **16.49 t/s** (16.483 / 16.494 / 16.482 /
+  16.503).
+- **Suites**: `test_gfx906_fa.py` 104 passed; `test_moe_wna16.py` 49
+  passed / 9 skipped; `test_config.py` + `test_rocm_unquantized_gemm.py` +
+  `test_gdn_metadata_builder.py` + `test_moe_align_m1_gfx906.py` green
+  except two offline HF-download cases (`test_rope_customization`,
+  `test_eagle_draft_model_config`).
+
+**Parked on a healthy boot (degradation #113).** Mid-session the host
+entered the #110 state (amdsmi broken, sync-heavy mamba suite stalled at
+15 %, the MTP-k=2 canary stalled with the GPU idle) with no passwordless
+sudo to reboot. So the mamba / MiniMax-M3 suites, the canary and the
+**TP=2 serving gate were not run**, and no spec-decode/TP=2 number is
+recorded. Re-run them after the next reboot before promoting the branch.
+
+**Open follow-ups**: QSA-FN-11 (adopt upstream's official PLE offload
+#57497 / `--engram-config`; the fork's mmap path was kept); MiniMax-M3
+`amd/ops` + `rocm_aiter_mla_sparse` fp16 re-validation on the merged
+tree; `_repack_qzeros_kfirst_for_triton` is now unused in production
+(kept, still tested); the MoE PPL point sits just below its recorded band.
+
 ## 2026-10-06 (GDN-1 closed — the "red" gate was the test's indexing, and all four guards are live)
 
 ### GDN-1 — SYV-10 bounds-port test coverage · [#20](../../issues/20)
