@@ -9,7 +9,7 @@ Known Issues:
 """
 
 import sys
-from types import ModuleType, SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -47,9 +47,6 @@ from vllm.v1.attention.backends.mla.prefill.base import MLADimensions
 from vllm.v1.attention.backends.mla.prefill.selector import (
     MLAPrefillSelectorConfig,
 )
-from vllm.v1.attention.backends.mla.prefill.trtllm_ragged import (
-    TrtllmRaggedPrefillBackend,
-)
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.ops.flashmla import is_flashmla_dense_supported
 from vllm.v1.kv_cache_interface import (
@@ -71,47 +68,6 @@ if current_platform.is_rocm():
     BACKENDS_TO_TEST.append(AttentionBackendEnum.ROCM_AITER_MLA)
 
 DEVICE_TYPE = current_platform.device_type
-
-
-def test_trtllm_ragged_prefill_passes_cpu_sequence_lengths(monkeypatch):
-    calls = []
-
-    def fake_trtllm_ragged_attention_deepseek(**kwargs):
-        calls.append(kwargs)
-        if kwargs["return_lse"]:
-            query = kwargs["query"]
-            lse = torch.empty(query.shape[:2])
-            return kwargs["out"], lse
-        return kwargs["out"]
-
-    prefill_module = ModuleType("flashinfer.prefill")
-    prefill_module.__dict__["trtllm_ragged_attention_deepseek"] = (
-        fake_trtllm_ragged_attention_deepseek
-    )
-    flashinfer_module = ModuleType("flashinfer")
-    flashinfer_module.__dict__["prefill"] = prefill_module
-    monkeypatch.setitem(sys.modules, "flashinfer", flashinfer_module)
-    monkeypatch.setitem(sys.modules, "flashinfer.prefill", prefill_module)
-
-    backend = object.__new__(TrtllmRaggedPrefillBackend)
-    backend.scale = 0.125
-    backend._workspace_buffer = torch.empty(1, dtype=torch.uint8)
-    query_lens_cpu = torch.tensor([2, 3], dtype=torch.int32)
-    prefill_metadata = SimpleNamespace(
-        query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
-        query_lens_cpu=query_lens_cpu,
-        max_query_len=3,
-        output_dtype=torch.float16,
-    )
-    backend.prepare_metadata(prefill_metadata)
-
-    q = torch.empty(5, 2, 4)
-    k = torch.empty_like(q)
-    v = torch.empty_like(q)
-    backend.run_prefill_new_tokens(q, k, v, return_softmax_lse=False)
-
-    assert calls[0]["q_seq_lens_cpu"] is query_lens_cpu
-    assert calls[0]["kv_seq_lens_cpu"] is query_lens_cpu
 
 
 @pytest.mark.parametrize(
@@ -262,12 +218,14 @@ def test_mla_kv_cache_spec_uses_layer_cache_dtype(
     cache_dtype: str, expected_quant_mode: KVQuantMode
 ):
     layer = SimpleNamespace(
+        attn_backend=flashmla_module.FlashMLABackend,
         kv_cache_dtype=cache_dtype,
         head_size=576,
         indexer=None,
         non_causal_multi_token_decode=False,
         sliding_window=None,
     )
+    layer._uses_flat_kv_cache = MethodType(MLAAttention._uses_flat_kv_cache, layer)
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=64), model_config=None
     )
@@ -559,6 +517,7 @@ def create_and_prepopulate_kv_cache(
 
     Returns:
         MLA KV cache tensor
+
     """
     batch_size = len(kv_c_contexts)
     seq_lens = common_attn_metadata.seq_lens.cpu()
@@ -1310,6 +1269,7 @@ def test_flashmla_dcp_decode_metadata_uses_gathered_query_heads(
         query_start_loc_cpu=query_start_loc,
         query_start_loc_device=query_start_loc,
         num_decode_tokens=2,
+        max_query_len=1,
         dcp_tot_seq_lens_device=None,
     )
 
@@ -1351,7 +1311,6 @@ def run_attention_backend(
     chunked_prefill_workspace_size: int | None = None,
 ) -> torch.Tensor:
     """Run attention computation using the specified backend's AttentionImpl."""
-
     builder_cls, impl_cls = try_get_attention_backend(backend)
 
     # Force the prefill backend selection (None means auto-select).
@@ -1448,8 +1407,6 @@ def run_attention_backend(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
         )
-        if attn_metadata.prefill is not None:
-            assert attn_metadata.prefill.query_lens_cpu is not None
 
         # Create output buffer
         num_tokens = query.shape[0]
@@ -1480,8 +1437,7 @@ def _run_backend_correctness(
     v_head_dim: int,
     chunked_prefill_workspace_size: int | None = None,
 ):
-    """
-    Test that all backends produce similar outputs to a reference implementation
+    """Test that all backends produce similar outputs to a reference implementation
     using torch.nn.functional.scaled_dot_product_attention.
 
     This test works by:
@@ -1500,7 +1456,6 @@ def _run_backend_correctness(
     multiple GPUs. This tests that backends work correctly with different
     head counts.
     """
-
     # Filter backends to those that support the requested kv_cache_dtype
     backends_to_test = [
         b

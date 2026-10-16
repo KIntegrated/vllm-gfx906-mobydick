@@ -37,10 +37,6 @@ class ScalarType<half> {
   static __host__ __device__ float2 inline num22float2(const half2 x) {
     return __half22float2(x);
   }
-
-  static __host__ __device__ half2 inline float22num2(const float2 x) {
-    return __float22half2_rn(x);
-  }
 };
 
 // TODO: support 8

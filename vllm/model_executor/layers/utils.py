@@ -421,8 +421,7 @@ def apply_penalties(
     frequency_penalties: torch.Tensor,
     repetition_penalties: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Applies penalties in place to the logits tensor
+    """Applies penalties in place to the logits tensor
     logits : The input logits tensor of shape [num_seqs, vocab_size]
     prompt_tokens_tensor: A tensor containing the prompt tokens. The prompts
         are padded to the maximum prompt length within the batch using
@@ -632,6 +631,7 @@ def wvsplitkrc_dispatch(n: int, k: int, m: int, cu_count: int) -> tuple[int, boo
     Returns:
         The CHUNKK the kernel will dispatch with, and whether the CU budget and
         split-K workspace admit the shape at all.
+
     """
     # Next ^2 of n
     N_p2 = 1 << (n - 1).bit_length()
@@ -811,6 +811,13 @@ def rocm_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # dispatch_unquantized_gemm() picks this backend for any ROCm build,
+    # regardless of the tensor's actual device; the custom op below is only
+    # registered for the CUDA/HIP dispatch key, so route CPU tensors (e.g.
+    # from unit tests that build layers without moving them to the GPU)
+    # through the device-agnostic fallback instead of hard-crashing.
+    if not x.is_cuda:
+        return default_unquantized_gemm(layer, x, weight, bias)
     return torch.ops.vllm.rocm_unquantized_gemm(x, weight, bias)
 
 
@@ -949,7 +956,10 @@ def dispatch_cpu_unquantized_gemm(
             )
         )
         if remove_weight:
-            layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+            layer.weight = torch.nn.Parameter(
+                torch.empty(0, dtype=dtype, device=layer.weight.device),
+                requires_grad=False,
+            )
         logger.debug_once(
             "CPU unquantized GEMM dispatch: using zentorch_linear_unary (prepacked=%s)",
             is_prepacked,
@@ -975,7 +985,10 @@ def dispatch_cpu_unquantized_gemm(
             bias,
         )
         if remove_weight:
-            layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+            layer.weight = torch.nn.Parameter(
+                torch.empty(0, dtype=dtype, device=layer.weight.device),
+                requires_grad=False,
+            )
         logger.debug_once(
             "CPU unquantized GEMM dispatch: using sgl-kernel weight_packed_linear"
         )
@@ -990,7 +1003,10 @@ def dispatch_cpu_unquantized_gemm(
             handler = ops.create_onednn_mm(origin_weight.t(), 32)
             layer.cpu_linear = lambda x, weight, bias: ops.onednn_mm(handler, x, bias)
             if remove_weight:
-                layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+                layer.weight = torch.nn.Parameter(
+                    torch.empty(0, dtype=dtype, device=layer.weight.device),
+                    requires_grad=False,
+                )
             logger.debug_once("CPU unquantized GEMM dispatch: using oneDNN onednn_mm")
             return
         except RuntimeError as e:

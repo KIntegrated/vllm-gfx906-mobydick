@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Warmup kernels used during model execution.
+"""Warmup kernels used during model execution.
 This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
@@ -137,16 +136,17 @@ def _warmup_bf16x3_router_gemm(
     logger.info_once("Warmed up BF16x3 router GEMM configs: %s.", configs)
 
 
-def _warmup_kimi_k3_gemm_rs_ar() -> None:
-    # Kimi-K3 model construction imports this module only when GEMM-RS/AR is
-    # enabled and initializes its singleton before kernel_warmup runs. Avoid
-    # importing it here so other models do not compile the RS/AR variants.
-    module = sys.modules.get("vllm.models.kimi_k3.nvidia.ops.cute_dsl.gemm_rs_ar")
+def _warmup_gemm_rs_ar() -> None:
+    # Model construction (Kimi-K3, DeepSeek-V4.1) imports this module only
+    # when GEMM-RS/AR is enabled and initializes its singleton before
+    # kernel_warmup runs. Avoid importing it here so other models do not
+    # compile the RS/AR variants.
+    module = sys.modules.get("vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar")
     if module is None:
         return
     compiled = module.warmup_gemm_rs_ar()
     if compiled:
-        logger.info_once("Warmed up %d Kimi-K3 GEMM-RS/AR variants.", compiled)
+        logger.info_once("Warmed up %d GEMM-RS/AR variants.", compiled)
 
 
 def _autotune_kimi_k3_kda_qkvg(model: torch.nn.Module) -> None:
@@ -209,7 +209,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     if current_platform.has_device_capability(90):
         _warmup_ll_bf16_router_gemm(worker.get_model())
 
-    _warmup_kimi_k3_gemm_rs_ar()
+    _warmup_gemm_rs_ar()
 
     if worker.vllm_config.kernel_config.enable_cutedsl_warmup:
         # TODO(roberto): Remove after registered CuTeDSL warmups are migrated
@@ -402,8 +402,7 @@ def _run_flashinfer_bf16_autotune_dummy_run(
 
 
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
-    """
-    Autotune FlashInfer operations.
+    """Autotune FlashInfer operations.
     FlashInfer have many implementations for the same operation,
     autotuning runs benchmarks for each implementation and stores
     the results. The results are cached transparently and

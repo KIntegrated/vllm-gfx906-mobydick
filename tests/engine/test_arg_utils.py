@@ -9,7 +9,13 @@ from typing import Annotated, Literal
 import pytest
 from pydantic import Field
 
-from vllm.config import AttentionConfig, CompilationConfig, ModelConfig, config
+from vllm.config import (
+    AttentionConfig,
+    CacheConfig,
+    CompilationConfig,
+    ModelConfig,
+    config,
+)
 from vllm.engine.arg_utils import (
     PREFIX_CACHE_RETENTION_INTERVAL_UNSET,
     EngineArgs,
@@ -88,6 +94,26 @@ def test_watermark_config_cli():
 
 
 @pytest.mark.parametrize(
+    "option",
+    ["--gpu-memory-utilization", "--device-memory-utilization"],
+)
+def test_memory_utilization_cli_aliases(option):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = EngineArgs.from_cli_args(parser.parse_args([option, "0.8"]))
+
+    assert args.gpu_memory_utilization == 0.8
+
+
+def test_device_memory_utilization_property():
+    config = CacheConfig(gpu_memory_utilization=0.8)
+
+    assert config.device_memory_utilization == 0.8
+
+    config.device_memory_utilization = 0.7
+    assert config.gpu_memory_utilization == 0.7
+
+
+@pytest.mark.parametrize(
     "options",
     [
         [
@@ -115,7 +141,7 @@ def test_engram_config_cli(options):
     "options,provided,dp_shared_memory",
     [
         ([], False, False),
-        (["--engram-config", "{}"], True, False),
+        (["--engram-config", "{}"], True, None),
         (
             ["--engram-config", '{"dp_shared_memory": true}'],
             True,
@@ -255,10 +281,13 @@ def test_get_type_hints(type_hint, expected):
     assert get_type_hints(type_hint) == expected
 
 
-def test_get_kwargs():
-    kwargs = get_kwargs(DummyConfig)
-    print(kwargs)
+@pytest.fixture
+def dummy_config_kwargs():
+    return get_kwargs(DummyConfig)
 
+
+def test_get_kwargs(dummy_config_kwargs):
+    kwargs = dummy_config_kwargs
     # bools should not have their type set
     assert kwargs["regular_bool"].get("type") is None
     assert kwargs["optional_bool"].get("type") is None
@@ -268,7 +297,7 @@ def test_get_kwargs():
     assert kwargs["optional_bool_or_str"]["const"] is True
     assert "action" not in kwargs["optional_bool_or_str"]
     # optional literals should have None as a choice
-    assert kwargs["optional_literal"]["choices"] == ["x", "y", "None"]
+    assert kwargs["optional_literal"]["choices"] == ["x", "y", None]
     # tuples should have the correct nargs
     assert kwargs["tuple_n"]["nargs"] == "+"
     assert kwargs["tuple_2"]["nargs"] == 2
@@ -292,6 +321,22 @@ def test_get_kwargs():
     assert json_tip in kwargs["json_tip"]["help"]
     # nested config should construct the nested config
     assert kwargs["nested_config"]["type"]('{"field": 2}') == NestedConfig(2)  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["--optional-literal", "None"], None),
+        (["--optional-literal", ""], None),
+        (["--optional-literal", "x"], "x"),
+    ],
+)
+def test_optional_handling(args, expected, dummy_config_kwargs):
+    parser = FlexibleArgumentParser()
+    parser.add_argument("--optional-literal", **dummy_config_kwargs["optional_literal"])
+
+    assert parser.parse_args(args).optional_literal is expected
+    assert "None" in parser.format_help()
 
 
 def test_jit_monitor_verbose_arg():
@@ -376,8 +421,7 @@ def test_media_io_kwargs_parser(arg, expected):
     ],
 )
 def test_optimization_level(args, expected):
-    """
-    Test space-separated optimization levels (-O 1, -O 2, -O 3) map to
+    """Test space-separated optimization levels (-O 1, -O 2, -O 3) map to
     optimization_level.
     """
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
@@ -396,9 +440,7 @@ def test_optimization_level(args, expected):
     ],
 )
 def test_mode_parser(args, expected):
-    """
-    Test compilation config modes (-cc.mode=int) map to compilation_config.
-    """
+    """Test compilation config modes (-cc.mode=int) map to compilation_config."""
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     parsed_args = parser.parse_args(args)
     assert parsed_args.compilation_config.mode == expected
@@ -437,6 +479,18 @@ def test_compilation_config():
         and args.compilation_config.cudagraph_capture_sizes == [1, 2, 4, 8]
         and args.compilation_config.backend == "inductor"
     )
+
+
+def test_trust_request_mm_kwargs_cli():
+    from vllm.entrypoints.launchers.cli_args import FrontendArgs
+
+    parser = FrontendArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args([])
+    assert not args.trust_request_mm_kwargs
+
+    args = parser.parse_args(["--trust-request-mm-kwargs"])
+    assert args.trust_request_mm_kwargs
 
 
 def test_attention_config():

@@ -719,7 +719,6 @@ def qsa_mqa_paged(
     score_scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute QSA scores directly from a paged compressed-key cache."""
-
     _validate_mqa(q)
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA scoring requires a GPU and Triton")
@@ -850,7 +849,6 @@ def expand_qsa_block_indices_cuda(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Expand compressed blocks and compact the causal tail of the open group."""
-
     if not block_indices.is_cuda or not HAS_TRITON:
         raise RuntimeError("QSA index expansion requires a GPU and Triton")
     if token_topk % compress_ratio:
@@ -984,7 +982,6 @@ def qsa_select_paged_tokens(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization."""
-
     rows = q.shape[0]
     output_width = token_topk + compress_ratio - 1
     if out is None:
@@ -1209,7 +1206,6 @@ def qsa_store_cache_rows(
     rows: torch.Tensor,
 ) -> None:
     """Store fixed-width rows in a QSA cache without boolean indexing."""
-
     if not cache.is_cuda or not HAS_TRITON:
         raise RuntimeError("QSA cache stores require a GPU and Triton")
     if cache.ndim != 4 or cache.shape[2] != 1:
@@ -1255,7 +1251,6 @@ def qsa_compress_groups_with_ratio(
     rope_cache: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool completed groups from the compressor-state ring and raw token rows."""
-
     if not raw_keys.is_cuda or not HAS_TRITON:
         raise RuntimeError("QSA compression requires a GPU and Triton")
     rows = token_to_req.numel()

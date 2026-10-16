@@ -54,7 +54,6 @@ QSA_KV_CACHE_DTYPES: tuple[CacheDType, ...] = ("auto", "float16", "bfloat16")
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
     """Return exact per-token positions as ``[tokens, 1, 3]`` int64 rows."""
-
     if positions.ndim == 1:
         positions = positions.unsqueeze(0).expand(3, -1)
     elif positions.ndim != 2 or positions.shape[0] not in (1, 3):
@@ -122,7 +121,6 @@ def circular_qsa_slot_mapping(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Map each request to its fixed physical block as a circular token ring."""
-
     if compressor_state_size <= 0:
         raise ValueError("QSA circular buffer size must be positive")
     if block_table.ndim != 2:
@@ -174,7 +172,6 @@ def compressed_qsa_slot_mapping(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build boundary-only slots for an ``MLAAttentionSpec`` QSA cache."""
-
     if storage_block_size <= 0 or compress_ratio <= 0:
         raise ValueError("QSA block size and compression ratio must be positive")
     compressed_positions = torch.div(
@@ -836,15 +833,18 @@ class QSAKeyStateCache(_QSAStateCache):
             )
         super().__init__(head_size=storage_head_size, **kwargs)
 
-    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        super().bind_kv_cache(kv_cache)
-        qsa_cache = self.kv_cache
-        self.key_cache = qsa_cache[..., : self.key_head_size]
-        if self.cache_rope_positions:
-            position_tail = qsa_cache[..., self.rope_position_offset :]
-            self.rope_position_cache = position_tail.view(torch.int64)
-        else:
-            self.rope_position_cache = None
+    # Derived on access so `kv_cache` stays the only reference to the bound
+    # storage: clearing it (e.g. after CUDA graph memory profiling) must free
+    # the cache, or the freed block stays pinned in the allocator.
+    @property
+    def key_cache(self) -> torch.Tensor:
+        return self.kv_cache[..., : self.key_head_size]
+
+    @property
+    def rope_position_cache(self) -> torch.Tensor | None:
+        if not self.cache_rope_positions:
+            return None
+        return self.kv_cache[..., self.rope_position_offset :].view(torch.int64)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Hold the open group's committed keys plus every row a speculative
