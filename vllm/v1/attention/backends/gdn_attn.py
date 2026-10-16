@@ -641,8 +641,17 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 prefill_indices = non_spec_indices[m.num_decodes :]
         else:
             spec_indices = blk_table[masks, : self.num_spec + 1]
-            if m.num_prefills > 0:
-                non_spec_indices = prefill_indices = blk_table[~masks, 0]
+            # W1: non-spec 1-token decodes stay decodes (num_decodes > 0,
+            # num_prefills == 0), so the non-spec indices must also be
+            # gathered when there is no prefill -- upstream's original
+            # `num_prefills > 0` alone left them None and the GDN forward
+            # crashed on `non_spec_state_indices_tensor[...]`. With
+            # num_decodes == 0 (upstream's reclassification) this is
+            # unchanged.
+            if m.num_prefills > 0 or m.num_decodes > 0:
+                non_spec_indices = blk_table[~masks, 0]
+                if m.num_prefills > 0:
+                    prefill_indices = non_spec_indices[m.num_decodes :]
 
         if self._stage_spec_decode(
             m.num_prefills, m.num_decodes, m.num_spec_decodes, m.num_spec_decode_tokens
