@@ -3522,3 +3522,25 @@ behind a `model_type == "qwen4_exp"` gate, and the drafter knob restored to upst
 no mamba or FA kernel is in the diff. Re-run them after a reboot; do not read their absence as a
 verdict on the branch.
 
+## 2026-10-16 16:06–16:28 — observation #113 (#110 recurrence during the v0.31.0 merge validation)
+
+Boot ~13:00 UTC, ~3.2 h up. The v0.31.0 merge train ran on this boot and its earlier, GPU-bound gates were all normal:
+PPL dense 10.5472 / MoE 15.9122 (0 top-20 misses each) / Nemotron 27.0612, the 35B MoE house bench 61.23 t/s (mclk 1000) and
+dense 27B 16.49 t/s, `test_gfx906_fa.py` 104 passed, and the config / moe / gdn / rocm suites green.
+
+- **Sync-heavy collapse.** `tests/kernels/mamba` (195 tests, ~56 s on a healthy boot) printed `[15%]` and 34 further dots in
+  ~10 min at 100 % CPU and then stopped advancing; it was killed. The 27B MTP-k=2 canary
+  (`/local/tmp/canary-0.31.0.sh`, the documented detection probe) loaded its 19.6 GiB and saved its AOT compile (82.9 s) but
+  then **stalled with the GPU idle (mclk 350 MHz) and the process at ~86 % CPU**, never printing `CANARY`. Both processes were
+  killed by PID; VRAM returned to the 10/18 MiB baseline and no vllm process remained.
+- **amdsmi broken.** `_query_gcn_arch_from_amdsmi()` raises `RuntimeError: amdsmi did not return valid GCN arch` — the
+  #106/#108/#110 pre-wedge symptom.
+- **No wedge events.** No journal GPU reset, no `Failed to resume KFD`, no OOM in the run logs; `rocm-smi` reported both GPUs
+  with sane VRAM throughout.
+
+Interpretation: this is #110's asymmetry (dense GPU work at full speed, sync-cadence work collapses) with the canary as the
+second stalled workload. It is **not** attributable to the merge under test: the stalled mamba suite is upstream CPU code the
+merge barely touches, the canary stall leaves the GPU completely idle, and the merge's own GPU-bound gates were normal in the
+same boot. **Consequence: the mamba/MiniMax suite runs, the canary verdict and the TP=2 serving gate are parked on a healthy
+boot; no spec-decode/TP=2 perf number was recorded from this boot.** No passwordless sudo this session (reboot is the
+operator's call).
