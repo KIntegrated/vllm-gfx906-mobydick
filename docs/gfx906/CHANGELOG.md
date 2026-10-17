@@ -8,6 +8,27 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-17 (later — DFLASH2-GATE passed, LAB-8 ported)
+
+**DFLASH2-GATE (#51) closed: both ported DFlash2 fixes validated on hardware.**
+`cyankiwi/Qwen3.8-27B-AWQ-INT4` + `syvai/Qwen3.8-27B-DFlash2-W4A16` (compressed-tensors,
+conv layers, 2048 window, no sinks → custom FA), TP=2, fp16, k=7: rescale off gives
+**0.3 % acceptance / 16.7 t/s**, on gives **51.4 % / 73.2 t/s** (the lab's own 73.7 on an
+fp16 drafter); reverting the non-causal window costs **4×** acceptance at 7.3k
+(29.4 → 7.3 %) and nothing at 2.0k. The rescale needed a new path for **quantized**
+drafters — it now scales `weight_scale` when there is no dense `weight`
+(`d36447016f`), which is what makes a pack-quantized drafter work at all.
+
+**LAB-8 (#56) closed:** the lab's `bench.py`/`longctx.py`/`agentctx.py` are ported to
+`tools/gfx906_lab_bench/` and were used as the gate harness. `agentctx.py` confirmed the
+filler inflation: **2.97 accept** on a distinct-file code dump vs 5.5 on our repeated
+filler at the same length.
+
+**BOLT-2 (#54) still open**: instrumentation ruled out drafter KV capacity (18,048 tokens
+per request) and confirmed the context write path sees whole prompts, but did not isolate
+the cause; a post-gather slot log and a per-request NaN poison are the next step. Also
+noted: the drafter's KV block size is 2256 tokens, larger than its 1024 window.
+
 ## 2026-10-17 (BOLT-1/2, LAB-1..LAB-4 — LiLiCorr drafter working; the lab's kernels ported)
 
 **BOLT-1 closed: the LiLiCorr drafter accepts 6.77 tokens per step** on the

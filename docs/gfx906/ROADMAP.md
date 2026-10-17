@@ -200,19 +200,6 @@ resolution our spec A/Bs keep missing. Only if graph-safe and <1 % overhead.
 HIP `hipSetDeviceFlags(4)` shim. A diagnostic lever for the "sync-cadence collapse while plain
 decode is fine" wedge family, not a default; record the ms/step delta on a healthy boot.
 
-### LAB-8 — port the lab's bench harnesses · [#56](../../issues/56)
-
-`bench.py` (prefill-excluded t/s), `longctx.py`, and `agentctx.py` — the last builds the prompt from
-**distinct** source files, unlike our repeated-filler probes, which inflate speculative acceptance.
-Re-run BOLT-2's 2.5k-vs-7.3k discrimination with it before any fix is claimed.
-
-### DFLASH2-GATE — validate the ported DFlash2 fixes · [#51](../../issues/51)
-
-The rescale and window fix are unit-tested but not yet proven on hardware here.
-Two arms (rescale off/on at short context; window reverted/original at 8k/32k)
-against the in-cache DFlash2 drafters. **Gate:** acceptance > 0 at position 0
-and at long context, greedy parity with non-spec.
-
 ### BOLT-2 — acceptance collapses past ~4k context · [#54](../../issues/54)
 
 The LiLiCorr drafter (working since `031fa0e4b2`, 6.77 tokens/step at short
