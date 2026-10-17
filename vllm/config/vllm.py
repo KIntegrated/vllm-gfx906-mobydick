@@ -468,6 +468,88 @@ def ple_hostids_mtp_conflict(
     )
 
 
+ENV_PLE_HOST_STAGE_UNDER_FULL = "VLLM_GFX906_PLE_HOST_STAGE_UNDER_FULL"
+"""Ask the PLE host-id staging to run on steps dispatched under a full CUDA graph.
+
+``"off"`` -- the default -- skips staging on those steps; any other value asks for
+it. ``model_state.py`` only ever compares this against ``"off"`` (``:619``,
+``:1199``, ``:1257``), and :func:`ple_hostids_full_cudagraph` mirrors that
+comparison exactly, so the config guard is never stricter or looser than the code
+it protects. A guard that disagrees with the runtime about what a knob means is
+just a second opinion nobody can act on.
+"""
+
+
+def ple_hostids_full_cudagraph(
+    environ: dict[str, str] | None = None,
+) -> tuple[bool, str]:
+    """May a full CUDA graph be kept, given how ``VLLM_GFX906_PLE_HOSTIDS`` is set?
+
+    Returns ``(keep_full, why)``, where ``why`` is the sentence the config guard
+    prints -- in both directions, because a guard that will not explain itself is
+    how ``downgrading cudagraph_mode`` came to be a line operators read without
+    knowing it was silently costing them full-graph decode.
+
+    The guard this feeds exists because the PLE n-gram op performs a blocking
+    device-to-host read inside the forward, and HIP cannot capture that: the
+    capture dies with ``hipErrorStreamCaptureUnsupported``.
+
+    ``HOSTIDS=1`` **with** ``PLE_HOST_STAGE_UNDER_FULL`` set removes that read. The
+    ids are built on the host and copied in through a pinned buffer before the
+    replay, so the op captured inside the graph only ever reads device memory.
+    Keeping FULL is then the point of the knob rather than an escape hatch around
+    the guard -- which is why this predicate, and not
+    ``VLLM_GFX906_QWEN4_EXP_ALLOW_FULL_CUDAGRAPH``, is the honest way to get full
+    graphs on this model. Measured on this box: ``logs/vllm.log.20261015-180519`
+    and ``logs/vllm.log.20261016-195716`` -- 9 full captures, 0 capture errors,
+    ``stale_steps=0`` across 107,520 accepted steps per worker, bit-identical
+    output, and +23 % decode at B=1 against the piecewise control the same evening
+    (``docs/measurement-ledger.md``).
+
+    Every other combination downgrades. The one worth reading is the first:
+
+    * ``HOSTIDS=1`` **without** ``PLE_HOST_STAGE_UNDER_FULL`` (the default) is the
+      dangerous pairing, not a harmless one. The step is still captured, staging
+      is still declined by choice, and under a captured graph "declined" means the
+      graph replays whatever rows it captured -- every step, forever, with
+      ``stale_steps`` never advancing because nothing considers it a stale replay.
+      Boot ``logs/vllm.log.20261008-083018`` measured 59.21 tok/s that way and it
+      read as a +19 % win.
+    * ``HOSTIDS=2`` compares host ids against device ids, which needs the device
+      gather to run, which puts the blocking read back on the path.
+    * Anything else, including unset, keeps the documented behaviour.
+    """
+    env = os.environ if environ is None else environ
+    mode = env.get(ENV_PLE_HOSTIDS, "0").strip()
+    stage_off = (
+        env.get(ENV_PLE_HOST_STAGE_UNDER_FULL, "off").strip().lower() == "off"
+    )
+    if mode != "1":
+        return False, (
+            f"{ENV_PLE_HOSTIDS}={mode or 'unset'} leaves the blocking D2H in the "
+            "PLE op"
+            + (
+                " -- mode 2 runs the device gather precisely so it can be "
+                "compared against"
+                if mode == "2"
+                else ""
+            )
+        )
+    if stage_off:
+        return False, (
+            f"{ENV_PLE_HOSTIDS}=1 but {ENV_PLE_HOST_STAGE_UNDER_FULL} is off: the "
+            "graph would capture the PLE op and then never be handed new rows, "
+            "which is one frozen embedding replayed every step with stale_steps "
+            f"pinned at 0. Set {ENV_PLE_HOST_STAGE_UNDER_FULL}=stage, or accept "
+            "PIECEWISE."
+        )
+    return True, (
+        f"{ENV_PLE_HOSTIDS}=1 with {ENV_PLE_HOST_STAGE_UNDER_FULL} on: the ids are "
+        "staged host-side through a pinned buffer before the replay, so the "
+        "captured PLE op reads device memory only"
+    )
+
+
 def gdn_async_ordering_risk(cfg: "VllmConfig") -> str | None:
     """Return why async scheduling is unsafe for this config, or None.
 
@@ -2262,7 +2344,18 @@ class VllmConfig:
             # test silently misses FULL_DECODE_ONLY -- exactly the mode an
             # explicit --compilation-config can ask for.
             if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
-                if (
+                keep_full, staging_why = ple_hostids_full_cudagraph()
+                if keep_full:
+                    # Not an override: the configuration deletes the read this
+                    # guard exists to avoid, so downgrading here would cost
+                    # full-graph decode for a hazard that is no longer on the
+                    # path. See ple_hostids_full_cudagraph for the measurement.
+                    logger.warning_once(
+                        "Qwen4Exp PLE: keeping %s -- %s.",
+                        self.compilation_config.cudagraph_mode,
+                        staging_why,
+                    )
+                elif (
                     os.environ.get("VLLM_GFX906_QWEN4_EXP_ALLOW_FULL_CUDAGRAPH", "0")
                     == "1"
                 ):
@@ -2285,7 +2378,8 @@ class VllmConfig:
                     logger.warning_once(
                         "Qwen4Exp's host-resident PLE n-gram lookup cannot run "
                         "inside a full cudagraph (blocking D2H mid-graph); "
-                        "downgrading cudagraph_mode to PIECEWISE."
+                        "downgrading cudagraph_mode to PIECEWISE (%s).",
+                        staging_why,
                     )
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
