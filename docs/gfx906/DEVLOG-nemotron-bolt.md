@@ -291,3 +291,29 @@ Implementation: `fit_residual_stream_to_fp16(..., default_divisor=2048.0)` at th
 LiLiCorr call site (DFlash2 keeps 32); `VLLM_LILICORR_FP16_RESIDUAL_DIVISOR`
 still overrides, `=1` disables. Values 32/128/256 were each tested and fail
 (128: MLP conv inf; 256: layers 0–1 finite, L4 NaN).
+
+### Follow-ups after the 2048 fix
+
+**Chat works, and the earlier kwargs recipe was wrong.** With the template's
+defaults (no `chat_template_kwargs`; the jinja already defaults
+`enable_thinking=True`, `medium_effort=False`) a chat request to the 74B target
++ LiLiCorr drafter answers correctly (`5` for the 5-machines/5-widgets puzzle),
+`finish_reason=stop`, 262 tokens, **acceptance 6.53 and 108–133 t/s**. Both
+non-default modes degenerate: `medium_effort=true` appends
+`{reasoning effort: efficient}` and the model never leaves `</think>` (loops to
+`finish_reason=length`), and `enable_thinking=false` emits `<think></think>`
+repeatedly. So the recipe recorded at bring-up ("needs
+`enable_thinking/medium_effort`") is inverted for this checkpoint; drop the
+kwargs.
+
+**TP=1 is infeasible.** The W4A16 checkpoint is 41 GB on disk and a single MI50
+offers 34.3 GB, so the weights do not fit before any KV cache. TP=1 would need
+expert offload (issue #44's territory), not a different launch flag.
+
+**BOLT-2 (new): acceptance collapses intermittently past ~4k context.** The same
+~7.3k-token prompt gives `acc/draft = 1.0, 1.0, 5.65` across three greedy reps,
+while ~2.5k is stable at `5.52, 5.52, 5.52`. `1.0` means only the bonus token's
+candidate is accepted — the classic shape of a drafter reading context it should
+not, and the same family as the lab's freed-block finding, but this drafter runs
+on **TRITON_ATTN** (the custom FA refuses it: no sink support), which the lab
+never exercised with a drafter. Prefill and decode themselves are fine at 7.3k.
