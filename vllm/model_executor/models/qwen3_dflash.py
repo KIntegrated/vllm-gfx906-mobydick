@@ -25,6 +25,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -540,13 +541,28 @@ class DFlashQwen3Model(nn.Module):
         self._context_qkv_projs = [a.qkv_proj for a in layers_attn]
         self._context_q_sizes = [a.q_size for a in layers_attn]
 
-        # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [_dense_kv_rows(a) for a in layers_attn]
-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
-        if has_bias:
-            kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
-            self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
+        # Fuse the per-layer KV projections only for layouts the fused path can
+        # consume: dense (UnquantizedLinearMethod) or the fork's pack-quantized
+        # dequant (_dense_kv_rows). Any other quantized layout runs per
+        # projection through its quant method (upstream's fallback, #57934).
+        projs = self._context_qkv_projs
+        if all(
+            isinstance(proj.quant_method, UnquantizedLinearMethod)
+            or getattr(proj, "weight_packed", None) is not None
+            for proj in projs
+        ):
+            # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
+            kv_weights = [_dense_kv_rows(a) for a in layers_attn]
+            self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+            if has_bias:
+                kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
+                self._fused_kv_bias: torch.Tensor | None = torch.cat(
+                    kv_biases, dim=0
+                )
+            else:
+                self._fused_kv_bias = None
         else:
+            self._fused_kv_weight = None
             self._fused_kv_bias = None
 
         # K-norm weights stacked into one contiguous [num_layers, head_dim]
