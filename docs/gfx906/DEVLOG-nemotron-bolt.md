@@ -317,3 +317,40 @@ candidate is accepted — the classic shape of a drafter reading context it shou
 not, and the same family as the lab's freed-block finding, but this drafter runs
 on **TRITON_ATTN** (the custom FA refuses it: no sink support), which the lab
 never exercised with a drafter. Prefill and decode themselves are fine at 7.3k.
+
+### Kernel ports (LAB-1/2/3) — measured on this Bolt setup
+
+Ported from `0c33/mi50-vllm-lab` (Apache-2.0; sources under
+`tools/gfx906_skinny/`, hooks in `layers/utils.py`, `exllama.py`,
+`cuda_communicator.py`). Build: `.venv/bin/python tools/gfx906_skinny/build.py`
+→ `tools/gfx906_skinny/build/gfx906_skinny.so`; enable with
+`VLLM_GFX906_SKINNY8_LIB` (fp16 + W4) and `VLLM_GFX906_HOSTAR_LIB` (TP=2 AR).
+
+Microbenchmarks (`bench_skinny.py`, `check_w4.py`, `test_hostar.py`):
+
+| shape (M=7) | current dispatch | skinny v20 | speedup |
+|---|---|---|---|
+| lm_head 124160×5120 | 6249 µs | **1808 µs** | 3.5× |
+| gate_up 17408×5120 | 875 µs | 274 µs | 3.2× |
+| fc 5120×25600 | 1312 µs | 402 µs | 3.3× |
+| ctx_kv 5120×5120 | 265 µs | 97 µs | 2.7× |
+
+M=1 is a wash or slower, so the hook starts at M=2 (the lab's starts at 1).
+W4 vs the float64 reference: **3.3–4.9e-4** rel err vs Exllama's 1.2–1.4e-3
+(closer to exact, as the lab reported). hostar: **0 mismatches over 3000
+random calls**, 73.7 → **18.0 µs** for 80 KB, 18.8 µs and bit-identical inside a
+CUDA graph.
+
+Served A/B (Bolt 74B W4A16 + LiLiCorr k=7, TP=2, same prompt, 3×96 tokens,
+greedy, two reps per arm, arms sequential):
+
+| arm | t/s (2 reps) | ms/step | acc/draft |
+|---|---|---|---|
+| kernels OFF | 96.0, 103.3 | 77.0, 71.5 | 6.77 |
+| kernels ON | **119.5, 130.7** | **61.8, 56.5** | 6.77 |
+
+**+25 % t/s / −20 % ms/step at identical acceptance** (non-overlapping ranges,
+so the effect is well outside this host's noise; the arms were sequential, not
+interleaved, which is the remaining caveat). Hooks confirmed engaged in the log
+(`gfx906 skinny8 GEMM enabled`, `gfx906 host-memory all-reduce enabled for TP=2
+(<= 131072 bytes)`).

@@ -11,6 +11,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
@@ -20,6 +21,54 @@ else:
 
     def on_gfx906() -> bool:
         return False
+
+
+def _gfx906_w4_skinny(
+    x: torch.Tensor, w_q: torch.Tensor, w_zp: torch.Tensor, w_s: torch.Tensor
+) -> torch.Tensor | None:
+    """M=2..8 4-bit GEMM for spec-decode verify on gfx906 (same shuffled layout).
+
+    Ported from 0c33/mi50-vllm-lab (Apache-2.0),
+    https://github.com/0c33/mi50-vllm-lab; source in tools/gfx906_skinny/w4.cu.
+    Dequantizes each weight once for all rows and accumulates with
+    v_dot2_f32_f16 in fp32 (Exllama sums 8 products in fp16 first and folds
+    K-splits with fp16 CAS atomics). M=1 keeps Exllama's tuned max-ilp kernel.
+    """
+    from vllm.model_executor.layers.utils import _gfx906_skinny8_available
+
+    m, k = x.shape
+    n = w_q.shape[1]
+    if not (
+        2 <= m <= 8
+        and n % 256 == 0
+        and k % 512 == 0
+        and _gfx906_skinny8_available()
+    ):
+        return None
+    kw = 256 if (k % 1024 == 0 and n >= 8192) else 128
+    return torch.ops.gfx906_skinny.w4gemm(x.contiguous(), w_q, w_zp, w_s, kw, 14)
+
+
+def _gfx906_gptq_gemm_w4_impl(
+    x: torch.Tensor, w_q: torch.Tensor, w_zp: torch.Tensor, w_s: torch.Tensor
+) -> torch.Tensor:
+    out = _gfx906_w4_skinny(x, w_q, w_zp, w_s)
+    if out is None:
+        out = ops.gptq_gemm(x, w_q, w_zp, w_s, True, True, 4)
+    return out
+
+
+def _gfx906_gptq_gemm_w4_fake(
+    x: torch.Tensor, w_q: torch.Tensor, w_zp: torch.Tensor, w_s: torch.Tensor
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], w_q.shape[1]))
+
+
+direct_register_custom_op(
+    op_name="gfx906_gptq_gemm_w4",
+    op_func=_gfx906_gptq_gemm_w4_impl,
+    fake_impl=_gfx906_gptq_gemm_w4_fake,
+)
 
 
 class ExllamaLinearKernel(MPLinearKernel):
@@ -157,15 +206,20 @@ class ExllamaLinearKernel(MPLinearKernel):
             else x_2d
         )
 
-        output = ops.gptq_gemm(
-            x_2d_fp16,
-            w_q,
-            w_zp,
-            w_s,
-            True,
-            use_v2_format,
-            c.weight_type.size_bits,
-        )
+        if use_v2_format and c.weight_type.size_bits == 4 and c.group_size == 32:
+            # Opaque op: the M-dependent kernel choice must happen at run time,
+            # not when torch.compile traces this method.
+            output = torch.ops.vllm.gfx906_gptq_gemm_w4(x_2d_fp16, w_q, w_zp, w_s)
+        else:
+            output = ops.gptq_gemm(
+                x_2d_fp16,
+                w_q,
+                w_zp,
+                w_s,
+                True,
+                use_v2_format,
+                c.weight_type.size_bits,
+            )
 
         if output.dtype != x.dtype:
             output = output.to(x.dtype)

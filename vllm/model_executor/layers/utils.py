@@ -661,6 +661,52 @@ def wvsplitkrc_dispatch(n: int, k: int, m: int, cu_count: int) -> tuple[int, boo
     return chunkk, fits
 
 
+_GFX906_SKINNY8_LIB = os.environ.get("VLLM_GFX906_SKINNY8_LIB", "")
+_GFX906_SKINNY8_VARIANT = int(os.environ.get("VLLM_GFX906_SKINNY8_VARIANT", "20"))
+
+
+@functools.cache
+def _gfx906_skinny8_available() -> bool:
+    """Load the M<=8 skinny fp16 GEMM library (VLLM_GFX906_SKINNY8_LIB).
+
+    Ported from 0c33/mi50-vllm-lab (Apache-2.0),
+    https://github.com/0c33/mi50-vllm-lab; sources in tools/gfx906_skinny/.
+    """
+    if not _GFX906_SKINNY8_LIB:
+        return False
+    try:
+        torch.ops.load_library(_GFX906_SKINNY8_LIB)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("gfx906 skinny8 GEMM library failed to load: %s", e)
+        return False
+    logger.info_once("gfx906 skinny8 GEMM enabled (%s)", _GFX906_SKINNY8_LIB)
+    return True
+
+
+def _gfx906_skinny8(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor | None:
+    """M=2..8 fp16 GEMM that streams W once and stages X in LDS.
+
+    Spec-decode verify/draft shapes (M = k+1 rows) otherwise re-read X per
+    weight row. M=2 is the floor: at M=1 the existing dispatch is as fast or
+    faster on every shape measured (tools/gfx906_skinny/bench_skinny.py).
+    """
+    n = x.numel() // x.size(-1)
+    m, k = weight.shape
+    if not (
+        2 <= n <= 8
+        and m >= 1024
+        and k % 512 == 0
+        and x.dtype == torch.float16
+        and weight.dtype == torch.float16
+        and weight.is_contiguous()
+        and _gfx906_skinny8_available()
+    ):
+        return None
+    x_view = x.reshape(-1, k).contiguous()
+    out = torch.ops.gfx906_skinny.gemm(x_view, weight, _GFX906_SKINNY8_VARIANT)
+    return out.reshape(*x.shape[:-1], m)
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -675,6 +721,11 @@ def rocm_unquantized_gemm_impl(
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
     k = weight.shape[1]
+
+    if on_gfx906() and bias is None:
+        out = _gfx906_skinny8(x, weight)
+        if out is not None:
+            return out
 
     cu_count = 0
     if not on_gfx906():

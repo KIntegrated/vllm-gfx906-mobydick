@@ -72,6 +72,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 rocm_aiter_ops.is_custom_all_reduce_enabled()
             )
 
+        self._init_gfx906_host_allreduce(unique_name)
+
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
@@ -332,7 +334,29 @@ class CudaCommunicator(DeviceCommunicatorBase):
             scope="global",
         )
 
+    def _init_gfx906_host_allreduce(self, unique_name: str) -> None:
+        """TP=2 all-reduce through pinned host memory (VLLM_GFX906_HOSTAR_LIB).
+
+        Ported from 0c33/mi50-vllm-lab (Apache-2.0); kernel in
+        tools/gfx906_skinny/hostar.cu. Off unless the env var points at the
+        built gfx906_skinny.so.
+        """
+        import os
+
+        self.gfx906_hostar = None
+        lib = os.environ.get("VLLM_GFX906_HOSTAR_LIB", "")
+        if lib and self.world_size == 2 and unique_name.split(":")[0] == "tp":
+            from .gfx906_host_allreduce import Gfx906HostAllReduce
+
+            self.gfx906_hostar = Gfx906HostAllReduce(
+                self.cpu_group, self.rank, self.ranks, lib
+            )
+
     def all_reduce(self, input_):
+        hostar = getattr(self, "gfx906_hostar", None)
+        if hostar is not None and hostar.should_use(input_):
+            return hostar.all_reduce(input_)
+
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None

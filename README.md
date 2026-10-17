@@ -66,6 +66,17 @@ See [`docs/gfx906/`](docs/gfx906/) for the full optimization record.
   (acceptance 0). Python-only: keeps the custom FA and restores the left window with the existing
   causal+window mask (`q_abs_offset = seq_len`, `window = nc_window + n_q`).
 
+- **M≤8 spec-decode GEMMs + TP=2 host all-reduce** (`tools/gfx906_skinny/`, hooks in
+  `layers/utils.py`, `exllama.py`, `cuda_communicator.py`): ported from
+  [**0c33/mi50-vllm-lab**](https://github.com/0c33/mi50-vllm-lab) (Apache-2.0). A spec step runs most
+  matmuls at M = k+1 ≤ 8, where the general paths re-read X per weight row. `skinny.cu` stages X in LDS
+  and streams W with coalesced 16-byte loads (**lm_head M=7: 6249 → 1808 µs**), `w4.cu` dequantizes each
+  4-bit weight once for all rows with fp32 accumulation (closer to exact than Exllama: 3.3e-4 vs 1.3e-3)
+  and `hostar.cu` all-reduces TP=2 through pinned host memory (**73.7 → 18.0 µs**, bit-identical,
+  graph-replayable). Build with `tools/gfx906_skinny/build.py`; opt in with `VLLM_GFX906_SKINNY8_LIB` /
+  `VLLM_GFX906_HOSTAR_LIB`. Served A/B (Bolt 74B + LiLiCorr k=7, TP=2): **+25 % t/s at identical
+  acceptance** (119.5/130.7 vs 96.0/103.3).
+
 - **`triton_attn` `seq_lens_cpu`** (`vllm/v1/attention/backends/triton_attn.py`): same fix as the
   lab's — `getattr(..., None)` so the opt-in torch-SDPA fast paths skip instead of running with an
   over-estimated length; they hit it first on an int8-KV boot (0.30 removed the field, #55353).
