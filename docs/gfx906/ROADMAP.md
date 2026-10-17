@@ -184,27 +184,6 @@ Recon: `RECON-mi50-vllm-lab.md`. Ported already: the fp16 residual rescale
 attribution rule: repo URL + license in the code, the README's "Ported
 optimizations" section, and the commit message.
 
-### LAB-1 — M≤8 skinny fp16 GEMM · [#45](../../issues/45)
-
-Spec-decode verify matmuls are M ≤ 8 and bandwidth-bound. Lab: lm_head
-124160×5120 at M=7 10.3 → 3.4 ms. Build the extension, A/B against
-SKINNY_M16/`_gfx906_spec_gemv_m4`, keep B=1 clean.
-
-### LAB-2 — M≤8 W4 GEMM · [#46](../../issues/46)
-
-4-bit Exllama-layout M=2..8 with fp32 accumulation (no fp16 atomics); M=1 keeps
-the max-ilp kernel. 1.1–1.7× per layer in the lab. Same extension, own dispatch.
-
-### LAB-3 — host-memory TP=2 all-reduce · [#47](../../issues/47)
-
-Pinned-host all-reduce, graph-replayable, no P2P needed: 72 → 28 µs there.
-Our P2P works, so measure before adopting; RCCL stays for large messages.
-
-### LAB-4 — amdsmi-first `.pth` · [#48](../../issues/48)
-
-One-line import-order shim for the boot-time "valid GCN arch" warning. Cheap
-experiment; do not ship without an observable effect.
-
 ### LAB-5 — int8 per-token-head KV 200k agent profile · [#49](../../issues/49)
 
 `KV_DTYPE=int8_per_token_head` + TRITON_ATTN + 128 softmax segments, 204800 ctx,

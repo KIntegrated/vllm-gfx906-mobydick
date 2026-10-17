@@ -8,6 +8,39 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-17 (BOLT-1/2, LAB-1..LAB-4 — LiLiCorr drafter working; the lab's kernels ported)
+
+**BOLT-1 closed: the LiLiCorr drafter accepts 6.77 tokens per step** on the
+Nemotron-Bolt 74B W4A16 target (TP=2, fp16, k=7): **96.2 t/s** vs 48.7 non-spec
+(17.9 with the broken drafter), 100 % acceptance at positions 0–3. Root cause
+was fp16 overflow in the drafter's **grouped dynamic conv**: its learned
+`base_kernel` taps (~150×) scale every sublayer output and are not touched by
+the residual rescale, so the unscaled stream reaches ~4e7 and the rescale needs
+a divisor >~1024 — the lab's 32 was calibrated on the conv-less z-lab DFlash2.
+Fixed by `fit_residual_stream_to_fp16(..., default_divisor=2048.0)` at the
+LiLiCorr call site (`031fa0e4b2`). The earlier ported fix was not wrong, only
+under-scaled for this architecture.
+
+Bolt follow-ups: chat works on **template defaults** (no `chat_template_kwargs`)
+— the recorded "needs `enable_thinking/medium_effort`" recipe is inverted;
+`medium_effort=true` and `enable_thinking=false` both degenerate into
+`</think>` loops. TP=1 is infeasible (41 GB checkpoint vs 34.3 GB per card).
+**BOLT-2 opened (#54):** acceptance intermittently collapses to 1.0 past ~4k
+context on the drafter's TRITON_ATTN path (2.5k stable at 5.52).
+
+**LAB-1/2/3 ported and measured** (`69ff678002`), from
+`0c33/mi50-vllm-lab` (Apache-2.0; `tools/gfx906_skinny/` + hooks): lm_head at
+M=7 **6249 → 1808 µs**, gate_up 875 → 274, fc 1312 → 402, ctx_kv 265 → 97; the
+W4 kernel is closer to exact than Exllama (3.3–4.9e-4 vs 1.2–1.4e-3); hostar is
+bit-identical over 3000 calls and 73.7 → 18.0 µs per 80 KB, graph-replayable.
+Served A/B on the Bolt setup: **+25 % t/s / −20 % ms/step at identical
+acceptance** (119.5/130.7 vs 96.0/103.3). **LAB-4 not adopted** — the
+amdsmi-first `.pth` silences the warning but changes `get_device_name()` to the
+generic "AMD Radeon Graphics" with no functional gain.
+
+```
+```
+
 ## 2026-10-16 (UP-3 — upstream v0.31.0 merged onto the fork line)
 
 `main` was promoted to the 0.30 train tip (`8d050331fa`, the 0.30.0-final
