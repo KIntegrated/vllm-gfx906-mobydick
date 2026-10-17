@@ -457,3 +457,91 @@ def test_context_kv_uses_quantized_projection_fallback(monkeypatch):
     torch.testing.assert_close(actual_k, expected_k)
     torch.testing.assert_close(actual_v, expected_v)
     assert [projection.calls for projection in projections] == [1, 1]
+
+
+def _rescale_layer():
+    import torch
+
+    layer = torch.nn.Module()
+    layer.self_attn = torch.nn.Module()
+    layer.self_attn.o_proj = torch.nn.Linear(4, 4, bias=False).half()
+    layer.mlp = torch.nn.Module()
+    layer.mlp.gate_up_proj = torch.nn.Linear(4, 8, bias=False).half()
+    # intermediate = 8/2 = 4 (gate+up fused), so down is 4 -> 4.
+    layer.mlp.down_proj = torch.nn.Linear(4, 4, bias=False).half()
+    layer.residual_scale = 1.0
+    return layer
+
+
+def test_fp16_residual_rescale_scales_every_branch(monkeypatch):
+    """Load-time rescale: o_proj/32, up half/8, down*4, residual_scale 1/32.
+
+    ``=1`` must be a no-op (the kill switch).
+    """
+    from vllm.model_executor.models.qwen3_dflash2 import fit_residual_stream_to_fp16
+
+    layer = _rescale_layer()
+    o0 = layer.self_attn.o_proj.weight.detach().clone()
+    gu0 = layer.mlp.gate_up_proj.weight.detach().clone()
+    d0 = layer.mlp.down_proj.weight.detach().clone()
+
+    monkeypatch.setenv("VLLM_TEST_RESIDUAL_DIVISOR", "32")
+    fit_residual_stream_to_fp16([layer], "VLLM_TEST_RESIDUAL_DIVISOR")
+
+    torch.testing.assert_close(
+        layer.self_attn.o_proj.weight, o0 / 32, rtol=2e-2, atol=0
+    )
+    torch.testing.assert_close(
+        layer.mlp.gate_up_proj.weight[:4], gu0[:4], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        layer.mlp.gate_up_proj.weight[4:], gu0[4:] / 8, rtol=2e-2, atol=0
+    )
+    # down_proj takes up_divisor/divisor = 8/32 = 1/4 so the MLP block scales 1/32.
+    torch.testing.assert_close(layer.mlp.down_proj.weight, d0 / 4, rtol=2e-2, atol=0)
+    assert layer.residual_scale == 1.0 / 32
+
+    off = _rescale_layer()
+    o1 = off.self_attn.o_proj.weight.detach().clone()
+    monkeypatch.setenv("VLLM_TEST_RESIDUAL_DIVISOR", "1")
+    fit_residual_stream_to_fp16([off], "VLLM_TEST_RESIDUAL_DIVISOR")
+    assert off.residual_scale == 1.0
+    torch.testing.assert_close(off.self_attn.o_proj.weight, o1, rtol=0, atol=0)
+
+
+def test_fp16_residual_rescale_preserves_the_normed_stream():
+    """Every branch is linear in its output projection, so the scaled stream is
+    exactly 1/32 of the unscaled one -- what the final RMSNorm consumes."""
+    from vllm.model_executor.models.qwen3_dflash2 import fit_residual_stream_to_fp16
+
+    layer = _rescale_layer()
+    o = layer.self_attn.o_proj.weight.float().clone()
+    gu = layer.mlp.gate_up_proj.weight.float().clone()
+    d = layer.mlp.down_proj.weight.float().clone()
+    x = torch.randn(4)
+    r = torch.randn(4)
+
+    def update(r, o, gu, d, residual_scale):
+        gate = torch.nn.functional.linear(x, gu[:4])
+        up = torch.nn.functional.linear(x, gu[4:])
+        down = torch.nn.functional.linear(torch.nn.functional.silu(gate) * up, d)
+        attn = torch.nn.functional.linear(x, o)
+        return r * residual_scale + attn + down
+
+    pre = update(r, o, gu, d, 1.0)
+
+    import os
+
+    os.environ["VLLM_TEST_RESIDUAL_DIVISOR"] = "32"
+    try:
+        fit_residual_stream_to_fp16([layer], "VLLM_TEST_RESIDUAL_DIVISOR")
+    finally:
+        os.environ.pop("VLLM_TEST_RESIDUAL_DIVISOR", None)
+    post = update(
+        r,
+        layer.self_attn.o_proj.weight.float(),
+        layer.mlp.gate_up_proj.weight.float(),
+        layer.mlp.down_proj.weight.float(),
+        layer.residual_scale,
+    )
+    torch.testing.assert_close(post, pre / 32, rtol=3e-2, atol=1e-3)

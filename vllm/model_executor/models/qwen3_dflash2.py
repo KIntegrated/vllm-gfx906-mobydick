@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -9,6 +11,7 @@ from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.triton_utils import tl, triton
@@ -20,6 +23,50 @@ from .qwen3_dflash import (
     DFlashQwen3Model,
 )
 from .utils import maybe_prefix
+
+logger = init_logger(__name__)
+
+
+def fit_residual_stream_to_fp16(
+    layers: nn.ModuleList, env_var: str, default_divisor: float = 32.0
+) -> None:
+    """Keep a bf16-trained draft's residual stream inside fp16 range.
+
+    gfx906 has no bf16, so these drafters run fp16. The stream passes fp16's
+    max (65504) within a couple of layers; the NaNs that follow make every
+    candidate id 0..top_k-1 and acceptance exactly zero (vllm-project/vllm#55250).
+    Every branch reads the stream through an RMSNorm, the final norm feeds the
+    candidates/selector, and the grouped conv is linear in the branch output, so
+    scaling each branch's output projection -- and the layer-0 residual -- by
+    one constant shrinks the whole stream without changing what the draft
+    computes. The up half of gate_up_proj takes part of the scale so the MLP's
+    intermediate product cannot overflow either. Load-time only; zero runtime
+    cost. ``=1`` disables.
+    """
+    if len(layers) == 0:
+        return
+    o_proj = layers[0].self_attn.o_proj
+    if o_proj.weight.dtype != torch.float16:
+        return
+    divisor = float(os.environ.get(env_var, str(default_divisor)))
+    if divisor == 1.0:
+        return
+    up_divisor = min(divisor, 8.0)
+    with torch.no_grad():
+        for layer in layers:
+            attn_out = layer.self_attn.o_proj
+            attn_out.weight.mul_(1.0 / divisor)
+            if getattr(attn_out, "bias", None) is not None:
+                attn_out.bias.mul_(1.0 / divisor)
+            gate_up = layer.mlp.gate_up_proj.weight
+            gate_up[gate_up.shape[0] // 2 :].mul_(1.0 / up_divisor)
+            layer.mlp.down_proj.weight.mul_(up_divisor / divisor)
+            layer.residual_scale = 1.0 / divisor
+    logger.info_once(
+        "Draft in float16: residual stream scaled by 1/%g (%s; 1 disables)",
+        divisor,
+        env_var,
+    )
 
 
 @triton.jit
@@ -263,6 +310,8 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         self.mlp_conv = DFlashGroupedConv(
             **conv_args, prefix=maybe_prefix(prefix, "mlp_conv")
         )
+        # Set by fit_residual_stream_to_fp16 (fp16 drafters only).
+        self.residual_scale = 1.0
 
     def forward(
         self,
@@ -273,6 +322,8 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+            if self.residual_scale != 1.0:
+                residual = residual * self.residual_scale
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
@@ -390,6 +441,13 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return super().embed_input_ids(input_ids) * self.input_embedding_scale
+
+    def load_weights(self, weights) -> set[str]:
+        loaded = super().load_weights(weights)
+        fit_residual_stream_to_fp16(
+            self.layers, "VLLM_DFLASH2_FP16_RESIDUAL_DIVISOR"
+        )
+        return loaded
 
 
 class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):

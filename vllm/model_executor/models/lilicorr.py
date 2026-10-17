@@ -26,7 +26,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 from .nemotron_h import NemotronHMLP
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
-from .qwen3_dflash2 import DFlash2Qwen3DecoderLayer
+from .qwen3_dflash2 import DFlash2Qwen3DecoderLayer, fit_residual_stream_to_fp16
 from .utils import AutoWeightsLoader, maybe_prefix
 
 
@@ -544,3 +544,10 @@ class LiLiCorrForCausalLM(DFlashQwen3ForCausalLM):
         head = self.model.lilicorr
         parameter = head.slot_embedding
         head.materialize_inference_buffers(parameter.device, parameter.dtype)
+        # The LiLiCorr correlator sees the draft's *post-final-norm* hidden
+        # (DFlashQwen3Model.forward returns self.norm(...)) and the anchor is the
+        # target's, so the fp16 residual rescale leaves every draft output
+        # unchanged -- same argument as DFlash2's candidate selector.
+        fit_residual_stream_to_fp16(
+            self.model.layers, "VLLM_LILICORR_FP16_RESIDUAL_DIVISOR"
+        )

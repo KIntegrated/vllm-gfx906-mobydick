@@ -45,6 +45,27 @@ See [`docs/gfx906/`](docs/gfx906/) for the full optimization record.
 
 ### Ported optimizations (external sources)
 
+
+- **DFlash2/LiLiCorr fp16 residual rescale** (`vllm/model_executor/models/qwen3_dflash2.py`,
+  `vllm/model_executor/models/lilicorr.py`; default ON, kill switch
+  `VLLM_DFLASH2_FP16_RESIDUAL_DIVISOR=1` / `VLLM_LILICORR_FP16_RESIDUAL_DIVISOR=1`): ported from
+  [**0c33/mi50-vllm-lab**](https://github.com/0c33/mi50-vllm-lab)
+  (`patches/vllm/qwen3_dflash2.patch`, 2026-10). The bf16-trained drafter runs fp16 on gfx906; its
+  residual stream passes fp16 max by layer 2, goes inf/NaN and **acceptance is exactly 0**. The fix
+  scales the branch output projections (and the layer-0 residual) by a power of two at load time;
+  output-preserving because every branch is normed and the final norm feeds both consumers (the LM
+  head and the LiLiCorr correlator). Zero runtime cost.
+
+- **Non-causal sliding window in the custom FA** (`vllm/gfx906_fa/gfx906_fa_paged.py`): ported from
+  [**0c33/mi50-vllm-lab**](https://github.com/0c33/mi50-vllm-lab)
+  (`patches/vllm/gfx906_fa_paged.patch`), with its freed-block regression test. FA-NONCAUSAL stage 1
+  zeroed the window, so a sliding drafter attended over freed KV blocks past ~2–4k context
+  (acceptance 0). Python-only: keeps the custom FA and restores the left window with the existing
+  causal+window mask (`q_abs_offset = seq_len`, `window = nc_window + n_q`).
+
+- **`triton_attn` `seq_lens_cpu`** (`vllm/v1/attention/backends/triton_attn.py`): same fix as the
+  lab's — `getattr(..., None)` so the opt-in torch-SDPA fast paths skip instead of running with an
+  over-estimated length; they hit it first on an int8-KV boot (0.30 removed the field, #55353).
 - **SYV-4 — sort-free small-k top-k/top-p sampler** (`vllm/v1/sample/ops/topk_topp_sampler.py`,
   default ON, opt-out `VLLM_GFX906_SORT_FREE_SMALL_K=0`): technique ported from
   [**syv-ai/qwen38-27b-rtx3090**](https://github.com/syv-ai/qwen38-27b-rtx3090)
