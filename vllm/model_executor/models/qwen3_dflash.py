@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 
 import io
+import os
 from collections.abc import Iterable
 
 import regex as re
@@ -268,7 +269,11 @@ class DFlashQwen3Attention(nn.Module):
             per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
-            sinks=self.attention_sink_bias,
+            sinks=(
+                None
+                if os.environ.get("VLLM_GFX906_DRAFT_NO_SINKS", "") not in ("", "0")
+                else self.attention_sink_bias
+            ),
         )
         self.causal = causal
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)

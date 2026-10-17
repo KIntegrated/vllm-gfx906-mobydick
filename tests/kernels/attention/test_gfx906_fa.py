@@ -4029,6 +4029,46 @@ def test_non_causal_sliding_window_never_reads_freed_blocks(window):
         assert rel < 5e-2, f"window={window} row {j}: rel {rel:.4f}"
 
 
+def test_backend_overrides_accept_every_base_parameter():
+    """Merge-drift guard: v0.31 added `kv_cache_spec` to
+    `get_supported_kernel_block_sizes()`; the 0-arg fork override only crashed
+    when a *draft* model asked for block sizes (BOLT-2 diagnosis, 2026-10-17).
+    Every override must accept the base class's parameter names.
+    """
+    import inspect
+
+    from vllm.gfx906_fa.gfx906_fa_backend import Gfx906FABackend
+    from vllm.v1.attention.backend import AttentionBackend
+
+    def params(fn):
+        out = []
+        for p in inspect.signature(fn).parameters.values():
+            if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+                return None
+            out.append(p.name)
+        return out
+
+    missing_all = {}
+    for name, raw in vars(AttentionBackend).items():
+        if name.startswith("_") or not hasattr(Gfx906FABackend, name):
+            continue
+        base = raw.__func__ if isinstance(raw, (classmethod, staticmethod)) else raw
+        if not callable(base):
+            continue
+        base_params = params(base)
+        ours_params = params(getattr(Gfx906FABackend, name))
+        if base_params is None or ours_params is None:
+            continue
+        missing = [
+            p
+            for p in base_params
+            if p not in ("self", "cls") and p not in ours_params
+        ]
+        if missing:
+            missing_all[name] = missing
+    assert not missing_all, missing_all
+
+
 def test_non_causal_causality_contract(monkeypatch):
     """FA-NONCAUSAL: the bool contract is honoured, the tensor form is not claimed.
 
