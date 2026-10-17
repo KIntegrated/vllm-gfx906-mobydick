@@ -258,7 +258,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
-            seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
+            # seq_lens_cpu was removed from CommonAttentionMetadata in v0.30;
+            # the upper bound is the CPU replacement (precise for prefill rows).
+            seq_lens_cpu=common_attn_metadata.seq_lens_cpu_upper_bound,
             seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
             is_prefilling=common_attn_metadata.is_prefilling,
             block_table=block_table_tensor,
