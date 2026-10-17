@@ -354,3 +354,11 @@ so the effect is well outside this host's noise; the arms were sequential, not
 interleaved, which is the remaining caveat). Hooks confirmed engaged in the log
 (`gfx906 skinny8 GEMM enabled`, `gfx906 host-memory all-reduce enabled for TP=2
 (<= 131072 bytes)`).
+
+**LAB-4 (amdsmi-first `.pth`) — not adopted.** Tested in the venv: with
+`import amdsmi` in a `.pth`, the `amdsmi_shut_down failed …(32)` warning
+disappears, but `current_platform.get_device_name()` changes from
+`AMD_GFX906` to the generic `AMD Radeon Graphics` (a different amdsmi query
+order). `on_gfx906()` is `True` either way, so nothing breaks, but there is no
+functional gain on this host — the lab needed it for container amdsmi boot
+failures, which we do not have. Documented and dropped.
