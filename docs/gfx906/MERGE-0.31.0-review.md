@@ -186,12 +186,12 @@ scoped above. The decisions in "Open questions" resolved as: base = the 0.30
 train (promote-then-cut); PLE = the fork's mmap kept (QSA-FN-11 follow-up);
 AllSpark = removal adopted.
 
-Four semantic fixes were needed beyond the conflict hunks (separate commits,
+Five semantic fixes were needed beyond the conflict hunks (separate commits,
 see [`CHANGELOG.md`](CHANGELOG.md) 2026-10-16): the N-first CT WNA16 repack
 (`36bd5a82d0`), REL30-1's fused M=1 align defaulting off (`427c445723`), the
 `use_v2_model_runner` / `triton_matmul` dtype fixes + test adaptations
-(`8c394235c8`), and the W1 GDN `update_block_table` / MTP crash
-(`d4a182edfb`).
+(`8c394235c8`), the W1 GDN `update_block_table` / MTP crash (`d4a182edfb`),
+and the dead-helper fix from the self-review (`64c0922256`).
 
 Gates run (all green): extension rebuild + op schemas; PPL dense 10.5472 /
 MoE 15.9122 / Nemotron 27.0612 (0 top-20 misses each); 35B house bench

@@ -43,6 +43,11 @@ separate commit:
   returned `non_spec_state_indices_tensor = None` and the forward raised
   `TypeError` at `qwen_gdn_linear_attn.py:1417` (hit by upstream's new
   `warmup_kernels` and by any MTP step; the canary failed 2/2).
+- `64c0922256` — **self-review fix**: upstream's
+  `_ensure_block_size_k_divisible` was added by the merge but left dead, with
+  the fork's older halving loops still in `get_moe_wna16_block_config`'s CUDA
+  branch. Adopt the helper (the Triton branch keeps the fork's
+  size_k-divisibility adjustment).
 - `8c394235c8` — `use_v2_model_runner`'s fork feature-driven early returns
   (dspark / mixed DFlash / DFlash2 / diffusion) removed: upstream's
   `_get_v1_model_runner_unsupported_features()` already lists them and
@@ -91,6 +96,17 @@ idle) was Triton 3.8 AMD codegen + autotune (`py-spy` showed `make_amdgcn` /
 canary read 38.7 t/s. `amdsmi` still raises "did not return valid GCN arch"
 across the reboot, so that is an environment property here, not a
 degradation marker. All the previously parked gates were then run (above).
+
+**Self-review (2026-10-17).** Re-read every fork-authored change in the
+train. One merge miss (above); the rest held up: fork switches all still have
+readers, the gfx906 custom ops are intact and allspark is gone, the GDN
+`update_block_table` fix only widens the non-spec gather to `num_decodes > 0`
+(no-op under upstream's reclassification), the widened
+`_is_symmetric_no_zp` only feeds the GFX906_HIP gates (the other caller
+short-circuits on non-CT configs), and `_is_dflash_candidate_draft` is a
+superset of the removed fork helper. Gates re-run after the review: 195 + 507
+unit tests (only the two offline HF cases fail), PPL dense 10.5472 / MoE
+16.0066 / Nemotron 26.9907 (0 misses), 35B house bench **61.21 t/s**.
 
 **Open follow-ups**: QSA-FN-11 (adopt upstream's official PLE offload
 #57497 / `--engram-config`; the fork's mmap path was kept); the
