@@ -3846,9 +3846,11 @@ def test_head_dim_96_instantiated_gather_and_paged_vs_fp32_ref():
 # sliding-window mask/clips on `window`, so the impl suppresses both for a
 # non-causal batch; this pins that, and pins that the flag has an effect (the
 # same batch served as causal must differ where the two masks disagree).
-# Stage 1: the symmetric +/-window of the reference is not implemented yet, so
-# the non-causal mask is the superset (full [0, seq_len)); see
-# docs/gfx906/DEVLOG-fa-noncausal.md.
+# A non-causal batch keeps its sliding window (causal clip off, left window
+# kept), so a sliding drafter never reads the freed blocks outside its window;
+# see docs/gfx906/DEVLOG-fa-noncausal.md and test_..._never_reads_freed_blocks.
+# The window fix is ported from 0c33/mi50-vllm-lab (Apache-2.0,
+# https://github.com/0c33/mi50-vllm-lab).
 # ---------------------------------------------------------------------------
 
 def test_non_causal_batch_is_bidirectional_vs_torch_ref():
@@ -3945,6 +3947,86 @@ def test_non_causal_batch_is_bidirectional_vs_torch_ref():
     ).reshape(hq, d)
     rel_a = ((b_amp[0] - ref_amp).norm() / ref_amp.norm()).item()
     assert rel_a < 5e-2, f"non-causal row 0 with amplified future keys: rel {rel_a:.4f}"
+
+
+@pytest.mark.parametrize("window", [64, 200])
+def test_non_causal_sliding_window_never_reads_freed_blocks(window):
+    """A non-causal sliding-window batch (DFlash2 drafter) keeps its window.
+
+    The KV-cache manager frees a sliding layer's blocks once they fall out of
+    its window, so their block-table entries may point anywhere. Attributing
+    the fix: ported from 0c33/mi50-vllm-lab (Apache-2.0,
+    https://github.com/0c33/mi50-vllm-lab), which measured the freed-block
+    collapse beyond ~2-4k context. Here every block the window-clipped gather
+    never reaches (the clip keeps GATHER_CLIP_MARGIN=128 rows before the
+    window) points at a NaN block; each row must match the windowed reference:
+    keys within `window` of the row's true position, in both directions.
+    """
+    from types import SimpleNamespace
+
+    from vllm.gfx906_fa.gfx906_fa_backend import (
+        Gfx906FAImpl,
+        Gfx906FAMetadata,
+    )
+
+    dev = "cuda"
+    torch.manual_seed(20261009)
+    L, sq, hq, hkv, d = 512, 8, 4, 2, 128
+    n_blocks = L // BLOCK
+    poison = n_blocks  # an extra physical block standing in for freed ones
+
+    kv = torch.zeros(n_blocks + 1, hkv, BLOCK, 2 * d, dtype=torch.float16, device=dev)
+    K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+    V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
+
+    impl = Gfx906FAImpl(
+        num_heads=hq,
+        head_size=d,
+        scale=1.0 / math.sqrt(d),
+        num_kv_heads=hkv,
+        alibi_slopes=None,
+        sliding_window=window,
+        kv_cache_dtype="float16",
+    )
+    layer = SimpleNamespace(_k_scale=1.0, _v_scale=1.0)
+    impl.do_kv_cache_update(
+        layer, K, V, kv, torch.arange(L, dtype=torch.int64, device=dev)
+    )
+    nan = torch.full((BLOCK, hkv, d), float("nan"), dtype=torch.float16, device=dev)
+    impl.do_kv_cache_update(
+        layer, nan, nan, kv,
+        torch.arange(poison * BLOCK, (poison + 1) * BLOCK, device=dev),
+    )
+
+    first_needed = L - sq + 1 - window  # row 0's window start
+    bt = torch.arange(n_blocks, dtype=torch.int32, device=dev)
+    bt[: (first_needed - 128) // BLOCK] = poison
+    m = Gfx906FAMetadata(
+        num_actual_tokens=sq,
+        max_query_len=sq,
+        max_seq_len=L,
+        query_start_loc=torch.tensor([0, sq], dtype=torch.int32, device=dev),
+        seq_lens=torch.tensor([L], dtype=torch.int32, device=dev),
+        block_table=bt.view(1, n_blocks),
+        slot_mapping=torch.arange(L - sq, L, dtype=torch.int64, device=dev),
+        causal=False,
+    )
+    q = torch.randn(sq, hq, d, device=dev, dtype=torch.float32) * 0.5
+    out = torch.empty(sq, hq, d, dtype=torch.float16, device=dev)
+    got = impl.forward(layer, q, K, V, kv, m, output=out)
+    got = (out if got is None else got).float().view(sq, hq, d)
+    assert torch.isfinite(got).all(), "read a freed block outside the window"
+
+    scale = 1.0 / math.sqrt(d)
+    g = hq // hkv
+    Kf, Vf = K.float(), V.float()
+    for j in range(sq):
+        lo = L - sq + j - window + 1
+        qg = q[j].view(hkv, g, d)
+        s_w = torch.einsum("gjd,lgd->gjl", qg, Kf[lo:]) * scale
+        ref = torch.einsum("gjl,lgd->gjd", torch.softmax(s_w, -1), Vf[lo:])
+        rel = ((got[j] - ref.reshape(hq, d)).norm() / ref.norm()).item()
+        assert rel < 5e-2, f"window={window} row {j}: rel {rel:.4f}"
 
 
 def test_non_causal_causality_contract(monkeypatch):
