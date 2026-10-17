@@ -213,3 +213,41 @@ context, before the freed-block regime.
 token) on a fixed prompt, and the aux-hidden magnitudes the drafter receives
 (`target_layer_ids` [1,18,35,51,68,85]) — that separates "draft produces
 garbage" from "lattice/candidate scoring broken" from "wrong target features".
+
+### BOLT-1 diagnostic — the NaN is inside the drafter's own forward
+
+Gated instrumentation (`VLLM_LILICORR_DEBUG`; patch saved at
+`/local/tmp/lilidbg.patch`), fp16 rescale active, one real greedy request:
+
+**Healthy upstream.** The target→drafter features are fine: 6 aux hidden states
+captured, concatenation absmax 533, `fc` output / `self.hidden_states[7]`
+absmax 3764 with `nan=0`, and the anchor is valid and non-zero (absmax 21.4,
+`anchor_valid=[True]`, `qsl=[0,8]`, anchor index 7 inside the filled range).
+The drafter's weights are fine too: `hidden_norm.w` 2.219, `fc.w` 5.188,
+`attention_sink_bias` 6.97 (rank 1: 6.53), no NaNs anywhere.
+
+**The drafter output is 100 % NaN.** `last_hidden_states` is all-NaN
+([1,7,4096] = 28672 elements), so the candidate logits are NaN, the top-k list
+degenerates to the constant `[3,2,1,0,6,7,4,5]`, the LiLiCorr head scores are
+NaN (448/448), and every slot argmaxes to candidate 0 ⇒
+`draft_tokens = [5,5,5,5,5,5,5]` on every step ⇒ 0 acceptance. (The earlier
+2-boot dump that showed `anchor=0` was the zero-input profile dummy run.)
+
+**Ruled out:** target aux-hidden capture / `target_layer_ids` indexing; the
+`prepare_context_anchor` indexing; uninitialised `sink` / `hidden_norm` / `fc`
+weights; the shared-embedding and LM-head path (`maybe_share_target_embed`
+replaces both and the checkpoint ships neither — it has only
+`lilicorr.rank_embedding` / `slot_embedding`); absence of the rescale.
+
+**Remaining, in order:** (1) fp16 overflow *inside* the drafter — the rescale
+covers only `o_proj`/`up`/`down` + the layer-0 residual, while the grouped
+dynamic conv multiplies un-rescaled activations; (2) `TRITON_ATTN` semantics:
+the model card says the draft is *bidirectional within the block* with a
+1024-token sliding window and sinks, but the Triton decoder path encodes the
+window as `(1023, 0)` (left only), which cannot express the block mask — a
+fully-masked row NaNs. The lab never ran a drafter on TRITON_ATTN: their DFlash2
+drafter ran on the custom FA, which refuses this drafter (no sink support).
+
+**Next discriminators (one boot each):** `VLLM_LILICORR_FP16_RESIDUAL_DIVISOR`
+256/1024 (overflow), then a drafter-eager run with per-layer NaN dumps (mask /
+kernel).
