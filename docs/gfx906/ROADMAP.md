@@ -202,12 +202,14 @@ Two arms (rescale off/on at short context; window reverted/original at 8k/32k)
 against the in-cache DFlash2 drafters. **Gate:** acceptance > 0 at position 0
 and at long context, greedy parity with non-spec.
 
-### BOLT-1 — LiLiCorr drafter accepts 0 drafts · [#52](../../issues/52)
+### BOLT-2 — acceptance collapses past ~4k context · [#54](../../issues/54)
 
-Survives the fp16 rescale (0/1995 draft tokens with `scaled by 1/32` logged), so
-the cause is elsewhere. Diagnostic: draft top-1 vs target token, aux-hidden
-magnitudes at `[1,18,35,51,68,85]`, head scores + `anchor_valid`. Ref:
-`DEVLOG-nemotron-bolt.md`.
+The LiLiCorr drafter (working since `031fa0e4b2`, 6.77 tokens/step at short
+context) intermittently drops to 1.0 accepted/draft at ~7.3k (2.5k is stable at
+5.52). It runs on **TRITON_ATTN** — the custom FA refuses it (sinks) — a
+drafter-on-Triton combination the lab never ran; same shape as their freed-block
+finding. Ref: `DEVLOG-nemotron-bolt.md`.
+
 
 ## Later / backlog
 
