@@ -45,8 +45,27 @@ def fit_residual_stream_to_fp16(
     """
     if len(layers) == 0:
         return
+    def _param(module: nn.Module) -> torch.Tensor | None:
+        """The tensor that scales this projection's output.
+
+        Dense drafts use `weight`; pack-quantized drafts (compressed-tensors
+        W4A16/W8A16) dequantize as (q - zp) * scale, so scaling `weight_scale`
+        is exactly equivalent. Called before the quant scheme's
+        process_weights_after_loading, so the layouts are still linear.
+        """
+        w = getattr(module, "weight", None)
+        if w is not None:
+            return w if w.dtype == torch.float16 else None
+        return getattr(module, "weight_scale", None)
+
     o_proj = layers[0].self_attn.o_proj
-    if o_proj.weight.dtype != torch.float16:
+    weight = _param(o_proj)
+    if weight is None:
+        logger.warning_once(
+            "Draft projection %s exposes neither a fp16 weight nor weight_scale: "
+            "fp16 residual rescale skipped",
+            type(o_proj).__name__,
+        )
         return
     divisor = float(os.environ.get(env_var, str(default_divisor)))
     if divisor == 1.0:
@@ -55,12 +74,22 @@ def fit_residual_stream_to_fp16(
     with torch.no_grad():
         for layer in layers:
             attn_out = layer.self_attn.o_proj
-            attn_out.weight.mul_(1.0 / divisor)
-            if getattr(attn_out, "bias", None) is not None:
-                attn_out.bias.mul_(1.0 / divisor)
-            gate_up = layer.mlp.gate_up_proj.weight
-            gate_up[gate_up.shape[0] // 2 :].mul_(1.0 / up_divisor)
-            layer.mlp.down_proj.weight.mul_(up_divisor / divisor)
+            w = _param(attn_out)
+            if w is not None:
+                w.mul_(1.0 / divisor)
+            gate_up_mod = layer.mlp.gate_up_proj
+            gate_up = _param(gate_up_mod)
+            if gate_up is not None:
+                gate_up[gate_up.shape[0] // 2 :].mul_(1.0 / up_divisor)
+            down_mod = layer.mlp.down_proj
+            down = _param(down_mod)
+            if down is not None:
+                down.mul_(up_divisor / divisor)
+            for mod in (attn_out, gate_up_mod, down_mod):
+                if getattr(mod, "bias", None) is not None:
+                    mod.bias.mul_(
+                        1.0 / divisor if mod is not down_mod else up_divisor / divisor
+                    )
             layer.residual_scale = 1.0 / divisor
     logger.info_once(
         "Draft in float16: residual stream scaled by 1/%g (%s; 1 disables)",

@@ -58,6 +58,9 @@ See [`docs/gfx906/`](docs/gfx906/) for the full optimization record.
   lab's 32, **LiLiCorr needs 2048** — its grouped dynamic conv applies a learned ~150x tap to every
   sublayer output (twice per layer), so the unscaled stream reaches ~4e7 and fp16 overflows anywhere
   below ~1024. With 2048: acceptance 6.77/7 drafts, 96.2 t/s vs 48.7 non-spec on the 74B target.
+  **Quantized drafters are covered too**: with no dense `weight` the helper rescales `weight_scale`
+  instead (equivalent for `(q - zp) * scale` dequant), which is what makes the compressed-tensors
+  DFlash2 drafter work — 0.3 % → 51.4 % acceptance, 16.7 → 73.2 t/s (matching the lab's 73.7).
 
 - **Non-causal sliding window in the custom FA** (`vllm/gfx906_fa/gfx906_fa_paged.py`): ported from
   [**0c33/mi50-vllm-lab**](https://github.com/0c33/mi50-vllm-lab)

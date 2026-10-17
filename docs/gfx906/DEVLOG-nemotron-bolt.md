@@ -392,3 +392,40 @@ Next for #54: instrument the drafter's attention metadata at 2.5k vs 7.3k
 (`seqused_k`, window, causal, block-table span) plus the number of context slots
 `precompute_and_store_context_kv` actually writes; then poison the drafter's KV
 cache with NaN and see whether the draft output depends on the poisoned region.
+
+## 2026-10-17 — DFLASH2-GATE (#51): both ported fixes validated on a real drafter
+
+Setup: `cyankiwi/Qwen3.8-27B-AWQ-INT4` target + **`syvai/Qwen3.8-27B-DFlash2-W4A16`**
+drafter (compressed-tensors pack-quantized, conv layers, `sliding_window: 2048`,
+no sink bias → the drafter runs on the **custom FA**), TP=2, fp16, k=7,
+`--max-model-len 16384`, `--max-num-seqs 1`, capture `[8]`. Harness: the ported
+`tools/gfx906_lab_bench/{bench,longctx}.py` (#56).
+
+**The rescale needed a new code path: quantized drafters.** The ported
+`fit_residual_stream_to_fp16` assumed a dense `o_proj.weight`; on this drafter
+that raised `AttributeError: 'RowParallelLinear' object has no attribute
+'weight'` at load. It now rescales **`weight_scale`** when there is no dense
+weight (pack-quantized dequantizes as `(q - zp) * scale`, so scaling the scale
+is exactly equivalent), sliced the same way (up half of `gate_up_proj`,
+`down_proj` by `up_divisor/divisor`), and it runs before the quant scheme's
+`process_weights_after_loading`.
+
+| arm | 2.0k prompt | 7.3k prompt |
+|---|---|---|
+| rescale **off** (dense path skipped) | **0.3 % acc**, 16.7 t/s mean | — |
+| rescale **on** (1/32, `bench.py`, 3 prompts x 2 reps) | **51.4 % acc**, **73.2 t/s** mean | — |
+| window fix **on** (`longctx.py`) | 53.3 % acc, 73.4 t/s | **29.4 % acc**, 45.9 t/s |
+| window fix **reverted** (`window = 0` for non-causal) | 51.7 % acc, 71.9 t/s | **7.3 % acc**, 23.1 t/s |
+
+- **Rescale:** 0.3 % → 51.4 % acceptance, 16.7 → **73.2 t/s** — and 73.2 is
+  within noise of the lab's own 73.7 t/s mean on their (fp16) drafter. Their
+  "every draft rejected" signature reproduced exactly before the fix.
+- **Window:** dropping it costs **4x acceptance** at 7.3k (29.4 % → 7.3 %) and
+  nothing at 2.0k (53.3 % vs 51.7 %) — the freed-block regime starts past
+  ~2-4k, matching the lab's finding. Not the full 0 % they saw (our prompt is a
+  repeated source, and the drafter's block cache still held live data), but the
+  direction and magnitude match.
+
+Verdict: **both ported fixes are validated end-to-end on hardware.** The
+`_rescale_layer` unit-test helper only covers the dense path; the packed path is
+covered by this gate rather than by a unit test.
