@@ -119,3 +119,65 @@ are CUDA/Blackwell artefacts). gfx906 has no FP4 and no IQ2 packing path in
 vLLM 0.31.0's `modelopt`/compressed-tensors stack, so the 2-bit experts would
 not dequant at all — and even the FP4 Mamba layers are unsupported. The
 41 GB AutoRound W4A16 build is the runnable choice here (this log).
+
+## 2026-10-17 — LiLiCorr draft model (DFlash spec decode): loads, runs, 0 acceptance
+
+**VERDICT:** OPEN — the drafter runs and spec decode is exact, but it accepts 0
+draft tokens on this target. · **GATE:** `spec_decode_num_accepted_tokens_total`.
+
+Model: `nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr` (962 MB,
+`LiLiCorrDraftModel`, qwen3 backbone + LiLiCorr head, `W4A16_NVFP4`). Official
+config is `{"method":"dflash","model":…,"num_speculative_tokens":7,
+"rejection_sample_method":"standard","draft_load_config":{"load_format":"auto"}}`
+(the card's `attention_backend: FLASHINFER` dropped — unavailable on ROCm).
+
+**FP4 is not runnable on gfx906 as-is.** `modelopt_fp4` + `W4A16_NVFP4` maps to
+"FP4 Marlin GEMM", and `init_nvfp4_linear_kernel` *forces* the Marlin kernel for
+W4A16 (`ValueError: Forced NVFP4 kernel MarlinNvFp4LinearKernel is not supported:
+Marlin FP4 not available`). The `emulation` NVFP4 kernel is W4A4 (it quantizes
+activations), so it does not cover this checkpoint either.
+
+**Fix: convert to bf16 offline** (`/local/tmp/dequant_lilicorr.py`). 25 FP4
+linears (`weight` U8 packed e2m1, `weight_scale` F8_E4M3 per 16, `weight_scale_2`
+F32 global) dequantized to bf16 = 2.2 GB. Verified **bit-identical** to vLLM's
+`dequantize_to_dtype(..., swizzle=False)` (max abs diff 0.0). The 104 BF16 / 25
+F32 tensors are copied as-is; `quantization_config` dropped from `config.json`.
+Result: `/biglocal/models/nvidia/…-LiLiCorr-bf16`. The GGUF variant
+(`…-LiLiCorr-GGUF`, one 998 MB `dflash`-arch GGUF) is llama.cpp-oriented and was
+not needed — the safetensors dequant was simpler and bit-exact.
+
+**Also fixed en route** (`49e17fdca7`): `triton_attn.py` still read the v0.30-
+removed `CommonAttentionMetadata._seq_lens_cpu` (`seq_lens_cpu_upper_bound` now).
+Latent before: serving always picked the custom gfx906 FA; the drafter forces
+`TRITON_ATTN` (the custom FA has no attention sinks) and hit AttributeError.
+
+**What works.** Boots TP=2, fp16, maxlen 16384: `LiLiCorrForCausalLM` loads, the
+LiLiCorr speculator captures its graphs, drafts are produced (7/step), and
+spec decode is **exact** — greedy outputs are byte-identical to the non-spec
+runs. Embeddings/lm_head are shared from the target by the LiLiCorr speculator;
+the aux hidden-state width check (6 taps x 4096) passes.
+
+**What does not.** `accepted_tokens_total = 0` at every draft position 0..6,
+over ~2000 draft tokens, at temperature 0 **and** 1.0 → decode 18 t/s vs the
+48.7 t/s non-spec baseline (pure overhead). Per-position 0 is also 0, so the
+very first proposal never matches the target's choice.
+
+Candidate causes, not yet separated:
+
+1. **Target-specific drafter.** The card ties this drafter to the 24GB **IQ2**
+   target; our target is the 41 GB W4A16 AutoRound build (same BF16 base,
+   different quant). Hidden states/logits differ, and the LiLiCorr head was
+   trained to correct the IQ2 target specifically.
+2. **A gfx906 bug in the draft's Triton path.** The drafter forces TRITON_ATTN
+   (no sinks in the custom FA) for a *non-causal + 1024-SWA + attention-sink*
+   stack, and its layers use the DFlash2 grouped-conv kernel plus the LiLiCorr
+   head's Triton sampler/scorer. None of those were exercised on gfx906 before.
+3. The hybrid-target warning `no KV cache group could be identified as the
+   draft model's` (mamba groups present, no `is_eagle_group` annotation); the
+   draft does get a group (the speculator asserts on it), so this is likely
+   benign, but it is unverified.
+
+**Next**: dump the draft's top-1 per slot against the target's argmax on a fixed
+prompt (distinguishes 1 from 2), and run the same drafter against a BF16 target
+if one fits; if it is the Triton path, the sink/non-causal/SWA handling in
+`triton_attn.py` is the place to look.
