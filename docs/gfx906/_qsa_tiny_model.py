@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """FN-3 — build a tiny Qwen3.8-Flash-Next (`qwen4_exp`) config for gfx906 dev.
 

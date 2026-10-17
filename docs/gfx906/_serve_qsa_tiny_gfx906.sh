@@ -96,6 +96,7 @@ start)
   esac
   plugin_env=()
   [ "$PLUGINS" = off ] && plugin_env=(VLLM_PLUGINS=)
+# shellcheck disable=SC2086  # EXTRA_ARGS is an intentional word-split arg bag
   env HIP_VISIBLE_DEVICES=0 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
       HF_HUB_OFFLINE=1 "${runner_env[@]}" "${plugin_env[@]}" \
     setsid nohup .venv/bin/vllm serve "$MODEL_DIR" \

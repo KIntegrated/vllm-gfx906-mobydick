@@ -13,6 +13,8 @@ Run (on a gfx906 host / with the ROCm image):
     pytest tests/kernels/moe/test_gfx906_moe_gemm.py -v
 """
 
+import os
+
 import pytest
 import torch
 
@@ -28,6 +30,17 @@ E = 16
 TOPK = 4
 GS = 128
 DBLL = "gfx"  # (unused; kept for readability in parametrize ids)
+
+# VLLM_GFX906_DETERMINISTIC is read ONCE PER PROCESS by the kernel launcher, so
+# a pytest run is either in the deterministic arm or in the CAS arm and cannot
+# flip mid-file (see scripts/red-controls-moe-det.sh, which runs the file twice).
+# Defined at import top so any test in the file can skip on it.
+_DET = os.environ.get("VLLM_GFX906_DETERMINISTIC", "0") == "1"
+# The v2 M=1 re-tile has an fp16 CAS epilogue and no deterministic mode, so the
+# deterministic flag deliberately routes around it (dispatch path 2, the same
+# path VLLM_GFX906_MOE_M1=0 takes). Dispatch-marker tests assert path 1 and are
+# therefore about the CAS arm only.
+_NEEDS_CAS_ARM = _DET
 
 
 def _make_layer(N, K, layout, gs=GS):
@@ -305,6 +318,11 @@ def _take_path():
 
 
 @pytest.mark.parametrize("layout", ["awq_kfirst", "awq_kfirst_sym"])
+@pytest.mark.skipif(
+    _NEEDS_CAS_ARM,
+    reason="deterministic mode bypasses the v2 tile by design; marker tests "
+    "describe the CAS arm",
+)
 def test_gfx906_moe_gemm_m1_v2_flag(layout):
     """VLLM_GFX906_MOE_M1 re-tiles the M=1 gemm2 (fused weight/reduce)
     path to the 512-thread lane-column kernel. It is now DEFAULT-ON (the
@@ -449,6 +467,11 @@ def test_gfx906_moe_gemm_m1_v2_flag(layout):
 
 
 @pytest.mark.parametrize("layout", ["awq_kfirst", "awq_kfirst_sym"])
+@pytest.mark.skipif(
+    _NEEDS_CAS_ARM,
+    reason="its baseline arm asserts the v2 gemm2 marker, which deterministic "
+    "mode bypasses by design",
+)
 def test_gfx906_moe_gemm_m1_npt2_flag(layout):
     """VLLM_GFX906_MOE_NPT=2 re-tiles the M=1 **gemm1** (w13 scatter) path
     to the <1,2> kernel (64 cols/block vs <1,4>'s 128). It is now
@@ -700,6 +723,125 @@ def test_gfx906_moe_gemm_m1_shape_gate(layout):
     for name, out in (("default(fallback)", out_default), ("opt-out", out_off)):
         rel = ((out.float() - ref_out).abs().max() / scale).item()
         assert rel < 1e-1, f"shape-gate fallback gemm2 ({name}) too far: maxrel={rel:.2e}"
+
+
+# ---------------------------------------------------------------------------
+# Deterministic accumulation (VLLM_GFX906_DETERMINISTIC) -- "cause 1" of temp-0
+# jitter. The flag is read ONCE PER PROCESS in the kernel launcher (a static,
+# because it is on the per-launch path), so these arms cannot be flipped inside
+# one pytest run: run the file twice, with and without the flag, exactly as
+# scripts/red-controls-moe-det.sh does. Each arm skips the other's tests so a
+# single-process run cannot silently pass both.
+# ---------------------------------------------------------------------------
+
+
+def _repeat_outputs(M, block_m, reps=5, shape=(1024, 2048, 1024, 512), gs=128):
+    """Run the same MoE call `reps` times on identical inputs.
+
+    Returns a list of (gemm1_out, gemm2_out) clones. Everything about the inputs
+    -- weights, activations, routing, alignment -- is built once, so any
+    difference between two entries came from inside the kernel and nowhere else.
+    With TOPK=4 and K13=2048 the shape exercises BOTH collision classes at once:
+    gemm1 fans in over gridDim.z = 8 K-shards, gemm2 over 4 expert slots x 2
+    K-shards = 8 contributors per output cell.
+    """
+    from vllm import _custom_ops as ops
+
+    N13, K13, N2, K2 = shape
+    w13, s13, z13, _, zz13 = _make_layer(N13, K13, "awq_kfirst", gs)
+    w2, s2, z2, _, zz2 = _make_layer(N2, K2, "awq_kfirst", gs)
+    wq13, sc13, zp13 = _repack_w4a16_gfx906_expert(w13, s13, z13)
+    wq2, sc2, zp2 = _repack_w4a16_gfx906_expert(w2, s2, z2)
+
+    torch.manual_seed(1234)
+    x = torch.randn(M, K13, device="cuda", dtype=torch.float16) * 0.5
+    topk_ids = torch.randint(0, E, (M, TOPK), dtype=torch.int32, device="cuda")
+    topk_w = torch.rand(M, TOPK, device="cuda", dtype=torch.float16)
+    sorted_ids, expert_ids, ntp = moe_align_block_size(topk_ids, block_m, E)
+    empty_tw = torch.empty(0, dtype=torch.float32, device="cuda")
+
+    outs = []
+    for _ in range(reps):
+        c1 = torch.zeros(M * TOPK, N13, device="cuda", dtype=torch.float16)
+        ops.moe_gptq_gemm_gfx906(
+            x, c1, wq13, sc13, zp13, empty_tw, sorted_ids, expert_ids, ntp,
+            TOPK, block_m, False, 0, 0,
+        )
+        inter = (
+            torch.nn.functional.silu(c1[:, : N13 // 2].float())
+            * c1[:, N13 // 2 :].float()
+        ).half().contiguous()
+        out = torch.zeros(M, N2, device="cuda", dtype=torch.float16)
+        ops.moe_gptq_gemm_gfx906(
+            inter, out, wq2, sc2, zp2, topk_w.view(-1).float(), sorted_ids,
+            expert_ids, ntp, 1, block_m, True, TOPK, 0,
+        )
+        outs.append((c1.clone(), out.clone()))
+    return outs
+
+
+@pytest.mark.skipif(
+    not _DET,
+    reason="needs VLLM_GFX906_DETERMINISTIC=1 in the environment (static per "
+    "process); see scripts/red-controls-moe-det.sh for both arms",
+)
+@pytest.mark.parametrize("M,block_m", [(1, 1), (4, 1), (8, 4), (64, 16)])
+def test_gfx906_moe_deterministic_repeat(M, block_m):
+    """With the flag on, the same call repeated must be bit-identical.
+
+    This is the whole point of the change: integer accumulation is commutative,
+    so arrival order cannot move the sum. Compared with torch.equal, not
+    allclose -- a tolerance would let the exact bug under test through.
+    """
+    outs = _repeat_outputs(M, block_m)
+    for i, (c1, o) in enumerate(outs[1:], 1):
+        assert torch.equal(c1, outs[0][0]), (
+            f"gemm1 output differs on repeat {i} with "
+            f"VLLM_GFX906_DETERMINISTIC=1 (M={M}, bm={block_m})"
+        )
+        assert torch.equal(o, outs[0][1]), (
+            f"gemm2 output differs on repeat {i} with "
+            f"VLLM_GFX906_DETERMINISTIC=1 (M={M}, bm={block_m})"
+        )
+
+
+@pytest.mark.skipif(
+    not _DET,
+    reason="needs VLLM_GFX906_DETERMINISTIC=1 in the environment",
+)
+def test_gfx906_moe_deterministic_skips_v2_tile():
+    """The v2 M=1 tile has no deterministic epilogue, so the flag must route
+    around it. Dispatch path 2 is the legacy <1,4> gemm2; path 1 would mean a
+    CAS-accumulating kernel ran with the flag on."""
+    _repeat_outputs(1, 1, reps=1)
+    assert _take_path() == 2, (
+        "deterministic mode took M=1 gemm2 dispatch path "
+        f"{_take_path()} instead of the legacy <1,4> tile (2)"
+    )
+
+
+@pytest.mark.skipif(
+    _DET,
+    reason="this is the flag-OFF control: it asserts the fp16 CAS jitter is "
+    "actually visible at these shapes, so the bit-identical assertion above "
+    "means something",
+)
+@pytest.mark.parametrize("M,block_m", [(8, 4), (64, 16)])
+def test_gfx906_moe_cas_jitter_visible_without_flag(M, block_m):
+    """RED CONTROL. If this passes at least one of 8 repeats differs, the
+    comparison in test_gfx906_moe_deterministic_repeat is capable of failing and
+    its success is evidence. If it does NOT differ, that test passing proves
+    nothing about these shapes and the harness has to say so loudly."""
+    outs = _repeat_outputs(M, block_m, reps=8)
+    differs = any(
+        not torch.equal(c1, outs[0][0]) or not torch.equal(o, outs[0][1])
+        for c1, o in outs[1:]
+    )
+    assert differs, (
+        f"no run-to-run difference in 8 repeats (M={M}, bm={block_m}) with the "
+        "flag OFF -- the fp16 CAS path is not visibly nondeterministic at this "
+        "shape, so bit-identity under the flag is not evidence here"
+    )
 
 
 if __name__ == "__main__":

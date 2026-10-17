@@ -117,9 +117,17 @@ class EncoderOnlyModelState(DefaultModelState):
         self.token_type_ids.pop(req_id, None)
 
     def prepare_inputs(
-        self, input_batch: InputBatch, req_states: RequestState
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        cudagraph_mode: CUDAGraphMode | None = None,
     ) -> dict[str, torch.Tensor | None]:
-        model_inputs = super().prepare_inputs(input_batch, req_states)
+        # Forwarded, not used: the base state takes the same per-step context now and
+        # an override that drops it would silently un-thread it for any state that
+        # inherits from this one. See ModelState.prepare_inputs.
+        model_inputs = super().prepare_inputs(
+            input_batch, req_states, cudagraph_mode=cudagraph_mode
+        )
         if not self.token_type_ids:
             return model_inputs
 

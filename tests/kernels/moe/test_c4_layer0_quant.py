@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """Unit tests for C4 load-time int4 quantization (c4_layer0_moe).
 
@@ -11,8 +12,6 @@ Covers, CPU-only:
   independently from the same (q, scale, zp);
 - the env gate.
 """
-
-import os
 
 import pytest
 import torch
@@ -65,8 +64,9 @@ def test_roundtrip_accuracy(group_size, n, k):
     zhi = ((qzeros >> 4) & 0xF).to(torch.int32)
     zp_unpacked = torch.stack([zlo, zhi], dim=1).reshape(n, G)
 
-    dequant = (q_unpacked - zp_unpacked.repeat_interleave(group_size, dim=1)) \
-        * scales.float().repeat_interleave(group_size, dim=1)
+    dequant = (
+        q_unpacked - zp_unpacked.repeat_interleave(group_size, dim=1)
+    ) * scales.float().repeat_interleave(group_size, dim=1)
     err = (w.float() - dequant).abs()
     # Per-element bound: half a step of the element's own group, plus the
     # fp16-scale-rounding term. Codepoints use sw (the stored scale), but the
@@ -75,8 +75,7 @@ def test_roundtrip_accuracy(group_size, n, k):
     # adding at most 15*(c - sw) ~= 0.7% of a step.
     step_elem = scales.float().repeat_interleave(group_size, dim=1)
     assert (err <= step_elem * 0.51 + 1e-6).all(), (
-        f"max err {err.max().item():.3e} vs bound "
-        f"{(step_elem * 0.51).max().item():.3e}"
+        f"max err {err.max().item():.3e} vs bound {(step_elem * 0.51).max().item():.3e}"
     )
     # L2 relative error is the meaningful accuracy metric for int4 weight
     # quantization (~6-8% for unit-variance data); the final quality gate is
@@ -130,12 +129,12 @@ def test_repack_matches_independent_exllama_layout():
         sc_list.append(s)
         zq_list.append(z)
 
-    q_stacked = torch.stack(q_ref_list)          # [E, N, K]
-    sc_stacked = torch.stack(sc_ref_list)        # [E, N, G]
-    zp_stacked = torch.stack(zp_ref_list)        # [E, N, G]
-    w_in = torch.stack(qw_list).contiguous()     # [E, N, K/2] uint8
-    sc_in = torch.stack(sc_list).contiguous()    # [E, N, G] fp16
-    z_in = torch.stack(zq_list).contiguous()     # [E, N/2, G] uint8
+    q_stacked = torch.stack(q_ref_list)  # [E, N, K]
+    sc_stacked = torch.stack(sc_ref_list)  # [E, N, G]
+    zp_stacked = torch.stack(zp_ref_list)  # [E, N, G]
+    w_in = torch.stack(qw_list).contiguous()  # [E, N, K/2] uint8
+    sc_in = torch.stack(sc_list).contiguous()  # [E, N, G] fp16
+    z_in = torch.stack(zq_list).contiguous()  # [E, N/2, G] uint8
 
     wq, sc_out, zp_out = _repack_w4a16_gfx906_expert(w_in, sc_in, z_in)
 
@@ -144,9 +143,10 @@ def test_repack_matches_independent_exllama_layout():
     G = K // group_size
     shifts_out = torch.tensor([0, 16, 4, 20, 8, 24, 12, 28], dtype=torch.int32)
     wq_ref = (
-        (q_stacked.to(torch.int32).view(E, N, K // 8, 8)
-         << shifts_out.view(1, 1, 8)).sum(dim=3)
-        .permute(0, 2, 1).contiguous()
+        (q_stacked.to(torch.int32).view(E, N, K // 8, 8) << shifts_out.view(1, 1, 8))
+        .sum(dim=3)
+        .permute(0, 2, 1)
+        .contiguous()
     )
     assert torch.equal(wq, wq_ref), "exllama shuffle mismatch"
 
@@ -162,8 +162,14 @@ def test_repack_matches_independent_exllama_layout():
     # int32 so the top nibble wraps exactly as in the kernel's int32 OR.
     zp_nk = zp_stacked.to(torch.int32)
     zp_ref = (
-        zp_nk.view(E, N // 8, 8, G) << (4 * torch.arange(8, dtype=torch.int32)).view(1, 1, 8, 1)
-    ).sum(dim=2).permute(0, 2, 1).contiguous()
+        (
+            zp_nk.view(E, N // 8, 8, G)
+            << (4 * torch.arange(8, dtype=torch.int32)).view(1, 1, 8, 1)
+        )
+        .sum(dim=2)
+        .permute(0, 2, 1)
+        .contiguous()
+    )
     assert zp_out.shape == (E, G, N // 8)
     assert torch.equal(zp_out, zp_ref), "zero-point packing mismatch"
 

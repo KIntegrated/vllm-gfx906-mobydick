@@ -429,7 +429,47 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.use_aux_hidden_state_outputs = True
 
         # Draft tokens propagation - for spec-dec + struct outputs.
-        self.draft_tokens_handler = DraftTokensHandler(self.device)
+        #
+        # GFX906: VLLM_GFX906_PLE_HOSTIDS also mirrors each step's draft tokens
+        # into a pinned host buffer. That mirror is the only way the host can
+        # know the three-of-four drafted rows of the *next* decode step
+        # (docs/d1-host-ids-design.md for the trace), and it rests on the
+        # end-of-step host sync that sync scheduling performs anyway: with async
+        # scheduling the mirror would lag one step and produce a plausible
+        # ngram id built from stale context, which is a wrong answer rather
+        # than a crash. VllmConfig refuses that combination at validation; this
+        # is the belt-and-braces check for a config built without validation
+        # (tests, and any future direct construction).
+        #
+        # The environment variable is read here rather than via
+        # ple_hostids.hostids_enabled() on purpose: importing that module pulls
+        # vllm/models/qwen4_exp/__init__.py, i.e. model code, into every worker
+        # of every model. tests/models/qwen4_exp/test_ple_hostids_wiring.py
+        # asserts the two readers of the name cannot drift apart.
+        # "1" = host ids authoritative, "2" = differential (compare only). Both
+        # need the mirror; the set of accepted values is pinned to
+        # ple_hostids.hostids_mode() by a test, because a value one reader accepts
+        # and the other ignores is a knob that silently never engages.
+        host_draft_staging = os.environ.get("VLLM_GFX906_PLE_HOSTIDS", "0") in (
+            "1",
+            "2",
+        )
+        if host_draft_staging and self.scheduler_config.async_scheduling:
+            logger.error(
+                "GFX906_PLE_HOSTIDS: REFUSED - async scheduling is active, so "
+                "the end-of-step host sync the draft mirror depends on does not "
+                "happen. Falling back to the device path (unchanged behaviour)."
+            )
+            host_draft_staging = False
+        elif host_draft_staging:
+            logger.info(
+                "GFX906_PLE_HOSTIDS: enabled at worker init; per-worker "
+                "engagement is the 'GFX906_PLE_HOSTIDS: draft staging active' "
+                "line on the first step that drafts."
+            )
+        self.draft_tokens_handler = DraftTokensHandler(
+            self.device, host_draft_staging=host_draft_staging
+        )
 
         self.pcp_manager: pcp.PCPManager | None = None
 
@@ -576,6 +616,73 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
+
+        # GFX906: the host PLE id producer needs the draft mirror staged by the
+        # handler built in __init__. Wired once here rather than passed per step,
+        # and only when staging is actually on; model states that do not consume
+        # it (every other model) are not asked.
+        #
+        # Read through getattr, not self.draft_tokens_handler, because a runner
+        # built without __init__ exists: the EPLB unit test constructs one with
+        # GPUModelRunner.__new__() and calls load_model on it. Upstream's
+        # load_model never touched this attribute, so that construction was
+        # harmless until this block landed here. A missing handler and a handler
+        # with staging off have to mean the same thing -- nothing to wire -- so
+        # the guard is correct rather than merely quiet: it changes behaviour
+        # only for an object that has no mirror to wire in the first place.
+        draft_handler = getattr(self, "draft_tokens_handler", None)
+        if (
+            getattr(draft_handler, "host_draft_staging", False)
+            and hasattr(self.model_state, "set_host_draft_source")
+        ):
+            self.model_state.set_host_draft_source(draft_handler)
+
+        # P1.6: the same producer also needs the epilogue's accepted-token handoff.
+        # Resolved to a bound method once rather than looked up per step, and left
+        # as None for every model state that does not define it, so a non-Qwen4Exp
+        # boot pays nothing at the end of a step.
+        self._ple_stage_host_tokens = getattr(
+            self.model_state, "stage_host_tokens", None
+        )
+
+        # PLE dispatch veto: dispatch a step whose host PLE staging refused eager,
+        # instead of replaying a FULL graph that holds the PREVIOUS step's n-gram
+        # rows (measured on acceptance length: 1.98 stale vs 4.00 correct vs 3.31
+        # zeroed, and the generation tripwire cannot see it). The step itself lives
+        # in model_state.ple_veto_descriptor; whether it may run at all is a dispatch
+        # question, so it is decided here. Under data parallelism the graph mode is
+        # agreed collectively (cudagraph_utils.py:254-275), and a NONE chosen on one
+        # rank only would have the ranks replay different things in the same step --
+        # so dp_size == 1 is a precondition, and the veto stays off, in the log,
+        # rather than becoming a cross-rank protocol.
+        self._ple_veto = bool(
+            getattr(self.model_state, "arm_ple_dispatch_veto", None) is not None
+            and getattr(self.model_state, "PLE_HOST_VETO", False)
+            and self.dp_size == 1
+        )
+        if self._ple_veto:
+            self.model_state.arm_ple_dispatch_veto(True)
+            logger.info(
+                "PLE HOSTIDS: dispatch veto ARMED -- a step whose PLE rows cannot be "
+                "staged is dispatched cg_mode=NONE and computes them on the device "
+                "path. On the coverage line, stale_steps should stay near zero and "
+                "veto=<ledgered>/<applied> should be close: applied is the number of "
+                "downgrades that landed, ledgered also counts FULL-step refusals the "
+                "runner never asked about (capture and warmup). A gap much bigger "
+                "than that means refusals are arriving on steps the veto cannot see. "
+                "Declines (policy off, staging disabled, no draft source) are still "
+                "stale steps by design -- the veto does not act on those."
+            )
+        elif getattr(self.model_state, "PLE_HOST_VETO", False) and hasattr(
+            self.model_state, "arm_ple_dispatch_veto"
+        ):
+            logger.warning(
+                "PLE HOSTIDS: dispatch veto NOT armed (dp_size=%s): a refused FULL "
+                "step will replay the previous step's PLE rows. Making this safe "
+                "under data parallelism means moving the veto inside "
+                "dispatch_cg_and_sync_dp's agreement, not forcing it here.",
+                self.dp_size,
+            )
 
         self.decode_query_len = (
             self.num_speculative_steps
@@ -1131,8 +1238,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pooling_runner.clear()
 
     @torch.inference_mode()
+    @_gc_freeze_around
     def profile_cudagraph_memory(self) -> int:
-        """Estimate the GPU memory required to capture CUDA graphs."""
+        """Estimate the GPU memory required to capture CUDA graphs.
+
+        GFX906: this is the third boot phase, and until now the only unguarded
+        one. Worker.determine_available_memory (gpu_worker.py:556-572) runs
+        profile_run -> profile_cudagraph_memory -> capture_model, and
+        _gc_freeze_around covered the first and the third. The middle phase
+        calls gc.collect() twice (cudagraph_utils.py:737 and, via
+        _teardown_profiling_state, :895) with the heap at its largest: Dynamo +
+        Inductor + xgrammar churn from profile_run, plus the drafter's own
+        warmup. Every boot-time SIGSEGV in these logs dies in exactly one of
+        those traversals (_PyGCHead_NEXT <- update_refs <- deduce_unreachable),
+        immediately after the drafter's `Initial profiling/warmup run` line --
+        which is why GFX906_GC_FREEZE=1 "demonstrably did not prevent" the
+        crash (decode-launch-bound.md 6a): the knob was on, the region was not
+        the one that died. It is also why --enforce-eager never crashes: with
+        CUDAGraphMode.NONE, profile_cudagraph_memory returns at
+        cudagraph_utils.py:732 before reaching either collect. Nothing here
+        repairs the corruptor; it removes the frame that trips over it.
+        """
         return _profile_cudagraph_memory(self)
 
     def needs_cudagraph_capture(self) -> bool:
@@ -1867,6 +1993,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc
             )
+            # A step whose host PLE rows could not be staged must not replay a
+            # captured FULL graph, which would serve the PREVIOUS step's rows; the
+            # model state returns a NONE descriptor for those. Asked HERE, before
+            # prepare_attn, because the attention metadata it builds depends on the
+            # graph mode and cannot be rebuilt. Logic and reasoning live in
+            # model_state.ple_veto_descriptor; this file stays model-agnostic.
+            if self._ple_veto:
+                batch_desc = self.model_state.ple_veto_descriptor(
+                    batch_desc, input_batch, self.req_states
+                )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
@@ -2012,7 +2148,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             "intermediate_tensors": None,
             # NOTE: Values returned by `prepare_inputs` will override the default
             # values above.
-            **self.model_state.prepare_inputs(input_batch, self.req_states),
+            **self.model_state.prepare_inputs(
+                input_batch, self.req_states, cudagraph_mode=batch_desc.cg_mode
+            ),
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
@@ -2241,6 +2379,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             check_ep_fault=self.check_ep_fault,
             routed_experts=routed_experts,
         )
+        # P1.6: hand the host PLE mirror the tokens this step committed. This is
+        # the same device tensor ``_post_update_kernel`` appends from, copied to
+        # host memory a few lines above for output processing, so the mirror costs
+        # no extra D2H, no extra stream and no wait: the commit carries the copy
+        # event and the consumer only ever polls it. No-op unless
+        # VLLM_GFX906_PLE_HOSTIDS is set.
+        stage_host_tokens = self._ple_stage_host_tokens
+        if stage_host_tokens is not None:
+            stage_host_tokens(
+                input_batch.idx_mapping_np[: input_batch.num_reqs],
+                async_output.sampled_token_ids,
+                async_output.num_sampled_tokens_np,
+                async_output.copy_event,
+            )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         # The encoder runner exists only on the first PP rank, so later ranks
@@ -2391,6 +2543,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        # FIRST, before anything that can block or destroy state. The model state's
+        # final PLE staging coverage line is the last thing a short boot says about
+        # what its host-ids arm did -- and both `synchronize` below (which hangs on a
+        # wedged GPU) and `del self.model_state` further down (which drops the
+        # counters) are what would otherwise keep it out of the log. This is reached
+        # on SIGINT and SIGTERM through ``worker_main``'s ``finally`` block
+        # (multiproc_executor.py), i.e. the ordinary restart path, and it must stay
+        # above `del self.model_state` for that reason.
+        model_state = getattr(self, "model_state", None)
+        if model_state is not None and hasattr(
+            model_state, "log_staging_coverage_at_shutdown"
+        ):
+            model_state.log_staging_coverage_at_shutdown()
         torch.accelerator.synchronize()
         self.cudagraph_manager = None
         self.fast_prefill = None

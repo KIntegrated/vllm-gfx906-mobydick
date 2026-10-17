@@ -40,6 +40,7 @@ import mmap
 
 import numpy as np
 import pytest
+import regex as re
 import torch
 
 ple = pytest.importorskip(
@@ -47,9 +48,21 @@ ple = pytest.importorskip(
     reason="qwen4_exp AMD model code is not importable in this build",
 )
 
+# This file is about the shard-layout guard. Trees that predate it (the v0.29 pin,
+# site-packages, the prof-async-guard worktree) have the mmap-shard loader but no
+# `build_ple_shard_layout`, and there the import above succeeds while every test in
+# here would error on a missing attribute -- an error that reads as a regression in
+# the tree under test. Skip the module and say why instead.
+if not hasattr(ple, "build_ple_shard_layout"):
+    pytest.skip(
+        "this tree has no shard-layout guard (build_ple_shard_layout is absent)",
+        allow_module_level=True,
+    )
+
 NUM_SHARDS = 3
 CAPACITY = 8  # rows per shard
 DIM = 5
+_4K = 4096
 
 
 def _shard(base: int, dtype=torch.float16, n: int = CAPACITY) -> torch.Tensor:
@@ -315,7 +328,14 @@ class _Stub:
     Constructing the real module means running the prime search over
     `ngram_vocab_size_base`, which is not what is under test here; `load_weights`
     only ever touches the attributes below, so it is called unbound against this.
+    The list of things it touches is the contract: when ``load_weights`` grows a
+    new responsibility the stub has to grow it too, which is how the P1.5 scratch
+    allocation below is exercised rather than worked around.
     """
+
+    # Real method, not a no-op: load_weights allocates the generation tripwire's
+    # device mirror, and that allocation is a claim worth testing behaviourally.
+    _alloc_gen_scratch = ple.Qwen4ExpNGramEmbedding._alloc_gen_scratch
 
     def __init__(self, split_ngram_parts=NUM_SHARDS, dim=DIM):
         self.split_ngram_parts = split_ngram_parts
@@ -325,6 +345,8 @@ class _Stub:
         self.ngram_embedding = ple.MmapShardedNGramEmbedding(
             split_ngram_parts, CAPACITY, dim
         )
+        # Production __init__ sets this to None; load_weights is what fills it in.
+        self._gen_device: torch.Tensor | None = None
 
 
 def _load(stub, weights):
@@ -368,6 +390,25 @@ def test_load_weights_fills_persistent_buffers():
     loaded = _load(stub, [("ngram_heads_offsets", vals)])
     assert "ngram_heads_offsets" in loaded
     assert torch.equal(stub.ngram_heads_offsets, vals)
+
+
+def test_load_weights_allocates_the_generation_scratch():
+    """P1.5: the tripwire's device mirror must exist before the first capture.
+
+    Asserted behaviourally rather than by grepping for the call: a formatter is
+    free to reflow source, and a missing allocation is not free. The scratch's
+    first value is the whole difference between "the graph has never run the
+    staged branch" and a generation the host will accept as fresh.
+    """
+    stub = _Stub()
+    assert getattr(stub, "_gen_device", None) is None
+    _load(stub, [("ngram_heads_offsets", torch.zeros(2, dtype=torch.long))])
+    scratch = stub._gen_device
+    assert isinstance(scratch, torch.Tensor), "load_weights did not allocate it"
+    assert scratch.dtype == torch.long
+    assert scratch.numel() == 1
+    assert int(scratch[0]) == 0, "the scratch must start as 'never written'"
+    assert scratch.device == stub.layer_multipliers.device
 
 
 def test_load_weights_rejects_buffer_shape_mismatch():
@@ -458,6 +499,47 @@ def test_layout_rejects_a_split_that_does_not_add_up_to_the_id_space():
             num_shards=5,
             shard_row_capacity=5,
             vocab_size=20,
+        )
+
+
+def test_layout_accepts_a_checkpoint_padded_past_the_id_space(caplog):
+    """`Qwen3.8-Flash-Next-AwQ-INT4` verbatim, from the boot of 2026-10-10 23:01:
+    128 shards of 2,500,012 rows (320,001,536 total) against a head layout whose
+    last head ends at 320,001,446.
+
+    An exact `total == vocab_size` check refused this and the engine would not
+    boot. The two numbers are different kinds: `shard_row_capacity` is
+    `ceil(padded_vocab_size / parts)`, so the shards are built to the *padded*
+    vocab, while the id space is the end of the last head. The 90-row surplus is
+    padding that no id addresses -- both lookup paths keep every id below the id
+    space inside a shard that has its row -- so this must serve, with a note.
+    """
+    rows = [2500012] * 128
+    with caplog.at_level("WARNING"):
+        starts, out_rows = ple.build_ple_shard_layout(
+            rows,
+            num_shards=128,
+            shard_row_capacity=2500012,
+            vocab_size=320001446,
+        )
+    assert starts == [i * 2500012 for i in range(128)]
+    assert out_rows == rows
+    # The property that makes the surplus safe: the largest id still has a row.
+    assert 320001446 - 1 < starts[-1] + out_rows[-1]
+    warned = [r for r in caplog.records if "vocab padding" in r.getMessage()]
+    assert len(warned) == 1
+    assert "90 rows" in warned[0].getMessage()
+
+
+def test_layout_still_refuses_a_shortfall_past_the_last_row():
+    """The half of the check that is real: rows fewer than the id space strand the
+    tail ids off the end of the last shard. Kept as a refusal, not a warning."""
+    with pytest.raises(ValueError, match="refusing to serve"):
+        ple.build_ple_shard_layout(
+            [2500012] * 127 + [2499921],
+            num_shards=128,
+            shard_row_capacity=2500012,
+            vocab_size=320001446,
         )
 
 
@@ -552,11 +634,13 @@ def test_load_weights_finalizes_the_layout_from_the_shards():
     assert torch.equal(emb(ids), _reference(emb._shards, ids, DIM))
 
 
-def test_load_weights_refuses_a_split_that_does_not_match_the_id_space():
-    """With the layout buffers present, a split that does not add up is refused at
-    load time instead of being served."""
+def test_load_weights_refuses_a_split_short_of_the_id_space():
+    """With the layout buffers present, a split that cannot cover the id space is
+    refused at load time. This is the half of the check that is real: NUM_SHARDS x
+    CAPACITY = 24 rows for an id space of 25 leaves id 24 with no row, and the
+    lookup would read past the end of the last shard instead of failing."""
     stub = _Stub()
-    stub.ngram_heads_vocab_sizes = torch.tensor([7], dtype=torch.long)
+    stub.ngram_heads_vocab_sizes = torch.tensor([NUM_SHARDS * CAPACITY + 1], dtype=torch.long)
     stub.ngram_heads_offsets = torch.tensor([0], dtype=torch.long)
     shards = [
         (f"ngram_embedding.shard_{index}.weight", _shard(index * 100))
@@ -565,3 +649,158 @@ def test_load_weights_refuses_a_split_that_does_not_match_the_id_space():
     weights = shards + [("ngram_heads_offsets", torch.tensor([0], dtype=torch.long))]
     with pytest.raises(ValueError, match="id space"):
         _load(stub, weights)
+
+
+def test_load_weights_serves_a_split_padded_past_the_id_space(caplog):
+    """The other direction, which is NOT a disagreement and must serve.
+
+    The shards are sized from the padded vocab (`shard_row_capacity` is
+    `ceil(padded_vocab_size / parts)`); the id space is the end of the last head.
+    24 rows for an id space of 7 is padding that no id addresses. The real
+    `Qwen3.8-Flash-Next-AwQ-INT4` checkpoint is this shape -- 128 x 2,500,012 =
+    320,001,536 rows for an id space of 320,001,446 -- and refusing it is what
+    stopped the v0.30 boot on 2026-10-10: an exact `total == vocab_size` test
+    compared a padded quantity against an unpadded one."""
+    stub = _Stub()
+    stub.ngram_heads_vocab_sizes = torch.tensor([7], dtype=torch.long)
+    stub.ngram_heads_offsets = torch.tensor([0], dtype=torch.long)
+    shards = [
+        (f"ngram_embedding.shard_{index}.weight", _shard(index * 100))
+        for index in range(NUM_SHARDS)
+    ]
+    weights = shards + [("ngram_heads_offsets", torch.tensor([0], dtype=torch.long))]
+    with caplog.at_level("WARNING"):
+        _load(stub, weights)  # must not raise
+    emb = stub.ngram_embedding
+    assert emb._shard_rows == [CAPACITY] * NUM_SHARDS
+    assert [r for r in caplog.records if "vocab padding" in r.getMessage()]
+    # every id below the id space resolves to the row the checkpoint stored there
+    ids = torch.tensor([0, 3, 4, 6])
+    assert torch.equal(emb(ids), _reference(emb._shards, ids, DIM))
+
+
+
+
+# --------------------------------------------------------------------------
+# VLLM_GFX906_PLE_MADV_RANDOM -- opt-in read-ahead suppression
+#
+# The table is ~99 GiB of randomly-gathered rows, larger than the node's page
+# cache, so every fault pulls a 128 KiB window that the next (different-shard)
+# touch throws away: measured 1.03 MB of NVMe per prefill token at ~28x
+# amplification, with the GPUs idle ~60 % of the wall clock
+# (docs/prefill-io-wall.md). MADV_RANDOM sets VM_RAND_READ, which makes the
+# kernel fetch one page per fault.
+#
+# These assert the *observable kernel state* (`rr` in /proc/self/smaps
+# VmFlags) rather than timings, so they are deterministic.
+# --------------------------------------------------------------------------
+
+
+def _rand_read_flag_is_set(tensor: torch.Tensor) -> bool:
+    """True if the VMA backing ``tensor`` carries VM_RAND_READ ('rr')."""
+    addr = tensor.data_ptr()
+    rng = None
+    with open("/proc/self/smaps") as fh:
+        for line in fh:
+            if re.match(r"^[0-9a-f]+-", line):
+                start, end = line.split()[0].split("-")
+                rng = (int(start, 16), int(end, 16))
+            elif line.startswith("VmFlags") and rng and rng[0] <= addr < rng[1]:
+                return "rr" in line.split(":")[1].split()
+    raise AssertionError("no VMA found for the tensor's data_ptr")
+
+
+def test_madv_random_is_off_by_default(monkeypatch):
+    """Unset env => the mapping is left exactly as the kernel configured it."""
+    monkeypatch.delenv("VLLM_GFX906_PLE_MADV_RANDOM", raising=False)
+    calls: list[torch.Tensor] = []
+
+    def spy(tensor):
+        calls.append(tensor)
+        return True, 1, "stub"
+
+    monkeypatch.setattr(ple, "_advise_random", spy)
+    e = ple.MmapShardedNGramEmbedding(NUM_SHARDS, CAPACITY, DIM)
+    for i in range(NUM_SHARDS):
+        e.set_shard(i, _shard(i * 100))
+    assert calls == [], "the default must not touch the mapping"
+    assert e._advised_bytes == 0
+
+
+def test_madv_random_applies_once_per_shard_when_opted_in(monkeypatch):
+    monkeypatch.setenv("VLLM_GFX906_PLE_MADV_RANDOM", "1")
+    calls: list[torch.Tensor] = []
+
+    def spy(tensor):
+        calls.append(tensor)
+        return True, 7 * 2**20, "stub"
+
+    monkeypatch.setattr(ple, "_advise_random", spy)
+    e = ple.MmapShardedNGramEmbedding(NUM_SHARDS, CAPACITY, DIM)
+    for i in range(NUM_SHARDS):
+        e.set_shard(i, _shard(i * 100))
+    assert len(calls) == NUM_SHARDS
+    assert e._advised_bytes == 3 * 7 * 2**20  # bytes, not rounded MiB
+
+
+def test_madv_random_reaches_the_real_file_mapping(monkeypatch, tmp_path):
+    """The load-bearing property: madvise() lands on the mmap the gather reads.
+
+    If the loader ever starts handing over a copy instead of a view, this fails
+    loudly instead of the knob silently doing nothing in production.
+    """
+    monkeypatch.setenv("VLLM_GFX906_PLE_MADV_RANDOM", "1")
+    rows = 64
+    payload = _shard(0, n=rows)
+    path = tmp_path / "shard0.safetensors-like"
+    path.write_bytes(payload.numpy().tobytes())
+    nbytes = payload.numel() * payload.element_size()
+    with open(path, "rb") as fh:
+        mm = mmap.mmap(fh.fileno(), nbytes, access=mmap.ACCESS_READ)
+        tensor = torch.frombuffer(mm, dtype=torch.float16, count=payload.numel())
+        tensor = tensor.reshape(rows, DIM)
+        try:
+            assert not _rand_read_flag_is_set(tensor), "test premise: rr unset"
+            ok, advised, detail = ple._advise_random(tensor)
+            assert ok, detail
+            # The span covers the tensor plus the partial page in front of it.
+            assert nbytes <= advised < _4K + nbytes
+            assert _rand_read_flag_is_set(tensor), "VM_RAND_READ ('rr') not set"
+        finally:
+            tensor = None  # release the export before unmapping
+            del payload
+            mm.close()
+
+
+def test_madv_random_failure_is_warned_once_and_never_fatal(monkeypatch, caplog):
+    """A refused madvise must not cost a boot -- the read path is correct without it."""
+    monkeypatch.setenv("VLLM_GFX906_PLE_MADV_RANDOM", "1")
+
+    def refuse(tensor):
+        return False, 0, "madvise failed: errno 22 (EINVAL)"
+
+    monkeypatch.setattr(ple, "_advise_random", refuse)
+    e = ple.MmapShardedNGramEmbedding(NUM_SHARDS, CAPACITY, DIM)
+    with caplog.at_level("WARNING"):
+        for i in range(NUM_SHARDS):
+            e.set_shard(i, _shard(i * 100))
+    assert [t.shape for t in e._shards] == [(CAPACITY, DIM)] * NUM_SHARDS
+    assert sum("could not be applied" in r.message for r in caplog.records) == 1, (
+        "the warning must fire once, not once per shard"
+    )
+
+
+def test_madv_random_cannot_change_lookup_results(monkeypatch):
+    """Why the knob is safe to try: it changes bytes *fetched*, not bytes *seen*."""
+    ids = torch.tensor([0, 3, 9, 14, 22])
+    monkeypatch.delenv("VLLM_GFX906_PLE_MADV_RANDOM", raising=False)
+    off = ple.MmapShardedNGramEmbedding(NUM_SHARDS, CAPACITY, DIM)
+    for i in range(NUM_SHARDS):
+        off.set_shard(i, _shard(i * 100))
+    baseline = off(ids)
+
+    monkeypatch.setenv("VLLM_GFX906_PLE_MADV_RANDOM", "1")
+    on = ple.MmapShardedNGramEmbedding(NUM_SHARDS, CAPACITY, DIM)
+    for i in range(NUM_SHARDS):
+        on.set_shard(i, _shard(i * 100))
+    assert torch.equal(on(ids), baseline)

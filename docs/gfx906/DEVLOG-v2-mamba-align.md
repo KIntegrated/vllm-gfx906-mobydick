@@ -49,7 +49,7 @@ column*, not a copy-arithmetic bug in the kernel.
 **The fault** (before the fix, `tests/models/qwen4_exp` tiny config, one MI50,
 prefix caching ON, V2 runner):
 
-```
+```text
 :0:rocdevice.cpp :3678: Memory Fault Error [host: mi50-01, GPU index: 0,
   faulting addr: 0x94237cc28000, kernel: precopy_mamba_align_fused_kernel]
   -> c10::AcceleratorError / EngineDeadError -> HTTP 500
@@ -63,7 +63,7 @@ resumed/preempted request).
 
 **The mechanism** (launcher dump, the faulting step):
 
-```
+```text
 [v2m-dbg] add_request slot=0 num_computed=1152 block_size=4 mamba_block_size=192
           spec=192 -> 287
 [v2m-dbg] 64 preprocess.in  n=1 state_idx=[287, 0, 0, 0] src_col=[10, 0, 0, 0]
@@ -72,7 +72,7 @@ resumed/preempted request).
 `(1152 - 1) // 4 = 287` (buggy) vs `(1152 - 1) // 192 = 5` (correct): the seeded
 column landed ~57× past the true one. `precopy`'s temporal path is
 
-```
+```text
 actual_src_block_id = tl.load(block_table_base + src_col + token_bias)
 src_addr = state_base_addr + actual_src_block_id * state_block_stride
 ```
@@ -83,7 +83,7 @@ block table, and the garbage id is then scaled by the page stride.
 **The three block sizes** in one run (measured, all in the same config object):
 
 | value | source | used by |
-|---|---|---|
+| --- | --- | --- |
 | 192 | `cache_config.mamba_block_size`, `MambaSpec.block_size` | the align kernels, block tables, `max_num_blocks_per_req` |
 | 4 | `cache_config.block_size`, **after** engine startup narrows it to `min(g.kv_cache_spec.block_size for g in kv_cache_groups)` | scheduler granularity |
 | 192 | attention block size, *raised* earlier by `_align_hybrid_block_size` ("Setting attention block size to 192 tokens … Padding mamba page size by 37.14%") | attention KV |
@@ -94,7 +94,7 @@ The 4 comes from a **`CircularBufferSpec` group with `prefix_cacheable=False`**
 **Gates (after the fix), tiny rig, greedy, one MI50:**
 
 | arm | requests | greedy vs pcOFF | top-5 logprobs vs pcOFF |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | pcOFF (align off) | 12/12 OK | baseline | baseline |
 | pcON (align on) | 12/12 OK | 12/12 identical | worst \|Δ\| = **0.000000** |
 | pcON + MTP k=3 | 12/12 OK | 12/12 identical | worst \|Δ\| = **0.000000** |
@@ -163,6 +163,6 @@ no loadable Qwen4Exp checkpoint here (QSA-FN-3/8).
   one.
 - `precopy_mamba_align_fused_kernel` has no bounds check on `src_col` against
   the block-table width. A cheap belt-and-braces guard (clamp or early-exit)
-  would turn any future mis-seed into a no-op instead of a wild read; not added
+  would turn any future bad seed into a no-op instead of a wild read; not added
   because the seed is now provably in range and a silent clamp could hide the
   next bug of this class.

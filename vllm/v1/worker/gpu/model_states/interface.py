@@ -203,8 +203,19 @@ class ModelState(ABC):
 
     @abstractmethod
     def prepare_inputs(
-        self, input_batch: InputBatch, req_states: RequestState
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        cudagraph_mode: CUDAGraphMode | None = None,
     ) -> dict[str, Any]:
+        """Build this step's model inputs.
+
+        ``cudagraph_mode`` is the mode the runner has dispatched this step to --
+        the same value :meth:`prepare_attn` already receives, so a model state that
+        cares about the difference between a replayed FULL graph and an
+        eagerly-built step has it in both callbacks. It is optional and defaults to
+        ``None`` because most states cannot act on it.
+        """
         raise NotImplementedError
 
     @abstractmethod

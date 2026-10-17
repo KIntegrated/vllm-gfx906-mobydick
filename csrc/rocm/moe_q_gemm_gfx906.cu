@@ -92,6 +92,129 @@ __forceinline__ __device__ void atomic_add_pk4_f16(half* addr, half2 v01,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Deterministic accumulation (VLLM_GFX906_DETERMINISTIC) -- "cause 1" of temp-0
+// jitter. See docs/moe-deterministic-accumulation.md for why this and not a
+// partial pool.
+//
+// The epilogue below accumulates the per-K-shard (gemm1) / per-expert-slot
+// (gemm2) partials into fp16 with a packed-CAS atomic add. Float addition is not
+// associative, so the sum depends on the order the 10 contributors arrive in --
+// which on a GPU is never the same twice, and a 0.04-nat difference at greedy
+// temperature is a different token. The fix is to make the accumulation EXACT
+// rather than ordered: convert each partial to a scaled int32 and plain-atomicAdd
+// it. Integer addition is commutative, associative, and never rounds, so the sum
+// is identical whatever order the contributors arrive in. The grid, the weight
+// traffic and the launch count are all unchanged.
+//
+// Scale 2^12: resolution 2.4e-4, against fp16's own ulp of 9.8e-4 at 1.0 and 0.5
+// at 1024 -- the accumulation stays finer than the path it replaces at every
+// magnitude, and it rounds once at the end instead of k_rnd times in arrival
+// order. With k_rnd <= 64 the worst-case quantisation error is 64 * 1.2e-4 =
+// 0.008 absolute, well under one fp16 ulp of any output this kernel writes.
+//
+// The per-contributor saturation CLIP is a launch argument, NOT a constant: the
+// launcher passes INT32_MAX / k_rnd, so k_rnd contributors saturating in the same
+// direction still cannot overflow int32, and the ceiling (8.2e3 at k_rnd=64,
+// 1.3e5 at k_rnd=4) sits far above anything fp16 could represent anyway.
+//
+// It was a constant once, and that was a bug worth naming: `MOE_FIXED_CLIP
+// 131071.0f` applied to the ALREADY-SCALED value saturates at +-131071/2^14 =
+// +-8.0 in real terms. gemm1 activations reach ~30 and gemm2 partials ~1.1e3 in
+// this repo's own test corpus, so every contributor clipped, the answer was wrong
+// by up to 97 %, and -- because clipping is deterministic -- every bit-identity
+// test still passed. Order-invariance is not accuracy; check both.
+#define MOE_FIXED_SCALE 4096.0f
+#define MOE_FIXED_INV (1.0f / 4096.0f)
+
+__forceinline__ __device__ int32_t float_to_fixed(float v, float clip) {
+  float s = v * MOE_FIXED_SCALE;
+  s = fminf(fmaxf(s, -clip), clip);
+  return (int32_t)__float2int_rn(s);
+}
+
+// One flag turns on every deterministic site in this extension (the dense GEMV
+// in dense_gemv_gfx906.cu reads the same variable), read once per process.
+static bool moe_det_enabled() {
+  static const bool on = [] {
+    const char* e = getenv("VLLM_GFX906_DETERMINISTIC");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+// Persistent scratch for the deterministic path: the int32 accumulator plus one
+// ticket cell per (output row, n-tile). Allocated on the first MoE launch, which
+// happens inside vLLM's memory-profile pass, so the profiler counts it once and
+// the KV cache is sized with it in mind -- determinism is not paid for in served
+// capacity. Sized for the worst case: gemm1 needs [M*top_k, N] and gemm2 needs
+// [M, hidden], and they run sequentially on one stream, so one buffer covers
+// both (52 MB at max_num_batched_tokens=4096, i.e. ~0.05 GiB of KV).
+//
+// The accumulator self-cleans (the converting block zeroes the cells it reads)
+// and the tickets self-reset. That holds only if every launch completes: an
+// aborted MoE launch leaves cells dirty and the scratch silently double-counts on
+// the next call. The tickets are therefore re-zeroed before every NON-captured
+// launch (cheap: <=164 KB, and prefill runs uncaptured), which repairs ticket
+// state after a decode-graph failure; the accumulator is not re-zeroed, because
+// a 52 MB memset per prefill launch is a real cost. A process that survives an
+// aborted MoE launch must be restarted -- it already would be.
+struct MoeDetScratch {
+  torch::Tensor fixed;  // int32 accumulator
+  torch::Tensor cntr;   // ticket cells
+  int64_t fixed_numel = 0;
+  int64_t cntr_numel = 0;
+};
+
+static MoeDetScratch& moe_det_scratch() {
+  static MoeDetScratch s;
+  return s;
+}
+
+static MoeDetScratch& ensure_moe_det_scratch(int64_t fixed_numel,
+                                             int64_t cntr_numel,
+                                             cudaStream_t stream) {
+  const bool capturing = [stream] {
+    hipStreamCaptureStatus st = hipStreamCaptureStatusNone;
+    hipStreamIsCapturing(stream, &st);
+    return st != hipStreamCaptureStatusNone;
+  }();
+  MoeDetScratch& s = moe_det_scratch();
+  // Never allocate inside a capture: the first MoE call is the profile/warmup
+  // pass (uncaptured, and the largest shape), so needing to grow here means the
+  // warmup order changed under us. Fail loudly instead of capturing an alloc.
+  TORCH_CHECK(!capturing || (fixed_numel <= s.fixed_numel &&
+                              cntr_numel <= s.cntr_numel),
+              "moe_gptq_gemm_gfx906: the deterministic MoE scratch would have to "
+              "grow during CUDA graph capture (fixed ",
+              fixed_numel, " vs ", s.fixed_numel, "). A MoE launch larger than "
+              "the warmup shape reached capture; refuse to capture an allocation.");
+  if (fixed_numel > s.fixed_numel) {
+    s.fixed = torch::zeros(
+        {fixed_numel},
+        torch::TensorOptions().dtype(torch::kInt).device(torch::kCUDA));
+    s.fixed_numel = fixed_numel;
+  }
+  if (cntr_numel > s.cntr_numel) {
+    s.cntr = torch::zeros({cntr_numel},
+                          torch::TensorOptions().dtype(torch::kInt)
+                              .device(torch::kCUDA));
+    s.cntr_numel = cntr_numel;
+  } else if (!capturing) {
+    hipMemsetAsync(s.cntr.data_ptr(), 0, (size_t)s.cntr_numel * 4, stream);
+  }
+  static const bool warned = [] {
+    TORCH_WARN_ONCE(
+        "moe_gptq_gemm_gfx906: DETERMINISTIC accumulation ON (exact int32 "
+        "atomics, scale 2^12, scratch ",
+        (long long)(moe_det_scratch().fixed_numel * 4 / 1048576), " MiB, tickets ",
+        (long long)moe_det_scratch().cntr_numel, ")");
+    return true;
+  }();
+  (void)warned;
+  return s;
+}
+
 // N nibbles starting at column n within a single packed uint32 word.
 // Safe only when (n % 8) + N <= 8: all N nibbles live in one word.  This holds
 // whenever n is aligned to N_PER_THREAD and N_PER_THREAD divides 8, which is
@@ -179,7 +302,15 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
     const int expert_zeros_stride,   // groups * (N/8)
     const bool mul_topk_weight,
     const int output_topk,           // >0: write to row token_id/output_topk
-    const int zero_offset) {
+    const int zero_offset,
+    // Deterministic path only (docs/moe-deterministic-accumulation.md). c_fixed
+    // is the int32 accumulator (null = the legacy fp16 CAS path), cntr holds one
+    // ticket cell per (output row, n-tile), and k_rnd is how many contributors
+    // complete one such cell: gridDim.z K-shards, times output_topk expert slots
+    // when the kernel also reduces over top-k. det_clip is the per-contributor
+    // saturation ceiling in SCALED units (INT32_MAX / k_rnd, from the launcher).
+    int32_t* __restrict__ c_fixed, int* __restrict__ cntr, const int k_rnd,
+    const float det_clip) {
   static_assert(N_PER_THREAD == 4 || N_PER_THREAD == 2,
                 "N_PER_THREAD must be 2 or 4");
   const int t = threadIdx.x;
@@ -187,7 +318,15 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
   const int offset_n = blockIdx.y * BLOCK_KN_SIZE * N_PER_THREAD;
   const int offset_k = blockIdx.z * BLOCK_KN_SIZE;
   const int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
-  const int n = offset_n + t * N_PER_THREAD;
+  // Threads whose columns fall past size_n exist only in a tail n-tile (gemm1 for
+  // this model: size_n=320 inside a 512-column tile, so half the threads are
+  // inert). The legacy path returns here. The deterministic path cannot: those
+  // threads have to reach the barriers in the epilogue. They clamp their loads to
+  // column 0 (in bounds, result discarded) and drop their stores instead.
+  const int n_raw = offset_n + t * N_PER_THREAD;
+  const bool col_active = (n_raw < size_n);
+  const int n = col_active ? n_raw : 0;
+  const bool det = (c_fixed != nullptr);
 
   // Early exit for padding blocks or invalid experts (expert_map = -1)
   if (token_block * BLOCK_SIZE_M >= num_tokens_post_padded[0]) return;
@@ -230,7 +369,13 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
   }
   __syncthreads();
 
-  if (n >= size_n) return;
+  // Column-inactive threads exit here on the legacy path, exactly as they always
+  // did -- AFTER the block_a fill and its barrier, because the K-loop reads every
+  // thread's column of that LDS tile. The deterministic path cannot exit (the
+  // epilogue has barriers, and a thread that returns can never be told to
+  // rejoin them), so it stays alive with n clamped to column 0: it redundantly
+  // recomputes thread 0's column and drops the result.
+  if (!col_active && !det) return;
 
   // Group bookkeeping
   const int groupsize = size_k / groups;
@@ -324,6 +469,84 @@ __global__ void __launch_bounds__(THREADS_X) moe_gemm_q4_kernel_gfx906(
     k += 32;
   }
 
+  // --- Deterministic epilogue: exact integer accumulation, then the last
+  //     contributor converts and self-cleans (docs/moe-deterministic-accumulation.md)
+  if (det) {
+    __shared__ int s_convert[BLOCK_SIZE_M];
+
+    auto row_of = [&](int32_t token_id) -> int64_t {
+      return (output_topk > 0) ? (int64_t)(token_id / output_topk)
+                               : (int64_t)token_id;
+    };
+
+    // 1. Add this block's columns. Integer, so arrival order cannot matter.
+    //    The router weight is applied here, exactly where the CAS path applies it.
+    #pragma unroll
+    for (int m = 0; m < BLOCK_SIZE_M; ++m) {
+      const int32_t token_id = sorted_token_ids[offset_m_base + m];
+      if (token_id / top_k >= size_m) continue;  // padding row: not ours to write
+      if (mul_topk_weight && topk_weights != nullptr) {
+        const float tw = topk_weights[token_id];
+        #pragma unroll
+        for (int j = 0; j < N_PER_THREAD; ++j) block_c[m][j] *= tw;
+      }
+      if (!col_active) continue;  // recomputed column 0; somebody else stores it
+      int32_t* acc = c_fixed + row_of(token_id) * (int64_t)size_n + n;
+      #pragma unroll
+      for (int j = 0; j < N_PER_THREAD; ++j)
+        atomicAdd(acc + j, float_to_fixed(block_c[m][j], det_clip));
+    }
+
+    // 2. Publish, then take one ticket per (row, n-tile). Every writing thread
+    //    fences (a threadfence orders its own writes); the barrier tells thread 0
+    //    that all of them have. The ticket only ever answers "is the set whole".
+    if (col_active) __threadfence();
+    __syncthreads();
+    if (t == 0) {
+      #pragma unroll
+      for (int m = 0; m < BLOCK_SIZE_M; ++m) {
+        const int32_t token_id = sorted_token_ids[offset_m_base + m];
+        if (token_id / top_k >= size_m) {
+          s_convert[m] = 0;
+          continue;
+        }
+        const int64_t cell =
+            row_of(token_id) * (int64_t)gridDim.y + blockIdx.y;
+        s_convert[m] = (atomicAdd(&cntr[cell], 1) + 1 == k_rnd) ? 1 : 0;
+      }
+    }
+    __syncthreads();
+
+    // 3. The completing contributor reads the exact sums, writes fp16 once, and
+    //    zeroes the accumulator cells so the scratch is clean for the next launch.
+    for (int m = 0; m < BLOCK_SIZE_M; ++m) {
+      if (!s_convert[m] || !col_active) continue;
+      const int32_t token_id = sorted_token_ids[offset_m_base + m];
+      const int64_t row = row_of(token_id);
+      int32_t* acc = c_fixed + row * (int64_t)size_n + n;
+      half* out = c + row * (int64_t)size_n + n;
+      __threadfence();  // acquire: read the sums after the ticket that proved them
+      #pragma unroll
+      for (int j = 0; j < N_PER_THREAD; ++j) {
+        out[j] = __float2half_rn(__int2float_rn(acc[j]) * MOE_FIXED_INV);
+        acc[j] = 0;
+      }
+    }
+
+    // 4. Reset the ticket. Only this block can reach this cell again: by
+    //    definition everyone else had already arrived when it won.
+    __syncthreads();
+    if (t == 0) {
+      #pragma unroll
+      for (int m = 0; m < BLOCK_SIZE_M; ++m) {
+        if (!s_convert[m]) continue;
+        const int32_t token_id = sorted_token_ids[offset_m_base + m];
+        cntr[row_of(token_id) * (int64_t)gridDim.y + blockIdx.y] = 0;
+      }
+    }
+    return;
+  }
+
   // --- Epilogue: apply topk_weight and atomic-add to output ---
   #pragma unroll
   for (int m = 0; m < BLOCK_SIZE_M; ++m) {
@@ -375,12 +598,39 @@ void launch_moe_gemm_q4(
                 (BLOCK_KN_SIZE * N_PER_THREAD),
             (size_k + BLOCK_KN_SIZE - 1) / BLOCK_KN_SIZE);
 
+  // Deterministic path: same grid, same launch. Only the accumulator and the
+  // epilogue change.
+  int32_t* c_fixed = nullptr;
+  int* cntr = nullptr;
+  int k_rnd = 0;
+  float det_clip = 0.0f;
+  if (moe_det_enabled()) {
+    // Rows the accumulator must cover. gemm1 writes row token_id (every routed
+    // slot is a row: size_m * top_k of them); gemm2 reduces slots onto their
+    // original row (size_m / output_topk of them, which is exact -- every token
+    // has exactly output_topk slots).
+    const int64_t rows_out = (output_topk > 0)
+                                 ? (int64_t)(size_m / output_topk)
+                                 : (int64_t)size_m * top_k;
+    MoeDetScratch& s = ensure_moe_det_scratch(rows_out * size_n,
+                                              rows_out * grid.y, stream);
+    c_fixed = s.fixed.data_ptr<int32_t>();
+    cntr = s.cntr.data_ptr<int>();
+    // A (row, n-tile) is complete when every K-shard has arrived, times every
+    // expert slot if this call also reduces over top-k.
+    k_rnd = (int)(grid.z * (output_topk > 0 ? output_topk : 1));
+    // Ceiling per contributor that keeps the SUM of all k_rnd of them inside
+    // int32, in scaled units. Floor division makes k_rnd * clip <= INT32_MAX.
+    det_clip = (float)(INT32_MAX / (k_rnd > 0 ? k_rnd : 1));
+  }
+
   moe_gemm_q4_kernel_gfx906<BLOCK_SIZE_M, N_PER_THREAD>
       <<<grid, block, 0, stream>>>(
           a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
           expert_ids, num_tokens_post_padded, size_m, size_n, size_k, groups,
           top_k, expert_weight_stride, expert_scales_stride,
-          expert_zeros_stride, mul_topk_weight, output_topk, zero_offset);
+          expert_zeros_stride, mul_topk_weight, output_topk, zero_offset,
+          c_fixed, cntr, k_rnd, det_clip);
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +926,17 @@ void dispatch_moe_gemm_q4(
   // programming error, not a fallback case). Combined TP=2 M=1 A/B
   // (Qwen3.5-35B-A3B, pp2048/tg256, graph): +2.72 % vs off; see
   // docs/gfx906/DEVLOG-moe-c2v.md "C2 combined TP=2 M=1 A/B".
+  // The v2 tile accumulates with the same fp16 CAS epilogue and has no
+  // deterministic mode, so the deterministic flag routes around it: gemm2 falls
+  // back to the legacy <1,4> tile (dispatch path 2), which is the path
+  // VLLM_GFX906_MOE_M1=0 already selects. Inert for this model either way -- the
+  // v2 shape gate needs size_k % 256 == 0 and gemm2 here is K=160.
+  //
+  // The det guard wraps only the LAUNCH, not the shape check: a user who forces
+  // v2 on a shape it cannot compute has made a programming error, and that stays
+  // an error whether or not determinism is on (the check used to sit inside the
+  // guard, so det silently swallowed it -- test_gfx906_moe_gemm_m1_shape_gate
+  // caught that as "DID NOT RAISE").
   if (block_size_m == 1 && output_topk > 0 && size_m == output_topk) {
     const bool v2_shape_ok =
         size_n % 256 == 0 && size_k % 256 == 0 && size_k <= 2048 &&
@@ -691,14 +952,21 @@ void dispatch_moe_gemm_q4(
     // closed on bad shapes); other values like "true" now leave the default-on
     // shape gate to decide instead of asserting. Documented behavior change.
     const bool disable_v2 = m1_env != nullptr && m1_env[0] == '0';
-    if (!disable_v2 && (force_v2 || v2_shape_ok)) {
-      // Only assert the shape when the user explicitly forced v2 (=1); a
-      // default-on non-qualifying shape is handled by the fallback above.
-      TORCH_CHECK(
-          !force_v2 || v2_shape_ok,
-          "VLLM_GFX906_MOE_M1=1 forces the v2 M=1 tile but the gemm2 shape "
-          "does not qualify (requires size_n%256==0, size_k%256==0, "
-          "size_k<=2048, groupsize%32==0); unset the flag to fall back");
+    // Only assert the shape when the user explicitly forced v2 (=1); a
+    // default-on non-qualifying shape is handled by the fallback below.
+    TORCH_CHECK(
+        !force_v2 || v2_shape_ok,
+        "VLLM_GFX906_MOE_M1=1 forces the v2 M=1 tile but the gemm2 shape "
+        "does not qualify (requires size_n%256==0, size_k%256==0, "
+        "size_k<=2048, groupsize%32==0); unset the flag to fall back");
+    // Forcing v2 while asking for determinism is a contradiction, and the
+    // det guard below resolves it silently in det's favour. Say so instead.
+    TORCH_CHECK(
+        !force_v2 || !moe_det_enabled(),
+        "VLLM_GFX906_MOE_M1=1 (force the v2 M=1 tile) contradicts "
+        "VLLM_GFX906_DETERMINISTIC=1: the v2 tile has no deterministic "
+        "epilogue and is bypassed. Unset one of the two flags.");
+    if (!moe_det_enabled() && !disable_v2 && (force_v2 || v2_shape_ok)) {
       moe_m1_dispatch_path.store(1);            // path 1: v2 gemm2
       launch_moe_gemm_q4_v2<512, 4, 256>(
           a, c, b_q_weight, b_scales, b_qzeros, topk_weights,
@@ -881,6 +1149,15 @@ void moe_gptq_gemm_gfx906(torch::Tensor a, torch::Tensor c,
     TORCH_CHECK(b_qzeros.size(2) * 8 == size_n,
                 "moe_gptq_gemm_gfx906: zeros N (", b_qzeros.size(2) * 8,
                 ") != qweight N (", size_n, ")");
+  }
+
+  if (vllm::moe_gptq_gfx906::moe_det_enabled()) {
+    // The deterministic accumulator is indexed by output row, so gemm2's row
+    // count must divide cleanly (see the launcher's rows_out).
+    TORCH_CHECK(output_topk <= 0 || a.size(0) % output_topk == 0,
+                "moe_gptq_gemm_gfx906: VLLM_GFX906_DETERMINISTIC needs a.size(0) (",
+                a.size(0), ") to be a multiple of output_topk (", output_topk,
+                ")");
   }
 
   // Per-expert strides

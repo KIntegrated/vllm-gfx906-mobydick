@@ -100,6 +100,7 @@ def get_autotune_config():
         ),
     ]
 
+
 def get_heuristics():
     return {
         # gfx906 matrix instructions naturally operate on 16-row tiles. This
@@ -108,31 +109,41 @@ def get_heuristics():
         "BLOCK_SIZE_M": lambda args: 16
     }
 
-# `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator, which consumes:
+
+# `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator,
+# which consumes:
 #   - A list of `triton.Config` objects that define different configurations of
-#       meta-parameters (e.g., `BLOCK_SIZE_M`) and compilation options (e.g., `num_warps`) to try
+# meta-parameters (e.g., `BLOCK_SIZE_M`) and compilation options (e.g., `num_warps`) to
+# try
 #   - An auto-tuning *key* whose change in values will trigger evaluation of all the
 #       provided configs
-@triton.autotune(
-    configs=get_autotune_config(),
-    key=['M', 'N', 'K']
-)
+@triton.autotune(configs=get_autotune_config(), key=["M", "N", "K"])
 @triton.heuristics(values=get_heuristics())
 @triton.jit
 def triton_matmul_kernel(
-        # Pointers to matrices
-        a_ptr, b_ptr, c_ptr,
-        # Matrix dimensions
-        M, N, K,
-        # The stride variables represent how much to increase the ptr by when moving by 1
-        # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
-        # by to get the element one row down (A has M rows).
-        stride_am, stride_ak,  #
-        stride_bk, stride_bn,  #
-        stride_cm, stride_cn,
-        # Meta-parameters
-        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
-        GROUP_SIZE_M: tl.constexpr  #
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    # Matrix dimensions
+    M,
+    N,
+    K,
+    # The stride variables represent how much to increase the ptr by when moving by 1
+    # element in a particular dimension. E.g. `stride_am` is how much to increase
+    # `a_ptr`
+    # by to get the element one row down (A has M rows).
+    stride_am,
+    stride_ak,  #
+    stride_bk,
+    stride_bn,  #
+    stride_cm,
+    stride_cn,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,  #
+    GROUP_SIZE_M: tl.constexpr,  #
 ):
     """Kernel for computing the matmul C = A x B.T.
     A has shape (M, K), B has shape (N, K) and C has shape (M, N)
@@ -180,7 +191,7 @@ def triton_matmul_kernel(
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
-    c = accumulator.to(tl.float16) # acc in fp32 back to fp16
+    c = accumulator.to(tl.float16)  # acc in fp32 back to fp16
 
     # -----------------------------------------------------------
     # Write back the block of the output matrix C with masks.
@@ -190,16 +201,18 @@ def triton_matmul_kernel(
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
+
 def triton_matmul(a, b):
     # Check constraints.
     # 2026-09-15 (DFL2-1): two assumptions asserted here at model warmup for the DFlash2
     # drafter's projections (x=(2, 7, 5120), weight=(256, 5120)):
-    #   1. activations may be >2-D — flatten the leading dims and restore them on the way
+    # 1. activations may be >2-D — flatten the leading dims and restore them on the way
     #      out (the "n <= 16 and bias is None" branch passes the raw x);
-    #   2. the weight may arrive as [K, N] (upstream's convention) where this kernel wants
+    # 2. the weight may arrive as [K, N] (upstream's convention) where this kernel wants
     #      [N, K] (see the `b.shape inv` note below) — transpose that case, and keep the
     #      assert for genuinely incompatible shapes.
-    # PERF NOTE: this generic fp16 kernel (waves_per_eu=1) is the *fallback* for shapes the
+    # PERF NOTE: this generic fp16 kernel (waves_per_eu=1) is the *fallback* for shapes
+    # the
     # gfx906 skinny/GEMV family does not cover; the DFlash2 draft shapes land here — see
     # ROADMAP DFL2-7.
     a_shape = a.shape
@@ -217,26 +230,86 @@ def triton_matmul(a, b):
         f"Incompatible dimensions: a={tuple(a.shape)} b={tuple(b.shape)}"
         " (gfx906 kernel expects b as [N, K])"
     )
-    assert a.dtype == b.dtype, "Matrices A and B must have the same dtype (assuming fp16)"
+    assert a.dtype == b.dtype, (
+        "Matrices A and B must have the same dtype (assuming fp16)"
+    )
     assert a.is_contiguous(), "Matrix A must be contiguous"
     M, K = a.shape
-    N, K = b.shape # NOTE(gfx906): b.shape inv
+    N, K = b.shape  # NOTE(gfx906): b.shape inv
     launch_kwargs = {}
-    launch_kwargs["waves_per_eu"] = 1 # best for gfx906
+    launch_kwargs["waves_per_eu"] = 1  # best for gfx906
 
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
     # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
     triton_matmul_kernel[grid](
-        a, b, c,  #
-        M, N, K,  #
-        a.stride(0), a.stride(1),  #
-        b.stride(1), b.stride(0),  # NOTE(gfx906): b.stride inv
-        c.stride(0), c.stride(1),  #
+        a,
+        b,
+        c,  #
+        M,
+        N,
+        K,  #
+        a.stride(0),
+        a.stride(1),  #
+        b.stride(1),
+        b.stride(0),  # NOTE(gfx906): b.stride inv
+        c.stride(0),
+        c.stride(1),  #
         **launch_kwargs,
     )
     return c if len(a_shape) == 2 else c.reshape(*a_shape[:-1], N)
+
+
+# --- gfx906 custom-kernel observability ------------------------------------
+# These switches are read from os.environ inside the WORKER, on every linear
+# layer, and "unset" means ON. That combination is easy to misread from the
+# outside: /proc/<pid>/environ is not trustworthy on a renamed process (vLLM
+# calls setproctitle, which overwrites the argv/environ region -- a snapshot of
+# a live EngineCore here shows thousands of entries with no '=' in them), and a
+# silently defaulted switch is indistinguishable from a honoured one. So log,
+# from the process that actually decides, (a) the switch values this pid sees
+# and (b) the first time each custom kernel is really entered. (b) absent while
+# (a) says "0" is a kill switch working. (b) present while (a) says "0" is a
+# bug in the gate. (a) saying "<unset>" when the operator did set it means the
+# value never reached this process.
+_GFX906_ENV_LOGGED = False
+_GFX906_KERNEL_LOGGED: set[str] = set()
+_GFX906_SWITCHES = (
+    "VLLM_GFX906_DENSE_GEMV",
+    "VLLM_GFX906_DOWN_GEMV",
+    "VLLM_GFX906_SKINNY_M16",
+    "VLLM_GFX906_SPEC_GEMM",
+    # Not a kill switch: the m4/m16 GEMV still runs and still logs its hit key
+    # with this on. It pins the split-K addition order (see
+    # csrc/rocm/dense_gemv_gfx906.cu), so the witness that it took effect is
+    # probe-determinism-where showing identical decode, not a log line.
+    "VLLM_GFX906_DETERMINISTIC",
+)
+
+
+def _gfx906_kernel_env_log_once() -> None:
+    """Log once per process the kernel switches as THIS process sees them."""
+    global _GFX906_ENV_LOGGED
+    if _GFX906_ENV_LOGGED:
+        return
+    _GFX906_ENV_LOGGED = True
+    logger.info(
+        "gfx906 kernel switches as seen by pid %d: %s ('<unset>' means the "
+        "default, which is ON)",
+        os.getpid(),
+        {k: os.environ.get(k, "<unset>") for k in _GFX906_SWITCHES},
+    )
+
+
+def _gfx906_kernel_hit_log(kernel: str) -> None:
+    """Log once per process the first time a custom kernel is actually used."""
+    if kernel in _GFX906_KERNEL_LOGGED:
+        return
+    _GFX906_KERNEL_LOGGED.add(kernel)
+    logger.info("gfx906 custom kernel %s: first use in pid %d", kernel, os.getpid())
 
 
 def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor | None:
@@ -283,6 +356,7 @@ def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor | 
     )
     if gemv_ok:
         if weight.shape[1] == 2048 and (m == 1 or m == 256 or m >= 2048):
+            _gfx906_kernel_hit_log("dense_gemv_gfx906(k=2048)")
             return ops.dense_gemv_gfx906(weight, x_view, 2048)
         # Shared-expert down_proj (dense fp16): 5.6-5.7 us GEMV vs
         # 6.7-7.7 us LLMM1 rpb4 at kchunk=512/RPT=2 (measured).
@@ -293,7 +367,14 @@ def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor | 
             and m == 2048
             and os.environ.get("VLLM_GFX906_DOWN_GEMV", "1") != "0"
         ):
+            _gfx906_kernel_hit_log("dense_gemv_gfx906(k=512,down_proj)")
             return ops.dense_gemv_gfx906(weight, x_view, 512)
+    if on_gfx906():
+        # Report what this process sees even when the answer was "do not use the
+        # custom kernel", and even when the shapes never matched: a boot that
+        # prints no line must not be ambiguous between "switches off" and "gate
+        # never consulted".
+        _gfx906_kernel_env_log_once()
     if m % 4 == 0:
         return ops.LLMM1(weight, x_view, 4)
     out = ops.LLMM1(torch.nn.functional.pad(weight, (0, 0, 0, 4 - m)), x_view, 4)
@@ -346,13 +427,11 @@ def _gfx906_spec_gemv_m4(
         m16 = False  # the m16 kernel is RPT=1
     if m16 and 5 <= n <= 16:
         mb = m * k * 2
-        if not (n <= 7 or (n == 8 and mb <= 32 * 1024 * 1024) or
-                mb <= 10 * 1024 * 1024):
+        if not (
+            n <= 7 or (n == 8 and mb <= 32 * 1024 * 1024) or mb <= 10 * 1024 * 1024
+        ):
             m16 = False
-    if not (
-        ((2 <= n <= 4) or (m16 and 5 <= n <= 16)) and k % 8 == 0
-        and m % rpt == 0
-    ):
+    if not (((2 <= n <= 4) or (m16 and 5 <= n <= 16)) and k % 8 == 0 and m % rpt == 0):
         return None
     # Keep the tuned hipBLAS special case (m==5120, 2048<=k<=2304, n=2..16)
     # below untouched.
@@ -361,6 +440,8 @@ def _gfx906_spec_gemv_m4(
     if k % 1024 != 0 and k % 512 != 0:
         return None
     kchunk = 2048 if k % 2048 == 0 else (1024 if k % 1024 == 0 else 512)
+    _gfx906_kernel_env_log_once()
+    _gfx906_kernel_hit_log(f"dense_gemv_m4_gfx906(m={m},k={k},kchunk={kchunk})")
     return ops.dense_gemv_m4_gfx906(weight, x_view.contiguous(), kchunk)
 
 
@@ -380,6 +461,8 @@ def _gfx906_gemv_long_k(
     """
     from vllm.platforms.rocm import on_gfx906
 
+    if on_gfx906():
+        _gfx906_kernel_env_log_once()
     if not (
         on_gfx906()
         and os.environ.get("VLLM_GFX906_DENSE_GEMV", "1") != "0"
@@ -390,8 +473,10 @@ def _gfx906_gemv_long_k(
     ):
         return None
     if weight.shape[1] == 17408:
+        _gfx906_kernel_hit_log("dense_gemv_gfx906(k=1024,long_k 17408)")
         return ops.dense_gemv_gfx906(weight, x_view, 1024)
     if weight.shape[1] == 10240:
+        _gfx906_kernel_hit_log("dense_gemv_gfx906(k=2048,long_k 10240)")
         return ops.dense_gemv_gfx906(weight, x_view, 2048)
     return None
 
@@ -709,7 +794,9 @@ def rocm_unquantized_gemm_impl(
         # K % 256 == 0 (it walks K with fixed-size descriptors and won't pad a
         # partial last tile). Some whitelisted shapes have K=2880 (e.g. gpt-oss-120b
         # hidden), so skip aiter there and fall back to the torch GEMM path below.
-        if use_aiter_triton_gemm(n, m, k, x.dtype) and not (on_gfx1250() and k % 256 != 0):
+        if use_aiter_triton_gemm(n, m, k, x.dtype) and not (
+            on_gfx1250() and k % 256 != 0
+        ):
             from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 
             return gemm_a16w16(x, weight, bias)
@@ -760,20 +847,18 @@ def rocm_unquantized_gemm_impl(
         # paths on gfx906 (8 vs 118-142 us at the [128, 2688] gate shape);
         # the fp16 GEMV family rejects fp32 operands.
         if x_view.dtype == torch.float32:
-            return torch.mv(weight, x_view[0]).reshape(
-                *x.shape[:-1], weight.shape[0]
-            )
+            return torch.mv(weight, x_view[0]).reshape(*x.shape[:-1], weight.shape[0])
         if k <= 8192:
             out = _llmm1_tiny_m(weight, x_view)
         else:
             out = _gfx906_gemv_long_k(weight, x_view)
         if out is not None:
             return out.reshape(*x.shape[:-1], weight.shape[0])
-        return triton_matmul(
-            x if x.is_contiguous() else x.contiguous(), weight
-        )
+        return triton_matmul(x if x.is_contiguous() else x.contiguous(), weight)
     elif m > 8 and 0 < n <= 4 and (on_gfx9() or on_gfx1x()):
-        out = ops.wvSplitK(weight, x_view, cu_count, bias)  # matrix cores not supported by gfx906 so excluded here
+        out = ops.wvSplitK(
+            weight, x_view, cu_count, bias
+        )  # matrix cores not supported by gfx906 so excluded here
         return out.reshape(*x.shape[:-1], weight.shape[0])
     # low batch size, use triton matmul
     elif n <= 16 and bias is None:
@@ -799,6 +884,8 @@ def rocm_unquantized_gemm_impl(
 
     # otherwise, use native torch
     return torch.nn.functional.linear(x, weight, bias)
+
+
 def rocm_unquantized_gemm_fake(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:

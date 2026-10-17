@@ -98,8 +98,12 @@ class EncoderDecoderModelState(ModelState):
         return None
 
     def prepare_inputs(
-        self, input_batch: InputBatch, req_states: RequestState
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        cudagraph_mode: CUDAGraphMode | None = None,
     ) -> dict[str, Any]:
+        # Accepted for interface parity; unused. See ModelState.prepare_inputs.
         model_inputs = {"encoder_outputs": self.encoder_outputs}
         self.encoder_outputs = []
         return model_inputs

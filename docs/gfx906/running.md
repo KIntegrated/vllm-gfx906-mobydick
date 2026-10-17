@@ -168,7 +168,7 @@ entry — so the list you pass is authoritative and nothing is auto-extended.
 ### Container images (this fork)
 
 | image | code | ROCm | toolchain / arch override |
-|-------|------|------|---------------------------|
+| --- | --- | --- | --- |
 | `aiinfos/vllm-gfx906-mobydick:v0.23.1rc0.x-rocm7.2.1-pytorch2.11.0` | upstream 0.23 | 7.2.1 | **`HSA_OVERRIDE_GFX_VERSION=9.0.6` REQUIRED** |
 | `mixa3607/vllm-gfx906:0.26.0-rocm-7.2.1-kintegrated` | gfx906 0.26 | 7.2.1 | **`HSA_OVERRIDE_GFX_VERSION=9.0.6` REQUIRED** |
 | `mixa3607/vllm-gfx906:0.27.99rc0-rocm-7.14-kintegrated` | gfx906 main | **7.14** | **NO HSA override** (7.14 has native gfx906) |
@@ -185,6 +185,21 @@ via `torch.version.hip` and derives the device name from the GCN arch — just b
 aware if you see empty device/ROCm detection on 7.14.
 
 ---
+
+## 1b. The reference-box launcher (in-tree copy)
+
+The 4×MI50 box that produced every measurement in `degradation.md` boots with a
+single script — `tools/gfx906/run-vllm.sh` is a copy of it with the API key removed.
+Use it as the authoritative list of flags for this model on gfx906 (TP=4, MTP spec
+decode, piecewise graphs, the `OPTIMIZED` knob bundle and the boot manifest), not as
+a portable entry point: its paths and its preflight canary are those of one machine.
+
+```bash
+tools/gfx906/export-run-vllm.sh --check /path/to/live/run-vllm   # copy == live, key removed
+tools/gfx906/export-run-vllm.sh       /path/to/live/run-vllm   # re-publish a newer launcher
+```
+
+See `tools/gfx906/README.md`.
 
 ## 2. GPU memory pressure
 

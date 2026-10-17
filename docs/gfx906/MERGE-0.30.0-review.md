@@ -46,7 +46,7 @@ hand) · **G** = our code that is **gated off by default** (archive candidate) �
 has (take theirs, drop our copy) · **D** = bindings/CI/test glue (mechanical).
 
 | file | ours | theirs | class | our-side change (fork-only commits) → recommendation |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `csrc/libtorch_stable/quantization/gptq/q_gemm.cu` | 178+/64− | 112+/423− | L | q_gemm M=1 max-ILP split + the 0.29-merge fixes; **kill-switch `VLLM_GFX906_QGEMM_M1_MAXILP` is default-ON** (AGENTS: build default). KEEP — highest-value hand-merge |
 | `vllm/_custom_ops.py` | 241+/2− | 483+/155− | L | MoE M1/NPT default-on, dead S2-topk removal, Minimax-M3 bindings. KEEP |
 | `vllm/model_executor/layers/utils.py` | 494+/60− | 50+/27− | L+G | fp32 router-gate GEMV (NH-3), `DENSE_GEMV`/`DOWN_GEMV` default-on, triton_matmul >2-D — **plus `SKINNY_M16` (default off)**. KEEP; split out the M16 hunk (see Table 2) |
@@ -93,8 +93,8 @@ passed and whose only open item is a default flip** (Kevin's call). The record, 
 switch:
 
 | flag | status in our own docs | recommendation |
-|---|---|---|
-| `VLLM_GFX906_SKINNY_M16` | **SHIPPED, not parked** — `DEVLOG-fp16-skinny.md`: 35B MoE N=8 graph **+14.5 %** (191.0 vs 166.9 t/s), 27B (Qwen3.8) N=8 **+6.1 %**, 27B N=4 control flat (−0.6 %, flag inert); kernel correctness + per-shape 2–7.5× PASS; *"the A/B arms are positive on both models and the flag-on soak passed (30 reps × 2 models, flat), so `VLLM_GFX906_SKINNY_M16=1` is cleared to go default-on; flipping it is Kevin's call"* | **FLIP, do not delete.** It covers the M=5..16 spec-verify / 5–16-seq concurrent-decode regime; today we leave the win unclaimed. Caveat on record: the ksplit>1 epilogue is fp16 `atomicAdd` (same property as the shipped M≤4 rail) | 
+| --- | --- | --- |
+| `VLLM_GFX906_SKINNY_M16` | **SHIPPED, not parked** — `DEVLOG-fp16-skinny.md`: 35B MoE N=8 graph **+14.5 %** (191.0 vs 166.9 t/s), 27B (Qwen3.8) N=8 **+6.1 %**, 27B N=4 control flat (−0.6 %, flag inert); kernel correctness + per-shape 2–7.5× PASS; *"the A/B arms are positive on both models and the flag-on soak passed (30 reps × 2 models, flat), so `VLLM_GFX906_SKINNY_M16=1` is cleared to go default-on; flipping it is Kevin's call"* | **FLIP, do not delete.** It covers the M=5..16 spec-verify / 5–16-seq concurrent-decode regime; today we leave the win unclaimed. Caveat on record: the ksplit>1 epilogue is fp16 `atomicAdd` (same property as the shipped M≤4 rail) |
 | `VLLM_GFX906_QUANT_LAYER0_MOE` | **GO, not parked** — `ROADMAP.md` C4 + `DEVLOG-c4-layer0-quant.md`: unquantized layer-0 experts cost ~740 µs/call vs 182 µs for the W4A16 rail ⇒ ~558 µs/step; gates all passed — unit 8/8, PPL 15.9531 → **15.9929** (Δ +0.04, gate < 0.5), greedy fingerprint bit-identical (`d2e5262183c6b92f`), serving A/B off 84.95 → **87.51 t/s = +3.0 %** (noise floor ~1.8 %); ~1.5 GiB returned to graph capture. Open item: *"default-on decision after soak"* | **FLIP (soak is a process call, the measurements are done), do not delete** — it is a quality trade-off the checkpoint author did not make, so it is Kevin's call, but the numbers are in |
 | `VLLM_GFX906_FUSED_DRAFT` | **live, not dead** — `tests/kernels/attention/test_gfx906_fa.py` "A3 (revived 2026-09-14 on the V2 bring-up branch)": the flag is the opt-in for the fused multi-step draft *metadata* protocol, whose consumer **is in-tree** (`v1/worker/gpu/spec_decode/autoregressive/speculator.py:_generate_fused_drafts`), pinned by **three tests** (flag, view contract, and an end-to-end reuse/corruption guard). `DEAD-ENDS.md`'s "has no reader in-tree now" is **stale** — the reader is the gfx906 FA builder, the attribute consumer is upstream V2 | **KEEP; fix the stale DEAD-ENDS row.** FD-1's *neutral* verdict was about the B=4/120k offline arm (stack-confounded), not about deleting the mechanism |
 | `VLLM_GFX906_MAMBA_FUSED_GROUP_NORM` | NH-4: gate **ran** 2026-08-30 (A–B–A, fresh boot/arm, TP=2+EP): A 109.8 / B 110.05 / A2 109.37 t/s = +0.4 % inside noise (the A-vs-A2 drift exceeds the effect), PPL 24.9034 vs 24.8944, 0 top-20 misses; isolated 68→55 µs/layer ≈ 0.29 ms/step, hidden by a MoE-GEMV-bound step. The dev log labels it SHIPPED with the flip documented as a one-liner for a config that stops being GEMV-bound; the in-code comment still says "pending the A/B" (stale) | strip is **behaviorally safe** (default-off, measured-neutral in the served config) and saves 23 conflict lines; keeping it costs the same 23 lines at merge. Genuinely optional — my default is keep, fix the comment |
@@ -103,6 +103,16 @@ switch:
 
 Switches already default-on (`ALIGN_M1`, `DENSE_GEMV`, `DOWN_GEMV`,
 `SORT_FREE_SMALL_K`, `SPEC_CG_SMALL`, `SPEC_GEMM`, `TOPK_SINGLE_GROUP`) are live.
+
+## Outcome (2026-09-18)
+
+Steps 1-3 executed: **both gated wins flipped to default-on** (SKINNY_M16, C4;
+`=0` kill switches, comments updated in the same commit, gate semantics verified
+and the house gates re-run), **NH-4 kept** with its comment corrected, and the
+**stale-verdict sweep** run (findings in the CHANGELOG entry for 2026-09-18; the
+standing rule is now `AGENTS.md` merge-train rule 6). Nothing was deleted, and no
+dead-code branch was created — the "off-by-default = parked" premise did not
+survive contact with the records.
 
 ## Proposed plan (revised after checking the records)
 

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """QSA-FN-4 gate: the tiled indexer route, selection + speed.
 
 Record: docs/gfx906/DEVLOG-qwen38-flash-qsa.md (4); run from the repo root.
@@ -37,11 +40,11 @@ BN, BM = 32, 16
 def bench(fn, it=20):
     for _ in range(5):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     t = time.time()
     for _ in range(it):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return (time.time() - t) / it * 1e6
 
 
@@ -113,7 +116,7 @@ def run(dt):
 
     lg_t, vb_t = op(uni)
     lg_p, _ = krn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     fin = torch.isfinite(lg_t) & torch.isfinite(lg_p)
     nrmse = (
         torch.linalg.vector_norm((lg_t - lg_p)[fin].float())

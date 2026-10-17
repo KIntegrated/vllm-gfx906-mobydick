@@ -87,9 +87,7 @@ def _quantize_fp16_to_moe_wna16(
         [N/2, G] uint8) with the packing documented in the module docstring.
     """
     N, K = w.shape
-    assert K % group_size == 0, (
-        f"K={K} not divisible by group_size={group_size}"
-    )
+    assert K % group_size == 0, f"K={K} not divisible by group_size={group_size}"
     G = K // group_size
 
     wf = w.float()
@@ -155,7 +153,9 @@ class C4QuantizedLayer0MoEMethod(UnquantizedFusedMoEMethod):
             logger.warning_once(
                 "C4: hidden/intermediate sizes (K13=%d, K2=%d) not divisible "
                 "by AWQ group_size=%d; keeping the unquantized path.",
-                K13, K2, group_size,
+                K13,
+                K2,
+                group_size,
             )
             super().process_weights_after_loading(layer)
             return
@@ -163,23 +163,19 @@ class C4QuantizedLayer0MoEMethod(UnquantizedFusedMoEMethod):
         device = w13.device
         logger.info(
             "C4: quantizing %d routed experts to int4 (group_size=%d) on %s",
-            E, group_size, device.type,
+            E,
+            group_size,
+            device.type,
         )
 
         q13 = torch.empty(E, N13, K13 // 2, dtype=torch.uint8, device=device)
-        s13 = torch.empty(
-            E, N13, K13 // group_size, dtype=w13.dtype, device=device
-        )
+        s13 = torch.empty(E, N13, K13 // group_size, dtype=w13.dtype, device=device)
         z13 = torch.empty(
             E, N13 // 2, K13 // group_size, dtype=torch.uint8, device=device
         )
         q2 = torch.empty(E, N2, K2 // 2, dtype=torch.uint8, device=device)
-        s2 = torch.empty(
-            E, N2, K2 // group_size, dtype=w2.dtype, device=device
-        )
-        z2 = torch.empty(
-            E, N2 // 2, K2 // group_size, dtype=torch.uint8, device=device
-        )
+        s2 = torch.empty(E, N2, K2 // group_size, dtype=w2.dtype, device=device)
+        z2 = torch.empty(E, N2 // 2, K2 // group_size, dtype=torch.uint8, device=device)
 
         # Quantize per expert (keeps temporaries small: one [N, K] fp32 at a
         # time). The loaded weights are contiguous logical tensors here —
@@ -259,21 +255,28 @@ class C4QuantizedLayer0MoEMethod(UnquantizedFusedMoEMethod):
             return self._wna16_method.supports_eplb
         return super().supports_eplb
 
-    def apply(self, layer, x, topk_weights, topk_ids, shared_experts,
-              shared_experts_input):
+    def apply(
+        self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
+    ):
         if self._c4_active and self._wna16_method is not None:
             return self._wna16_method.apply(
-                layer, x, topk_weights, topk_ids, shared_experts,
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                shared_experts,
                 shared_experts_input,
             )
         return super().apply(
-            layer, x, topk_weights, topk_ids, shared_experts,
+            layer,
+            x,
+            topk_weights,
+            topk_ids,
+            shared_experts,
             shared_experts_input,
         )
 
 
 def _register_param(layer, name: str, tensor: torch.Tensor) -> None:
     """Register a fresh (non-trainable) parameter on the experts module."""
-    layer.register_parameter(
-        name, torch.nn.Parameter(tensor, requires_grad=False)
-    )
+    layer.register_parameter(name, torch.nn.Parameter(tensor, requires_grad=False))
