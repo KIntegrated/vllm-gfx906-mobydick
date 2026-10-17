@@ -499,13 +499,27 @@ class HostTokenHistory:
     clustered at batch transitions. Blocking once is much the cheaper failure.
     """
 
-    def __init__(self, num_slots: int, width: int) -> None:
+    def __init__(
+        self, num_slots: int, width: int, vocab_bound: int | None = None
+    ) -> None:
         if num_slots <= 0 or width <= 0:
             raise ValueError(
                 f"num_slots and width must be positive, got {num_slots}, {width}"
             )
         self.num_slots = int(num_slots)
         self.width = int(width)
+        # Task #69: the ceiling a committed value must sit under to be a token id at
+        # all. Passed in by the model state from ``hf_text_config.vocab_size``; the
+        # fallback is NOT a vocab size and is labelled as such in the report, because
+        # "out of range" is only interesting if the reader knows which range. A bound
+        # that is too wide still catches the recycled-memory class (float bit patterns
+        # reinterpret as ~1e18 integers) and misses values that merely look like
+        # another request's ids -- which is exactly the split seen in the 148 logged
+        # disagreement events, so the wide bound is a real observation, not a shrug.
+        self.vocab_bound = int(vocab_bound) if vocab_bound else (1 << 31) - 1
+        self.vocab_bound_source = "vocab_size" if vocab_bound else "fallback-2p31"
+        self.bad_value_events = 0
+        self.last_bad_value = ""
         self.window = np.zeros((self.num_slots, self.width), dtype=np.int64)
         self.length = np.zeros(self.num_slots, dtype=np.int64)
         self._pending: list[_PendingCommit] = []
@@ -684,6 +698,74 @@ class HostTokenHistory:
         self.last_drop = detail
         return False
 
+    def _observe_committed(
+        self, row: object, slot: int, i: int, entry: "_PendingCommit"
+    ) -> None:
+        """Task #69. Look at a row about to be committed and record anything that
+        could not be a token id. OBSERVATION ONLY: it changes no control flow, drops
+        nothing, and never raises.
+
+        Why this exists. Across 148 logged host-vs-device disagreement events the
+        defect is one cell -- the newest -- read before the worker wrote it, and the
+        host values in that cell were either fused small integers or, reinterpreted
+        as two float32s, plausible floats ((0.0037, 0.00036), (985.15, -619.197)).
+        Five theories were eliminated statically (split-event lag, drain ignoring
+        invalidation, int64 fusion of two int32s, the ``-1`` sampler sentinel, and a
+        read-index error). What is left cannot be seen in source: ``async_copy_to_np``
+        is ``x.to("cpu", non_blocking=True).numpy()``, a FRESH host allocation per
+        step that the system allocator recycles, so the only way to tell "the block
+        handed over is not the block the copy wrote" from "the device wrote that
+        block" is to look at a live boot. This method is that look.
+
+        Each field is here because it separates two explanations:
+
+        * ``row[:8]`` versus the offending cell -- sane ids in the prefix and garbage
+          in the tail means the copy DID write this block and stopped short; garbage
+          across the whole row means nothing wrote it this step.
+        * ``addr`` -- the host address of the buffer the commit reads. Recycled
+          blocks show up as the same address carrying different content across
+          events, which is the allocator's signature; a monotonically new address per
+          step with the same content is not.
+        * ``bad_as_float32`` -- the reinterpretation, computed here so a log line is
+          evidence on its own instead of a number someone has to come back to.
+        * ``window_tail`` -- the cell the next step will actually feed, which is
+          ``window[slot, width-1]`` (both writers keep the newest token there for any
+          length), not the length-indexed cell it is tempting to read.
+
+        Cadenced rather than per-event: a boot where this fires every step is the
+        failure mode, and a log that says so 19 times a second is not evidence.
+        """
+        try:
+            arr = np.asarray(row)
+            if arr.size == 0:
+                return
+            bad = arr[(arr < 0) | (arr >= self.vocab_bound)]
+            if bad.size == 0:
+                return
+            self.bad_value_events += 1
+            if not (
+                self.bad_value_events <= 4 or self.bad_value_events % 64 == 0
+            ):
+                return
+            full = np.asarray(entry.sampled)
+            prefix = [int(v) for v in np.asarray(full[i])[:8]]
+            # int64 buffer re-read as two float32s: the check for the recycled-float
+            # class, in the same line as the integer that raised the alarm.
+            pair = np.asarray([int(bad[0])], dtype=np.int64).view(np.float32)
+            self.last_bad_value = (
+                f"#{self.bad_value_events} slot={slot} row={i} "
+                f"n={arr.size} bound={self.vocab_bound}"
+                f"({self.vocab_bound_source}) "
+                f"bad={[int(v) for v in bad[:4]]} "
+                f"bad_as_float32={[float(v) for v in pair]} "
+                f"row[:8]={prefix} "
+                f"addr=0x{int(getattr(getattr(entry.sampled, 'ctypes', None), 'data', 0)):x} "
+                f"shape={tuple(full.shape)} dtype={full.dtype} "
+                f"window_tail={int(self.window[slot, self.width - 1])}"
+            )
+        except Exception as exc:  # noqa: BLE001 - an instrument must not cost a boot
+            self.last_bad_value = f"observation failed: {type(exc).__name__}: {exc}"
+
     def drain(self, flush: bool = False) -> int:
         """Apply every queued commit whose copy has landed. Never blocks unless
         ``flush`` says to wait for the head.
@@ -736,7 +818,11 @@ class HostTokenHistory:
                     )
                     continue
                 if n:
-                    self.commit(int(entry.slots[i]), entry.sampled[i, :n])
+                    row = entry.sampled[i, :n]
+                    # Observation only (task #69): reads the row, records what it saw,
+                    # commits anyway. Committing is what this line always did.
+                    self._observe_committed(row, int(entry.slots[i]), i, entry)
+                    self.commit(int(entry.slots[i]), row)
                     applied += 1
         return applied
 

@@ -5650,3 +5650,26 @@ def test_the_final_coverage_line_cannot_break_worker_teardown(
     ]
     assert len(warns) == 1, warns
     assert "RuntimeError" in warns[0], warns[0]
+
+
+def test_the_instrument_appears_on_the_coverage_line(hostids_env) -> None:
+    """Task #69, and the same rule ``test_policy_off_appears_on_the_coverage_line``
+    states: an instrument that is not on the periodic line is not an instrument.
+
+    The counter is asserted ZERO on a healthy boot rather than absent, because the
+    failure this protects against is the misleading kind: a boot that never ran the
+    instrument and a boot that ran it and saw nothing must not print the same thing.
+    A missing field reads as "no anomalies" to whoever is grepping the log at 3am,
+    which is exactly how the #58 heartbeat gap stayed invisible for a whole boot.
+    """
+    st, _emb, input_batch, req_states = _armed_state(hostids_env)
+    st._stage_host_ple_ids(input_batch, req_states, cudagraph_mode=CUDAGraphMode.FULL)
+
+    line = st._ple_host_coverage()
+    assert "bad=0" in line, line
+
+    # And the ~200-char detail rides along only once there is something to report.
+    st._ple_host_history.bad_value_events = 3
+    st._ple_host_history.last_bad_value = "#3 slot=2 row=0 n=2 addr=0xdeadbeef"
+    line = st._ple_host_coverage()
+    assert "bad=3/#3 slot=2 row=0 n=2 addr=0xdeadbeef)" in line, line

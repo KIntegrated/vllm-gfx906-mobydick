@@ -362,7 +362,18 @@ class Qwen4ExpModelState(MambaHybridModelState):
         # stage. The size comes from the ngram config, so the mirror is correct
         # whether or not ids are ever staged on the host.
         self._ple_host_history = HostTokenHistory(
-            self.max_num_reqs, self.ngram_context_len + 1
+            self.max_num_reqs,
+            self.ngram_context_len + 1,
+            # Task #69: the ceiling that separates "token id" from "recycled host
+            # block". Guarded twice because hf_text_config is HF-specific and
+            # vocab_size is not guaranteed on every wrapper: a missing attribute
+            # degrades to the wide fallback inside HostTokenHistory, it does not
+            # cost a boot.
+            vocab_bound=getattr(
+                getattr(self.model_config, "hf_text_config", None),
+                "vocab_size",
+                None,
+            ),
         )
         self._ple_host_slots: dict[str, int] = {}
 
@@ -2179,7 +2190,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
             f"post_disable="
             f"{'zero' if getattr(self, '_ple_disabled_zero', False) else 'eager' if getattr(self, '_ple_disabled_eager', False) else 'replay'} "
             f"mirror(staged={hist.staged} dropped={hist.dropped} "
-            f"sliced={hist.sliced} flushes={hist.flushes} pending={hist.pending}) "
+            f"sliced={hist.sliced} flushes={hist.flushes} pending={hist.pending} "
+            # Task #69: the count is always printed (zero is the answer on a healthy
+            # boot); the detail only rides along when it is non-zero, because the
+            # detail is ~200 chars of evidence and this line prints on cadence.
+            f"bad={hist.bad_value_events}"
+            f"{('/' + hist.last_bad_value) if hist.bad_value_events else ''}) "
             f"resync={self._ple_resyncs} "
             f"mirror_ahead={self._ple_resync_mirror_ahead} "
             f"mirror_offset={self._ple_resync_mirror_offset} "
@@ -2244,11 +2260,20 @@ class Qwen4ExpModelState(MambaHybridModelState):
             return
         self._ple_coverage_logged_at_shutdown = True
         try:
+            coverage = self._ple_host_coverage()
             logger.info(
                 "PLE HOSTIDS: FINAL coverage at %s. %s",
                 reason,
-                self._ple_host_coverage(),
+                coverage,
             )
+            # Belt and braces: the same line, appended straight to a file.
+            # The logger line above travels from the TP worker to the log file
+            # through vLLM's log forwarding, and nothing in the teardown order
+            # guarantees that pipe is still alive when Worker.shutdown() runs --
+            # boots 20261011-072549 / -123104 ended with the hook armed and no
+            # FINAL line anywhere in the log, in neither its success nor its
+            # failure form. A plain write(2) cannot be lost that way.
+            self._ple_coverage_write_file(reason, coverage)
         except Exception as exc:  # pragma: no cover - teardown path
             logger.warning(
                 "PLE HOSTIDS: could not print the final coverage line (%s: %s); "
@@ -2256,6 +2281,24 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 type(exc).__name__,
                 exc,
             )
+
+    def _ple_coverage_write_file(self, reason: str, coverage: str) -> None:
+        """Append the FINAL coverage line to ``$LOG_DIR/ple-hostids-final.log".
+
+        One line per worker per boot, so four lines for a TP=4 boot. Never
+        raises: this is a teardown path, and a coverage sink must not be able
+        to hold a GPU. Set ``VLLM_GFX906_PLE_FINAL_FILE=0`` to disable.
+        """
+        if os.environ.get("VLLM_GFX906_PLE_FINAL_FILE", "1") == "0":
+            return
+        path = os.path.join(os.environ.get("LOG_DIR") or ".", "ple-hostids-final.log")
+        try:
+            with open(path, "a") as fh:
+                fh.write(
+                    f"{time.time():.3f} pid={os.getpid()} reason={reason} {coverage}\n"
+                )
+        except OSError:
+            pass
 
     def _full_graph_captured_this_boot(self) -> bool:
         """True once a FULL graph has captured the staged branch. Boot-global.

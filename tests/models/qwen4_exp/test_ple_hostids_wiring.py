@@ -523,3 +523,61 @@ def test_worker_teardown_prints_the_final_coverage_line_before_it_can_be_lost() 
     assert hasattr(
         Qwen4ExpModelState, "log_staging_coverage_at_shutdown"
     ), "the runner calls a method the model state does not have"
+
+
+def test_final_coverage_line_is_written_straight_to_a_file(tmp_path, monkeypatch):
+    """The FINAL line must not depend on vLLM's log forwarding surviving teardown.
+
+    Two boots on 2026-10-11 ended with the veto ARMED (all four ranks printed the
+    arming line) and NO FINAL coverage line in the log -- not the line, not its
+    failure form. The logger call travels worker -> forwarder -> file and the
+    teardown order does not promise the forwarder is still alive when
+    Worker.shutdown() runs, so the same content also goes to $LOG_DIR via write(2).
+    """
+    from vllm.models.qwen4_exp.amd.model_state import Qwen4ExpModelState
+
+    class _State:
+        """Only what the hook touches. The helper must be the REAL one: a
+        SimpleNamespace without it makes the hook swallow an AttributeError and
+        the test passes for the wrong reason."""
+
+        _ple_host_coverage = lambda self: "staged_steps=7 dropped=1 bad=2/mirror-tail"
+        _ple_coverage_write_file = Qwen4ExpModelState._ple_coverage_write_file
+
+    monkeypatch.setenv("LOG_DIR", str(tmp_path))
+    monkeypatch.delenv("VLLM_GFX906_PLE_FINAL_FILE", raising=False)
+    obj = _State()
+
+    Qwen4ExpModelState.log_staging_coverage_at_shutdown(obj, "test-teardown")
+
+    written = (tmp_path / "ple-hostids-final.log").read_text()
+    assert "staged_steps=7" in written
+    assert "reason=test-teardown" in written
+
+    # Idempotent through the same flag the logger path uses: a doubled FINAL line
+    # is a false second data point in a boot log, and now in the sink too.
+    Qwen4ExpModelState.log_staging_coverage_at_shutdown(obj, "second-call")
+    assert len((tmp_path / "ple-hostids-final.log").read_text().splitlines()) == 1
+
+
+def test_final_coverage_file_sink_is_opt_out_and_cannot_raise(tmp_path, monkeypatch):
+    from vllm.models.qwen4_exp.amd.model_state import Qwen4ExpModelState
+
+    class _State:
+        _ple_host_coverage = lambda self: "staged_steps=0"
+        _ple_coverage_write_file = Qwen4ExpModelState._ple_coverage_write_file
+
+    monkeypatch.setenv("LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_GFX906_PLE_FINAL_FILE", "0")
+    obj = _State()
+
+    Qwen4ExpModelState.log_staging_coverage_at_shutdown(obj, "test")
+    assert not (tmp_path / "ple-hostids-final.log").exists()
+
+    # A LOG_DIR that cannot be written must not break teardown: the hook swallows
+    # it and still reports, rather than being the reason a worker keeps its GPU.
+    # Fresh object: the idempotence flag from the call above would otherwise make
+    # this assertion pass without ever attempting the write.
+    monkeypatch.setenv("VLLM_GFX906_PLE_FINAL_FILE", "1")
+    monkeypatch.setenv("LOG_DIR", "/proc/definitely-not-writable")
+    Qwen4ExpModelState.log_staging_coverage_at_shutdown(_State(), "unwritable")

@@ -468,3 +468,175 @@ def test_padded_rows_with_out_of_range_counts_still_stage():
     assert history.drain() == 1
     assert history.window[0].tolist() == [0, 1, 6]
     assert history.length[0] == 2
+
+
+# --------------------------------------------------------------------------------
+# Task #69: the drain-time anomaly instrument.
+#
+# The instrument exists because five explanations for the host mirror's bad newest
+# cell were eliminated statically and the sixth cannot be seen in source: the values
+# logged at drain are recycled allocator bytes, and `async_copy_to_np` allocates a
+# FRESH host block per step. Telling "the block handed over is not the block the copy
+# wrote" from "the device wrote that block" needs a live boot, so the instrument has
+# to be inert, must never raise, and has to be tested for exactly those two
+# properties before it is ever allowed near a serving engine.
+# --------------------------------------------------------------------------------
+
+# Boot #14's reported value where a token id belongs. Reinterpreted as two float32s
+# this is (0.0037265, 0.000364706) -- plausible floats, which is the whole clue.
+GARBAGE = 4161103993993705554
+
+
+class _Entry:
+    """Just enough of ``_PendingCommit`` for the instrument's own unit tests."""
+
+    def __init__(self, sampled) -> None:
+        self.sampled = sampled
+
+
+def _stage_i64(history, slots, rows, counts, done=None):
+    """``_stage`` with an int64 matrix.
+
+    The production ``sampled`` arrives via ``async_copy_to_np(...).numpy()`` from the
+    sampler's int64 output, and the recycled-block values are 64-bit, so a test that
+    wants to reproduce one cannot use the int32 matrix ``_stage`` builds.
+    """
+    width = max(len(r) for r in rows)
+    matrix = np.zeros((len(rows), width), dtype=np.int64)
+    for i, row in enumerate(rows):
+        matrix[i, : len(row)] = row
+    return history.stage_step(
+        np.array(slots, np.int32),
+        matrix,
+        np.array(counts, np.int32),
+        done,
+    )
+
+
+def test_instrument_is_inert_when_every_value_is_a_token_id():
+    history = HostTokenHistory(SLOTS, W, vocab_bound=1000)
+    assert _stage(history, [0], [[7, 9, 11]], [3], FakeEvent(done=True))
+    assert history.drain() == 1
+    assert history.bad_value_events == 0
+    assert history.last_bad_value == ""
+
+
+def test_out_of_range_value_is_observed_but_still_committed():
+    # OBSERVATION ONLY is the load-bearing property, so it is asserted on the window
+    # rather than on a flag: if the instrument changed what gets committed, the
+    # garbage would be missing from the mirror and the instrument would itself be a
+    # correctness bug on the serving path.
+    history = HostTokenHistory(SLOTS, W, vocab_bound=1000)
+    assert _stage_i64(history, [0], [[GARBAGE, 5]], [2], FakeEvent(done=True))
+    assert history.drain() == 1
+    assert history.bad_value_events == 1
+    assert history.window[0, W - 1] == 5  # newest in the tail cell, as always
+    assert history.window[0, W - 2] == GARBAGE  # committed, not skipped
+    assert history.dropped == 0
+
+
+def test_report_carries_the_fields_that_discriminate_the_remaining_theories():
+    history = HostTokenHistory(SLOTS, W, vocab_bound=1000)
+    _stage_i64(history, [0], [[9, GARBAGE]], [2], FakeEvent(done=True))
+    history.drain()
+    detail = history.last_bad_value
+    # Each of these separates two explanations; see the method's docstring.
+    for field in (
+        "slot=0",
+        "row=0",
+        "bound=1000(vocab_size)",
+        "bad=[",
+        "bad_as_float32=[",
+        "row[:8]=[",
+        "addr=0x",
+        "window_tail=",
+    ):
+        assert field in detail, f"{field!r} missing from {detail!r}"
+    # And the address has to be a REAL one. Asserting only that the field exists
+    # would be satisfied by a stub that always printed 0x0, which is exactly what a
+    # recycled-block investigation cannot use: the address is the field that
+    # separates "wrong block" from "device wrote it", so a constant is not a
+    # degraded report, it is no report.
+    assert "addr=0x0 " not in detail, "numpy source must report its real address"
+    assert int(detail.split("addr=0x")[1].split()[0], 16) > 0
+
+
+def test_float_pair_is_the_actual_reinterpretation_not_a_plausible_one():
+    # Computed independently here. A printed bit pattern that is subtly wrong is
+    # worse than no printed bit pattern: it is the evidence someone quotes at each
+    # other, and this project has already been bitten by a number written into a
+    # document without being computed.
+    expected = float(np.asarray([GARBAGE], dtype=np.int64).view(np.float32)[0])
+    history = HostTokenHistory(SLOTS, W, vocab_bound=1000)
+    _stage_i64(history, [0], [[GARBAGE]], [1], FakeEvent(done=True))
+    history.drain()
+    assert repr(expected) in history.last_bad_value
+    assert 1e-4 < expected < 1e-2  # not denormal, not huge: a plausible logit
+
+
+def test_a_missing_vocab_bound_falls_back_wide_and_says_so():
+    # The fallback catches the recycled-float class (bit patterns re-read as int64
+    # are astronomically large) and CANNOT catch a value that is merely another
+    # request's id. Both halves are asserted, because the limitation is the part an
+    # operator would otherwise assume away.
+    history = HostTokenHistory(SLOTS, W)
+    assert history.vocab_bound == (1 << 31) - 1
+    assert history.vocab_bound_source == "fallback-2p31"
+    _stage_i64(history, [0], [[GARBAGE]], [1], FakeEvent(done=True))
+    history.drain()
+    assert history.bad_value_events == 1
+    assert "fallback-2p31" in history.last_bad_value
+
+    other = HostTokenHistory(SLOTS, W)
+    _stage_i64(other, [0], [[231807]], [1], FakeEvent(done=True))
+    other.drain()
+    assert other.bad_value_events == 0, "wide bound must not pretend to catch this"
+
+
+def test_a_negative_value_is_out_of_range_by_definition():
+    # ``PLACEHOLDER_TOKEN_ID = -1`` is the sampler's padding sentinel, and zero -1
+    # values appeared in the 148 logged events -- so if this ever fires on a real
+    # boot, it is an overrun, not padding.
+    history = HostTokenHistory(SLOTS, W, vocab_bound=1000)
+    _stage_i64(history, [0], [[-1]], [1], FakeEvent(done=True))
+    history.drain()
+    assert history.bad_value_events == 1
+
+
+def test_report_is_cadenced_not_per_event():
+    history = HostTokenHistory(SLOTS, W, vocab_bound=1000)
+    for _ in range(8):
+        _stage_i64(history, [0], [[GARBAGE]], [1], FakeEvent(done=True))
+        history.drain()
+    assert history.bad_value_events == 8
+    # The counter keeps counting; only the ~200-char detail is cadenced (1..4, then
+    # every 64th). A boot where this fires every step is the failure mode, and 19
+    # identical lines a second is not evidence of it.
+    assert history.last_bad_value.startswith("#4 ")
+
+
+def test_instrument_reports_a_source_with_no_ctypes_at_all():
+    # ``entry.sampled`` is a numpy view today, but an instrument on the serving path
+    # may not assume that forever: a torch tensor has no ``.ctypes``. The address is
+    # reported as 0 rather than raising.
+    history = HostTokenHistory(SLOTS, W, vocab_bound=1000)
+    history._observe_committed(
+        np.array([GARBAGE], np.int64), 0, 0, _Entry([[GARBAGE, 1, 2, 3]])
+    )
+    assert "addr=0x0 " in history.last_bad_value
+    assert history.bad_value_events == 1
+
+
+def test_instrument_cannot_cost_a_boot():
+    # The instrument must never raise, whatever the row is. This is not defensive
+    # programming for its own sake: a module with no logger and no exceptions is
+    # this file's existing contract, and breaking it turns a diagnostic into an
+    # outage on a box that serves traffic.
+    class Exploding:
+        def __array__(self, dtype=None):  # noqa: ANN001
+            raise RuntimeError("boom")
+
+    history = HostTokenHistory(SLOTS, W, vocab_bound=1000)
+    history._observe_committed(Exploding(), 0, 0, _Entry([[1, 2]]))
+    assert history.bad_value_events == 0
+    assert "observation failed" in history.last_bad_value
