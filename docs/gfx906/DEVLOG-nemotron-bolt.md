@@ -181,3 +181,35 @@ Candidate causes, not yet separated:
 prompt (distinguishes 1 from 2), and run the same drafter against a BF16 target
 if one fits; if it is the Triton path, the sink/non-causal/SWA handling in
 `triton_attn.py` is the place to look.
+
+## 2026-10-17 (later) — lab fixes ported; the LiLiCorr 0-acceptance survives the fp16 rescale
+
+Ported from `0c33/mi50-vllm-lab` (Apache-2.0; README "Ported optimizations"):
+the DFlash2/LiLiCorr **fp16 residual rescale** (`cc9e994ac9`), the **non-causal
+sliding window** in the custom FA + its freed-block test (`3161af4cda`), and the
+**triton_attn** `getattr(..., None)` form (`a7b29d3c4c`). The test suites also
+surfaced a merge miss of my own: upstream's
+`test_context_kv_uses_quantized_projection_fallback` (from the LiLiCorr PR
+#57934) — the fork's `_dense_kv_rows` had replaced upstream's per-projection
+fallback instead of sitting behind it (`7763dd7ee1`).
+Suites: `test_dflash2` + `test_dflash_causality` + `test_gfx906_fa` = 133
+passed / 10 skipped.
+
+**The LiLiCorr drafter still accepts 0.** With the rescale active (log:
+`Draft in float16: residual stream scaled by 1/32
+(VLLM_LILICORR_FP16_RESIDUAL_DIVISOR…)`), 3 requests gave
+drafts=285, draft_tokens=1995, **accepted=0, position-0 accepted=0**, 17.9 t/s
+(vs 48.7 non-spec). So the fp16 residual overflow is **not** the LiLiCorr
+failure mode: either its stream does not overflow at this divisor, or the cause
+is elsewhere (the draft's candidates, the LiLiCorr lattice scoring, or the
+target aux-hidden capture for the Omni target). The port itself stands — it is
+output-preserving and is the lab's measured DFlash2 fix (10.2 → 48.4 t/s).
+
+Note the window fix does not touch this gate either: the LiLiCorr drafter runs
+`TRITON_ATTN` (the custom FA has no attention sinks), and it fails at short
+context, before the freed-block regime.
+
+**Next diagnostic:** dump the draft's per-slot top-1 (and the target's chosen
+token) on a fixed prompt, and the aux-hidden magnitudes the drafter receives
+(`target_layer_ids` [1,18,35,51,68,85]) — that separates "draft produces
+garbage" from "lattice/candidate scoring broken" from "wrong target features".
