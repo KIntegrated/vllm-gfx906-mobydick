@@ -362,3 +362,33 @@ disappears, but `current_platform.get_device_name()` changes from
 order). `on_gfx906()` is `True` either way, so nothing breaks, but there is no
 functional gain on this host — the lab needed it for container amdsmi boot
 failures, which we do not have. Documented and dropped.
+
+### BOLT-2 discrimination — the backend is not the cause
+
+Four arms, same two prompts (3 greedy reps each; `acc/draft`):
+
+| arm | drafter backend | sinks | prefill chunk | 2.5k | 7.3k |
+|---|---|---|---|---|---|
+| control | TRITON_ATTN | on | 4096 | 5.52, 5.52, 5.52 | 1.0, 1.0, 5.65 |
+| A | TRITON_ATTN (`attention_backend`) | **off** | 4096 | 5.38, 2.18, 5.38 | **1.0, 5.65, 1.0** |
+| D | **CUSTOM (gfx906 FA)** | **off** | 4096 | 5.52, 5.38, 5.65 | **1.0, 5.65, 1.0** |
+| E | TRITON_ATTN | on | **8192 (single chunk)** | 5.52, 5.38, 5.38 | **5.65, 1.0, 1.0** |
+
+**Widening the custom FA would not fix it.** The custom FA reproduces the
+collapse with the *same values* (1.0 and 5.65) as Triton, and the sink path is
+irrelevant (arm A), as is prefill chunking (arm E). 2.5k is stable in every arm;
+the trigger is context length, and the failure is intermittent on identical
+input — so it is state in the **drafter's context/KV path** (speculator side),
+not the attention implementation.
+
+Arm D also exposed a genuine fork bug: with the sink bias dropped the custom FA
+becomes eligible for the drafter, and the engine died on
+`Gfx906FABackend.get_supported_kernel_block_sizes() takes 0 positional
+arguments but 1 was given` — v0.31 added a `kv_cache_spec` argument that the
+fork's override never got, unreachable until today. Fixed in `68e00234c2` with
+a merge-drift guard test that fails on the old signature.
+
+Next for #54: instrument the drafter's attention metadata at 2.5k vs 7.3k
+(`seqused_k`, window, causal, block-table span) plus the number of context slots
+`precompute_and_store_context_kv` actually writes; then poison the drafter's KV
+cache with NaN and see whether the draft output depends on the poisoned region.
