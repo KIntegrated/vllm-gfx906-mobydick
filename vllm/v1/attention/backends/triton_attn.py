@@ -258,9 +258,13 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
-            # seq_lens_cpu was removed from CommonAttentionMetadata in v0.30;
-            # the upper bound is the CPU replacement (precise for prefill rows).
-            seq_lens_cpu=common_attn_metadata.seq_lens_cpu_upper_bound,
+            # 0.30.0 removed CommonAttentionMetadata.seq_lens_cpu (#55353); only
+            # the opt-in torch-SDPA fast paths read it and they skip when it is
+            # None (can_use_torch_sdpa_{prefill,mtp_decode} both return False).
+            # An upper bound must NOT be substituted: it would enable the MTP
+            # decode path with an over-estimated length. Fix ported from
+            # 0c33/mi50-vllm-lab (Apache-2.0, github.com/0c33/mi50-vllm-lab).
+            seq_lens_cpu=getattr(common_attn_metadata, "_seq_lens_cpu", None),
             seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
             is_prefilling=common_attn_metadata.is_prefilling,
             block_table=block_table_tensor,
