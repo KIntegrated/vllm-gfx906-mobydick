@@ -81,3 +81,41 @@ router gates bf16-f32 (unquantized).
 **Next**: A/B the router/unquantized-path precision, compare a greedy
 decode against a short fp32 reference on a fixed prompt set, and try the
 NVIDIA chat template variant with `medium_effort`/reasoning-effort set.
+
+## 2026-10-16 (later) — the repetition is a chat-template/reasoning-effort issue, not dequant
+
+**VERDICT:** the `<think>` loop is fixed by the template args · **GATE:** chat answers.
+
+The model needs the template's **reasoning-effort hint**: with
+`chat_template_kwargs={"enable_thinking": true, "medium_effort": true}` (the
+template appends `{reasoning effort: efficient}` to the last user message) the
+loop disappears and the model answers normally:
+
+- "What is 84 * 3 / 2?" -> reasoning "84 * 3 = 252. 252 / 2 = 126." +
+  content `126` (stop).
+- "capital of France/Japan" -> `Paris.` / `Tokyo.`
+- first five primes -> `2 3 5 7 11`.
+- Without `medium_effort` the same requests emit `<think>` / `<think></think>`
+  forever (V1 and V2 alike); the reasoning parser is not involved (raw
+  `/v1/completions` with the exact chat ids reproduces it).
+
+Residual quality (QUALITY-OPEN): arithmetic is unreliable (17*23 -> 413,
+3 KiB -> 3096), some prompts never close the think block within a normal
+`max_tokens` (empty content; `force_nonempty_content` exists for that), and a
+few still repeat with a stray `</s></think>`. The template knobs are
+**per-request** in 0.31.0 — there is no `--default-chat-template-kwargs` CLI
+flag — so clients must send them. Leading residual cause is still the
+bf16-calibrated checkpoint running on fp16 (gfx906 has no bf16).
+
+## Official `nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB` — NOT runnable on gfx906
+
+**VERDICT:** DEAD-END for this box. The card documents **ModelOpt** quant:
+routed+shared experts at **IQ2-XXS (2.0625 bits, ggml-style block packing)**,
+Mamba layers at **NVFP4** (4-bit float, group 16), embeddings/output at
+**Q8_0**. Hardware compatibility is stated as **NVIDIA Blackwell SM120/SM121**
+(RTX 5090 / Spark), and the recipe needs a vLLM *nightly*
+(`nightly-77154ca6116…`) plus `vllm download-kernels` (the IQ2/NVFP4 kernels
+are CUDA/Blackwell artefacts). gfx906 has no FP4 and no IQ2 packing path in
+vLLM 0.31.0's `modelopt`/compressed-tensors stack, so the 2-bit experts would
+not dequant at all — and even the FP4 Mamba layers are unsupported. The
+41 GB AutoRound W4A16 build is the runnable choice here (this log).
