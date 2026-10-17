@@ -195,6 +195,17 @@ whether int8 KV is worth it on 32 GB cards.
 `prep_inputs` / `attn_metadata` / `ctx_kv` / `gen_draft` ms/step regions — the
 resolution our spec A/Bs keep missing. Only if graph-safe and <1 % overhead.
 
+### LAB-7 — blocking-sync `.pth` for TP≥2 · [#55](../../issues/55)
+
+HIP `hipSetDeviceFlags(4)` shim. A diagnostic lever for the "sync-cadence collapse while plain
+decode is fine" wedge family, not a default; record the ms/step delta on a healthy boot.
+
+### LAB-8 — port the lab's bench harnesses · [#56](../../issues/56)
+
+`bench.py` (prefill-excluded t/s), `longctx.py`, and `agentctx.py` — the last builds the prompt from
+**distinct** source files, unlike our repeated-filler probes, which inflate speculative acceptance.
+Re-run BOLT-2's 2.5k-vs-7.3k discrimination with it before any fix is claimed.
+
 ### DFLASH2-GATE — validate the ported DFlash2 fixes · [#51](../../issues/51)
 
 The rescale and window fix are unit-tested but not yet proven on hardware here.

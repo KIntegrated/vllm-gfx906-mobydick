@@ -120,3 +120,27 @@ re-port, and the `.so` a rebuild. Expect the DFlash2/MTP numbers to carry.
 (`docs/gfx906/DEVLOG-dflash2.md`, DFL2-*), (4) is a kernel train that overlaps
 our own M≤8 GEMV work (`SKINNY_M16`, `_gfx906_spec_gemv_m4`) — compare before
 adopting rather than layering both.
+
+## Coverage audit (2026-10-17)
+
+Every file in `0c33/mi50-vllm-lab` mapped to its disposition here. Sources are
+copied with attribution headers; hooks are opt-in.
+
+| lab file | status | where |
+|---|---|---|
+| `patches/vllm/qwen3_dflash2.patch` | **ported** | `cc9e994ac9` + `031fa0e4b2` (LiLiCorr needs divisor 2048, not 32) |
+| `patches/vllm/gfx906_fa_paged.patch` | **ported** | `3161af4cda` + freed-block test |
+| `patches/vllm/triton_attn.patch` | **ported** | `a7b29d3c4c` |
+| `kernels/skinny.cu` + `patches/vllm/utils.patch` | **ported** | `69ff678002` (`tools/gfx906_skinny/`, M≥2 gate) |
+| `kernels/w4.cu` + `patches/vllm/exllama.patch` | **ported** | `69ff678002` |
+| `kernels/hostar.cu` + `cuda_communicator.patch` + `gfx906_host_allreduce.py` | **ported** | `69ff678002` |
+| `kernels/{build,bench_skinny,bench_w4,check_w4,test_hostar}.py` | **ported** | `tools/gfx906_skinny/` (all run; `bench_w4.py` copied, not yet run) |
+| `docker/gfx906-amdsmi-first.pth` | tested, **not adopted** | LAB-4 (#48), `2768e5d7d1` |
+| `docker/gfx906-blocking-sync.pth` | **open** | LAB-7 (#55) |
+| `patches/vllm/gfx906_steptimer.py` + `model_runner.patch` + `dflash_speculator.patch` | **open** | LAB-6 (#50) |
+| `serve/serve-agent.sh` (int8 KV, 200k, segments) | **open** | LAB-5 (#49) — parameters captured in the issue |
+| `serve/{serve,serve-dflash2,common}.sh` | recipe only | superseded by our own launch scripts; no code |
+| `bench/{bench,longctx,agentctx}.py` | **open** | LAB-8 (#56) — `agentctx.py` matters: distinct sources, not a repeated filler |
+| `docker/{vllm,opt}.Dockerfile`, `build-opt.sh`, `requirements/` | **not applicable** | the fork runs from the venv, not a container; derived from MIT `mixa3607/ML-gfx906` |
+| `upstream/pr-dflash2/0001–0003`, `upstream/pr-triton-attn/0001` | **ported** | the three fixes above (0003 is prose) |
+| `docs/RESULTS.md`, `docs/charts/*` | reference | numbers re-measured here; recorded in `DEVLOG-nemotron-bolt.md` |
