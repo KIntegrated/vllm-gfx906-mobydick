@@ -251,3 +251,43 @@ drafter ran on the custom FA, which refuses this drafter (no sink support).
 **Next discriminators (one boot each):** `VLLM_LILICORR_FP16_RESIDUAL_DIVISOR`
 256/1024 (overflow), then a drafter-eager run with per-layer NaN dumps (mask /
 kernel).
+
+**VERDICT (2026-10-17): the LiLiCorr drafter works — the lab's rescale needs divisor
+2048 for this architecture, not 32.**
+`/biglocal/models/SergiioB/Nemotron-3.5-Bolt-74B-A9B-AutoRound-W4A16-G128-sym`
+(TP=2, fp16) + the bf16 LiLiCorr drafter, k=7, graphs: **39 drafts / 264 accepted
+= 6.77 tokens per step**, acceptance 100 % at positions 0–3, **96.2 t/s** over
+three 96-token requests (vs **48.7** non-spec and **17.9** with the broken
+drafter). Greedy output unchanged.
+
+Root cause and the fix (both measured, not guessed):
+
+- **The drafter's grouped dynamic conv overflows fp16.** Per-layer bisect
+  (eager run, `DFlash2Qwen3DecoderLayer.forward` traces at L0):
+
+  ```
+  L0 in_hidden         absmax=0.166   nan=0
+  L0 attn_out          absmax=716     nan=0
+  L0 attn_conv_finish  absmax=inf     ← `_grouped_conv`: 716 × |tap| (≤151)
+  L0 post_attn_ln      nan=7
+  ```
+
+  The conv taps are the *learned* `base_kernel` (+ a small projected delta), so
+  the gain (~150×) is **not** scaled by the residual rescale, and it is applied
+  after the attention **and** again after the MLP. With the DFlash2 value (32)
+  the attention conv alone hits 1.1e5; at 128 the attention conv fits (46k) but
+  the MLP conv overflows (`mlp_out` 470 × ~150); the unscaled stream is ~4e7 by
+  the last layer, i.e. fp16 needs a divisor >~1024. At **2048** every layer is
+  finite with ~3.5× headroom (L4 `mlp_conv_finish` 18.7k) and acceptance is
+  6.77/7. The lab's 32 was calibrated on the conv-less z-lab DFlash2 drafter.
+
+- The rescale itself is still output-preserving here: every branch reads the
+  stream through an RMSNorm, and the conv is linear in the branch output (the
+  `base_kernel` term dominates the projected delta), so a uniform divisor only
+  changes the representation, not the result — confirmed by the greedy output
+  matching the non-spec arm token for token.
+
+Implementation: `fit_residual_stream_to_fp16(..., default_divisor=2048.0)` at the
+LiLiCorr call site (DFlash2 keeps 32); `VLLM_LILICORR_FP16_RESIDUAL_DIVISOR`
+still overrides, `=1` disables. Values 32/128/256 were each tested and fail
+(128: MLP conv inf; 256: layers 0–1 finite, L4 NaN).

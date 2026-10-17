@@ -548,6 +548,13 @@ class LiLiCorrForCausalLM(DFlashQwen3ForCausalLM):
         # (DFlashQwen3Model.forward returns self.norm(...)) and the anchor is the
         # target's, so the fp16 residual rescale leaves every draft output
         # unchanged -- same argument as DFlash2's candidate selector.
+        # The grouped dynamic conv multiplies every sublayer output by its
+        # learned taps (|base_kernel| up to ~150 here, and again after the MLP),
+        # so the unscaled stream reaches ~4e7 by the last layer: fp16 needs
+        # >~1024 rather than the DFlash2 (conv-less) 32. 2048 keeps ~3.5x
+        # headroom; a smaller divisor NaNs in the layer-0 MLP conv.
         fit_residual_stream_to_fp16(
-            self.model.layers, "VLLM_LILICORR_FP16_RESIDUAL_DIVISOR"
+            self.model.layers,
+            "VLLM_LILICORR_FP16_RESIDUAL_DIVISOR",
+            default_divisor=2048.0,
         )
