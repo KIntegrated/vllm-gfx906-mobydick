@@ -70,6 +70,15 @@ Feature, not bugfix; on gfx906 also a 4.4× kernel win. Shared
 `common/qsa_cache.py` edits must stay dtype-general (no CUDA path change); the
 upstream copy has moved (103/25). Needs a model eval arm we cannot run here.
 
+### U6 — upstream the DFlash context-KV row-0 fix · [#57](../../issues/57)
+
+Upstream regression (#57632): the drafter's context KV is stored from row
+`num_context` instead of row 0, so a prefill step never writes its first rows and
+draft acceptance collapses to 1.0 on prompts above ~4k. One-line fix in
+`dflash/speculator.py`, validated here (6.4k: 1.0 → 3.75–5.94/step); issue text,
+diff and model-eval numbers are pre-written in [#57](../../issues/57). Human
+submitter required (`AGENTS.md` §1). Ref: `UPSTREAM-dflash-context-kv.md`.
+
 ## Next — 0.30-post and 0.31
 
 ### QSA-FN-10 — next tester measurement list · [#5](../../issues/5)
