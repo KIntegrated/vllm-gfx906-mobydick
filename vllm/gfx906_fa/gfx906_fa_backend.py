@@ -614,6 +614,15 @@ class Gfx906FABackend(AttentionBackend):
                     f"padding: head_size={spec.head_size} would pad to "
                     f"{_padded_head_size(spec.head_size)}. Set "
                     "GFX906_FA_PACKED=0 for this model.")
+            if spec.page_size_padded is not None:
+                # The skip-quant path (kv_cache_dtype_skip_layers) reconciles
+                # pages across layers by padding them to skip_page_size_padded;
+                # the packed cell is not a two-half row, so publishing it while
+                # clearing that hint would silently drop the reconciliation.
+                raise NotImplementedError(
+                    "GFX906_FA_PACKED cannot honour a padded page size "
+                    f"(page_size_padded={spec.page_size_padded}) from the "
+                    "skip-quant path. Set GFX906_FA_PACKED=0 for this model.")
             cell = _packed_cell_bytes(spec.head_size)
             k_row = _packed_k_row_bytes(spec.head_size)
             base_cell = (spec.head_size + (spec.head_size_v or spec.head_size)) * (

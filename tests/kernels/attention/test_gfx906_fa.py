@@ -4219,6 +4219,11 @@ def test_packed_customize_spec_publishes_the_cell_and_refuses_unsupported(
     # A dim that would need head padding would slice inside the Q8 K region.
     with pytest.raises(NotImplementedError, match="require"):
         backend.Gfx906FABackend.customize_spec(spec(80))
+    # A padded page size (skip-quant reconciliation) must fail closed rather
+    # than be silently dropped.
+    padded_page = dataclasses.replace(spec(128), page_size_padded=1024)
+    with pytest.raises(NotImplementedError, match="padded page size"):
+        backend.Gfx906FABackend.customize_spec(padded_page)
 
     # Flag off: byte-identical behaviour, same object back.
     monkeypatch.setenv("GFX906_FA_PACKED", "0")

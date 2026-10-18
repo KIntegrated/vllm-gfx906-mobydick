@@ -69,6 +69,14 @@ See [`docs/gfx906/`](docs/gfx906/) for the full optimization record.
   (acceptance 0). Python-only: keeps the custom FA and restores the left window with the existing
   causal+window mask (`q_abs_offset = seq_len`, `window = nc_window + n_q`).
 
+- **Packed KV cell (K Q8_0 bytes | V fp16)** (`vllm/gfx906_fa/gfx906_fa_backend.py`, opt-in
+  `GFX906_FA_PACKED=1`): from [**KIntegrated/vllm-gfx906-mobydick#43**](https://github.com/KIntegrated/vllm-gfx906-mobydick/pull/43)
+  (phoenixclyde), rebased onto the 0.31 line. The default alias layout writes the Q8 K row into an
+  fp16-sized K half, wasting the rest of it; packing K and V into one cell (400 vs 512 B at head_dim 128,
+  784 vs 1024 at 256) gives **+22 % KV tokens** on non-hybrid models with **bit-identical** attention
+  output and a **2.9–9.8 % faster** decode kernel (bandwidth-bound). Off by default: on hybrid models it
+  moves the scheduler block size (2096 → 2672) for ~0 % capacity gain, so it stays a per-model choice.
+
 - **M≤8 spec-decode GEMMs + TP=2 host all-reduce** (`tools/gfx906_skinny/`, hooks in
   `layers/utils.py`, `exllama.py`, `cuda_communicator.py`): ported from
   [**0c33/mi50-vllm-lab**](https://github.com/0c33/mi50-vllm-lab) (Apache-2.0). A spec step runs most
