@@ -8,6 +8,20 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-18 (docs + gates — packed KV is the documented, gated default)
+
+README now explains the packed KV cell as a user-facing feature (what it is, why
+you want it: ~22 % more KV tokens at the same VRAM with bit-identical output and
+a 2.9–9.8 % faster decode kernel; how to force it with `--gfx906-fa-packed
+auto|on|off`; and when `auto` deliberately stays on the alias layout). The flag is
+in the validated serve example (and that example is shell-checked).
+
+Our gates run it by default: `ppl_probe.py` and `_bench_gfx906.py` pass
+`gfx906_fa_packed="on"` unless `BENCH_FA_PACKED=auto|off`. In-build A/B on the
+35B: **alias 15.9104 vs packed 15.9021** (0 top-20 misses both) — the packed
+reference band is ~15.90, slightly below the old alias tablet number because on
+this hybrid-flagged model packing also moves the scheduler block size.
+
 ## 2026-10-18 (final — packed KV: auto/fallback, config knob, default on for non-hybrid)
 
 The packed KV layout is now a first-class, **on-by-default for non-hybrid

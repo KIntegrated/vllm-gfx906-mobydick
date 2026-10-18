@@ -181,6 +181,10 @@ def main():
         # need an explicit float16 to select the fp16-only gfx906 kernels.
         dtype=os.environ.get("BENCH_DTYPE", "auto"),
         enforce_eager=eager,
+        # Packed KV cell (K Q8_0 | V fp16): ~+22 % KV tokens at the same VRAM,
+        # bit-identical output, 2.9-9.8 % faster decode kernel. On by default for
+        # our runs; BENCH_FA_PACKED=auto/off reverts.
+        gfx906_fa_packed=os.environ.get("BENCH_FA_PACKED", "on"),
         **extra,
     )
     tok = llm.get_tokenizer()

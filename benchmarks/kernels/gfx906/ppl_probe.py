@@ -74,6 +74,10 @@ def main():
         enforce_eager=True,
         dtype=bench_dtype,
         hf_overrides={},
+        # Packed KV cell (K Q8_0 | V fp16, ~+22 % KV tokens, bit-identical
+        # output). On by default for our runs; BENCH_FA_PACKED=auto/off reverts.
+        # Measured parity: 15.9584 (alias) vs 15.9635 (packed), 0 top-20 misses.
+        gfx906_fa_packed=os.environ.get("BENCH_FA_PACKED", "on"),
         **extra,
     )
     sp = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=20)

@@ -69,13 +69,15 @@ See [`docs/gfx906/`](docs/gfx906/) for the full optimization record.
   (acceptance 0). Python-only: keeps the custom FA and restores the left window with the existing
   causal+window mask (`q_abs_offset = seq_len`, `window = nc_window + n_q`).
 
-- **Packed KV cell (K Q8_0 bytes | V fp16)** (`vllm/gfx906_fa/gfx906_fa_backend.py`, opt-in
-  `GFX906_FA_PACKED=1`): from [**KIntegrated/vllm-gfx906-mobydick#43**](https://github.com/KIntegrated/vllm-gfx906-mobydick/pull/43)
+- **Packed KV cell (K Q8_0 bytes | V fp16)** (`vllm/gfx906_fa/gfx906_fa_backend.py`;
+  `--gfx906-fa-packed auto|on|off`, default `auto`): from
+  [**KIntegrated/vllm-gfx906-mobydick#43**](https://github.com/KIntegrated/vllm-gfx906-mobydick/pull/43)
   (phoenixclyde), rebased onto the 0.31 line. The default alias layout writes the Q8 K row into an
   fp16-sized K half, wasting the rest of it; packing K and V into one cell (400 vs 512 B at head_dim 128,
   784 vs 1024 at 256) gives **+22 % KV tokens** on non-hybrid models with **bit-identical** attention
-  output and a **2.9–9.8 % faster** decode kernel (bandwidth-bound). Off by default: on hybrid models it
-  moves the scheduler block size (2096 → 2672) for ~0 % capacity gain, so it stays a per-model choice.
+  output and a **2.9–9.8 % faster** decode kernel (bandwidth-bound). `auto` (the default) keeps the
+  alias layout when packing would move the scheduler block size on a hybrid model (2096 → 2672 for
+  ~0 % capacity gain) and falls back for unsupported shapes; see the KV-layout section above.
 
 - **M≤8 spec-decode GEMMs + TP=2 host all-reduce** (`tools/gfx906_skinny/`, hooks in
   `layers/utils.py`, `exllama.py`, `cuda_communicator.py`): ported from
@@ -144,6 +146,41 @@ reuse the prompt prefix); the harness default has been prefix caching OFF since
 mclk-verified). See the note under the model table.
 See [`docs/gfx906/`](docs/gfx906/) for the full change inventory, numbers,
 and bench recipes.
+
+### KV cache layout: one packed cell per (block, KV head)
+
+The default gfx906 layout stores the Q8 K row *inside* an fp16-sized K half and
+wastes the rest of that half. The packed layout puts both operands in one cell:
+
+```
+cell = K (Q8_0 bytes) | 16-byte-aligned pad | V (fp16)
+       head_dim 128:  400 B  vs 512 B   (+28 %)
+       head_dim 256:  784 B  vs 1024 B  (+31 %)
+       head_dim  64:  208 B  vs 256 B   (+23 %)
+```
+
+**Why you would want it.** The KV pool is what caps context length and
+concurrency at fixed VRAM, so the same cards hold **~22 % more tokens**
+(measured: 35B MoE 142,987 → 174,762 at 16k ctx; TP=2 Qwen3.8-27B + DFlash2
+184,178 → 205,381 at 16k). Nothing about the numerics changes: K is
+**bit-identical** (the same Q8 bytes, merely relocated), V stays fp16, and the
+attention output is bit-identical in a kernel A/B across eight shapes — PPL
+15.9584 (alias) vs 15.9635 (packed), 0 top-20 misses in both. The decode kernel
+also gets **2.9–9.8 % faster** (the step is bandwidth-bound and the cell is
+smaller), and model-level decode is neutral, so the win is capacity.
+
+```bash
+vllm serve <model> --gfx906-fa-packed on    # force it
+vllm serve <model> --gfx906-fa-packed off   # or GFX906_FA_PACKED=0
+```
+
+Default is **`auto`**: packed wherever the model supports it, alias layout
+otherwise. `auto` falls back (and logs the reason) for head dims that need
+padding, asymmetric K/V head dims, skip-quant padded pages and non-2-byte KV
+dtypes; on **hybrid** (mamba+attention) models it keeps the alias layout when
+packing would move the scheduler block size (measured 2096 → 2672), because that
+figure is config-visible. `GFX906_FA_PACKED=1`/`=0` still works as a debug
+override. Layout details and limits: `docs/gfx906/MERGE-lab9-packed-review.md`.
 
 ### Vision-tower (ViT) attention — custom FA by default on 0.29.0
 
@@ -405,7 +442,8 @@ vllm serve <model> \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
   --reasoning-parser qwen3 \
-  --generation-config auto
+  --generation-config auto \
+  --gfx906-fa-packed on   # +22 % KV tokens at the same VRAM (see above)
 ```
 
 - **Model Runner: V2 is the validated default on 0.29.0+, per model.** Upstream

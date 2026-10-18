@@ -662,3 +662,20 @@ Net effect of the flip: models the config does **not** flag as hybrid get the
 packed layout by default (no aligner, so no block-size question), with the
 auto-fallback covering the unsupported shapes; hybrid models keep today's
 layout unless a user opts in, which is the state LAB-10/#58 assumes.
+
+### Our gates now run the packed layout by default
+
+Per the LAB-9 decision, the harnesses pass `--gfx906-fa-packed on` unless
+overridden (`BENCH_FA_PACKED=auto|off`), so the layout we ship is the layout we
+gate:
+
+- `benchmarks/kernels/gfx906/ppl_probe.py` — in-build A/B on the 35B:
+  **alias 15.9104 vs packed 15.9021** (–0.05 %), 0 top-20 misses in both. That
+  moves the 35B reference band slightly (the old 16.0066 tablet was alias, and an
+  older build); the packed band is ~15.90. The small delta is expected: on this
+  hybrid-flagged model packing also moves the scheduler block size (1056 → 2112),
+  which changes the kernel tiling, not the maths.
+- `docs/gfx906/_bench_gfx906.py` (house serving bench) — same default.
+
+Both print nothing new to parse: the layout shows up in the boot log as
+`GFX906_FA_PACKED: KV cell … B` (packed) or its absence (alias).
