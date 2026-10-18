@@ -8,6 +8,25 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-18 (later still — community PRs: sampler hunk landed, packed KV A/B'd)
+
+**PR #41 hunk landed** (`afc9565da5`): the SYV-4 sort-free sampler now runs
+before the triton path in `apply_top_k_top_p`. `HAS_TRITON` is always true on
+this stack, so the earlier ordering made the sort-free branch **dead code** and
+every small-batch top-k paid a full-vocab sort. 4.7x on the dispatcher at B=1
+(k=8: 1434 -> 306 us), bit-identical output. Attribution: approach from
+phoenixclyde's PR #41, recorded with a `Co-authored-by` trailer.
+
+**PR #43 (packed KV layout, "E2") rebased and A/B'd, kept opt-in.** Cherry-picked
+on branch `gfx906/e2-packed` (`063bd7a17c`, author preserved). K stays Q8_0 bytes
+(bit-identical to the existing path), V stays fp16; the win is the page: one cell
+holds both operands (784 B vs 1024 B at head_dim 256). Measured on the 35B MoE:
+**PPL 15.9584 (off) vs 15.9635 (on)**, 0 top-20 misses in both, and
+**195,863 -> 240,298 KV tokens (+22.7 %)**. Not merged: the flag
+(`GFX906_FA_PACKED`) defaults off, because enabling it changes
+`attn_page_size_1_token` and the hybrid block-size aligner, which can invalidate
+pinned block/retention settings. Tracked as LAB-9 on the roadmap.
+
 ## 2026-10-18 (later — BOLT-2 fixed; upstream bug)
 
 **BOLT-2 (#54) closed: the drafter's context KV now stores from row 0** (`6fce381638`).
