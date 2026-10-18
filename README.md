@@ -227,6 +227,9 @@ backend automatically and now log a WARNING that names the reason. Full record:
 | ↳ **post-0.30.0 re-measure (TP=2, 2026-09-24)** | **MTP k=3 (current default depth) + `GFX906_FA_LEGACY=0` KV read** | **2k 79.1 · 64k 42.0 · 120k 40.7 t/s** (filler, prefix caching OFF, bt4096, max-seqs 4, util 0.82, capture `[4,8,12,16]`; TTFT 4.2/185.3/442.2 s; PPL 10.5472). Standard `vllm bench serve` random 2048→256: **52.9 t/s** @ TPOT 18.90 ms, acceptance 59.9 % / 2.80 |
 | ↳ N=8 concurrent decode | W4 (`VLLM_GFX906_SKINNY_M16=1`) | **104.2** (TP=1, util 0.90) |
 | ↳ 256k context | FA gather fix (2026-08-24); kv_split fix (2026-09-03) | 250k needle PASS; **37.95 t/s MTP @ 64k ctx** (was 16.6 pre-fix) |
+| **Nemotron-3.5-Bolt-74B-A9B** (W4A16 G128 sym, 41 GB) | supported, **TP=2** (weights alone exceed one card) | 48.7 @216 ctx / 39.7 @856 (greedy, 16k ctx) |
+| ↳ with the **LiLiCorr** drafter (k=7, fp16) | spec decode, **6.77 accepted tokens/step** | **96.2 t/s**; **119.5–130.7 t/s** with the M≤8 kernels on |
+| ↳ chat | template **defaults** only; `ultra_v3` parser via the checkpoint's plugin | correct answers — `enable_thinking`/`medium_effort` kwargs *degenerate* it into `</think>` loops |
 | Qwen3.6 fp16 checkpoints (52–67 GB) | do not fit 32 GB | — |
 
 **Decode-t/s basis (2026-09-13).** The rows above use the *historical bench
@@ -240,6 +243,15 @@ warm / 16.27 cold** — identical hardware, ~11 %/~34 % metric difference, no
 regression. Use `BENCH_PREFIX_CACHE=1` to compare with the table, `=0` for
 serving-shaped prefill-honest numbers; the fork-base deltas (3.49 → 67.39,
 18.89 → 25.60) are unaffected because both arms were measured on one basis.
+
+**Nemotron-3.5-Bolt** notes: the official `nvidia/…-24GB` quant is IQ2-XXS +
+NVFP4 (Blackwell SM120/121 only) and cannot run here; the numbers above use an
+AutoRound W4A16 G128 checkpoint of the same base. No PPL band is recorded for it
+— the numeric gates were greedy-output equality plus draft acceptance. Its
+LiLiCorr drafter needed the fp16 residual rescale at divisor **2048** (not the
+lab's 32; its grouped dynamic conv amplifies ~150×), and it runs on
+`TRITON_ATTN` (attention sinks). Recipe and caveats:
+[`docs/gfx906/DEVLOG-nemotron-bolt.md`](docs/gfx906/DEVLOG-nemotron-bolt.md).
 
 Details, per-model caveats, and bench recipes:
 [`docs/gfx906/README.md`](docs/gfx906/README.md) §Model support status.

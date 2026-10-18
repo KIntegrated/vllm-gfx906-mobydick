@@ -75,6 +75,17 @@ TTFT parity, decode −1.8 % @2k / −1.0 % @8k vs V1, `DEVLOG-muse-glimmer.md`)
 removes the V1 runner in **0.32.0**; no model here is pinned to it any more
 (ROADMAP `DFL2-2`, `GEMMA4-1`, `MUSE-1`).
 
+**Nemotron-3.5-Bolt-74B-A9B (W4A16, 41 GB) — TP=2 only.** 48.7 t/s greedy
+@216 ctx / 39.7 @856; with its **LiLiCorr** drafter (k=7, fp16) 6.77 accepted
+tokens/step and **96.2 t/s**, up to **119.5–130.7** with the M≤8 kernel ports.
+The official 24 GB quant (IQ2-XXS + NVFP4) is Blackwell-only and not runnable; the
+numbers are an AutoRound W4A16 checkpoint. No PPL band: gated on greedy equality
++ acceptance. Chat must use the template **defaults** (`enable_thinking` on,
+`medium_effort` off) — the kwargs recorded at bring-up degenerate it into
+`</think>` loops — and the `ultra_v3` reasoning parser needs the checkpoint's
+plugin path. Drafter details (rescalse divisor 2048, `TRITON_ATTN` because of
+attention sinks, BOLT-2 context-KV fix): `DEVLOG-nemotron-bolt.md`.
+
 **Prompt format — read before gating any model.** *Instruction-tuned* checkpoints answer
 only in their own chat template; fed **raw text** (a `/v1/completions` continuation, or a
 raw-text PPL probe) they emit fluent garbage that looks like a broken model or kernel.
