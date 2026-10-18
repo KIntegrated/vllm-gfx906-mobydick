@@ -89,15 +89,21 @@ Measured: **PPL parity** (15.9584 off vs 15.9635 on, 0 top-20 misses both) and
 publish/refuse contract and the cell byte decomposition (flag-off suite: 140
 passed).
 
-**Open work before it can be a default** (the plan's stages 2–4): decode t/s is
-unmeasured; enabling it moves `attn_page_size_1_token` (4096 → 3136 B) and the
-hybrid aligner (448 → 576), so the default should first apply only where that
-aligner outcome is unchanged; 16 legacy-layout tests fail under the flag by
-construction and must be parameterized over the layout (or the old path
-deleted) before "one path" is possible; the four guards (asymmetric K/V head
-dims, head padding, non-2-byte KV dtypes, padding+packed) are the feature
-matrix still missing, and `GFX906_FA_LEGACY=1` (fp16 K) stays a separate
-decision.
+**Measured 2026-10-18** (see `DEVLOG-nemotron-bolt.md`): the flag does **not**
+cost throughput. Kernel-level decode is **2.9–9.8 % faster** (smaller cell,
+bandwidth-bound) with **bit-identical outputs**; model-level on the 35B at
+B=1/16k it is neutral (57.1 vs 57.2 t/s) while KV tokens rise **+22.2 %**
+(142,987 → 174,762) and prefix caching behaves identically.
+
+**Open work before it can be a default** (plan stages 2–4): B=4 model-level,
+TP=2 + a drafter (8-row verify), and the **hybrid aligner** case — enabling the
+flag moves `attn_page_size_1_token` (4096 → 3136 B) and the aligner (448 → 576),
+which is the only config-visible consequence and therefore the remaining blocker
+for a default; 16 legacy-layout tests fail under the flag by construction and
+must be parameterized over the layout (or the old path deleted) before "one
+path" is possible; the four guards (asymmetric K/V head dims, head padding,
+non-2-byte KV dtypes, padding+packed) are the feature matrix still missing, and
+`GFX906_FA_LEGACY=1` (fp16 K) stays a separate decision.
 
 ## Next — 0.30-post and 0.31
 

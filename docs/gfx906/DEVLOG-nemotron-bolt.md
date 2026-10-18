@@ -510,3 +510,44 @@ No collapse in six 6.4k runs (three before at 1.0/1.0/5.65, three after at 3.75/
 report written up in `UPSTREAM-dflash-context-kv.md` (no duplicate upstream; #57632 suspected
 introducer). The remaining acceptance spread (3.75–5.94) is this stack's normal draft chaos, not the
 collapse signature (which was exactly 1.0).
+
+## 2026-10-18 — LAB-9 measurement campaign (does the packed KV layout cost throughput?)
+
+Answer: **no** — and at the kernel level it is *faster*. Two layers of
+measurement, both with the layout as the only variable.
+
+**1. Kernel, interleaved per rep** (`benchmarks/kernels/gfx906/fa_packed_layout_bench.py`,
+20 reps, decode 1 row/seq, bk=16, HKV=2, HQ=16, equal token counts):
+
+| D | B | ctx | legacy µs | packed µs | Δ |
+|---|---|---|---|---|---|
+| 128 | 1 | 2048 | 231.9 | 211.9 | −8.6 % |
+| 128 | 1 | 16384 | 318.5 | 297.8 | −6.5 % |
+| 128 | 4 | 2048 | 245.4 | 221.4 | −9.8 % |
+| 128 | 4 | 16384 | 736.6 | 715.1 | −2.9 % |
+| 256 | 1 | 2048 | 254.9 | 230.1 | −9.7 % |
+| 256 | 1 | 16384 | 384.6 | 356.2 | −7.4 % |
+| 256 | 4 | 2048 | 286.2 | 264.5 | −7.6 % |
+| 256 | 4 | 16384 | 1051.1 | 1000.8 | −4.8 % |
+
+Outputs are **bit-identical** in all eight shapes (`max|Δ| = 0`), i.e. the same
+Q8 K values and fp16 V — the layout claim holds. The cell is 22-23 % smaller and
+the decode step is bandwidth-bound, so it gets faster, not slower.
+
+**2. Model level** (35B MoE, single MI50, 16k ctx, **prefix caching ON** — the
+combination that had never been run with packed):
+
+| | KV tokens | decode t/s | first TTFT | prefix-cache queries/hits |
+|---|---|---|---|---|
+| `GFX906_FA_PACKED=0` | 142,987 | 57.1 | 0.64 s | 44 / 0 |
+| `GFX906_FA_PACKED=1` | **174,762 (+22.2 %)** | **57.2** | 0.64 s | 44 / 0 |
+
+So end-to-end decode is **neutral** at B=1/16k (the 35B's weight streaming
+dominates, which masks the KV-path win) while capacity rises 22 %. Prefix
+caching behaves identically; the hit counter stayed at 0 in *both* arms, so the
+honest statement is "no change", not "reuse verified".
+
+**Not yet measured:** B=4 model-level, TP=2 + a drafter (the 8-row verify), and
+the hybrid aligner case (448 → 576). The aligner is the only *config-visible*
+consequence and therefore the only remaining blocker for a default; the 16
+legacy-layout tests are the blocker for ever deleting the alias path.
