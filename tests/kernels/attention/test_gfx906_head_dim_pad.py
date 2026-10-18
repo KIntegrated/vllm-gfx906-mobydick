@@ -7,8 +7,18 @@ rejected, while the ViT path already pads them. 96 became an instantiated kernel
 on 2026-09-16 (FA-D96), so 72/80 now pad to 96 rather than 128.
 """
 
+import os
+
 import pytest
 import torch
+
+# The packed KV layout (GFX906_FA_PACKED, fork PR #43) refuses head dims that
+# need padding by design (`customize_spec` raises rather than slicing inside the
+# Q8 K region), so this whole file is padding-specific and cannot run with it.
+pytestmark = pytest.mark.skipif(
+    os.environ.get("GFX906_FA_PACKED") == "1",
+    reason="head-dim padding is unsupported by GFX906_FA_PACKED by design",
+)
 
 try:
     from vllm.gfx906_fa.gfx906_fa_backend import (

@@ -29,6 +29,46 @@ pytestmark = pytest.mark.skipif(
 BLOCK, HKV, HQ, D = 16, 2, 16, 256
 BYTES = (D // 32) * 34
 
+# Layout-selecting fixture: the two KV layouts (the Q8 alias default and the
+# packed cell from fork PR #43) are both written through
+# `impl.do_kv_cache_update`, so a test only needs the right cache *geometry* to
+# run on either. Tests that assert the alias layout's internals instead are
+# marked `_LEGACY_ONLY`, and padded head dims are refused by the packed layout
+# by design (`_PADDED_BY_DESIGN`), so both are skipped when the flag is on.
+_LEGACY_ONLY = pytest.mark.skipif(
+    os.environ.get("GFX906_FA_PACKED") == "1",
+    reason="asserts the alias layout's internals (fused cache / gather buffers); "
+    "the packed layout has its own coverage in test_packed_*",
+)
+_PADDED_BY_DESIGN = pytest.mark.skipif(
+    os.environ.get("GFX906_FA_PACKED") == "1",
+    reason="GFX906_FA_PACKED refuses head dims that need padding (by design; "
+    "see customize_spec)",
+)
+
+
+@pytest.fixture(params=[False, True], ids=["alias", "packed"])
+def packed_layout(request, monkeypatch):
+    """Runs the test once per KV layout; the mode is read at impl construction."""
+    monkeypatch.setenv("GFX906_FA_PACKED", "1" if request.param else "0")
+    monkeypatch.delenv("GFX906_FA_LEGACY", raising=False)
+    return request.param
+
+
+def _layout_cache(packed: bool, n_blocks: int, d: int, hkv: int, dev: str):
+    """KV cache of the given layout: [nb, Hkv, block, cell] fp16 in both cases."""
+    if packed:
+        from vllm.gfx906_fa.gfx906_fa_backend import _packed_cell_elems
+
+        return torch.zeros(
+            (n_blocks, hkv, BLOCK, _packed_cell_elems(d)),
+            dtype=torch.float16,
+            device=dev,
+        )
+    return torch.zeros(n_blocks, hkv, BLOCK, 2 * d, dtype=torch.float16, device=dev)
+
+
+
 
 def _kv_split(kv: torch.Tensor):
     """K/V views of the 0.29 fused KV layout (upstream #51718): one tensor per
@@ -487,6 +527,7 @@ def test_fused_fp16_gather_matches_torch_gather():
     assert bool((v_f2[1, :, L2:] == 0).all())
 
 
+@_LEGACY_ONLY
 def test_q_pad_buffer_survives_capture_then_prefill_grow(monkeypatch):
     """Review F1: a captured graph bakes in the VA of the q_pad buffer
     that was current at capture time. An eager prefill with a larger
@@ -605,6 +646,7 @@ def test_q_pad_buffer_survives_capture_then_prefill_grow(monkeypatch):
          cls._q_pad_captured) = saved
 
 
+@_LEGACY_ONLY
 def test_gather_buffers_lifecycle_postfix(monkeypatch):
     """plan-gfx906-fa-fix.md §5 — pins the POST-FIX gather-buffer
     contract (GFX906_FA_GATHER_EXACT=0) by driving the real
@@ -812,6 +854,7 @@ def test_gather_buffers_lifecycle_postfix(monkeypatch):
          cls._gather_exact, cls._gather_retired_warned) = saved
 
 
+@_LEGACY_ONLY
 def test_persistent_gather_fa_wide_buffer_poisoned_tail():
     """plan §5 — width >> live is safe end-to-end on the persistent
     path: the gather's work is live-bounded (device-side seq_lens) and
@@ -926,6 +969,7 @@ def test_persistent_gather_fa_wide_buffer_poisoned_tail():
          cls._gather_captured, cls._gather_buf_captured) = saved
 
 
+@_LEGACY_ONLY
 def test_wide_buffer_b17_fused_quant_no_leak():
     """plan §2.2c/§5 — num_seqs > _PERSIST_MAX_SEQS with a WIDE class
     buffer: the fused-quant path keeps the exact contract, so it must
@@ -1002,6 +1046,7 @@ def test_wide_buffer_b17_fused_quant_no_leak():
          cls._gather_captured, cls._gather_buf_captured) = saved
 
 
+@_LEGACY_ONLY
 def test_gather_exact_killswitch_restores_old_policy():
     """plan §5 — GFX906_FA_GATHER_EXACT=1 (cls._gather_exact here; the
     in-service A/B sets the env var, read at import by both files)
@@ -1135,6 +1180,7 @@ def test_gather_freeable_generation_exact_need():
          cls._gather_exact, cls._gather_retired_warned) = saved
 
 
+@_LEGACY_ONLY
 def test_gather_multi_retire_warns(monkeypatch):
     """plan §2.2b guard — retiring MORE than one capture-baked gather
     generation warns, one-shot. The original guard was dead code: it
@@ -1255,6 +1301,7 @@ def test_gather_multi_retire_warns(monkeypatch):
          cls._gather_exact, cls._gather_retired_warned) = saved
 
 
+@_LEGACY_ONLY
 def test_gather_mixed_width_buffers_not_reused():
     """plan §2.2c follow-up — the persistent branch's k/v capacity
     reuse requires EQUAL widths. A hand-set class buffer pair with
@@ -3301,6 +3348,7 @@ def test_r3_kv_split_defaults_aligned(monkeypatch):
 # Sq_pad=128 for both; ncols1=64 -> seq2 has tile0 (row 0, straddling) and
 # tile1 (rows 64..127, FULLY PAD -> must be clamped).
 # ---------------------------------------------------------------------------
+@_LEGACY_ONLY
 def test_forward_mixed_batch_pad_tile_clamp_and_host_cu():
     import math
 
@@ -3525,6 +3573,7 @@ def test_a3_metadata_build_is_persistent_views():
     assert md.slot_mapping.data_ptr() == smap.data_ptr()
 
 
+@_LEGACY_ONLY
 def test_a3_draft_step_reuse_reads_live_seq_lens(monkeypatch):
     """The fused-loop contract end-to-end: build metadata once (step 1), advance
     seq_lens + slot + KV write in place (what the captured update_draft_inputs /
@@ -3709,6 +3758,7 @@ def test_a3_draft_step_reuse_reads_live_seq_lens(monkeypatch):
     (112, 128, True),
     (72, 128, False),  # rollback map
 ])
+@_PADDED_BY_DESIGN
 def test_padded_head_dim_matches_torch_ref(real_d, padded, pad96, monkeypatch):
     from types import SimpleNamespace
 
@@ -3853,7 +3903,7 @@ def test_head_dim_96_instantiated_gather_and_paged_vs_fp32_ref():
 # https://github.com/0c33/mi50-vllm-lab).
 # ---------------------------------------------------------------------------
 
-def test_non_causal_batch_is_bidirectional_vs_torch_ref():
+def test_non_causal_batch_is_bidirectional_vs_torch_ref(packed_layout):
     from types import SimpleNamespace
 
     from vllm.gfx906_fa.gfx906_fa_backend import (
@@ -3866,7 +3916,7 @@ def test_non_causal_batch_is_bidirectional_vs_torch_ref():
     L, sq, hq, hkv, d = 64, 8, 4, 2, 128
     n_blocks = L // BLOCK
 
-    kv = torch.zeros(n_blocks, hkv, BLOCK, 2 * d, dtype=torch.float16, device=dev)
+    kv = _layout_cache(packed_layout, n_blocks, d, hkv, dev)
     K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
     V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
 
@@ -3950,7 +4000,7 @@ def test_non_causal_batch_is_bidirectional_vs_torch_ref():
 
 
 @pytest.mark.parametrize("window", [64, 200])
-def test_non_causal_sliding_window_never_reads_freed_blocks(window):
+def test_non_causal_sliding_window_never_reads_freed_blocks(window, packed_layout):
     """A non-causal sliding-window batch (DFlash2 drafter) keeps its window.
 
     The KV-cache manager frees a sliding layer's blocks once they fall out of
@@ -3975,7 +4025,7 @@ def test_non_causal_sliding_window_never_reads_freed_blocks(window):
     n_blocks = L // BLOCK
     poison = n_blocks  # an extra physical block standing in for freed ones
 
-    kv = torch.zeros(n_blocks + 1, hkv, BLOCK, 2 * d, dtype=torch.float16, device=dev)
+    kv = _layout_cache(packed_layout, n_blocks + 1, d, hkv, dev)
     K = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
     V = torch.randn(L, hkv, d, device=dev, dtype=torch.float16) * 0.5
 
