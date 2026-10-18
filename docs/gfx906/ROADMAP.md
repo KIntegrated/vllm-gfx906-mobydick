@@ -95,13 +95,21 @@ bandwidth-bound) with **bit-identical outputs**; model-level on the 35B at
 B=1/16k it is neutral (57.1 vs 57.2 t/s) while KV tokens rise **+22.2 %**
 (142,987 → 174,762) and prefix caching behaves identically.
 
-**Open work before it can be a default** (plan stages 2–4): B=4 model-level,
-TP=2 + a drafter (8-row verify), and the **hybrid aligner** case — enabling the
-flag moves `attn_page_size_1_token` (4096 → 3136 B) and the aligner (448 → 576),
-which is the only config-visible consequence and therefore the remaining blocker
-for a default; 16 legacy-layout tests fail under the flag by construction and
-must be parameterized over the layout (or the old path deleted) before "one
-path" is possible; the four guards (asymmetric K/V head dims, head padding,
+**Hybrid aligner arm measured (2026-10-18)** — the condition for a default is
+now data, not guesswork: on Nemotron-3.5-Lightning-30B (`--mamba-cache-mode
+align`) the scheduler block size moves **2096 → 2672** and KV tokens rise only
+**+0.4 %** (526,336 → 528,384), and the PR's motivating pinned
+`--prefix-cache-retention-interval 576` is rejected in **both** arms (the 0.30
+448 → 576 story does not transfer to 0.31). So a default must be **non-hybrid
+only**; hybrid models stay opt-in. Non-hybrid block size is unchanged (35B:
+8192 in both arms).
+
+**Open work, in order:** (1) parameterize the **16 legacy-layout tests** over the
+layout — this is now the blocking item for *any* default flip, because they
+construct the fused cache directly and would go red; (2) then the conditional
+default (packed on unless the model has hybrid KV groups, keyed where
+`_align_hybrid_block_size` runs); (3) B=4 model-level and TP=2 + drafter (8-row
+verify) numbers while the suite is being reworked; the four guards (asymmetric K/V head dims, head padding,
 non-2-byte KV dtypes, padding+packed) are the feature matrix still missing, and
 `GFX906_FA_LEGACY=1` (fp16 K) stays a separate decision.
 

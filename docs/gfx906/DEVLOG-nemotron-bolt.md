@@ -551,3 +551,39 @@ honest statement is "no change", not "reuse verified".
 the hybrid aligner case (448 → 576). The aligner is the only *config-visible*
 consequence and therefore the only remaining blocker for a default; the 16
 legacy-layout tests are the blocker for ever deleting the alias path.
+
+### LAB-9 aligner arm — hybrid models: packed is all risk, no benefit
+
+Hybrid (mamba+attention) `primitive-ai/Nemotron-3.5-Lightning-30B-A3B-mixed-INT4-INT8`,
+`--mamba-cache-mode align`, 8k ctx, `GFX906_FA_PACKED` off vs on:
+
+| | scheduler block size | KV tokens | `--prefix-cache-retention-interval 576` |
+|---|---|---|---|
+| off | **2096** | 526,336 | rejected (not a multiple of 2096) |
+| on | **2672** | **528,384 (+0.4 %)** | rejected (not a multiple of 2672) |
+
+Three conclusions:
+
+1. **The flag changes a config-visible number on hybrid models** — the scheduler
+   block size moves 2096 → 2672 — so any pinned `--block-size` /
+   `--kv-cache-memory-bytes` / `--prefix-cache-retention-interval` is affected.
+2. **The PR's motivating case does not reproduce on the 0.31 line.** Their 0.30
+   tree moved the aligner 448 → 576 and thereby *unlocked* a pinned 576; here
+   both arms reject 576 (the base aligner result is 2096, not 448), and packed
+   makes the block size *larger*, not smaller.
+3. **The capacity win collapses for hybrid models**: +22 % on the non-hybrid 35B,
+   but **+0.4 %** here, because the pool is dominated by the mamba/state groups
+   whose size the attention page barely moves.
+
+⇒ **The conditional default's condition is now measured, not guessed:** packed by
+default for models **without** hybrid KV groups (where the block size is
+unchanged, e.g. 35B: 8192 in both arms) and **off** for hybrid models, where it
+must stay opt-in.
+
+**Not implemented yet — and the reason is ordering, not hesitation:** flipping
+the default on makes the 16 legacy-layout tests fail, because they construct the
+fused cache directly. So the 16-test parameterization is now the blocking item
+for the default (not just for deleting the alias path). Doing it first keeps the
+suite green; the conditional-default change itself is then small (a
+`_packed_enabled()` default keyed on a hybrid-vs-not flag set where
+`_align_hybrid_block_size` runs).
