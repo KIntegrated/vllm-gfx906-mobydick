@@ -429,3 +429,48 @@ is exactly equivalent), sliced the same way (up half of `gate_up_proj`,
 Verdict: **both ported fixes are validated end-to-end on hardware.** The
 `_rescale_layer` unit-test helper only covers the dense path; the packed path is
 covered by this gate rather than by a unit test.
+
+### BOLT-2 root cause: the drafter's context KV is written with two holes
+
+Post-gather logging + a per-request NaN poison (`VLLM_DFLASH_CTXDBG` /
+`VLLM_DFLASH_POISON`, patch at `/local/tmp/ctxdbg2.patch`) settled it. The
+failure is **on the write side of the speculator**, not in attention:
+
+- **Hole 1 — the first 8 rows.** `_precompute_context_kv` is called as
+  `(num_context, num_target_tokens)` with `num_context = min(reqs*(k+1),
+  max_num_tokens) = 8`; rows 0..7 are left to the captured graph. The outside
+  write therefore starts at row 8, and the log shows it:
+
+  ```
+  write n=1600 slots=1600 slot_min=151160 slot_max=152759 pos_min=8 pos_max=1607
+  ```
+
+- **Hole 2 — whole earlier prefill chunks.** On a multi-chunk prefill only the
+  **last** chunk is stored, because the speculator is only invoked on the step
+  that has draft tokens. For a 6.4k prompt the single write is
+
+  ```
+  write n=2320 slots=2320 slot_min=159761 slot_max=166592 pos_min=4097 pos_max=6416
+  ```
+
+  i.e. **positions 0..4096 never enter the drafter's KV cache.**
+
+- **Poison test.** Filling every draft `kv_cache` with NaN once per request
+  before its prefill drops acceptance to **0 at both 1.6k and 6.4k** (`accept
+  1.00` on both agentctx prompts), so the draft *depends on slots this request
+  does not write* — either the graph's rows 0..7 or positions outside the
+  written range.
+
+This explains the threshold exactly: below 4096 only the first 8 positions are
+missing (negligible — those tokens rarely decide the next one, so acceptance
+stays ~5.5); above 4096 up to 4096 positions are missing, so the drafter's
+context is largely stale and acceptance collapses to 1.0. It also explains why
+the failure looked backend-, sink- and chunk-agnostic in the earlier arms.
+
+Fix directions: (a) precompute from row **0** in the `else` branch above (the
+graph rewrites the same rows, so it is idempotent); (b) store the context KV on
+**every** prefill chunk, not just the last one — that is the real fix, and it
+needs the target's hidden states for the earlier chunks, which the target only
+produces for the step it runs in. (b) is therefore a scheduling-side change
+(run the store during chunked prefill) or an explicit prefix store when the
+first decode step runs.
