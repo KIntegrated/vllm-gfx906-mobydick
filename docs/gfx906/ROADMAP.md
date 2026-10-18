@@ -195,14 +195,6 @@ whether int8 KV is worth it on 32 GB cards.
 `prep_inputs` / `attn_metadata` / `ctx_kv` / `gen_draft` ms/step regions — the
 resolution our spec A/Bs keep missing. Only if graph-safe and <1 % overhead.
 
-### BOLT-2 — acceptance collapses past ~4k context · [#54](../../issues/54)
-
-The LiLiCorr drafter (working since `031fa0e4b2`, 6.77 tokens/step at short
-context) intermittently drops to 1.0 accepted/draft at ~7.3k (2.5k is stable at
-5.52). It runs on **TRITON_ATTN** — the custom FA refuses it (sinks) — a
-drafter-on-Triton combination the lab never ran; same shape as their freed-block
-finding. Ref: `DEVLOG-nemotron-bolt.md`.
-
 
 ## Later / backlog
 

@@ -8,6 +8,25 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-18 (later — BOLT-2 fixed; upstream bug)
+
+**BOLT-2 (#54) closed: the drafter's context KV now stores from row 0** (`6fce381638`).
+`propose()` in `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py` computed
+`num_context = _num_graph_context_tokens(num_reqs)` and stored only
+`[num_context, num_target_tokens)`, leaving rows `[0, num_context)` to the captured graph;
+on a prefill step the graph is not what runs, so those rows were never written and the
+drafter attended over stale K/V. Measured on Bolt 74B + LiLiCorr k=7 with `agentctx.py`
+(distinct-source prompts, greedy): a 6.4k-token prompt went from **1.0, 1.0, 5.65**
+accepted-per-step to **3.75, 5.94, 3.80**, and 1.6k from 2.97 to 4.29/4.23. The store is
+idempotent with the graph's rows and costs `num_context` extra KV rows per prefill step.
+
+**This is an upstream bug, not a fork one.** The file has no fork commits and the hole was
+introduced by upstream **#57632** ("Capture the context K/V precompute in the draft CUDA
+graph"). A ready-to-file report (symptom, root cause, poison-test evidence, fix, suggested
+regression test) is in `docs/gfx906/UPSTREAM-dflash-context-kv.md`, referenced from the
+upstream queue (#32). Duplicate check found nothing (nearest is #51581, unrelated).
+Filing it needs a human submitter per the contribution policy.
+
 ## 2026-10-18 (BOLT-2 root cause; LAB-7 closed as a no-op lever)
 
 **BOLT-2 (#54) root cause found — a write bug in the speculator, not attention.**
