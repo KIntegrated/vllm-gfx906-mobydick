@@ -1236,6 +1236,37 @@ class RocmPlatform(Platform):
 
         model_config = vllm_config.model_config
         scheduler_config = vllm_config.scheduler_config
+
+        # gfx906 custom FA: publish the KV cell layout choice for the backend,
+        # which has no vllm_config access when it customizes the KV spec. Hybrid
+        # (mamba+attention) models stay on the alias layout under "auto": there
+        # the packed cell buys ~0.4 % capacity while moving the scheduler block
+        # size (2096 -> 2672 measured), so it must not change silently. See
+        # LAB-9/#58 in the fork's roadmap.
+        cache_config = vllm_config.cache_config
+        if cache_config is not None and on_gfx906():
+            try:
+                from vllm.gfx906_fa.gfx906_fa_backend import set_packed_config_mode
+            except Exception:  # noqa: BLE001 - the custom FA may not be present
+                pass
+            else:
+                mode = getattr(cache_config, "gfx906_fa_packed", "off")
+                if mode == "auto" and model_config.is_hybrid:
+                    # Conservative: `is_hybrid` is broader than "the aligner
+                    # would move the block size" (e.g. Qwen3.5-35B-A3B is flagged
+                    # hybrid yet keeps block_size 8192 with and without packed,
+                    # and does get the +22 % win). So auto under-delivers on such
+                    # models; set gfx906_fa_packed=on to opt in. Refining this to
+                    # "did the aligner's block size change" needs a dry run of
+                    # _align_hybrid_block_size (LAB-10/#58).
+                    logger.info_once(
+                        "gfx906 FA: packed KV layout left off for this hybrid "
+                        "model under gfx906_fa_packed=auto (conservative: the "
+                        "block-size aligner may move a config-visible number; "
+                        "set gfx906_fa_packed=on to force it)."
+                    )
+                    mode = "off"
+                set_packed_config_mode(mode)
         # Note: model_config may be None during testing
         if (
             model_config is not None

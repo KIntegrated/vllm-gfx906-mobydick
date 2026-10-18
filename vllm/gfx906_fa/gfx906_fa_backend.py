@@ -132,12 +132,26 @@ _PACKED_2B_DTYPES = ("auto", "float16", "half", "bfloat16", "bf16")
 _PACKED_MODE: str | None = None
 
 
+# Value of CacheConfig.gfx906_fa_packed, published by the platform's config
+# path so the backend (a class with no vllm_config access at spec time) can see
+# it. Defaults to "off" until set.
+_PACKED_CONFIG_MODE: str = "off"
+
+
+def set_packed_config_mode(mode: str) -> None:
+    """Publish CacheConfig.gfx906_fa_packed to the backend (platform config path)."""
+    global _PACKED_CONFIG_MODE
+    if mode not in ("auto", "off", "on"):
+        raise ValueError(f"gfx906_fa_packed must be auto/off/on, got {mode!r}")
+    _PACKED_CONFIG_MODE = mode
+
+
 def _packed_choice() -> str:
-    """'on' / 'off' when explicitly configured, else 'auto'."""
+    """'on' / 'off' / 'auto': the env var wins, then the cache config field."""
     value = _os.environ.get(_PACKED_ENV)
-    if value is None:
-        return "auto"
-    return "on" if value == "1" else "off"
+    if value is not None:
+        return "on" if value == "1" else "off"
+    return _PACKED_CONFIG_MODE
 
 
 def _packed_resolve(on: bool, reason: str = "") -> None:

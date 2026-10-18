@@ -4241,6 +4241,24 @@ def test_packed_customize_spec_publishes_the_cell_and_refuses_unsupported(
         backend.Gfx906FABackend.get_kv_cache_shape(4, 16, 2, 128, "int8")
 
 
+def test_packed_choice_precedence_env_over_config(monkeypatch):
+    """The CLI/config field drives the mode; the env var is the escape hatch."""
+    from vllm.gfx906_fa import gfx906_fa_backend as backend
+
+    monkeypatch.delenv("GFX906_FA_PACKED", raising=False)
+    for mode in ("off", "on", "auto"):
+        backend.set_packed_config_mode(mode)
+        assert backend._packed_choice() == mode
+    backend.set_packed_config_mode("on")
+    monkeypatch.setenv("GFX906_FA_PACKED", "0")
+    assert backend._packed_choice() == "off"  # env wins
+    monkeypatch.setenv("GFX906_FA_PACKED", "1")
+    assert backend._packed_choice() == "on"
+    with pytest.raises(ValueError):
+        backend.set_packed_config_mode("packed")
+    backend.set_packed_config_mode("off")
+
+
 def test_packed_auto_mode_falls_back_instead_of_failing_the_boot(monkeypatch):
     """Unset flag = auto: a spec the layout cannot express selects the alias
     layout once (logged) and stays there; an explicit =1 still raises."""
@@ -4262,8 +4280,9 @@ def test_packed_auto_mode_falls_back_instead_of_failing_the_boot(monkeypatch):
     def spec(d, head_size_v=None, page_size_padded=None):
         return Spec(d, head_size_v, 16, 2, torch.float16, 2 * d, page_size_padded)
 
-    def reset():
+    def reset(auto=True):
         monkeypatch.setattr(backend, "_PACKED_MODE", None)
+        backend.set_packed_config_mode("auto" if auto else "off")
 
     # auto + packable -> packed, and the decision sticks.
     reset()
@@ -4295,7 +4314,7 @@ def test_packed_auto_mode_falls_back_instead_of_failing_the_boot(monkeypatch):
         assert again.state_content_bytes == 2 * 128
         assert backend._packed_enabled() is False
 
-    # Explicit opt-in keeps the loud failure.
+    # Explicit opt-in keeps the loud failure (env wins over the config field).
     reset()
     monkeypatch.setenv("GFX906_FA_PACKED", "1")
     with pytest.raises(NotImplementedError):
@@ -4304,12 +4323,13 @@ def test_packed_auto_mode_falls_back_instead_of_failing_the_boot(monkeypatch):
     # auto + a non-2-byte KV dtype -> alias geometry, not a boot failure.
     reset()
     monkeypatch.delenv("GFX906_FA_PACKED", raising=False)
+    monkeypatch.delenv("GFX906_FA_PACKED", raising=False)
     shape = backend.Gfx906FABackend.get_kv_cache_shape(4, 16, 2, 128, "int8")
     assert shape[-1] == 128
     assert backend._packed_enabled() is False
 
-    # Resolved ON, then a spec that cannot be packed: fail loudly rather than
-    # silently mixing layouts in one pool.
+    # Resolved ON (auto), then a spec that cannot be packed: fail loudly rather
+    # than silently mixing layouts in one pool.
     reset()
     monkeypatch.delenv("GFX906_FA_PACKED", raising=False)
     backend.Gfx906FABackend.customize_spec(spec(128))

@@ -168,6 +168,23 @@ class CacheConfig:
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
+    gfx906_fa_packed: Literal["auto", "off", "on"] = "off"
+    """gfx906 custom FA only: KV cache cell layout.
+
+    "off" keeps the long-standing alias layout (the Q8 K row stored inside an
+    fp16-sized K half). "on" packs K and V into one cell (K Q8_0 bytes | V fp16),
+    which is ~22 % denser and faster to read but refuses head dims that need
+    padding, asymmetric K/V head dims, padded page sizes from the skip-quant
+    path and non-2-byte KV dtypes — with "on" those raise. "auto" packs when the
+    model supports it and otherwise falls back to the alias layout with a logged
+    reason. Models the config flags as hybrid stay on "off" under "auto" — a
+    conservative rule: some of them (e.g. Qwen3.5-35B-A3B) keep their block size
+    and would benefit, while others (mamba+attention) move the scheduler block
+    size for ~0 % capacity, so opting in explicitly is the safe direction
+    (refining the rule needs a dry run of the hybrid aligner; LAB-10/#58).
+    Overridden by the GFX906_FA_PACKED env var (1/0), which is a debug escape
+    hatch.
+    """
     mamba_page_size_padded: int | None = None
     """ Optional override for mamba page size; used by hybrid mamba/attention
     models to ensure exact alignment with attention page size."""
