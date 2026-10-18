@@ -244,13 +244,45 @@ regression. Use `BENCH_PREFIX_CACHE=1` to compare with the table, `=0` for
 serving-shaped prefill-honest numbers; the fork-base deltas (3.49 → 67.39,
 18.89 → 25.60) are unaffected because both arms were measured on one basis.
 
-**Nemotron-3.5-Bolt** notes: the official `nvidia/…-24GB` quant is IQ2-XXS +
-NVFP4 (Blackwell SM120/121 only) and cannot run here; the numbers above use an
-AutoRound W4A16 G128 checkpoint of the same base. No PPL band is recorded for it
-— the numeric gates were greedy-output equality plus draft acceptance. Its
-LiLiCorr drafter needed the fp16 residual rescale at divisor **2048** (not the
-lab's 32; its grouped dynamic conv amplifies ~150×), and it runs on
-`TRITON_ATTN` (attention sinks). Recipe and caveats:
+**Nemotron-3.5-Bolt** — quant and recipe. The official `nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB`
+is **IQ2-XXS weights + NVFP4** (Blackwell SM120/121 only) and cannot run on gfx906.
+The numbers above use **`SergiioB/Nemotron-3.5-Bolt-74B-A9B-AutoRound-W4A16-G128-sym`**
+(41 GB: AutoRound **W4A16, group 128, symmetric**, GPTQ K-first with a `g_idx`
+group map; top-k 9 of 512 experts, `moe_latent` 1024). It needs **TP=2** — the
+weights alone exceed one 32 GB card.
+
+Prefill (5.3k-token prompts, prefix caching off, TTFT basis): **1052–1057 tok/s**;
+target-only decode 37.2 t/s at 2k→256.
+
+Running it **with the drafter** (this is the documented recipe; the drafter is
+`nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr`, NVFP4 dequantised to bf16
+here because gfx906 has no FP4):
+
+```bash
+D=/biglocal/models/SergiioB/Nemotron-3.5-Bolt-74B-A9B-AutoRound-W4A16-G128-sym
+DR=/biglocal/models/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr-bf16
+VLLM_LILICORR_FP16_RESIDUAL_DIVISOR=2048 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
+vllm serve "$D" --served-model-name nemotron-bolt --trust-remote-code \
+  --tensor-parallel-size 2 --dtype float16 --max-model-len 16384 --max-num-seqs 1 \
+  --max-num-batched-tokens 4096 --gpu-memory-utilization 0.90 --mamba-cache-mode align \
+  --no-enable-prefix-caching --gfx906-fa-packed on \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --reasoning-parser-plugin "$D/ultra_v3_reasoning_parser.py" --reasoning-parser ultra_v3 \
+  --speculative-config '{"method":"dflash","model":"'"$DR"'","num_speculative_tokens":7,"rejection_sample_method":"standard"}'
+```
+
+The drafter needs the fp16 residual rescale at divisor **2048** (not the lab's 32:
+its grouped dynamic conv amplifies ~150×), runs on `TRITON_ATTN` (attention
+sinks), and its context-KV write had to store from row 0 (BOLT-2, an upstream
+bug). Chat must use the template **defaults** — `enable_thinking`/`medium_effort`
+kwargs degenerate it into `</think>` loops.
+
+**No PPL band is recorded for Bolt yet.** The probe reads **255.0 raw / 263.9
+chat-templated with 0 top-20 misses**, ~10× flatter than its sibling
+(Nemotron-3.5-Lightning, ~27), so the numbers are not usable as a band until the
+cause is known (the AutoRound quant vs our WNA16 path); a CUDA reference run is
+planned. Gating used greedy equality + draft acceptance. Tracked in
+[#59](https://github.com/KIntegrated/vllm-gfx906-mobydick/issues/59); dev log:
 [`docs/gfx906/DEVLOG-nemotron-bolt.md`](docs/gfx906/DEVLOG-nemotron-bolt.md).
 
 Details, per-model caveats, and bench recipes:

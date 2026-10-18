@@ -79,8 +79,13 @@ removes the V1 runner in **0.32.0**; no model here is pinned to it any more
 @216 ctx / 39.7 @856; with its **LiLiCorr** drafter (k=7, fp16) 6.77 accepted
 tokens/step and **96.2 t/s**, up to **119.5–130.7** with the M≤8 kernel ports.
 The official 24 GB quant (IQ2-XXS + NVFP4) is Blackwell-only and not runnable; the
-numbers are an AutoRound W4A16 checkpoint. No PPL band: gated on greedy equality
-+ acceptance. Chat must use the template **defaults** (`enable_thinking` on,
+numbers are an AutoRound W4A16 group-128 **symmetric** checkpoint
+(`SergiioB/Nemotron-3.5-Bolt-74B-A9B-AutoRound-W4A16-G128-sym`, 41 GB, GPTQ
+K-first + `g_idx`). Prefill 1052–1057 tok/s at 5.3k (TTFT basis, prefix caching
+off). **No PPL band yet**: the probe reads 255.0 raw / 263.9 chat-templated with 0
+top-20 misses, ~10x flatter than the sibling Lightning (~27), so it is not usable
+until the cause is known (AutoRound quant vs our WNA16 path — CUDA reference
+planned, #59). Gated on greedy equality + acceptance. Chat must use the template **defaults** (`enable_thinking` on,
 `medium_effort` off) — the kwargs recorded at bring-up degenerate it into
 `</think>` loops — and the `ultra_v3` reasoning parser needs the checkpoint's
 plugin path. Drafter details (rescalse divisor 2048, `TRITON_ATTN` because of

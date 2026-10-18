@@ -78,6 +78,15 @@ def main():
         # output). On by default for our runs; BENCH_FA_PACKED=auto/off reverts.
         # Measured parity: 15.9584 (alias) vs 15.9635 (packed), 0 top-20 misses.
         gfx906_fa_packed=os.environ.get("BENCH_FA_PACKED", "on"),
+        # TP>1 / custom architectures: the 74B-class W4A16 checkpoints need
+        # BENCH_TP=2, Bolt also needs trust_remote_code and mamba_cache_mode=align.
+        tensor_parallel_size=int(os.environ.get("BENCH_TP", "1")),
+        trust_remote_code=os.environ.get("BENCH_TRUST_REMOTE_CODE", "0") == "1",
+        **(
+            {"mamba_cache_mode": os.environ["BENCH_MAMBA_CACHE_MODE"]}
+            if os.environ.get("BENCH_MAMBA_CACHE_MODE")
+            else {}
+        ),
         **extra,
     )
     sp = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=20)

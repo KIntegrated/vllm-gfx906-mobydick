@@ -679,3 +679,25 @@ gate:
 
 Both print nothing new to parse: the layout shows up in the boot log as
 `GFX906_FA_PACKED: KV cell … B` (packed) or its absence (alias).
+
+### Bolt gates: prefill measured, PPL not yet usable, harness knobs added
+
+Both harnesses gained `BENCH_TP`, `BENCH_TRUST_REMOTE_CODE` and
+`BENCH_MAMBA_CACHE_MODE` (defaults unchanged; Bolt is the first TP=2 hybrid they
+gate).
+
+- **Prefill** (serving, 5.3k-token distinct prompts, prefix caching off,
+  TTFT basis): **1052–1057 tok/s**, three reps spread <0.5 %. Target-only decode
+  from the house bench: **37.17 t/s** at pp=2048/tg=256, mclk 1000, 4 samples
+  spread <0.1 %.
+- **PPL is anomalous**: 255.0195 raw (365 tok) and 263.8917 through the chat
+  template (557 tok, the valid form for an IFT checkpoint) — both with **0
+  top-20 misses**. The sibling Nemotron-3.5-Lightning-30B sits near 27 and
+  Qwen3.5-35B at 15.9, so Bolt's distribution is ~10x flatter while its ranking
+  is intact. Filed as **#59** with the hypotheses (third-party AutoRound
+  W4A16-G128 quant vs the fork's WNA16 MoE path for top-k 9 / 512 experts /
+  `g_idx`) and the planned CUDA reference. **No band recorded.**
+- **Chat gate signal**: one `/v1/chat/completions` call reasoned correctly
+  ("...the answer is Paris.") but returned `content: ''` with `finish_reason:
+  stop` at 31 tokens, while earlier calls returned content — prompt/termination
+  dependent; recorded in #59 as a second thing to check (parser vs EOS).

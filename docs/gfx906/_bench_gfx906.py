@@ -185,6 +185,14 @@ def main():
         # bit-identical output, 2.9-9.8 % faster decode kernel. On by default for
         # our runs; BENCH_FA_PACKED=auto/off reverts.
         gfx906_fa_packed=os.environ.get("BENCH_FA_PACKED", "on"),
+        # TP>1 / custom architectures (74B-class W4A16, NemotronH hybrids).
+        tensor_parallel_size=int(os.environ.get("BENCH_TP", "1")),
+        trust_remote_code=os.environ.get("BENCH_TRUST_REMOTE_CODE", "0") == "1",
+        **(
+            {"mamba_cache_mode": os.environ["BENCH_MAMBA_CACHE_MODE"]}
+            if os.environ.get("BENCH_MAMBA_CACHE_MODE")
+            else {}
+        ),
         **extra,
     )
     tok = llm.get_tokenizer()
