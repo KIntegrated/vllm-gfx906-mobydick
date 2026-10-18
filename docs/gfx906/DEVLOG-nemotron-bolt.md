@@ -587,3 +587,42 @@ for the default (not just for deleting the alias path). Doing it first keeps the
 suite green; the conditional-default change itself is then small (a
 `_packed_enabled()` default keyed on a hybrid-vs-not flag set where
 `_align_hybrid_block_size` runs).
+
+### LAB-9 items 3–4 — TP=2 + drafter measured; the default flip needs a better condition
+
+**TP=2 + drafter (8-row verify)**, Qwen3.8-27B-AWQ-INT4 + DFlash2-W4A16 k=7,
+`GFX906_FA_PACKED` off vs on, `tools/gfx906_lab_bench/bench.py` (3 prompt
+classes × 2 reps, greedy):
+
+| | KV tokens | mean decode | acceptance | accept len |
+|---|---|---|---|---|
+| off | 184,178 | **73.74 t/s** | 51.9 % | 4.63 |
+| on | **205,381 (+11.5 %)** | **73.46 t/s** | 51.5 % | 4.61 |
+
+Neutral throughput and equal acceptance (expected: the kernel output is
+bit-identical), with the capacity win holding on the TP=2/drafter path. Together
+with the kernel A/B and the 35B arm, no serving path we run regresses.
+
+**Item 4 (flip the default) is deferred, and implementing items 1–2 is what
+showed why.** The planned condition was "exclude hybrid models", but
+`model_config.is_hybrid` is not a usable proxy for "the aligner would move the
+block size":
+
+- Qwen3.5-35B-A3B is flagged **hybrid**, yet its block size is 8192 with *and*
+  without packed (only a non-attention group's size moves 1056 → 1376) and it is
+  where the +22 % win was measured. Excluding it would drop the win from our own
+  main bench model.
+- Nemotron-3.5-Lightning-30B (mamba+attention) is where the block size moves
+  2096 → 2672 and the win is +0.4 %.
+
+The discriminator is therefore the *aligner outcome*, not the model class: the
+flip needs `_align_hybrid_block_size` dry-run twice (packed/alias page) and a
+comparison of the resulting `block_size`, restoring the fields it mutates
+(`block_size`, `mamba_block_size`, `mamba_page_size_padded`,
+`skip_page_size_padded`) in between. That is a change inside the platform's
+config path and is not something to land unverified at the end of a session.
+
+So: `gfx906_fa_packed` stays `"off"` by default (config field + CLI + auto/fallback
+all landed and tested), and the flip waits for the dry-run comparison. Until
+then, the capacity win is available per model with `--gfx906-fa-packed on` or
+`GFX906_FA_PACKED=1`.

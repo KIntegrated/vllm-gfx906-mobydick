@@ -104,6 +104,17 @@ align`) the scheduler block size moves **2096 → 2672** and KV tokens rise only
 only**; hybrid models stay opt-in. Non-hybrid block size is unchanged (35B:
 8192 in both arms).
 
+**Default flip: still pending, with a better-specified blocker.** Items 1–2 of the
+plan landed (`650b417651` auto/fallback, `f1e0328805` config field +
+`--gfx906-fa-packed`, default **off**), and item 3 (TP=2 + DFlash2 k=7) shows no
+regression: 73.74 → 73.46 t/s, acceptance equal, KV 184,178 → **205,381
+(+11.5 %)**. Item 4 exposed that `is_hybrid` is **not** a usable condition — the
+35B is flagged hybrid yet keeps block_size 8192 and is where the +22 % win lives,
+while Lightning moves 2096 → 2672 for +0.4 %. The flip therefore needs a
+dry-run of `_align_hybrid_block_size` in both modes and a `block_size`
+comparison (restoring `block_size`, `mamba_block_size`,
+`mamba_page_size_padded`, `skip_page_size_padded` between runs).
+
 **Open work, in order:** (1) ~~parameterize the legacy-layout tests~~ **done**
 (`packed_layout` fixture + `_layout_cache`; the two non-causal tests now run on
 both layouts in the default run, alias-internals tests skip with reasons, and
