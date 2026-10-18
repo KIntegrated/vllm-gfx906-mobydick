@@ -4099,3 +4099,145 @@ def test_non_causal_causality_contract(monkeypatch):
     assert Gfx906FABackend.supports_non_causal()
     monkeypatch.setenv("GFX906_FA_NO_NONCAUSAL", "1")
     assert not Gfx906FABackend.supports_non_causal()
+
+
+# ---------------------------------------------------------------------------
+# Packed KV layout (E2, GFX906_FA_PACKED=1; fork PR #43, authored by
+# phoenixclyde). Layout tests only: the numeric side is gated by the PPL A/B
+# recorded in docs/gfx906/CHANGELOG.md (15.9584 off vs 15.9635 on, 0 top-20
+# misses) and by the 35B KV-pool measurement (195,863 -> 240,298 tokens).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("d", "k_row", "v_off", "cell"),
+    [(64, 68, 80, 208), (128, 136, 144, 400), (256, 272, 272, 784)],
+)
+def test_packed_cell_geometry_matches_the_documented_table(d, k_row, v_off, cell):
+    """Q8_0 row width, the 16 B-aligned V offset, and the documented cell sizes."""
+    from vllm.gfx906_fa.gfx906_fa_backend import (
+        _packed_cell_bytes,
+        _packed_cell_elems,
+        _packed_k_row_bytes,
+        _packed_v_offset_bytes,
+        _packed_v_offset_elems,
+    )
+
+    assert _packed_k_row_bytes(d) == k_row == (d // 32) * 34
+    assert _packed_v_offset_bytes(d) == v_off
+    assert _packed_cell_bytes(d) == cell
+    # Invariants the C++ entry points and the view construction rely on.
+    assert v_off % 16 == 0 and cell % 16 == 0
+    assert v_off >= k_row and 0 <= v_off - k_row < 16
+    assert _packed_cell_elems(d) == cell // 2
+    assert _packed_v_offset_elems(d) == v_off // 2
+    # Strictly denser than the K||V baseline the alias path allocates.
+    assert cell < 2 * d * 2
+
+
+def test_packed_customize_spec_publishes_the_cell_and_refuses_unsupported(
+    monkeypatch,
+):
+    """The spec publishes the cell size, refuses unservable shapes, and is inert
+    when the flag is off (the additive guarantee)."""
+    import dataclasses
+    from dataclasses import dataclass
+
+    from vllm.gfx906_fa import gfx906_fa_backend as backend
+
+    @dataclass
+    class Spec:
+        head_size: int
+        head_size_v: int | None
+        block_size: int
+        num_kv_heads: int
+        dtype: torch.dtype
+        state_content_bytes: int
+        page_size_padded: int | None
+
+    def spec(d, head_size_v=None):
+        return Spec(d, head_size_v, 16, 2, torch.float16, 2 * d, None)
+
+    monkeypatch.setenv("GFX906_FA_PACKED", "1")
+    out = backend.Gfx906FABackend.customize_spec(spec(128))
+    assert out.state_content_bytes == backend._packed_cell_bytes(128) == 400
+    assert out.page_size_padded is None
+
+    # Asymmetric K/V head dims cannot be expressed by one packed cell.
+    with pytest.raises(NotImplementedError, match="head_size_v"):
+        backend.Gfx906FABackend.customize_spec(spec(128, 64))
+    # A dim that would need head padding would slice inside the Q8 K region.
+    with pytest.raises(NotImplementedError, match="require"):
+        backend.Gfx906FABackend.customize_spec(spec(80))
+
+    # Flag off: byte-identical behaviour, same object back.
+    monkeypatch.setenv("GFX906_FA_PACKED", "0")
+    untouched = spec(128)
+    assert backend.Gfx906FABackend.customize_spec(untouched) is untouched
+
+    # And the 5D geometry agrees with the published cell.
+    monkeypatch.setenv("GFX906_FA_PACKED", "1")
+    shape = backend.Gfx906FABackend.get_kv_cache_shape(4, 16, 2, 128, "auto")
+    assert shape == (4, 2, 16, 2, backend._packed_cell_elems(128))
+    with pytest.raises(NotImplementedError, match="2-byte"):
+        backend.Gfx906FABackend.get_kv_cache_shape(4, 16, 2, 128, "int8")
+
+
+@pytest.mark.parametrize("d", [128, 256])
+def test_packed_views_decompose_the_cell(monkeypatch, d):
+    """K bytes, alignment pad and fp16 V must land at exactly the documented
+    offsets in the shared cell, and the cell width must match head_size."""
+    from vllm.gfx906_fa.gfx906_fa_backend import (
+        Gfx906FAImpl,
+        _packed_cell_bytes,
+        _packed_k_row_bytes,
+        _packed_v_offset_bytes,
+    )
+
+    monkeypatch.setenv("GFX906_FA_PACKED", "1")
+    hq, hkv, bs, nb = 8, 2, 16, 4
+    cell_b = _packed_cell_bytes(d)
+    k_row = _packed_k_row_bytes(d)
+    v_off = _packed_v_offset_bytes(d)
+    dev = "cuda"
+
+    impl = Gfx906FAImpl(
+        num_heads=hq,
+        head_size=d,
+        scale=1.0 / math.sqrt(d),
+        num_kv_heads=hkv,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="float16",
+    )
+    # The per-layer view the pool hands the impl: [nb, Hkv, block, cell_elems].
+    cache = torch.zeros((nb, hkv, bs, cell_b // 2), dtype=torch.float16, device=dev)
+    k_q8, v = impl._ensure_packed_views(cache)
+    assert k_q8.shape == (nb, bs, hkv, k_row) and k_q8.dtype == torch.uint8
+    assert v.shape == (nb, bs, hkv, d) and v.dtype == torch.float16
+
+    # Write a distinct pattern through each view, then read the raw cell bytes.
+    kanon = torch.arange(k_row, device=dev, dtype=torch.int32).repeat(nb * bs * hkv)
+    k_q8.copy_(kanon.view(nb, bs, hkv, k_row).to(torch.uint8))
+    vanon = torch.arange(d, device=dev, dtype=torch.float16).repeat(nb * bs * hkv)
+    v.copy_(vanon.view(nb, bs, hkv, d) * 0.5)
+    raw = cache.view(torch.uint8)  # [nb, Hkv, block, cell_b] (fp16 -> 2 bytes/el)
+    for n in range(nb):
+        for h in range(hkv):
+            for s in range(bs):
+                cell = raw[n, h, s]
+                assert torch.equal(cell[:k_row], k_q8[n, s, h])
+                # The alignment pad between the two regions stays untouched.
+                assert int(cell[k_row:v_off].abs().sum()) == 0
+                v_here = cell[v_off : v_off + 2 * d].view(torch.float16)
+                assert torch.equal(v_here, v[n, s, h])
+
+    # Out-of-lockstep cell width and a wrong head/token order must fail loudly.
+    with pytest.raises(AssertionError, match="cell mismatch"):
+        impl._ensure_packed_views(
+            torch.zeros((nb, hkv, bs, cell_b // 2 + 1), dtype=torch.float16, device=dev)
+        )
+    with pytest.raises(AssertionError, match="Hkv"):
+        impl._ensure_packed_views(
+            torch.zeros((nb, bs, hkv, cell_b // 2), dtype=torch.float16, device=dev)
+        )
