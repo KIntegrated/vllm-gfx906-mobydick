@@ -104,12 +104,14 @@ align`) the scheduler block size moves **2096 → 2672** and KV tokens rise only
 only**; hybrid models stay opt-in. Non-hybrid block size is unchanged (35B:
 8192 in both arms).
 
-**Open work, in order:** (1) parameterize the **16 legacy-layout tests** over the
-layout — this is now the blocking item for *any* default flip, because they
-construct the fused cache directly and would go red; (2) then the conditional
-default (packed on unless the model has hybrid KV groups, keyed where
-`_align_hybrid_block_size` runs); (3) B=4 model-level and TP=2 + drafter (8-row
-verify) numbers while the suite is being reworked; the four guards (asymmetric K/V head dims, head padding,
+**Open work, in order:** (1) ~~parameterize the legacy-layout tests~~ **done**
+(`packed_layout` fixture + `_layout_cache`; the two non-causal tests now run on
+both layouts in the default run, alias-internals tests skip with reasons, and
+the padding suite skips under the flag by design — default 143 passed, flag on
+103 passed + 40 skipped). (2) The **conditional default** is now unblocked:
+packed on unless the model has hybrid KV groups, keyed where
+`_align_hybrid_block_size` runs. (3) B=4 model-level and TP=2 + drafter (8-row
+verify) numbers; the four guards (asymmetric K/V head dims, head padding,
 non-2-byte KV dtypes, padding+packed) are the feature matrix still missing, and
 `GFX906_FA_LEGACY=1` (fp16 K) stays a separate decision.
 
