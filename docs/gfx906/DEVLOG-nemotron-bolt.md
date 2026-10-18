@@ -489,3 +489,24 @@ sequential arms):
 **No effect** (≤0.3 %, inside this host's noise), as expected on a healthy
 TP=2 boot with the official DKMS driver. Kept as an opt-in lever for the
 sync-cadence wedge family; not installed in the venv.
+
+### BOLT-2 FIXED — store the drafter's context KV from row 0
+
+`_precompute_context_kv(num_context, num_target_tokens)` → `(0, num_target_tokens)` in the
+FULL-graph branch of `propose()` (upstream `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py`,
+regressed by upstream #57632; the file has no fork commits). The extra rows are the ones the captured
+graph also writes, so the store is idempotent, and it closes the hole where rows
+`[0, num_context)` were never stored on prefill steps.
+
+Validation (Bolt 74B + LiLiCorr k=7, production config; `agentctx.py`, distinct-source prompts,
+greedy):
+
+| prompt | before | after |
+|---|---|---|
+| 1.6k | 2.97 accept | **4.29, 4.23** |
+| 6.4k | **1.0, 1.0, 5.65** | **3.75, 5.94, 3.80** |
+
+No collapse in six 6.4k runs (three before at 1.0/1.0/5.65, three after at 3.75/5.94/3.80). Upstream
+report written up in `UPSTREAM-dflash-context-kv.md` (no duplicate upstream; #57632 suspected
+introducer). The remaining acceptance spread (3.75–5.94) is this stack's normal draft chaos, not the
+collapse signature (which was exactly 1.0).

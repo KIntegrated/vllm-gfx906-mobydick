@@ -32,6 +32,7 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
@@ -478,8 +479,13 @@ class DFlashSpeculator(DraftModelSpeculator):
                     PAD_SLOT_ID
                 )
             else:
-                # Prefill context beyond the graph's rows is stored before replay.
-                self._precompute_context_kv(num_context, num_target_tokens)
+                # Store every context row outside the graph, including the
+                # first `num_context` rows the capture also writes: that store
+                # is idempotent (same rows, positions and hidden states) and it
+                # closes a hole where rows 0..num_context-1 were never stored at
+                # replay (BOLT-2: poisoning the draft KV collapsed acceptance at
+                # 1.6k, and this write started at pos_min=8).
+                self._precompute_context_kv(0, num_target_tokens)
         else:
             self._precompute_context_kv(0, num_target_tokens, dummy_run)
 
