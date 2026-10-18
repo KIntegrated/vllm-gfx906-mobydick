@@ -195,11 +195,6 @@ whether int8 KV is worth it on 32 GB cards.
 `prep_inputs` / `attn_metadata` / `ctx_kv` / `gen_draft` ms/step regions — the
 resolution our spec A/Bs keep missing. Only if graph-safe and <1 % overhead.
 
-### LAB-7 — blocking-sync `.pth` for TP≥2 · [#55](../../issues/55)
-
-HIP `hipSetDeviceFlags(4)` shim. A diagnostic lever for the "sync-cadence collapse while plain
-decode is fine" wedge family, not a default; record the ms/step delta on a healthy boot.
-
 ### BOLT-2 — acceptance collapses past ~4k context · [#54](../../issues/54)
 
 The LiLiCorr drafter (working since `031fa0e4b2`, 6.77 tokens/step at short

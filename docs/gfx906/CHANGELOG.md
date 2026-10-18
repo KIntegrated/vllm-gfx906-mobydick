@@ -8,6 +8,23 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-18 (BOLT-2 root cause; LAB-7 closed as a no-op lever)
+
+**BOLT-2 (#54) root cause found — a write bug in the speculator, not attention.**
+Post-gather slot logging and a per-request NaN poison (`VLLM_DFLASH_CTXDBG` /
+`VLLM_DFLASH_POISON`) show the drafter's context KV is written with two holes: the
+outside-graph precompute starts at row 8 (`pos_min=8`, rows 0..7 left to the captured
+graph), and on a multi-chunk prefill only the **last** chunk is stored — a 6.4k prompt's
+single write is `pos_min=4097..6416`, so positions 0..4096 never enter the drafter's
+cache. Poisoning collapses acceptance to 0 at both 1.6k and 6.4k. This matches the ~4k
+threshold and explains why backend, sinks and chunk size all looked irrelevant. Fix
+directions recorded in the issue (row-0 precompute; store on every prefill chunk).
+
+**LAB-7 (#55) closed:** the lab's blocking-sync `.pth` is ported to
+`tools/gfx906_blocking_sync/` and measured — **no effect** on a healthy TP=2 boot
+(61.8/56.5 vs 62.0/56.5 ms/step, acceptance identical), so it stays an opt-in lever for
+the sync-cadence wedge family, not a default.
+
 ## 2026-10-17 (later — DFLASH2-GATE passed, LAB-8 ported)
 
 **DFLASH2-GATE (#51) closed: both ported DFlash2 fixes validated on hardware.**

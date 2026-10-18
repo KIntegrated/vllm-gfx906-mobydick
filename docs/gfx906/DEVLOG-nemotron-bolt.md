@@ -474,3 +474,18 @@ needs the target's hidden states for the earlier chunks, which the target only
 produces for the step it runs in. (b) is therefore a scheduling-side change
 (run the store during chunked prefill) or an explicit prefix store when the
 first decode step runs.
+
+### LAB-7 (#55) — the blocking-sync lever is a no-op on a healthy boot
+
+Ported the lab's `.pth` to `tools/gfx906_blocking_sync/` and measured it on the
+Bolt + LiLiCorr setup with the kernels enabled (2 reps per arm, same prompt,
+sequential arms):
+
+| arm | t/s | ms/step | acc/draft |
+|---|---|---|---|
+| lever off (recorded arm) | 119.5, 130.7 | 61.8, 56.5 | 6.77 |
+| lever on | 119.1, 130.6 | 62.0, 56.5 | 6.77 |
+
+**No effect** (≤0.3 %, inside this host's noise), as expected on a healthy
+TP=2 boot with the official DKMS driver. Kept as an opt-in lever for the
+sync-cadence wedge family; not installed in the venv.
