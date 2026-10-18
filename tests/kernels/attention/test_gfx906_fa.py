@@ -4259,6 +4259,51 @@ def test_packed_choice_precedence_env_over_config(monkeypatch):
     backend.set_packed_config_mode("off")
 
 
+def test_packed_auto_dry_run_compares_the_aligner_block_size(monkeypatch):
+    """`auto` on a hybrid model must key on the aligner's block size, not on the
+    model class: compare both layouts, restoring what the aligner writes."""
+    from types import SimpleNamespace
+
+    from vllm.gfx906_fa import gfx906_fa_backend as fa
+    from vllm.platforms.rocm import RocmPlatform
+
+    cache = SimpleNamespace(
+        block_size=16,
+        mamba_block_size=None,
+        mamba_page_size_padded=None,
+        skip_page_size_padded=None,
+    )
+    cfg = SimpleNamespace(cache_config=cache)
+
+    def align(vllm_config, backend_cls):
+        # Lightning-30B-like: the packed page moves the derived block size.
+        # Writes the config it is given (the dry-run clone), not the original.
+        vllm_config.cache_config.block_size = (
+            2672 if fa._packed_choice() == "on" else 2096
+        )
+
+    monkeypatch.setattr(
+        RocmPlatform, "_align_hybrid_block_size", staticmethod(align)
+    )
+    assert RocmPlatform._gfx906_packed_auto_block_size(cfg, "on") == 2672
+    assert RocmPlatform._gfx906_packed_auto_block_size(cfg, "off") == 2096
+    # Dry runs mutate only the clone; the real config and resolution are untouched.
+    assert cache.block_size == 16
+    assert cache.mamba_block_size is None
+    assert fa._PACKED_MODE is None
+
+    # Qwen3.5-35B-A3B-like: block size is the same either way (the +22 % case),
+    # so `auto` may keep packed.
+    def align_same(vllm_config, backend_cls):
+        vllm_config.cache_config.block_size = 8192
+
+    monkeypatch.setattr(
+        RocmPlatform, "_align_hybrid_block_size", staticmethod(align_same)
+    )
+    assert RocmPlatform._gfx906_packed_auto_block_size(cfg, "on") == 8192
+    assert RocmPlatform._gfx906_packed_auto_block_size(cfg, "off") == 8192
+
+
 def test_packed_auto_mode_falls_back_instead_of_failing_the_boot(monkeypatch):
     """Unset flag = auto: a spec the layout cannot express selects the alias
     layout once (logged) and stays there; an explicit =1 still raises."""

@@ -626,3 +626,39 @@ So: `gfx906_fa_packed` stays `"off"` by default (config field + CLI + auto/fallb
 all landed and tested), and the flip waits for the dry-run comparison. Until
 then, the capacity win is available per model with `--gfx906-fa-packed on` or
 `GFX906_FA_PACKED=1`.
+
+### LAB-9 item 4 — the default is now `auto`, gated on the aligner's block size
+
+`CacheConfig.gfx906_fa_packed` defaults to **`"auto"`**. On a hybrid model
+`auto` dry-runs `_align_hybrid_block_size` for both layouts and keeps packed only
+when the derived **scheduler block size is unchanged**; otherwise it logs the
+numbers and stays on the alias layout. The dry run runs on a **copy** of the
+config, because restoring a snapshot is not equivalent to a fresh run (measured:
+2672 restored vs 4192 on a dirty config), and its logging is suppressed so the
+log never shows a phantom "packed enabled".
+
+Verified on the two hybrid models we have:
+
+| model | dry run (alias → packed) | `auto` decision | pool |
+|---|---|---|---|
+| Nemotron-3.5-Lightning-30B | 2096 → **2672** | **off** | 526,336 tok (identical to the control) |
+| Qwen3.5-35B-A3B | 1056 → **2112** | **off** | 142,987 tok (identical to the control) |
+
+**Correction to an earlier note in this log:** I had recorded the 35B's block
+size as "unchanged (8192)". That was a misreading of `kv cache group sizes`
+(8192 is the attention group's context capacity, not the scheduler block size);
+the 35B's block size really does move with the layout (1056 → 1376 with the env
+override, 1056 → 2112 in the engine's config stage). So the block-size rule
+correctly excludes both of our hybrid models, and their **+22 % / +11.5 %**
+wins remain opt-in via `--gfx906-fa-packed on`.
+
+Known wart, recorded: the dry run runs in both the API-server and engine-core
+config paths and the two report different "would-be" block sizes (2672 vs 4192
+for Lightning; 1376 vs 2112 for the 35B) because the config is at a different
+stage in each. The decision matches; computing it once (or passing the decision
+through) is a follow-up.
+
+Net effect of the flip: models the config does **not** flag as hybrid get the
+packed layout by default (no aligner, so no block-size question), with the
+auto-fallback covering the unsupported shapes; hybrid models keep today's
+layout unless a user opts in, which is the state LAB-10/#58 assumes.

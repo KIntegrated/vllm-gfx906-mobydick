@@ -1213,6 +1213,35 @@ class RocmPlatform(Platform):
         compilation_config.custom_ops.append("+sparse_attn_indexer")
 
     @classmethod
+    def _gfx906_packed_auto_block_size(
+        cls, vllm_config: "VllmConfig", packed_mode: str
+    ) -> int:
+        """Scheduler block size the hybrid aligner derives for one KV layout.
+
+        Dry run: the aligner writes ``block_size``/``mamba_block_size`` (and the
+        page-padded hints), so those are snapshotted and restored, and the
+        backend's layout resolution is reset before and after.
+        """
+        import copy
+
+        from vllm.gfx906_fa import gfx906_fa_backend as fa
+
+        # Run on copies: the aligner writes several cache_config fields based on
+        # whatever it read at entry, so restoring a snapshot is not equivalent to
+        # a fresh run (measured: 2672 restored vs 4192 on a dirty config).
+        dry = copy.copy(vllm_config)
+        dry.cache_config = copy.copy(vllm_config.cache_config)
+        fa.set_packed_config_mode(packed_mode)
+        fa.reset_packed_mode()
+        fa.set_packed_dry_run(True)
+        try:
+            cls._align_hybrid_block_size(dry, fa.Gfx906FABackend)
+            return dry.cache_config.block_size
+        finally:
+            fa.set_packed_dry_run(False)
+            fa.reset_packed_mode()
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         from vllm.config.compilation import CUDAGraphMode
 
@@ -1252,20 +1281,45 @@ class RocmPlatform(Platform):
             else:
                 mode = getattr(cache_config, "gfx906_fa_packed", "off")
                 if mode == "auto" and model_config.is_hybrid:
-                    # Conservative: `is_hybrid` is broader than "the aligner
-                    # would move the block size" (e.g. Qwen3.5-35B-A3B is flagged
-                    # hybrid yet keeps block_size 8192 with and without packed,
-                    # and does get the +22 % win). So auto under-delivers on such
-                    # models; set gfx906_fa_packed=on to opt in. Refining this to
-                    # "did the aligner's block size change" needs a dry run of
-                    # _align_hybrid_block_size (LAB-10/#58).
-                    logger.info_once(
-                        "gfx906 FA: packed KV layout left off for this hybrid "
-                        "model under gfx906_fa_packed=auto (conservative: the "
-                        "block-size aligner may move a config-visible number; "
-                        "set gfx906_fa_packed=on to force it)."
-                    )
-                    mode = "off"
+                    # The packed cell shrinks the attention page, which can move
+                    # the block size the hybrid aligner derives -- a
+                    # config-visible number (Lightning-30B: 2096 -> 2672 for
+                    # +0.4 % capacity), while other hybrid-flagged models keep
+                    # their block size and do win (Qwen3.5-35B-A3B: 8192 either
+                    # way, +22 %). So compare the aligner's outcome for both
+                    # layouts instead of keying on the model class.
+                    try:
+                        on_bs = cls._gfx906_packed_auto_block_size(
+                            vllm_config, "on"
+                        )
+                        off_bs = cls._gfx906_packed_auto_block_size(
+                            vllm_config, "off"
+                        )
+                    except Exception as exc:  # noqa: BLE001 - never break a boot
+                        logger.warning_once(
+                            "gfx906 FA: could not dry-run the hybrid block-size "
+                            "aligner for the packed KV layout (%s); keeping the "
+                            "alias layout.",
+                            exc,
+                        )
+                        mode = "off"
+                    else:
+                        if on_bs != off_bs:
+                            logger.info_once(
+                                "gfx906 FA: packed KV layout left off under "
+                                "gfx906_fa_packed=auto: it would move the "
+                                "scheduler block size %d -> %d. Pass "
+                                "gfx906_fa_packed=on to force it.",
+                                off_bs,
+                                on_bs,
+                            )
+                            mode = "off"
+                        else:
+                            logger.info_once(
+                                "gfx906 FA: packed KV layout enabled under "
+                                "gfx906_fa_packed=auto (block size stays %d).",
+                                on_bs,
+                            )
                 set_packed_config_mode(mode)
         # Note: model_config may be None during testing
         if (

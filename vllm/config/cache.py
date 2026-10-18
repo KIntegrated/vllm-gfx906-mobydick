@@ -168,7 +168,7 @@ class CacheConfig:
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
-    gfx906_fa_packed: Literal["auto", "off", "on"] = "off"
+    gfx906_fa_packed: Literal["auto", "off", "on"] = "auto"
     """gfx906 custom FA only: KV cache cell layout.
 
     "off" keeps the long-standing alias layout (the Q8 K row stored inside an

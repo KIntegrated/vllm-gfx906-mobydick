@@ -104,7 +104,19 @@ align`) the scheduler block size moves **2096 → 2672** and KV tokens rise only
 only**; hybrid models stay opt-in. Non-hybrid block size is unchanged (35B:
 8192 in both arms).
 
-**Default flip: still pending, with a better-specified blocker.** Items 1–2 of the
+**Default flipped to `auto` (2026-10-18)**, gated on the hybrid aligner's block
+size rather than the model class: on a hybrid model the aligner is dry-run for
+both layouts (on a config **copy**, since restoring a snapshot is not faithful)
+and packed is kept only when the scheduler block size is unchanged. Both of our
+hybrid models are excluded by that rule — Lightning 2096 → 2672, 35B **1056 →
+2112** (correcting an earlier note: the 35B's block size does move; 8192 was a
+group capacity) — with pools identical to the controls (526,336 / 142,987), so
+their capacity wins stay opt-in. Non-hybrid models get packed by default, with
+the auto-fallback covering unsupported shapes. Known wart: the dry run runs in
+both config paths and reports different would-be values (2672 vs 4192, 1376 vs
+2112) while agreeing on the decision; compute it once.
+
+**Earlier note, now superseded:** Items 1–2 of the
 plan landed (`650b417651` auto/fallback, `f1e0328805` config field +
 `--gfx906-fa-packed`, default **off**), and item 3 (TP=2 + DFlash2 k=7) shows no
 regression: 73.74 → 73.46 t/s, acceptance equal, KV 184,178 → **205,381

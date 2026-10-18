@@ -130,6 +130,10 @@ _PACKED_2B_DTYPES = ("auto", "float16", "half", "bfloat16", "bf16")
 # logged reason, instead of failing the boot; an *explicit* GFX906_FA_PACKED=1
 # keeps the loud NotImplementedError, because then the user asked for it.
 _PACKED_MODE: str | None = None
+# Config-time dry runs (the hybrid aligner is evaluated once per layout) must not
+# emit the "enabled"/cell warnings, which would describe a layout that is not
+# the one the engine ends up using.
+_PACKED_QUIET = False
 
 
 # Value of CacheConfig.gfx906_fa_packed, published by the platform's config
@@ -154,6 +158,22 @@ def _packed_choice() -> str:
     return _PACKED_CONFIG_MODE
 
 
+def set_packed_dry_run(quiet: bool) -> None:
+    """Silence/restore the layout logging around a config-time dry run."""
+    global _PACKED_QUIET
+    _PACKED_QUIET = quiet
+
+
+def reset_packed_mode() -> None:
+    """Forget the resolved layout.
+
+    Only for config-time dry runs (the hybrid aligner is evaluated once per
+    layout before the choice is made) and tests; a serving process resolves once.
+    """
+    global _PACKED_MODE
+    _PACKED_MODE = None
+
+
 def _packed_resolve(on: bool, reason: str = "") -> None:
     """Fix the process-wide layout decision (called once, on the first spec)."""
     global _PACKED_MODE
@@ -163,7 +183,8 @@ def _packed_resolve(on: bool, reason: str = "") -> None:
             "be decided once per process"
         )
     _PACKED_MODE = "on" if on else "off"
-    logger.info(
+    log = logger.debug if _PACKED_QUIET else logger.info
+    log(
         "gfx906 FA: packed KV layout %s%s",
         "enabled" if on else "unavailable, using the alias layout",
         f" ({reason})" if reason else "",
@@ -646,7 +667,8 @@ class Gfx906FABackend(AttentionBackend):
         k_row = _packed_k_row_bytes(spec.head_size)
         base_cell = (spec.head_size + (spec.head_size_v or spec.head_size)) * (
             2 if spec.dtype in (torch.float16, torch.bfloat16) else 1)
-        logger.warning(
+        log = logger.debug if _PACKED_QUIET else logger.warning
+        log(
             "GFX906_FA_PACKED: KV cell %d B (K q8 row %d B at offset 0, "
             "V %d B at offset %d) vs baseline %d B -> pool token capacity "
             "x%.3f",

@@ -8,6 +8,33 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-18 (final — packed KV: auto/fallback, config knob, default on for non-hybrid)
+
+The packed KV layout is now a first-class, **on-by-default for non-hybrid
+models** option rather than an env-only experiment:
+
+- `650b417651` — the mode is tri-state and resolved once per process. Unset =
+  `auto`: the layout falls back to the alias path (logged) on any shape it cannot
+  express (head dims needing padding, asymmetric K/V, skip-quant padded pages,
+  non-2-byte KV dtypes) instead of failing the boot; explicit `=1` still raises.
+- `f1e0328805` — `CacheConfig.gfx906_fa_packed` (`auto`/`off`/`on`) +
+  `--gfx906-fa-packed`; the env var stays as a debug override. The platform
+  publishes the value and `auto` dry-runs the hybrid aligner.
+- default flipped to **`auto`**: on a hybrid model the aligner is dry-run for
+  both layouts (on a config **copy** — restoring a snapshot is not faithful:
+  2672 restored vs 4192 fresh) and packed is kept only when the scheduler block
+  size is unchanged. Lightning-30B (2096 → 2672) and Qwen3.5-35B-A3B (**1056 →
+  2112**) are both excluded by that rule with pools identical to their controls
+  (526,336 / 142,987 tokens), so their capacity wins stay opt-in; non-hybrid
+  models get packed by default.
+
+Measured across the campaign: PPL 15.9584 off vs 15.9635 on (0 misses), kernel
+decode 2.9–9.8 % faster with **bit-identical** outputs, model-level decode
+neutral (35B 57.1 → 57.2 t/s; TP=2 + DFlash2 k=7 73.74 → 73.46 t/s), KV tokens
++22.2 % (35B), +11.5 % (TP=2/27B). Tests: the suite runs under both layouts
+(146 passed), including a dry-run decision test. Hybrid-model refinement is
+LAB-10 (#58).
+
 ## 2026-10-18 (later still — packed KV merged behind the flag, with tests)
 
 **PR #43 (packed KV layout, "E2") now lives on `main`, opt-in**
