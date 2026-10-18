@@ -115,6 +115,17 @@ verify) numbers; the four guards (asymmetric K/V head dims, head padding,
 non-2-byte KV dtypes, padding+packed) are the feature matrix still missing, and
 `GFX906_FA_LEGACY=1` (fp16 K) stays a separate decision.
 
+### LAB-10 — packed KV for hybrid models · [#58](../../issues/58)
+
+The layout **works** on hybrid models (Lightning-30B served at 528,384 tokens)
+but buys +0.4 % capacity and moves the scheduler block size 2096 → 2672, because
+`_align_hybrid_block_size` reconciles the (now smaller) attention page with the
+mamba page and the mamba state dominates the pool. **Measure first**: quantify
+the mamba:attention byte ratio per hybrid class and close the issue with that
+number if the ceiling is ~1-2 %; only then price a packed-aware aligner (the
+`_align_heterogeneous_kv_block_size` / `page_size_padded` precedent) or per-group
+block sizes.
+
 ## Next — 0.30-post and 0.31
 
 ### QSA-FN-10 — next tester measurement list · [#5](../../issues/5)
