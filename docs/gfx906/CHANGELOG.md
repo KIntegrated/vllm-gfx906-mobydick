@@ -8,6 +8,28 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-18 (later still — packed KV merged behind the flag, with tests)
+
+**PR #43 (packed KV layout, "E2") now lives on `main`, opt-in**
+(`9a3072f6a9` + tests `8150b72018`; author phoenixclyde preserved, `cherry-pick -x`).
+`GFX906_FA_PACKED` still defaults **off**, so the flag-off path is byte-identical
+(the spec is returned untouched). Capacity win measured earlier: **+22.7 % KV
+tokens** on the 35B (195,863 → 240,298) at **PPL 15.9584 off / 15.9635 on**, 0
+top-20 misses in both.
+
+The tests the LAB-9 plan asked for are in: the cell geometry table
+(D=64/128/256 → 208/400/784 B), the `customize_spec` publish/refuse contract
+(including the flag-off identity return and the 2-byte-dtype guard), and a
+byte-level round-trip proving K lands at offset 0, the alignment pad stays
+untouched and V lands at `v_off`. Flag-off suite: **140 passed**.
+
+Known cost, now measured rather than argued: with `GFX906_FA_PACKED=1` the same
+test file has **16 failures**, all of them legacy-layout tests (gather-buffer
+lifecycle, padded head dims, the non-causal alias cache). Making the packed
+layout the default therefore requires parameterizing those tests over the layout
+(or deleting the alias path), plus decode-t/s and feature-matrix work — tracked
+in LAB-9.
+
 ## 2026-10-18 (later still — community PRs: sampler hunk landed, packed KV A/B'd)
 
 **PR #41 hunk landed** (`afc9565da5`): the SYV-4 sort-free sampler now runs

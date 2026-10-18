@@ -79,16 +79,25 @@ draft acceptance collapses to 1.0 on prompts above ~4k. One-line fix in
 diff and model-eval numbers are pre-written in [#57](../../issues/57). Human
 submitter required (`AGENTS.md` §1). Ref: `UPSTREAM-dflash-context-kv.md`.
 
-### LAB-9 — decide on the packed KV layout (E2) · [PR #43](../../pull/43)
+### LAB-9 — packed KV layout (E2): merged behind the flag · [PR #43](../../pull/43)
 
-Community PR rebased onto `0.31` on branch `gfx906/e2-packed` (`063bd7a17c`,
-authored by phoenixclyde) and A/B'd here: **PPL parity** (15.9584 off vs
-15.9635 on, 0 top-20 misses both) and **+22.7 % KV capacity** on the 35B
-(195,863 → 240,298 tokens; cell 784 B vs 1024 B at head_dim 256). It stays
-**opt-in** (`GFX906_FA_PACKED`, default off) and **unmerged**: enabling it
-changes `attn_page_size_1_token` and therefore the hybrid block-size aligner,
-which can invalidate a user's pinned block/retention settings. Open question is
-whether the in-tree default should ever flip.
+Community PR rebased onto `0.31` (`9a3072f6a9`, author preserved), **merged to
+`main` with `GFX906_FA_PACKED` defaulting off** (`8150b72018` adds the tests).
+Measured: **PPL parity** (15.9584 off vs 15.9635 on, 0 top-20 misses both) and
+**+22.7 % KV capacity** on the 35B (195,863 → 240,298 tokens; cell 784 B vs
+1024 B at head_dim 256). Tests cover the geometry table, the `customize_spec`
+publish/refuse contract and the cell byte decomposition (flag-off suite: 140
+passed).
+
+**Open work before it can be a default** (the plan's stages 2–4): decode t/s is
+unmeasured; enabling it moves `attn_page_size_1_token` (4096 → 3136 B) and the
+hybrid aligner (448 → 576), so the default should first apply only where that
+aligner outcome is unchanged; 16 legacy-layout tests fail under the flag by
+construction and must be parameterized over the layout (or the old path
+deleted) before "one path" is possible; the four guards (asymmetric K/V head
+dims, head padding, non-2-byte KV dtypes, padding+packed) are the feature
+matrix still missing, and `GFX906_FA_LEGACY=1` (fp16 K) stays a separate
+decision.
 
 ## Next — 0.30-post and 0.31
 
