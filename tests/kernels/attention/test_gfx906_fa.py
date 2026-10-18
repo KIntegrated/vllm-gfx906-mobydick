@@ -4225,17 +4225,97 @@ def test_packed_customize_spec_publishes_the_cell_and_refuses_unsupported(
     with pytest.raises(NotImplementedError, match="padded page size"):
         backend.Gfx906FABackend.customize_spec(padded_page)
 
-    # Flag off: byte-identical behaviour, same object back.
+    # Flag off: byte-identical behaviour, same object back. The resolved mode is
+    # per-process (one layout per engine), so reset it before flipping the env.
+    monkeypatch.setattr(backend, "_PACKED_MODE", None)
     monkeypatch.setenv("GFX906_FA_PACKED", "0")
     untouched = spec(128)
     assert backend.Gfx906FABackend.customize_spec(untouched) is untouched
 
     # And the 5D geometry agrees with the published cell.
+    monkeypatch.setattr(backend, "_PACKED_MODE", None)
     monkeypatch.setenv("GFX906_FA_PACKED", "1")
     shape = backend.Gfx906FABackend.get_kv_cache_shape(4, 16, 2, 128, "auto")
     assert shape == (4, 2, 16, 2, backend._packed_cell_elems(128))
     with pytest.raises(NotImplementedError, match="2-byte"):
         backend.Gfx906FABackend.get_kv_cache_shape(4, 16, 2, 128, "int8")
+
+
+def test_packed_auto_mode_falls_back_instead_of_failing_the_boot(monkeypatch):
+    """Unset flag = auto: a spec the layout cannot express selects the alias
+    layout once (logged) and stays there; an explicit =1 still raises."""
+    import dataclasses
+    from dataclasses import dataclass
+
+    from vllm.gfx906_fa import gfx906_fa_backend as backend
+
+    @dataclass
+    class Spec:
+        head_size: int
+        head_size_v: int | None
+        block_size: int
+        num_kv_heads: int
+        dtype: torch.dtype
+        state_content_bytes: int
+        page_size_padded: int | None
+
+    def spec(d, head_size_v=None, page_size_padded=None):
+        return Spec(d, head_size_v, 16, 2, torch.float16, 2 * d, page_size_padded)
+
+    def reset():
+        monkeypatch.setattr(backend, "_PACKED_MODE", None)
+
+    # auto + packable -> packed, and the decision sticks.
+    reset()
+    monkeypatch.delenv("GFX906_FA_PACKED", raising=False)
+    out = backend.Gfx906FABackend.customize_spec(spec(128))
+    assert out.state_content_bytes == backend._packed_cell_bytes(128)
+    assert backend._packed_enabled() is True
+
+    # auto + each unsupported shape -> alias layout, no exception, sticky off.
+    for bad in (
+        spec(80),                        # head dim that needs padding
+        spec(128, 64),                   # asymmetric K/V
+        spec(128, page_size_padded=1024),  # skip-quant page reconciliation
+    ):
+        reset()
+        monkeypatch.delenv("GFX906_FA_PACKED", raising=False)
+        out = backend.Gfx906FABackend.customize_spec(bad)
+        # The packed path always rewrites state_content_bytes, so keeping the
+        # caller's value proves the alias path was taken; for the padded dim the
+        # alias path's own head-padding is what applies.
+        assert out.state_content_bytes == bad.state_content_bytes
+        assert out.head_size in (
+            bad.head_size,
+            backend._padded_head_size(bad.head_size),
+        )
+        assert backend._packed_enabled() is False
+        # The alias decision is sticky: a later packable spec does not flip it.
+        again = backend.Gfx906FABackend.customize_spec(spec(128))
+        assert again.state_content_bytes == 2 * 128
+        assert backend._packed_enabled() is False
+
+    # Explicit opt-in keeps the loud failure.
+    reset()
+    monkeypatch.setenv("GFX906_FA_PACKED", "1")
+    with pytest.raises(NotImplementedError):
+        backend.Gfx906FABackend.customize_spec(spec(80))
+
+    # auto + a non-2-byte KV dtype -> alias geometry, not a boot failure.
+    reset()
+    monkeypatch.delenv("GFX906_FA_PACKED", raising=False)
+    shape = backend.Gfx906FABackend.get_kv_cache_shape(4, 16, 2, 128, "int8")
+    assert shape[-1] == 128
+    assert backend._packed_enabled() is False
+
+    # Resolved ON, then a spec that cannot be packed: fail loudly rather than
+    # silently mixing layouts in one pool.
+    reset()
+    monkeypatch.delenv("GFX906_FA_PACKED", raising=False)
+    backend.Gfx906FABackend.customize_spec(spec(128))
+    assert backend._packed_enabled() is True
+    with pytest.raises(NotImplementedError):
+        backend.Gfx906FABackend.customize_spec(spec(80))
 
 
 @pytest.mark.parametrize("d", [128, 256])

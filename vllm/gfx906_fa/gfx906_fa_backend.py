@@ -125,8 +125,41 @@ _PACKED_ENV = "GFX906_FA_PACKED"
 _PACKED_2B_DTYPES = ("auto", "float16", "half", "bfloat16", "bf16")
 
 
+# Resolved decision for this process ("on"/"off"), or None until the first
+# spec asks. A default (auto) mode falls back to the alias layout once, with a
+# logged reason, instead of failing the boot; an *explicit* GFX906_FA_PACKED=1
+# keeps the loud NotImplementedError, because then the user asked for it.
+_PACKED_MODE: str | None = None
+
+
+def _packed_choice() -> str:
+    """'on' / 'off' when explicitly configured, else 'auto'."""
+    value = _os.environ.get(_PACKED_ENV)
+    if value is None:
+        return "auto"
+    return "on" if value == "1" else "off"
+
+
+def _packed_resolve(on: bool, reason: str = "") -> None:
+    """Fix the process-wide layout decision (called once, on the first spec)."""
+    global _PACKED_MODE
+    if _PACKED_MODE is not None:
+        raise RuntimeError(
+            "gfx906 FA: packed KV layout resolved twice; the pool geometry must "
+            "be decided once per process"
+        )
+    _PACKED_MODE = "on" if on else "off"
+    logger.info(
+        "gfx906 FA: packed KV layout %s%s",
+        "enabled" if on else "unavailable, using the alias layout",
+        f" ({reason})" if reason else "",
+    )
+
+
 def _packed_enabled() -> bool:
-    return _os.environ.get(_PACKED_ENV, "0") == "1"
+    if _PACKED_MODE is not None:
+        return _PACKED_MODE == "on"
+    return _packed_choice() == "on"
 
 
 def _packed_align16(n: int) -> int:
@@ -576,6 +609,39 @@ class Gfx906FABackend(AttentionBackend):
         return Gfx906FAImpl
 
     @classmethod
+    def _packed_spec(cls, spec):
+        """Publish the packed cell, or raise for a shape the layout cannot express."""
+        if spec.head_size_v not in (None, spec.head_size):
+            raise NotImplementedError(
+                "GFX906_FA_PACKED assumes head_size_v == head_size, got "
+                f"{spec.head_size_v} vs {spec.head_size}")
+        if _padded_head_size(spec.head_size) != spec.head_size:
+            raise NotImplementedError(
+                "GFX906_FA_PACKED does not support head dims that require "
+                f"padding: head_size={spec.head_size} would pad to "
+                f"{_padded_head_size(spec.head_size)}")
+        if spec.page_size_padded is not None:
+            # The skip-quant path (kv_cache_dtype_skip_layers) reconciles pages
+            # across layers via skip_page_size_padded; the packed cell is not a
+            # two-half row, so publishing it while clearing that hint would
+            # silently drop the reconciliation.
+            raise NotImplementedError(
+                "GFX906_FA_PACKED cannot honour a padded page size "
+                f"(page_size_padded={spec.page_size_padded})")
+        cell = _packed_cell_bytes(spec.head_size)
+        k_row = _packed_k_row_bytes(spec.head_size)
+        base_cell = (spec.head_size + (spec.head_size_v or spec.head_size)) * (
+            2 if spec.dtype in (torch.float16, torch.bfloat16) else 1)
+        logger.warning(
+            "GFX906_FA_PACKED: KV cell %d B (K q8 row %d B at offset 0, "
+            "V %d B at offset %d) vs baseline %d B -> pool token capacity "
+            "x%.3f",
+            cell, k_row, spec.head_size * 2, _packed_v_offset_bytes(
+                spec.head_size), base_cell, base_cell / cell if cell else 0.0)
+        return dataclasses.replace(
+            spec, state_content_bytes=cell, page_size_padded=None)
+
+    @classmethod
     def customize_spec(cls, spec):
         """Widen the KV spec's head dims to the padded one when padding is opted in.
 
@@ -594,47 +660,23 @@ class Gfx906FABackend(AttentionBackend):
                 f"block={spec.block_size} hkv={spec.num_kv_heads}",
                 flush=True,
             )
-        if _packed_enabled():
-            # PACKED (丙) takes precedence over head padding and the two are
-            # mutually exclusive by construction (adjudicated W572):
-            #   * the packed cell is NOT two equal halves, so the 0.29 fused
-            #     row (K||V, width 2*padded_head_size) cannot express it --
-            #     split(padded_head_size) would cut the K q8 region in half;
-            #   * _zero_cache_pad() writes [..., head_size:] of each half,
-            #     which in a packed cell lands inside the q8 K region.
-            # So a dim that would NEED padding is rejected explicitly here
-            # rather than silently producing a corrupt layout.
-            if spec.head_size_v not in (None, spec.head_size):
-                raise NotImplementedError(
-                    "GFX906_FA_PACKED assumes head_size_v == head_size, got "
-                    f"{spec.head_size_v} vs {spec.head_size}")
-            if _padded_head_size(spec.head_size) != spec.head_size:
-                raise NotImplementedError(
-                    "GFX906_FA_PACKED does not support head dims that require "
-                    f"padding: head_size={spec.head_size} would pad to "
-                    f"{_padded_head_size(spec.head_size)}. Set "
-                    "GFX906_FA_PACKED=0 for this model.")
-            if spec.page_size_padded is not None:
-                # The skip-quant path (kv_cache_dtype_skip_layers) reconciles
-                # pages across layers by padding them to skip_page_size_padded;
-                # the packed cell is not a two-half row, so publishing it while
-                # clearing that hint would silently drop the reconciliation.
-                raise NotImplementedError(
-                    "GFX906_FA_PACKED cannot honour a padded page size "
-                    f"(page_size_padded={spec.page_size_padded}) from the "
-                    "skip-quant path. Set GFX906_FA_PACKED=0 for this model.")
-            cell = _packed_cell_bytes(spec.head_size)
-            k_row = _packed_k_row_bytes(spec.head_size)
-            base_cell = (spec.head_size + (spec.head_size_v or spec.head_size)) * (
-                2 if spec.dtype in (torch.float16, torch.bfloat16) else 1)
-            logger.warning(
-                "GFX906_FA_PACKED=1: KV cell %d B (K q8 row %d B at offset 0, "
-                "V %d B at offset %d) vs baseline %d B -> pool token capacity "
-                "x%.3f",
-                cell, k_row, spec.head_size * 2, _packed_v_offset_bytes(
-                    spec.head_size), base_cell, base_cell / cell if cell else 0.0)
-            return dataclasses.replace(
-                spec, state_content_bytes=cell, page_size_padded=None)
+        choice = _packed_choice()
+        if _PACKED_MODE == "on":
+            # Decided ON earlier in this process: a guard now is a real error.
+            return cls._packed_spec(spec)
+        if choice != "off" and _PACKED_MODE is None:
+            # First spec decides for the whole process. In auto mode a shape the
+            # layout cannot express selects the alias layout with a logged reason
+            # instead of failing the boot; an explicit GFX906_FA_PACKED=1 raises.
+            try:
+                out = cls._packed_spec(spec)
+            except NotImplementedError as exc:
+                if choice == "on":
+                    raise
+                _packed_resolve(False, f"{type(spec).__name__}: {exc}")
+            else:
+                _packed_resolve(True)
+                return out
         padded = _padded_head_size(spec.head_size)
         if padded is None or padded == spec.head_size:
             return spec
@@ -657,14 +699,14 @@ class Gfx906FABackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        if _packed_enabled():
-            # Packed (丙) geometry. On 0.30 the pool is sized by
-            # compute_layer_kv_cache_shape_bytes() (which reads
-            # state_content_bytes published in customize_spec), and the per-layer
-            # tensor is a 4D [B, Hkv, N, cell//2] view; this 5D return is kept in
-            # agreement with it so a caller that reads it back sees the packed
-            # width. The leading 2 is the 0.29 fused K||V marker and is unused by
-            # the packed read path.
+        # Packed (丙) geometry. On 0.30 the pool is sized by
+        # compute_layer_kv_cache_shape_bytes() (which reads state_content_bytes
+        # published in customize_spec), and the per-layer tensor is a 4D
+        # [B, Hkv, N, cell//2] view; this 5D return is kept in agreement with it
+        # so a caller that reads it back sees the packed width. NOTE the leading
+        # 2 is the 0.29 fused K||V marker and is unused by the packed read path,
+        # so numel(shape) is NOT the pool size - nothing in-tree sizes from it.
+        def _packed_shape() -> tuple[int, ...]:
             s = (cache_dtype_str or "auto").lower()
             if s not in _PACKED_2B_DTYPES:
                 raise NotImplementedError(
@@ -672,6 +714,20 @@ class Gfx906FABackend(AttentionBackend):
                     f"(auto/float16/bfloat16), got --kv-cache-dtype={s!r}")
             return (num_blocks, 2, block_size, num_kv_heads,
                     _packed_cell_elems(head_size))
+
+        choice = _packed_choice()
+        if _PACKED_MODE == "on":
+            return _packed_shape()
+        if choice != "off" and _PACKED_MODE is None:
+            try:
+                shape = _packed_shape()
+            except NotImplementedError as exc:
+                if choice == "on":
+                    raise
+                _packed_resolve(False, str(exc))
+            else:
+                _packed_resolve(True)
+                return shape
         # Identical to TritonAttentionBackend for instantiated head dims, so backends
         # can be swapped without re-allocating the KV cache. A pad-able dim widens
         # the row instead (opt-in via GFX906_FA_PAD; see _padded_head_size).
