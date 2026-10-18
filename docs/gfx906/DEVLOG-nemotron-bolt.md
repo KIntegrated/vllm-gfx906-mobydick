@@ -701,3 +701,25 @@ gate).
   ("...the answer is Paris.") but returned `content: ''` with `finish_reason:
   stop` at 31 tokens, while earlier calls returned content — prompt/termination
   dependent; recorded in #59 as a second thing to check (parser vs EOS).
+
+### In-depth serving test (2026-10-18): legitimate model, broken generation
+
+Served TP=2 + LiLiCorr, greedy, prompts across factual/arithmetic/unit/JSON/code/
+tool/long-form, plus a logprob probe:
+
+- **Legitimate:** correct short answers (`Canberra`, `23, 29, 31, …`), spec decode
+  acceptance up to 6.8/draft, and an excellent next-token distribution
+  ("Paris" logprob -0.078, p=0.925).
+- **Not well-formed:** 300-token raw completions collapse (`# CAP theorem` xN,
+  repeat ratio 0.82; unchanged at repetition_penalty 1.1/1.2); the default
+  thinking mode never reaches `content` within 2000 tokens (5/5 prompts,
+  `finish=length`, `<think>` loops in the reasoning tail); a JSON-only request
+  reasons correctly then emits 3833 chars of `" "` repeats (ratio 0.98); with
+  `enable_thinking=false` it loops on `<think></think>`; no tool call is ever
+  produced.
+- Because the collapse reproduces on **raw `/v1/completions`** with no chat
+  template and no parser, the cause is the model/quant (or our WNA16 MoE path for
+  top-k 9 / 512 experts / g_idx), not the serving path. Recorded with
+  discriminators (in-fork `BENCH_MOE_BACKEND=triton` A/B; CUDA reference) in #59.
+  The README no longer lists Bolt as a usable model — it says "loads and serves,
+  generation quality not yet usable".

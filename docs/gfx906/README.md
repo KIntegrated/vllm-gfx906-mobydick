@@ -75,7 +75,15 @@ TTFT parity, decode −1.8 % @2k / −1.0 % @8k vs V1, `DEVLOG-muse-glimmer.md`)
 removes the V1 runner in **0.32.0**; no model here is pinned to it any more
 (ROADMAP `DFL2-2`, `GEMMA4-1`, `MUSE-1`).
 
-**Nemotron-3.5-Bolt-74B-A9B (W4A16, 41 GB) — TP=2 only.** 48.7 t/s greedy
+**Nemotron-3.5-Bolt-74B-A9B (W4A16, 41 GB) — TP=2 only; generation quality
+unresolved (#59).** *Legitimate* (loads, serves, spec decode up to 6.8
+accepted/draft, short answers correct, "Paris" at p=0.925) but **not
+well-formed**: long raw completions collapse into repetition (`# CAP theorem`
+×N, repeat ratio 0.82), the default thinking mode never exits within 2000
+tokens, a JSON-only request returns `" "`-garbage, `enable_thinking=false` loops,
+and no tool calls. Reproduces on raw `/v1/completions`, so it is the quant (or our
+WNA16 path for this geometry), not the template/parser. Do not treat as generally
+usable yet. 48.7 t/s greedy
 @216 ctx / 39.7 @856; with its **LiLiCorr** drafter (k=7, fp16) 6.77 accepted
 tokens/step and **96.2 t/s**, up to **119.5–130.7** with the M≤8 kernel ports.
 The official 24 GB quant (IQ2-XXS + NVFP4) is Blackwell-only and not runnable; the

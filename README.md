@@ -227,7 +227,7 @@ backend automatically and now log a WARNING that names the reason. Full record:
 | ↳ **post-0.30.0 re-measure (TP=2, 2026-09-24)** | **MTP k=3 (current default depth) + `GFX906_FA_LEGACY=0` KV read** | **2k 79.1 · 64k 42.0 · 120k 40.7 t/s** (filler, prefix caching OFF, bt4096, max-seqs 4, util 0.82, capture `[4,8,12,16]`; TTFT 4.2/185.3/442.2 s; PPL 10.5472). Standard `vllm bench serve` random 2048→256: **52.9 t/s** @ TPOT 18.90 ms, acceptance 59.9 % / 2.80 |
 | ↳ N=8 concurrent decode | W4 (`VLLM_GFX906_SKINNY_M16=1`) | **104.2** (TP=1, util 0.90) |
 | ↳ 256k context | FA gather fix (2026-08-24); kv_split fix (2026-09-03) | 250k needle PASS; **37.95 t/s MTP @ 64k ctx** (was 16.6 pre-fix) |
-| **Nemotron-3.5-Bolt-74B-A9B** (W4A16 G128 sym, 41 GB) | supported, **TP=2** (weights alone exceed one card) | 48.7 @216 ctx / 39.7 @856 (greedy, 16k ctx) |
+| **Nemotron-3.5-Bolt-74B-A9B** (W4A16 G128 sym, 41 GB) | **loads and serves on TP=2; generation quality not yet usable** — short answers correct, long-form/JSON/tool use degenerate on this quant ([#59](https://github.com/KIntegrated/vllm-gfx906-mobydick/issues/59)) | 48.7 @216 ctx / 39.7 @856 (greedy, 16k ctx); prefill 1052–1057 tok/s |
 | ↳ with the **LiLiCorr** drafter (k=7, fp16) | spec decode, **6.77 accepted tokens/step** | **96.2 t/s**; **119.5–130.7 t/s** with the M≤8 kernels on |
 | ↳ chat | template **defaults** only; `ultra_v3` parser via the checkpoint's plugin | correct answers — `enable_thinking`/`medium_effort` kwargs *degenerate* it into `</think>` loops |
 | Qwen3.6 fp16 checkpoints (52–67 GB) | do not fit 32 GB | — |
@@ -281,7 +281,23 @@ kwargs degenerate it into `</think>` loops.
 chat-templated with 0 top-20 misses**, ~10× flatter than its sibling
 (Nemotron-3.5-Lightning, ~27), so the numbers are not usable as a band until the
 cause is known (the AutoRound quant vs our WNA16 path); a CUDA reference run is
-planned. Gating used greedy equality + draft acceptance. Tracked in
+planned. Gating used greedy equality + draft acceptance.
+
+**Quality status (2026-10-18, in-depth serving test).** The checkpoint is
+*legitimate* — it loads, spec decode works (up to 6.8 accepted/draft), short
+factual answers are correct (`Capital of Australia` → " Canberra", primes →
+" 23, 29, 31, …") and next-token calibration is excellent ("Paris" at p=0.925
+for "The capital of France is") — but its **generation is not well-formed**:
+long raw completions collapse into repetition (`# CAP theorem` × N, 40-char
+repeat ratio 0.82, unchanged by repetition penalties), the default thinking mode
+never leaves the reasoning block within 2000 tokens, a JSON-only request returns
+`" "`-repeated garbage after a correct reasoning trace, `enable_thinking=false`
+loops on `<think></think>`, and no tool call is ever emitted. Because the same
+degeneration reproduces on raw `/v1/completions` (no template, no parser), it is
+a model/quant issue rather than a serving-path one; the two discriminators
+(`BENCH_MOE_BACKEND=triton` A/B in-fork, and upstream vLLM on a CUDA box) are
+listed in [#59](https://github.com/KIntegrated/vllm-gfx906-mobydick/issues/59).
+Tracked in
 [#59](https://github.com/KIntegrated/vllm-gfx906-mobydick/issues/59); dev log:
 [`docs/gfx906/DEVLOG-nemotron-bolt.md`](docs/gfx906/DEVLOG-nemotron-bolt.md).
 
