@@ -148,3 +148,22 @@ formula stands; only the 16k *served* datum is missing.
 Next: retry the 16k on-arm on a healthy boot (amdsmi normal), and treat the
 silent fallback as a bug (log a warning whenever the requested mode is not the
 resolved one).
+
+## 2026-10-19 — fail-open fixed: an explicit `on` that cannot be applied now warns
+
+Root cause of the 16k on-arm falling back silently: the platform publishes
+`gfx906_fa_packed` from `check_and_update_config`, but that publish is gated on
+`on_gfx906()`. A degraded boot (the API process logged `Failed to get total memory
+via amdsmi`) fails the device query in the process that builds the config, so the
+publish is skipped, `_PACKED_CONFIG_MODE` keeps its `"off"` default, and
+`customize_spec` takes the alias branch without logging anything — the explicit
+flag is dropped.
+
+Fix (`f7a3d1d…`): `check_and_update_config` now warns once when the requested
+mode is `on` and gfx906 is not detected in this process, naming the cause and the
+remedy. `auto` stays silent (it is a preference, not a request). Test:
+`tests/platforms/test_gfx906_packed_auto.py::test_explicit_packed_on_warns_when_gfx906_is_not_detected`
+(monkeypatched `on_gfx906` -> False, asserts the warning).
+
+Still open on this path: retry the 16k on-arm on a healthy boot to close LAB-10's
+last served datum.

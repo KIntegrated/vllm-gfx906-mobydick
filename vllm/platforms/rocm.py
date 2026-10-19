@@ -1313,6 +1313,22 @@ class RocmPlatform(Platform):
         # size (2096 -> 2672 measured), so it must not change silently. See
         # LAB-9/#58 in the fork's roadmap.
         cache_config = vllm_config.cache_config
+        # An explicit request must never be dropped silently: gfx906 detection
+        # needs a device-name/props query, and a degraded boot (e.g. a broken
+        # amdsmi) can fail it in the process that builds the config. Measured
+        # 2026-10-19: `--gfx906-fa-packed on` served the alias layout with no
+        # message from the packed layer at all.
+        if (
+            cache_config is not None
+            and not on_gfx906()
+            and getattr(cache_config, "gfx906_fa_packed", "off") == "on"
+        ):
+            logger.warning_once(
+                "gfx906 FA: gfx906_fa_packed=on was requested but gfx906 was "
+                "not detected in this process (device-name/properties query "
+                "failed, e.g. a degraded amdsmi boot). The alias KV layout is "
+                "used; retry on a healthy boot."
+            )
         if cache_config is not None and on_gfx906():
             try:
                 from vllm.gfx906_fa.gfx906_fa_backend import set_packed_config_mode

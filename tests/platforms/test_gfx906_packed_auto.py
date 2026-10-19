@@ -59,3 +59,36 @@ def test_packed_loses_when_the_page_grows_into_the_same_block_count():
 def test_no_unified_page_predicts_nothing_and_stays_off():
     assert gain((16, None), (16, None), 8_192) == 0.0
     assert gain((16, 131_072), (16, None), 8_192) == 0.0
+
+
+def test_explicit_packed_on_warns_when_gfx906_is_not_detected(
+    monkeypatch, caplog
+):
+    """Fail-open guard: `--gfx906-fa-packed on` must never be dropped silently.
+
+    Measured 2026-10-19: on an amdsmi-degraded boot the flag served the alias KV
+    layout with no message from the packed layer, because the platform's publish
+    step is gated on `on_gfx906()` and the backend then resolves "off" by default.
+    """
+    import logging
+    from unittest.mock import MagicMock
+
+    from vllm.platforms import rocm as rocm_mod
+
+    monkeypatch.setattr(rocm_mod, "on_gfx906", lambda: False)
+    vllm_config = MagicMock()
+    vllm_config.cache_config.gfx906_fa_packed = "on"
+    vllm_config.parallel_config.prefill_context_parallel_size = 1
+    vllm_config.parallel_config.worker_cls = "ray"
+    vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs.return_value = (
+        False
+    )
+    vllm_config.model_config = None
+
+    with caplog.at_level(logging.WARNING, logger="vllm"):
+        RocmPlatform.check_and_update_config(vllm_config)
+
+    assert any(
+        "gfx906_fa_packed=on was requested but gfx906 was not detected" in r.message
+        for r in caplog.records
+    ), [r.message for r in caplog.records]
