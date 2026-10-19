@@ -88,97 +88,28 @@ re-run (none; #47930/#61261/#60174/#57032/#51581 all different), issue body read
 Left: post it. The acceptance numbers are from the **pre-refactor** shape — say so
 in the report (the persistence is code inference, not a re-measurement).
 
-### LAB-9 — packed KV layout (E2): merged behind the flag · [PR #43](../../pull/43)
+### LAB-9 — packed KV layout (E2) · [PR #43](../../pull/43) — **closed 2026-10-19**
 
-Community PR rebased onto `0.31` (`9a3072f6a9`, author preserved), **merged to
-`main` with `GFX906_FA_PACKED` defaulting off** (`8150b72018` adds the tests).
-Measured: **PPL parity** (15.9584 off vs 15.9635 on, 0 top-20 misses both) and
-**+22.7 % KV capacity** on the 35B (195,863 → 240,298 tokens; cell 784 B vs
-1024 B at head_dim 256). Tests cover the geometry table, the `customize_spec`
-publish/refuse contract and the cell byte decomposition (flag-off suite: 140
-passed).
+Default `auto` resolves **per (model, max_model_len)** on predicted *usable* KV
+capacity at a 5 % threshold, so the old "hybrid models stay opt-in" rule is
+retired: hybrid models go through the same rule (35B 8k +33.6 % -> on, Lightning
+8k +0.4 % -> off, Lightning 16k +14.8 % -> on). The four guard arms are tested
+(`test_gfx906_packed_guards.py`), B=4 exists, packed is throughput-neutral, and
+the two defects found on the way are fixed: `--gfx906-fa-packed on` now reaches
+the process that resolves the layout (`d3d3a59040`), and packed x TP>1 no longer
+crashes on the layout flag (`ad69623e9c`). Still open, separately:
+`GFX906_FA_LEGACY=1` (fp16 K) versus the Q8 side buffer. Numbers and history:
+`CHANGELOG.md`, `DEVLOG-packed-kv.md`.
 
-**Measured 2026-10-18** (see `DEVLOG-nemotron-bolt.md`): the flag does **not**
-cost throughput. Kernel-level decode is **2.9–9.8 % faster** (smaller cell,
-bandwidth-bound) with **bit-identical outputs**; model-level on the 35B at
-B=1/16k it is neutral (57.1 vs 57.2 t/s) while KV tokens rise **+22.2 %**
-(142,987 → 174,762) and prefix caching behaves identically.
+### LAB-10 — packed KV for hybrid models · [#58](../../issues/58) — **closed 2026-10-19**
 
-**Hybrid aligner arm measured (2026-10-18)** — the condition for a default is
-now data, not guesswork: on Nemotron-3.5-Lightning-30B (`--mamba-cache-mode
-align`) the scheduler block size moves **2096 → 2672** and KV tokens rise only
-**+0.4 %** (526,336 → 528,384), and the PR's motivating pinned
-`--prefix-cache-retention-interval 576` is rejected in **both** arms (the 0.30
-448 → 576 story does not transfer to 0.31). So a default must be **non-hybrid
-only**; hybrid models stay opt-in. Non-hybrid block size is unchanged (35B:
-8192 in both arms).
-
-**Default flipped to `auto` (2026-10-18)**, gated on the hybrid aligner's dry
-run rather than the model class. The gate was corrected on 2026-10-19 (LAB-10):
-it compares **usable** KV capacity - `page_off * ceil(max_model_len/block_off)` vs
-`page_on * ceil(max_model_len/block_on)` - not raw pool tokens and not "did the
-block size move". A request holds `ceil(max_model_len / block_size)` blocks, so
-a smaller cell pays only when it also needs fewer blocks per request:
-**Qwen3.5-35B-A3B at 8k: +33.6 %** (1056 → 1376; served +22.2 %), **Lightning at
-8k: +0.4 %** (2096 → 2672 — `ceil(8192/2672) = 4 = ceil(8192/2096)`, so the +28 %
-of raw pool tokens the block-level probe measured is unusable), Lightning at 16k:
-+14.8 %. Decisions live in `_gfx906_packed_auto_geometry` +
-`_gfx906_packed_capacity_gain` (unit test
-`tests/platforms/test_gfx906_packed_auto.py`); the dry-run pair is evaluated once
-from pristine copies. Non-hybrid models get packed by default, with the
-auto-fallback covering unsupported shapes.
-
-**Earlier note, now superseded:** Items 1–2 of the
-plan landed (`650b417651` auto/fallback, `f1e0328805` config field +
-`--gfx906-fa-packed`, default **off**), and item 3 (TP=2 + DFlash2 k=7) shows no
-regression: 73.74 → 73.46 t/s, acceptance equal, KV 184,178 → **205,381
-(+11.5 %)**. Item 4 exposed that `is_hybrid` is **not** a usable condition — the
-35B is flagged hybrid yet keeps block_size 8192 and is where the +22 % win lives,
-while Lightning moves 2096 → 2672 for +0.4 %. The flip therefore needs a
-dry-run of `_align_hybrid_block_size` in both modes and a `block_size`
-comparison (restoring `block_size`, `mamba_block_size`,
-`mamba_page_size_padded`, `skip_page_size_padded` between runs).
-
-**Open work, in order:** (1) ~~parameterize the legacy-layout tests~~ **done**
-(`packed_layout` fixture + `_layout_cache`; the two non-causal tests now run on
-both layouts in the default run, alias-internals tests skip with reasons, and
-the padding suite skips under the flag by design — default 143 passed, flag on
-103 passed + 40 skipped). (2) The **conditional default** is now unblocked:
-packed on unless the model has hybrid KV groups, keyed where
-`_align_hybrid_block_size` runs. (3) B=4 model-level and TP=2 + drafter (8-row
-verify) numbers; the four guards (asymmetric K/V head dims, head padding,
-non-2-byte KV dtypes, padding+packed) are the feature matrix still missing, and
-`GFX906_FA_LEGACY=1` (fp16 K) stays a separate decision.
-
-### LAB-10 — packed KV for hybrid models · [#58](../../issues/58)
-
-The layout **works** on hybrid models, and the LAB-10 measurement (2026-10-19)
-says the ceiling is **the cell saving, not 1-2 %**: in align mode the aligner pins
-the unified page to the attention page (mamba is 99.2-99.8 % of a block's bytes),
-but the mamba state is per **block**, so a smaller attention cell buys capacity by
-raising the block size — 35B 1056 → 1376 (+30.6 % page-limited, +22.2 % served),
-Lightning 2096 → 2672 (+28.0 % page-limited). The premise "mamba dominates the
-pool ⇒ packed is worth <2 %" is therefore **wrong for align mode**: the win is
-tokens per mamba state block, not saved page bytes. Lightning's recorded **+0.4 %**
-(526,336 → 528,384) does not contradict that — both its arms report the same
-9.25 GiB pool and token counts ≈ 64.25/64.5 × 8192, i.e. that arm was **capped by
-request capacity, not by VRAM**. **Remaining step:** one served run per arm on the
-Lightning class with the cap lifted, logging `num_gpu_blocks` and the per-group
-page sizes; only then is the LAB-9 auto rule ("packed off when the block size
-moves") testable — the 35B suggests it is over-conservative where the block move
-*is* the win. Geometry tool + numbers: `_hybrid_kv_ratio.py`,
-`DEVLOG-packed-kv.md`.
-
-**2026-10-19 step 2 + correction:** a block-level in-process probe (num_blocks +
-per-group pages) shows the ceiling is the cell saving **that survives the
-per-request block rounding**, not the cell saving and not the mamba share: at
-max_model_len 8192 Lightning's raw pool gains 28.1 % (423,392 → 542,416 tokens)
-while `ceil(8192/2672) = ceil(8192/2096) = 4` blocks per request caps the usable
-gain at +0.4 %. The `auto` gate now uses that formula (35B 8k +33.6 % → on,
-Lightning 8k +0.4 % → off, Lightning 16k +14.8 % → on). The served 16k check is
-still missing: the on-arm silently fell back to the alias layout on an
-amdsmi-degraded boot (block stayed 2096, no `packed KV layout enabled` line) —
-that fail-open is a separate bug to fix before closing this item.
+Premise overturned and acted on: the ceiling is the cell saving *that survives
+per-request block rounding*, not the mamba page share and not the raw cell
+saving, and the `auto` gate now uses exactly that. Served confirmation on
+Lightning at 16k: same 6.68 GiB pool, 570,368 -> **610,577 usable tokens
+(+7.05 %)** against a +14.8 % prediction - a prediction that over-states, because
+tokens quantise into whole `max_model_len` requests. Geometry tool
+`_hybrid_kv_ratio.py`; numbers in `CHANGELOG.md` and `DEVLOG-packed-kv.md`.
 
 ## Next — 0.30-post and 0.31
 
