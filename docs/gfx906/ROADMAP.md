@@ -79,6 +79,15 @@ draft acceptance collapses to 1.0 on prompts above ~4k. One-line fix in
 diff and model-eval numbers are pre-written in [#57](../../issues/57). Human
 submitter required (`AGENTS.md` §1). Ref: `UPSTREAM-dflash-context-kv.md`.
 
+**2026-10-19 re-check (upstream/main `dde9aca41c`):** refactored, hole survives —
+`propose()`'s FULL branch became `_prepare_graph_replay()` (owns
+`[num_context, num_target_tokens)`) while the captured `_prepare_graph_forward()`
+owns `[0, num_context)`, so the fix has the same one-line shape. Patch rebased to
+current main (`/local/tmp/u6-dflash-context-kv-row0.patch`), duplicate check
+re-run (none; #47930/#61261/#60174/#57032/#51581 all different), issue body ready.
+Left: post it. The acceptance numbers are from the **pre-refactor** shape — say so
+in the report (the persistence is code inference, not a re-measurement).
+
 ### LAB-9 — packed KV layout (E2): merged behind the flag · [PR #43](../../pull/43)
 
 Community PR rebased onto `0.31` (`9a3072f6a9`, author preserved), **merged to
