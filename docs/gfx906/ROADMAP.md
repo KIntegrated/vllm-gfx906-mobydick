@@ -200,10 +200,14 @@ templated numerics gate vs bf16, a serving/perf measurement, the same wiring gap
 in `qwen3_5_mtp.py`, then the DFlash2 INT8 pairing arm. Ref:
 `DEVLOG-int8-packed.md`.
 
-### MUSE-2 — Muse-Glimmer + official DFlash assistant · [#25](../../issues/25)
+### MUSE-2 — Muse-Glimmer + official DFlash assistant · [#25](../../issues/25) — **closed 2026-10-19**
 
-Now working with graphs on (≥ +29 % decode, acceptance 2.82–3.18). Remaining:
-B=4, the TP=1 path, and dropping the obsolete RBLOCK workaround. Refs:
+B=4 measured (acceptance **2.95**, same distribution as B=1; aggregate decode
+**60–62 t/s** vs 39–43 at B=1, wall 23–28 t/s with a 10–13 s TTFT), TP=1
+**infeasible** — every knob fails at load on the drafter's 2.51 GiB embedding
+(`qwen3_dflash.py:822`), so TP=2 stays the shape — and the
+`TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` workaround is dropped: stock Triton 3.8.0
+needs neither, verified in-process with a cold cache. Refs:
 `DEVLOG-muse-glimmer.md`, `DEVLOG-fa-noncausal.md`.
 
 ### FA-STRUCT — remaining FA decode headroom (structural) · [#28](../../issues/28)

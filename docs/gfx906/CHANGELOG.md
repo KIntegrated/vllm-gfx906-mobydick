@@ -2182,3 +2182,23 @@ TP=2 packed 125.56 vs 126.19 t/s alias (B=4, mclk 1000); TP=1 B=4 packed 89.24 v
 alias 88.87 (+0.41 %, A->P->A bracketed). TP=4/TP=8 are invariant-tested
 (`test_layout_choice_is_independent_of_tp`, 1/2/4/8 KV heads per rank) but not
 executed - this box has two GPUs. See `DEVLOG-packed-kv.md`.
+
+### 2026-10-19 — MUSE-2 closed (B=4, TP=1, RBLOCK)
+
+- **B=4** (Muse-Glimmer + DFlash assistant, k=7, graphs, capture `[8,16,24,32]`):
+  acceptance **2.95** with the same per-position distribution as B=1 (pos0 0.832
+  vs 0.844), so the full-bidirectional mask does not degrade drafting at batch.
+  Aggregate decode **60.0–62.6 t/s** (window excluding TTFT) vs 39.2–43.5 at B=1,
+  i.e. ~1.5×; wall 23.4/27.8/27.4 t/s because TTFT grows to 10.0–13.3 s on four
+  concurrent 2k prompts. Quote both, or neither.
+- **TP=1 does not fit.** 23 GB target + 4.8 GB drafter on 31.98 GiB, and every arm
+  OOMs identically at load with the same 2.51 GiB request (the drafter's embedding,
+  `qwen3_dflash.py:822` → `vocab_parallel_embedding`), so no serving knob moves it:
+  `max-num-seqs 1`, KV 512 MiB, maxlen 4096, batched-tokens 2048, `--enforce-eager`,
+  util 0.85/0.95 all fail the same way. TP=2 remains the supported shape; TP=1
+  without a drafter stays 27.1 t/s.
+- **RBLOCK workaround dropped.** It existed for the triton-gfx906 fork's
+  variant-compile crash; the venv now runs stock Triton 3.8.0. Verified with an
+  in-process `LLM` run (`VLLM_USE_AOT_COMPILE=0`, cold inductor cache, variable
+  unset, three prompt sizes, graphs) — passed. Removed from the README recipe and
+  scoped to the fork in the mem-attribution skill.

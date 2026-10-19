@@ -577,8 +577,11 @@ vllm serve <model> \
   re-copy the `.pth` after any fresh venv. TP=1: drop
   `--tensor-parallel-size`, set `HIP_VISIBLE_DEVICES=0`, skip the shim.
 - **In-process (harness) only:** `VLLM_ENABLE_V1_MULTIPROCESSING=0
-  VLLM_USE_AOT_COMPILE=0 TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` —
-  not needed for `vllm serve`.
+  VLLM_USE_AOT_COMPILE=0` — not needed for `vllm serve`.
+  (`TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` is no longer required: it only
+  worked around a variant-compile crash in the triton-gfx906 fork, and the
+  venv now runs stock Triton 3.8.0 — verified 2026-10-19, see
+  `docs/gfx906/DEVLOG-muse-glimmer.md`.)
 
 Deep-dive recipes, docker images, and build instructions:
 [`docs/gfx906/running.md`](docs/gfx906/running.md).

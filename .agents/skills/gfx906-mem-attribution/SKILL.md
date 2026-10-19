@@ -75,7 +75,6 @@ compiles new shapes:
 ```bash
 cd /local/git/vllm-gfx906-mobydick   # no env sourcing needed: /opt/rocm is default (HK-1)
 env VLLM_USE_AOT_COMPILE=0 \
-    TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0 \
     FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE HF_HUB_OFFLINE=1 \
     VLLM_ENABLE_V1_MULTIPROCESSING=0 HIP_VISIBLE_DEVICES=0 \
     .venv/bin/python <script>
@@ -84,8 +83,10 @@ env VLLM_USE_AOT_COMPILE=0 \
 - `VLLM_USE_AOT_COMPILE=0` — default is ON for torch ≥2.10
   (`vllm/envs.py` `use_aot_compile()`); the out-of-process AOT
   worker crashes in-process on degraded boots.
-- `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` — the rblock variant-compile
-  path crashes (`JITFunction.fn is None`).
+- `TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` — **only for the triton-gfx906
+  fork** (its rblock variant-compile path crashes with
+  `JITFunction.fn is None`). Stock Triton 3.8.0 does not need it
+  (verified 2026-10-19, cold cache, in-process).
 - The probe also monkeypatches `AsyncCompile.process_pool` →
   `ThreadPoolExecutor(max_workers=2)` (`PROBE_THREAD_COMPILE`,
   default 1) so compilation runs in parent-process threads where HSA

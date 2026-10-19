@@ -1575,3 +1575,64 @@ and a DSpark port). The first version of this entry quoted a single 43.1 t/s run
 the range from two clean runs, because the harness of the day did not reap orphaned TP=2 workers
 (fixed; see `DEVLOG-fa-noncausal.md` finding 3). Caveat: one load died first in the load lottery
 (wedge #100); the retry was clean. k was not swept (k=7 only), B=1 only.
+
+## 2026-10-19 — MUSE-2 closed: B=4 measured, TP=1 does not fit, RBLOCK dropped
+
+**VERDICT:** `B=4 measured (acceptance holds) · TP=1 infeasible with this drafter ·
+RBLOCK workaround unnecessary on stock Triton` — **GATE:** the same serving arm as
+2026-09-17 (Muse-Glimmer-30B-AWQ-INT4 + `meta-models/Muse-Glimmer-30B-assistant`,
+method `dflash`, k=7, graphs, chat-templated 2k prompt, 3 reps × 128 tokens,
+prefix caching off).
+
+### B=4: acceptance is unchanged, aggregate decode ~1.5× the B=1 arm
+
+Capture ladder `[8,16,24,32]` (multiples of k+1=8 up to `max_num_seqs*(k+1)`, the
+AGENTS capture-ladder rule), `--max-num-seqs 4`, client `--concurrency 4`.
+
+| metric | B=1 (2026-09-17) | **B=4 (this)** |
+|---|---|---|
+| mean acceptance length | 2.82-3.18 | **2.95** |
+| per-position acceptance | 0.844 / 0.508 / 0.305 / 0.180 / 0.117 / 0.023 / 0.000 | 0.832 / 0.527 / 0.297 / 0.207 / 0.079 / 0.006 / 0.000 |
+| aggregate decode t/s | 39.2-43.5 | **60.0-62.6** (window excl. TTFT) |
+| per-request decode t/s | 39.2-43.5 | 14.9-15.0 |
+| aggregate wall t/s (incl. TTFT) | — | 23.4 / 27.8 / 27.4 |
+| TTFT | 3.87-3.89 s | 10.0-13.3 s (4x 2k-token prefill) |
+
+Acceptance distribution is statistically the same as B=1, so the superset
+(full-bidirectional) mask still does not degrade drafting at batch — the mask
+guard holds at B=4. Aggregate **decode** rises ~1.5× over the B=1 arm; the wall
+number is dominated by prefill contention (4 concurrent 2k prompts on one shared
+prefill), which is why the client reports both. Do not quote 27 t/s as "B=4
+throughput" without the TTFT caveat, and do not quote 62 t/s without the
+decode-only caveat.
+
+### TP=1: does not fit, and the reason is the drafter's embedding
+
+Weights are 23 GB (target, AWQ-INT4) + 4.8 GB (drafter, bf16) on a 31.98 GiB card.
+Every arm OOM'd identically at **load**, with the same 2.51 GiB request and
+~30.13 GiB already allocated:
+
+```
+qwen3_dflash.py:822 __init__ -> vocab_parallel_embedding.py -> OutOfMemoryError
+```
+
+i.e. the drafter's own embedding table (≈202k vocab × 6656 hidden × 2 B = 2.51
+GiB). Because the shortfall is at load, **no serving knob moves it**: tried
+`--max-num-seqs 1`, `--kv-cache-memory-bytes 512 MiB`, `--max-model-len 4096`,
+`--max-num-batched-tokens 2048`, `--enforce-eager` and util 0.85/0.95 — all fail
+with the identical 2.51 GiB. TP=1 with this drafter needs a smaller drafter
+embedding (quantized/8-bit) or a lighter target; TP=2 stays the supported shape.
+TP=1 without a drafter remains 27.1 t/s (V2, recorded 2026-09-16).
+
+### RBLOCK: the workaround is dead on stock Triton
+
+`TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK=0` was required because the rblock
+*variant*-compile path crashed inside the **triton-gfx906 fork**
+(`JITFunction.fn is None` via `get_jit_fn_file_line`). This venv now runs **stock
+upstream Triton 3.8.0** (`3.8.0+gitc01b6774` = tag `c01b6774b1`, RECON-triton-1),
+so the fork code is not in play. Verified rather than assumed: an in-process `LLM`
+run with `VLLM_USE_AOT_COMPILE=0`, a **cold** `TORCHINDUCTOR_CACHE_DIR`, the
+variable **unset**, and three prompt sizes (7/33/129 words, i.e. fresh dynamic
+shapes → the variant path) with `cudagraph_capture_sizes [1,2,4]` — compiled and
+generated cleanly (`RBLOCK-CHECK PASSED`). Dropped from the README recipe and from
+the mem-attribution skill.
