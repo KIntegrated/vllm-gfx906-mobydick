@@ -814,6 +814,30 @@ void top_k_per_row_decode(const torch::stable::Tensor& logits, int64_t next_n,
   const cudaStream_t stream = get_current_cuda_stream();
   const auto numColumns = logits.size(1);
 
+  // Every launch below requests topK (or 2*topK) int32_t of DYNAMIC shared
+  // memory and never opts in via cudaFuncAttributeMaxDynamicSharedMemorySize, so
+  // the request is capped by the device's per-block LDS. Exceeding it does not
+  // fail cleanly: the launch faults inside the kernel and takes the context with
+  // it (sticky HIP error, observed on gfx906 at selection width 12288 in this
+  // fork's QSA indexer probe). Fail closed instead, and derive the bound from the
+  // device rather than hardcoding it: the split path asks for 2*topK*4 B, so
+  // topK <= sharedMemPerBlockOptin / 8 (8192 on gfx906's 64 KiB LDS).
+  {
+    static int max_smem_per_block = 0;
+    if (max_smem_per_block == 0) {
+      max_smem_per_block = get_device_prop()->sharedMemPerBlockOptin;
+    }
+    const int64_t max_top_k = max_smem_per_block / (2 * sizeof(int32_t));
+    STD_TORCH_CHECK(topK > 0 && topK <= max_top_k,
+                    "top_k_per_row_decode: topK=", topK,
+                    " exceeds this device's dynamic shared-memory budget (",
+                    max_smem_per_block, " B per block => topK <= ", max_top_k,
+                    "). The multi-block split path needs 2*topK*int32 of LDS "
+                    "and this kernel does not opt in to a larger dynamic "
+                    "allocation; run it on a device with more LDS, or pick a "
+                    "smaller selection width.");
+  }
+
   // True if seqLens is 2D (B, next_n): each logit row has its own pre-computed
   // effective seq_len. False if seqLens is 1D (B,): all rows in a batch share
   // the same seq_len and the kernel computes the per-row offset itself.

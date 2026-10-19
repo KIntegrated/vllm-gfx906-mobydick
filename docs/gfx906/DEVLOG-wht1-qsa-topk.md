@@ -157,3 +157,34 @@ evidence; the reference path here is the local workaround.
 (`/local/tmp/wht1/topk_case.py` is scratch). Not merged to the line yet: the fix is
 unit-verified but has not been exercised by a real model load on the box, and that is the
 natural first end-to-end check once the bf16 weights land.
+
+## 2026-10-19 — UPR-3 fix: the width cap is the dynamic-LDS budget, and it now fails closed
+
+**VERDICT: `SHIPPED (fork guard) · upstream report still owed`** — the illegal
+memory access above width 8192 was never a kernel-logic bug: every launch in
+`top_k_per_row_decode` requests `topK` (or `2*topK`) `int32` of **dynamic shared
+memory** and the function never opts in via
+`cudaFuncAttributeMaxDynamicSharedMemorySize`, so the request is capped by the
+device's per-block LDS. On gfx906 that is 64 KiB, and the split path needs
+`2*topK*4` B ⇒ `topK <= 8192` — exactly the measured AGREE/FAIL boundary
+(8192 → 32 KiB fits; 12288 → 48 KiB faults). Compare `topk.cu` and
+`cooperative_topk.cu`, which *do* opt in and therefore work above their default.
+
+Fix: derive the bound from the device at entry and `STD_TORCH_CHECK` it, so a
+too-wide selection is an argument error naming the budget instead of a sticky
+HIP fault that kills the context and surfaces at the next unrelated op.
+
+| case | before | after |
+|---|---|---|
+| `width=8192` (32 KiB) | AGREE | **AGREE** |
+| `width=12288` (48 KiB) | illegal memory access, sticky | **RuntimeError** naming the LDS budget |
+
+Probe: `/local/tmp/wht1/upr3_check.py` (one process per width — the sticky error
+otherwise misattributes). Rebuild: incremental `setup.py build_ext --inplace`
+(`sampler.hip.o` + relink, ~4 min).
+
+Not fixed, deliberately: making 12288 *work* needs either the opt-in plus a
+device with ≥96 KiB LDS (gfx950 has it; gfx906 does not — its opt-in max is the
+same 64 KiB), or a streaming top-k that does not stage `2*topK` candidates in
+LDS. Upstream's config validator still hides the widths, so the guard costs
+nothing in reachable behaviour.
