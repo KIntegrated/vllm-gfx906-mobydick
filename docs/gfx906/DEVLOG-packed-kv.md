@@ -167,3 +167,33 @@ remedy. `auto` stays silent (it is a preference, not a request). Test:
 
 Still open on this path: retry the 16k on-arm on a healthy boot to close LAB-10's
 last served datum.
+
+## 2026-10-19 — 16k datum obtained; the real bug is config-field propagation (no reboot needed)
+
+Retried on the same boot. `--gfx906-fa-packed on` again served the **alias** layout
+(block 2096) and the new detection warning did **not** fire, so `on_gfx906()` was
+healthy — the earlier "degraded boot" explanation was wrong. Re-run with the
+**env var** `GFX906_FA_PACKED=1` on the identical command line: packed engages
+(`KV cell 400 B`, block **2672**). So:
+
+> `CacheConfig.gfx906_fa_packed` (`--gfx906-fa-packed on`) does not reach the
+> process that resolves the KV layout, while the env override does. The
+> config-field path is silently ineffective for the explicit `on` (and is the
+> documented interface).
+
+16k served A/B (Lightning, align, max_model_len 16384, util 0.85, same 6.68 GiB):
+
+| arm | block | logged usable tokens | vs off |
+|---|---|---|---|
+| off | 2096 | 570,368 | — |
+| on (env) | 2672 | **610,577** | **+7.05 %** |
+
+So the 16k prediction (+14.8 %) is an **upper bound**: the real gain is +7.1 %,
+consistent with the block-rounding theory in direction (8k +0.4 % → 16k +7.1 %)
+but over-stated in magnitude because usable tokens quantise into whole
+`max_model_len` requests per group. The 3 % threshold keeps both verdicts right
+(8k off, 16k on).
+
+Open, in order: (1) fix the config-field propagation (the warning added today does
+not cover it — it fires only when detection fails); (2) LAB-10 can close once (1)
+lands, using the env-var datum above as the served confirmation.
