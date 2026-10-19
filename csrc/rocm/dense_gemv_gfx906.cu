@@ -79,6 +79,46 @@ __forceinline__ __device__ void atomic_add_pk4_f16(half* addr, half2 v01,
   }
 }
 
+// Scalar fp16 atomic add, toolchain-portable (ksplit>1 epilogue).
+//
+// `atomicAdd` on a `__half*` is a header addition rather than a hardware op:
+//
+//   * ROCm >= 7.14 provides it (amd_hip_fp16.h), delegating to clang's
+//     `__scoped_atomic_fetch_add`, which gfx906 lowers to a masked dword
+//     `global_atomic_cmpswap` retry loop (~39 instructions for the epilogue).
+//   * ROCm 7.2.1 has no such overload, so the bare call does not compile
+//     ("no matching function for call to 'atomicAdd'"); this is the tester
+//     base image reported in phoenixclyde's PR #41.
+//
+// Both paths do one `__hadd` per attempt under an aligned dword CAS, so the
+// result is identical; only the code size differs (the fallback nests a
+// 16-bit CAS inside HIP's masked dword CAS: ~67 instructions). Compile-only
+// difference, no change to served numerics. `-DVLLM_GFX906_FORCE_HALF_CAS=1`
+// forces the fallback so that arm stays build-tested on newer toolchains.
+__forceinline__ __device__ void atomic_add_f16_cas(half* addr, half v) {
+  unsigned short* addr_u = reinterpret_cast<unsigned short*>(addr);
+  unsigned short old = *addr_u;
+  while (true) {
+    union {
+      unsigned short u;
+      half h;
+    } cur, sum;
+    cur.u = old;
+    sum.h = __hadd(cur.h, v);
+    unsigned short prev = atomicCAS(addr_u, old, sum.u);
+    if (prev == old) break;
+    old = prev;
+  }
+}
+
+__forceinline__ __device__ void atomic_add_f16(half* addr, half v) {
+#if !defined(VLLM_GFX906_FORCE_HALF_CAS) && HIP_VERSION >= 71400000
+  atomicAdd(addr, v);
+#else
+  atomic_add_f16_cas(addr, v);
+#endif
+}
+
 // 8-wide fp32 dot: 4 x v_dot2_f32_f16 over (w.h2[i], a.h2[i]).
 __forceinline__ __device__ float dot8_f32(const half2 (&w)[4],
                                           const half2 (&a)[4]) {
@@ -584,7 +624,9 @@ __global__ void __launch_bounds__(KCHUNK / 8)
     if (ksplit == 1) {
       out[(int64_t)lane * N + row] = __float2half_rn(s);
     } else {
-      atomicAdd(&out[(int64_t)lane * N + row], __float2half(s));
+      // Was: atomicAdd(&out[...], __float2half(s)); ROCm 7.2.1 has no
+      // __half* overload - see atomic_add_f16 above.
+      atomic_add_f16(&out[(int64_t)lane * N + row], __float2half(s));
     }
   }
 }

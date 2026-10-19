@@ -103,10 +103,11 @@ superseded or wrong for this stack:
   honouring an arbitrary user-specified mamba block size there breaks the
   page/kernel alignment the aligner just computed. The defensible version is a
   warning when a user-specified value is overridden, not a gate.
-- `csrc/rocm/dense_gemv_gfx906.cu` `atomic_add_f16_scalar` — a ROCm 7.2.1
-  build adaptation (`atomicAdd(__half*)` missing there). This box is 7.14 and
-  the ksplit>1 path deliberately uses the compiler-lowered atomic (see the call
-  site comment); the CAS helper would replace working code.
+- `csrc/rocm/dense_gemv_gfx906.cu` `atomic_add_f16_scalar` — **taken in reworked
+  form, see above**: version-gated, so 7.14 keeps the native lowering and 7.2.1
+  builds; the plain CAS-everywhere form would have replaced working code with a
+  nested CAS loop on this toolchain. Measuring that nesting is what settled it
+  (39 vs 67 instructions).
 - `pyproject.toml` torch pin (2.15.0a0) — this box pins the local 2.13.0 gfx906
   build.
 
