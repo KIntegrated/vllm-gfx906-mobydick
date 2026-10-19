@@ -266,3 +266,9 @@ gfx906_fa_launcher*.hipi
 gfx906_fa_launcher*.o
 gfx906_fa_launcher*.s
 gfx906_fa_launcher*.out*
+# Local backup copies. They mix into the source tree and corrupt any
+# "file count / grep hit count" conclusion, so such conclusions must state
+# whether *.bak* was excluded.
+*.bak
+*.bak_*
+*_bak_*

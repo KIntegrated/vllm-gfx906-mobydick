@@ -71,6 +71,53 @@ layout the default therefore requires parameterizing those tests over the layout
 (or deleting the alias path), plus decode-t/s and feature-matrix work — tracked
 in LAB-9.
 
+## 2026-10-19 (PR #41 carry-over retargeted to 0.31)
+
+PR #41's remaining hunks (the sampler hunk landed 2026-10-18 as `afc9565da5`)
+were re-assessed against `main` on the 0.31 line. Three taken, three rejected as
+superseded or wrong for this stack:
+
+**Taken:**
+
+- `vllm/v1/attention/ops/chunked_prefill_paged_decode.py` — the gfx906 prefill
+  probe is skipped while a graph is capturing. The `.cpu()` reads it does
+  (`q_lens_cpu`/`seq_lens_cpu`) are illegal under capture, and
+  `can_use_torch_sdpa_prefill` only refuses the capture case *after* they run.
+- `vllm/model_executor/model_loader/default_loader.py` — `[load-weights-mem]`
+  BEGIN/END logging (alloc/peak/reserved) around `load_weights`, so a startup
+  OOM's traceback frame can be separated from the allocation owning the peak.
+- `.gitignore` — the `*.bak` family.
+
+**Rejected, with reasons (do not re-port):**
+
+- `layers/utils.py` reshape fixes — **already covered**: our `triton_matmul`
+  restores leading dims itself (`c.reshape(*a_shape[:-1], N)`, added under
+  DFL2-1), where their 0.28/0.30 base returned a bare 2-D result.
+- `platforms/rocm.py` graceful-shutdown override — the force-kill hazard it
+  cites is already handled upstream by #52281 (`3a386cfaf5`, a 15 s ROCm
+  EngineCore process grace in `v1/engine/utils.py`); what is left is a 60 s
+  request-drain default, which is a policy choice, not a fix.
+- `platforms/interface.py` mamba-align gate — **wrong direction for us**: in
+  `align` mode `mamba_block_size = block_size` is the invariant the align
+  pre-copy depends on (prefill checkpoints land on block boundaries), so
+  honouring an arbitrary user-specified mamba block size there breaks the
+  page/kernel alignment the aligner just computed. The defensible version is a
+  warning when a user-specified value is overridden, not a gate.
+- `csrc/rocm/dense_gemv_gfx906.cu` `atomic_add_f16_scalar` — a ROCm 7.2.1
+  build adaptation (`atomicAdd(__half*)` missing there). This box is 7.14 and
+  the ksplit>1 path deliberately uses the compiler-lowered atomic (see the call
+  site comment); the CAS helper would replace working code.
+- `pyproject.toml` torch pin (2.15.0a0) — this box pins the local 2.13.0 gfx906
+  build.
+
+**Still open, not ported:** the `cudagraph_utils` dynamic-SD gate + the
+speculator opt-out. They only matter once dynamic SD
+(`num_speculative_tokens_per_batch_size`) is enabled — i.e. MTP-1c — and the
+crash they describe (negative `decode_query_lens` -> `make_dummy` assert) cannot
+fire without it. And the `csrc/rocm/skinny_gemms.cu` LLMM1
+`TORCH_CHECK(M % rows_per_block == 0)`: our only caller pads weight rows to 4,
+so it is a free fail-closed guard, but it needs a rebuild to land.
+
 ## 2026-10-18 (later still — community PRs: sampler hunk landed, packed KV A/B'd)
 
 **PR #41 hunk landed** (`afc9565da5`): the SYV-4 sort-free sampler now runs

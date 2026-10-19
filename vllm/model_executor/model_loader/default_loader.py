@@ -478,7 +478,26 @@ class DefaultModelLoader(BaseModelLoader):
         self._init_ep_weight_filter(model_config)
         self._init_mm_encoder_only_weight_filter(model, model_config)
 
+        # Observation only: device memory either side of load_weights, so a
+        # startup OOM's traceback frame can be separated from the allocation
+        # that actually owns the peak (the frame is the last straw, not the
+        # owner). Cheap; no behavior change.
+        def _load_mem(tag: str) -> None:
+            if not torch.cuda.is_available():
+                return
+            dev = torch.cuda.current_device()
+            logger.info(
+                "[load-weights-mem] %s alloc=%.3f GiB peak=%.3f GiB "
+                "reserved=%.3f GiB",
+                tag,
+                torch.cuda.memory_allocated(dev) / 2**30,
+                torch.cuda.max_memory_allocated(dev) / 2**30,
+                torch.cuda.memory_reserved(dev) / 2**30,
+            )
+
+        _load_mem("BEGIN")
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        _load_mem("END")
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(
