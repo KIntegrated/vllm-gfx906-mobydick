@@ -227,7 +227,7 @@ backend automatically and now log a WARNING that names the reason. Full record:
 | ↳ **post-0.30.0 re-measure (TP=2, 2026-09-24)** | **MTP k=3 (current default depth) + `GFX906_FA_LEGACY=0` KV read** | **2k 79.1 · 64k 42.0 · 120k 40.7 t/s** (filler, prefix caching OFF, bt4096, max-seqs 4, util 0.82, capture `[4,8,12,16]`; TTFT 4.2/185.3/442.2 s; PPL 10.5472). Standard `vllm bench serve` random 2048→256: **52.9 t/s** @ TPOT 18.90 ms, acceptance 59.9 % / 2.80 |
 | ↳ N=8 concurrent decode | W4 (`VLLM_GFX906_SKINNY_M16=1`) | **104.2** (TP=1, util 0.90) |
 | ↳ 256k context | FA gather fix (2026-08-24); kv_split fix (2026-09-03) | 250k needle PASS; **37.95 t/s MTP @ 64k ctx** (was 16.6 pre-fix) |
-| **Nemotron-3.5-Bolt-74B-A9B** (W4A16 G128 sym, 41 GB) | **loads and serves on TP=2; generation quality not yet usable** — short answers correct, long-form/JSON/tool use degenerate on this quant ([#59](https://github.com/KIntegrated/vllm-gfx906-mobydick/issues/59)) | 48.7 @216 ctx / 39.7 @856 (greedy, 16k ctx); prefill 1052–1057 tok/s |
+| **Nemotron-3.5-Bolt-74B-A9B** (AutoRound W4A16 g128 41 GB; cyankiwi AWQ-INT4 g32 52 GB) | **loads and serves on TP=2; generation quality not yet usable** — short answers correct, long-form/JSON/tool use degenerate on this quant ([#59](https://github.com/KIntegrated/vllm-gfx906-mobydick/issues/59)) | 48.7 @216 ctx / 39.7 @856 (greedy, 16k ctx); prefill 1052–1057 tok/s |
 | ↳ with the **LiLiCorr** drafter (k=7, fp16) | spec decode, **6.77 accepted tokens/step** | **96.2 t/s**; **119.5–130.7 t/s** with the M≤8 kernels on |
 | ↳ chat | template **defaults** only; `ultra_v3` parser via the checkpoint's plugin | correct answers — `enable_thinking`/`medium_effort` kwargs *degenerate* it into `</think>` loops |
 | Qwen3.6 fp16 checkpoints (52–67 GB) | do not fit 32 GB | — |
@@ -282,6 +282,17 @@ chat-templated with 0 top-20 misses**, ~10× flatter than its sibling
 (Nemotron-3.5-Lightning, ~27), so the numbers are not usable as a band until the
 cause is known (the AutoRound quant vs our WNA16 path); a CUDA reference run is
 planned. Gating used greedy equality + draft acceptance.
+
+**Second checkpoint (2026-10-19).** `cyankiwi/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-AWQ-INT4`
+(compressed-tensors W4A16 g32 asymmetric, 52 GB) **fixes the generation-quality problem**: a
+300-token prose completion is coherent (repeat ratio 0.00 vs 0.82 for the AutoRound quant) and
+short answers stay correct, so the earlier degeneration was that quant. It needed one in-fork fix to
+load at all (its experts ship a fused `up_proj` with no `gate_proj`, which CT's MoE scheme check
+rejected). **The chat/thinking path still loops on `<think>` with this checkpoint too**, independent
+of quant, KV layout, vision on/off, graphs, context length and system prompt — the remaining variable
+under test is the spec-decode path (an earlier session with the drafter loaded did answer chat
+correctly). Both checkpoints also need TP=2 and leave very little memory: 0.92 OOMs on load, 0.85
+leaves no KV, 0.88-0.90 boots only with a small context and/or eager.
 
 **Quality status (2026-10-18, in-depth serving test).** The checkpoint is
 *legitimate* — it loads, spec decode works (up to 6.8 accepted/draft), short

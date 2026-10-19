@@ -723,3 +723,27 @@ tool/long-form, plus a logprob probe:
   discriminators (in-fork `BENCH_MOE_BACKEND=triton` A/B; CUDA reference) in #59.
   The README no longer lists Bolt as a usable model — it says "loads and serves,
   generation quality not yet usable".
+
+### Second checkpoint (cyankiwi AWQ-INT4, 52 GB): quant good, chat still broken
+
+`cyankiwi/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-AWQ-INT4` (compressed-tensors W4A16 **g32 asymmetric**,
+GPTQ K-first + `g_idx`) was downloaded and served; the comparison is direct.
+
+- **The quant is fine.** Raw completions are coherent and correct on the AWQ build where the
+  AutoRound g128 quant degenerated: `Canberra`, `23, 29, 31, …`, and a **coherent 300-token
+  CAP-theorem paragraph (repeat ratio 0.00 vs 0.82)**. The earlier long-form degeneration was the
+  AutoRound quant, not the model or our kernels.
+- **Loaded only after a fork fix.** `compressed_tensors_moe.py` required `.0.gate_proj` to exist; this
+  checkpoint's experts ship a **fused `up_proj`** and no gate, so it failed with "All MoE projections
+  need to have same quantization scheme but found multiple". Now uses the layer's declared
+  `ckpt_*_proj_name` (upstreamable).
+- **Chat still loops on `<think>`** (token 12), invariant to quant, `gfx906_fa_packed` on/off,
+  vision on/off (`--language-model-only` too), eager vs graphs, 4k/8k/16k context, system prompt, and
+  `enable_thinking` (false gives a `<think></think>` loop). Tokenizers of the two checkpoints are
+  identical (10/11/12/13) and generation configs only set EOS. The one uncontrolled variable is the
+  **spec-decode path**: the earlier session that answered chat correctly had the LiLiCorr drafter
+  loaded, i.e. the target ran the k+1-row path rather than plain per-token decode. Next test: repeat
+  the chat probes with the drafter on this checkpoint, then a CUDA reference if it still loops.
+- **Memory is brutal**: 52 GB at TP=2 means 0.92 OOMs during load, 0.85 leaves no KV blocks,
+  0.88-0.90 boots only with a small context and/or `--enforce-eager`. Served: vision on, 4k, util
+  0.90, eager, packed KV on, 45,738-token pool.
