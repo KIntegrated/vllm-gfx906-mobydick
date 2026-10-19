@@ -221,6 +221,25 @@ def _packed_cell_bytes(head_size: int) -> int:
     return cell
 
 
+def _pool_cell_bytes(kv_cache: torch.Tensor) -> int:
+    """Bytes in one (block, KV head) cell of the pool as handed to the impl."""
+    return int(kv_cache.shape[-1]) * kv_cache.element_size()
+
+
+def _pool_cell_is_packed(kv_cache: torch.Tensor, head_size: int) -> bool:
+    """Whether this pool was allocated with the packed (K q8 | V fp16) cell.
+
+    The pool's own cell width is the authority, and it is TP-agnostic: the
+    engine decides the layout, every rank sees the same cell.
+    """
+    return _pool_cell_bytes(kv_cache) == _packed_cell_bytes(head_size)
+
+
+def _pool_cell_is_fused_alias(kv_cache: torch.Tensor, padded_head_size: int) -> bool:
+    """Whether this pool uses the 0.29 fused axis (fp16 K | fp16 V cell)."""
+    return _pool_cell_bytes(kv_cache) == 4 * padded_head_size
+
+
 def _packed_v_offset_elems(head_size: int) -> int:
     """V region start in KV-cache elements (v_off is 16 B aligned, hence
     even, so this is always a whole number of 2-byte elements)."""
@@ -1008,14 +1027,19 @@ class Gfx906FAImpl(AttentionImpl):
         # which then read the uint8 pool as fp16: "key_cache must be fp16").
         # ------------------------------------------------------------------
         self._packed = _packed_enabled()
+        self._packed_layout_warned = False
+        # The packed view cache exists unconditionally: the layout is decided
+        # from the pool geometry at forward time (_use_packed_views), because a
+        # TP worker's impls are constructed before the KV layout is resolved and
+        # can therefore carry a stale `_packed` flag while the pool is packed.
+        self._v_cache: torch.Tensor | None = None
+        self._packed_src: torch.Tensor | None = None
         if self._packed:
             if self._head_pad != 0:
                 raise NotImplementedError(
                     "GFX906_FA_PACKED cannot be combined with head padding: "
                     f"head_size={head_size} pads to {self.padded_head_size}. "
                     "Set GFX906_FA_PACKED=0 for this model.")
-            self._v_cache: torch.Tensor | None = None
-            self._packed_src: torch.Tensor | None = None
             if head_size % 32 != 0:
                 raise NotImplementedError(
                     f"GFX906_FA_PACKED: head_size={head_size} must be a "
@@ -1215,6 +1239,13 @@ class Gfx906FAImpl(AttentionImpl):
         # so a 288-wide K view is rejected on device.
         k_q8 = t.view(torch.uint8)[..., :k_row]
         v = t[..., v_off:v_off + self.head_size]
+        if _os.environ.get("GFX906_FA_DEBUG_PACKED") and _DEBUG_SHAPES[0] < 3:
+            _DEBUG_SHAPES[0] += 1
+            print(f"[PACKED-DBG] pool={tuple(shape)} stride={kv_cache.stride()} "
+                  f"head_size={self.head_size} Hkv={self.num_kv_heads} "
+                  f"cell={cell} k_row={k_row} v_off={v_off} "
+                  f"k_view={tuple(k_q8.shape)} v_view={tuple(v.shape)}",
+                  flush=True)
         assert k_q8.shape[1] == t.shape[1] and k_q8.shape[2] == self.num_kv_heads, (
             f"K view dims must be [nb, block_size, Hkv, k_row], got "
             f"{tuple(k_q8.shape)}")
@@ -1703,6 +1734,35 @@ class Gfx906FAImpl(AttentionImpl):
         # count - never on the data.
         _packed_v_scatter(value, v_view, sm)
 
+    def _use_packed_views(self, kv_cache: torch.Tensor) -> bool:
+        """Whether THIS pool needs the packed split; decided from geometry.
+
+        ``self._packed`` records the mode at construction time, but a TP worker
+        builds its impls while loading weights - before the KV layout is
+        resolved - so that flag can lag behind the pool the engine allocated.
+        Splitting a packed pool along the fused axis yields a V view of
+        cell - D elems (392 -> 136 for D=256 at one KV head), which the Q8
+        gather rejects with "D must be multiple of 32": exactly the TP>1
+        failure. The cell width is authoritative and identical on every rank,
+        so derive the layout from it and keep the flag for the spec-time
+        checks (head padding, head_size % 32) only.
+        """
+        packed = _pool_cell_is_packed(kv_cache, self.head_size)
+        if packed != self._packed and not self._packed_layout_warned:
+            self._packed_layout_warned = True
+            logger.warning(
+                "GFX906_FA_PACKED: pool cell %d B decides the layout, but the "
+                "mode captured at construction was %s - using the pool "
+                "geometry (packed=%s). This is expected in a TP worker, whose "
+                "impls are built before the KV layout is resolved.",
+                _pool_cell_bytes(kv_cache), self._packed, packed)
+        assert packed or _pool_cell_is_fused_alias(kv_cache, self.padded_head_size), (
+            "gfx906_fa: unrecognised KV pool cell "
+            f"{_pool_cell_bytes(kv_cache)} B for head_size={self.head_size} "
+            f"(packed would be {_packed_cell_bytes(self.head_size)} B, fused "
+            f"alias {4 * self.padded_head_size} B)")
+        return packed
+
     def do_kv_cache_update(
         self,
         layer: AttentionLayer,
@@ -1711,7 +1771,7 @@ class Gfx906FAImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ):
-        if self._packed:
+        if self._use_packed_views(kv_cache):
             self._packed_kv_cache_update(layer, key, value, kv_cache,
                                          slot_mapping)
             return
@@ -1800,7 +1860,7 @@ class Gfx906FAImpl(AttentionImpl):
         # Packed (丙) instead splits one cell into its K q8 / V fp16 regions;
         # both branches set self._k_cache_q8, which the forward_paged call
         # below feeds as key_cache_q8.
-        if self._packed:
+        if self._use_packed_views(kv_cache):
             key_cache, value_cache = self._ensure_packed_views(kv_cache)
         else:
             key_cache, value_cache = kv_cache.transpose(1, 2).split(

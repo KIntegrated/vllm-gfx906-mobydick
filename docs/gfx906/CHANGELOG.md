@@ -2166,3 +2166,19 @@ Test-harness note worth keeping: drive the mode through `set_packed_config_mode`
 so `GFX906_FA_PACKED=auto` silently means **off** (`_packed_choice`) and the packed
 branch never executes. My first draft of these tests failed on exactly that, and it
 is an easy trap for anyone writing packed-layout tests.
+
+### 2026-10-19 — packed KV at TP>1: root-caused and fixed
+
+`packed` + `TP=2` on the 35B failed with `D must be multiple of 32` in the Q8
+gather. Cause: impls are constructed during weight load, **before** the KV layout
+is resolved, so a TP worker held `self._packed=False` while the pool was packed
+and split the packed cell along the fused axis (V width = 392-256 = 136 elems ->
+`D=136`, `136 % 32 = 8`). TP=1 was unaffected (single process publishes first).
+
+Fixed by deriving the layout from the pool cell width (authoritative, identical on
+every rank) instead of the construction-time flag; the flag now only gates
+construction-time validation, and an unrecognised cell width asserts. Verified:
+TP=2 packed 125.56 vs 126.19 t/s alias (B=4, mclk 1000); TP=1 B=4 packed 89.24 vs
+alias 88.87 (+0.41 %, A->P->A bracketed). TP=4/TP=8 are invariant-tested
+(`test_layout_choice_is_independent_of_tp`, 1/2/4/8 KV heads per rank) but not
+executed - this box has two GPUs. See `DEVLOG-packed-kv.md`.

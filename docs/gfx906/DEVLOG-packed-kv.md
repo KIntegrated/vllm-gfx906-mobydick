@@ -218,3 +218,63 @@ plus the existing decision tests (17 passed across the two platform files).
 With this, LAB-10 can close on the served 16k datum already measured
 (610,577 vs 570,368 usable tokens, +7.05 %), noting that predictions are upper
 bounds.
+
+## 2026-10-19 — VERDICT: packed KV breaks at TP>1; fixed by deriving the layout from the pool
+
+**GATE: `packed` x `TP=2` on Qwen3.5-35B-A3B-AWQ previously died 100 % of the
+time with `RuntimeError: D must be multiple of 32` (in `gather_paged_kv_q8`).
+Now it serves: 125.56 t/s vs 126.19 t/s for the alias layout (B=4, 4 requests,
+pp2048/tg256, util 0.85, 32768 ctx, same boot, mclk 1000). No measurable cost.**
+
+### Mechanism (measured, not inferred)
+
+The attention impls are constructed **while weights load**, i.e. *before* the KV
+layout is resolved; the packed mode is published from the platform's
+`update_block_size_for_backend`, which runs later. In a TP worker that left
+`self._packed = False` while the **pool** was packed, so `forward()` took the
+alias branch and split the packed cell along the fused axis:
+
+| | cell | K | V |
+|---|---|---|---|
+| packed pool (D=256) | 784 B = 392 fp16 elems | 272 B q8 | 512 B fp16 |
+| alias split of that cell | — | 256 elems | **136 elems** |
+
+`V` width 136 => `D=136`, and `136 % 32 = 8` => `TORCH_CHECK(D % 32 == 0)`.
+Confirmation: a debug print in the packed branch produced **zero** lines in the
+failing run (the branch was never entered), while the pool log said `KV cell
+784 B` — pool packed, views alias.
+
+TP=1 never failed because the single process publishes the mode before it builds
+any impl.
+
+### Fix
+
+The pool's own cell width is authoritative and identical on every rank, so the
+layout is derived from it (`_pool_cell_is_packed`: cell bytes ==
+`_packed_cell_bytes(head_size)`, 784 B for D=256). `self._packed` now only gates
+the construction-time validations (head padding, `head_size % 32`); the view
+cache (`_packed_src`, `_v_cache`) is initialised unconditionally, because a
+late-bound decision needs the state regardless of the flag. A disagreement logs
+once; an unrecognised cell width asserts instead of mis-splitting.
+
+**TP=4/TP=8:** no TP arithmetic enters the decision — TP only changes KV heads
+per rank (2 at TP=1, then 1 through sharding or replication), and the choice is
+byte-arithmetic on the cell. Covered by
+`test_layout_choice_is_independent_of_tp`, which parametrises 1/2/4/8 KV heads per
+rank. Not executed on hardware: this box has 2 MI50s.
+
+### Numbers (B=4 unless stated)
+
+| arm | t/s (mclk 1000) | note |
+|---|---|---|
+| TP=2 alias | 126.19 | B=4 |
+| TP=2 packed | 125.56 | B=4, crash gone (**-0.5 %**, in the arm-to-arm spread) |
+| TP=1/TP=2 alias, B=1 | 64.12 / — | TP=1 packed B=1: 57.5 |
+| TP=1 alias, B=4 | **88.87** | mean of A1 (3 samples) + A2 (2 samples) |
+| TP=1 packed, B=4 | **89.24** | **+0.41 %**, A->P->A bracketed |
+
+The TP=1 B=4 pair is the hot re-run of a first pair that read **idle mclk 350**
+(87.0/88.9 t/s) - the DVFS trap this repo documents. `mclk_median_mhz` in the
+harness JSON is the field that catches it (350 = idle, 1000 = loaded); a 350
+sample is discarded, not averaged. So packed is within noise of alias at B=4 and
+the win at TP=2 is capacity/robustness, not throughput.
