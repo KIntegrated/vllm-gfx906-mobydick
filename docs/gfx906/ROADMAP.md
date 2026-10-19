@@ -132,8 +132,13 @@ and whether #52301's ~13 % skip fires under EP. **Gate:** decode t/s + PPL
 
 ### U30-2 — persistent top-k on low-shared-memory GPUs · [#13](../../issues/13)
 
-Check which top-k kernel the gfx906 build selects and whether #54110's fallback
-triggers; measure only if it does.
+**Census done** (2026-10-19): the op is the DeepSeek-V3 indexer top-k, and the
+fallback fires on **every** gfx906 call — `sampled_topk` needs ≥144 KiB optin and
+`FilteredTopK` ≥128 KiB, while gfx906 offers 64 KiB, so the chunked cooperative
+`persistent_topk_kernel` always runs (8/6/5 CTA groups per 64k-column row for
+rows ≤4/≤8/>8). **Blocked on measurement:** the affected op is the QSA indexer and
+no QSA checkpoint is servable here; reopen by attributing the indexer's share of a
+64k decode step. Ref: `DEVLOG-u30-2-persistent-topk.md`.
 
 ### U30-3 — W4A16 packed zero-points for Gemma-4 AWQ · [#14](../../issues/14)
 
