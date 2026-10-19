@@ -2148,3 +2148,21 @@ So: kernel-level and in-process harness numbers stand; the bolt serve scripts'
 packed arms need re-running to be cited. Nothing in the roadmap's packed numbers
 depends on those (the 35B +22.2 % and the Lightning data are env-var or
 block-probe based).
+
+### The four `auto` guard arms — covered by tests
+
+`tests/platforms/test_gfx906_packed_guards.py` (4 passed) pins the shapes the packed
+cell cannot express, which is what makes the `auto` default safe:
+
+| arm | shape | expected |
+|---|---|---|
+| asymmetric K/V head dims | `head_size_v=64`, `head_size=128` | alias (guarded) |
+| head padding | `head_size=72` (alias path pads to 96) | alias (guarded) |
+| padded pages | `page_size_padded=4096` (skip-quant reconcile) | alias (guarded) |
+| explicit `on` + inexpressible shape | `head_size_v=64` | **raises** `NotImplementedError` |
+
+Test-harness note worth keeping: drive the mode through `set_packed_config_mode`
+(`CacheConfig`), **not** the env var — `GFX906_FA_PACKED` only understands `0`/`1`,
+so `GFX906_FA_PACKED=auto` silently means **off** (`_packed_choice`) and the packed
+branch never executes. My first draft of these tests failed on exactly that, and it
+is an easy trap for anyone writing packed-layout tests.
