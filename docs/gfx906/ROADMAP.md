@@ -118,12 +118,13 @@ size rather than the model class: on a hybrid model the aligner is dry-run for
 both layouts (on a config **copy**, since restoring a snapshot is not faithful)
 and packed is kept only when the scheduler block size is unchanged. Both of our
 hybrid models are excluded by that rule — Lightning 2096 → 2672, 35B **1056 →
-2112** (correcting an earlier note: the 35B's block size does move; 8192 was a
-group capacity) — with pools identical to the controls (526,336 / 142,987), so
+1376** — with pools of 526,336 / 142,987 tokens, so
 their capacity wins stay opt-in. Non-hybrid models get packed by default, with
 the auto-fallback covering unsupported shapes. Known wart: the dry run runs in
 both config paths and reports different would-be values (2672 vs 4192, 1376 vs
-2112) while agreeing on the decision; compute it once.
+2112) while agreeing on the decision; compute it once. The 35B's fresh value is
+**1376** (the boot logs agree); 2112 is only the second-pass value once
+`block_size` has already been raised to 1056 — see `DEVLOG-packed-kv.md`.
 
 **Earlier note, now superseded:** Items 1–2 of the
 plan landed (`650b417651` auto/fallback, `f1e0328805` config field +
@@ -149,14 +150,22 @@ non-2-byte KV dtypes, padding+packed) are the feature matrix still missing, and
 
 ### LAB-10 — packed KV for hybrid models · [#58](../../issues/58)
 
-The layout **works** on hybrid models (Lightning-30B served at 528,384 tokens)
-but buys +0.4 % capacity and moves the scheduler block size 2096 → 2672, because
-`_align_hybrid_block_size` reconciles the (now smaller) attention page with the
-mamba page and the mamba state dominates the pool. **Measure first**: quantify
-the mamba:attention byte ratio per hybrid class and close the issue with that
-number if the ceiling is ~1-2 %; only then price a packed-aware aligner (the
-`_align_heterogeneous_kv_block_size` / `page_size_padded` precedent) or per-group
-block sizes.
+The layout **works** on hybrid models, and the LAB-10 measurement (2026-10-19)
+says the ceiling is **the cell saving, not 1-2 %**: in align mode the aligner pins
+the unified page to the attention page (mamba is 99.2-99.8 % of a block's bytes),
+but the mamba state is per **block**, so a smaller attention cell buys capacity by
+raising the block size — 35B 1056 → 1376 (+30.6 % page-limited, +22.2 % served),
+Lightning 2096 → 2672 (+28.0 % page-limited). The premise "mamba dominates the
+pool ⇒ packed is worth <2 %" is therefore **wrong for align mode**: the win is
+tokens per mamba state block, not saved page bytes. Lightning's recorded **+0.4 %**
+(526,336 → 528,384) does not contradict that — both its arms report the same
+9.25 GiB pool and token counts ≈ 64.25/64.5 × 8192, i.e. that arm was **capped by
+request capacity, not by VRAM**. **Remaining step:** one served run per arm on the
+Lightning class with the cap lifted, logging `num_gpu_blocks` and the per-group
+page sizes; only then is the LAB-9 auto rule ("packed off when the block size
+moves") testable — the 35B suggests it is over-conservative where the block move
+*is* the win. Geometry tool + numbers: `_hybrid_kv_ratio.py`,
+`DEVLOG-packed-kv.md`.
 
 ## Next — 0.30-post and 0.31
 
