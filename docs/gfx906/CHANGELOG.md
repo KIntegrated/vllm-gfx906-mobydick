@@ -77,7 +77,7 @@ The hybrid `auto` rule asked "did the aligner's block size move?", which LAB-10
 showed is backwards: a moving block size is *how* packed buys capacity (the mamba
 state is per block, so a smaller attention cell packs more tokens into the same
 state). It now compares predicted capacity `block_size / unified_page` for both
-layouts and keeps packed at a >= 3 % gain
+layouts and keeps packed at a >= 5 % gain
 (`RocmPlatform._GFX906_PACKED_MIN_GAIN`, `_gfx906_packed_auto_geometry` +
 `_gfx906_packed_capacity_gain`, unit test
 `tests/platforms/test_gfx906_packed_auto.py`, 4 passed).
@@ -2124,3 +2124,27 @@ that both were gated wins awaiting a flip, not parked code.
   (359 tokens, 0 top-20 misses) — a different model from the 10.55 band, so not
   comparable to it.
 
+
+## 2026-10-19 (later — packed-KV threshold 3 % -> 5 %, and the interface audit)
+
+**Threshold raised to 5 %** (`_GFX906_PACKED_MIN_GAIN`) because the predicted
+gain is an **upper bound**: the 16k arm predicted +14.8 % and served +7.1 %
+(610,577 vs 570,368 usable tokens at the same 6.68 GiB), the difference being the
+per-request block rounding. Our two hybrid classes sit at +0.4 % and +14.8 %, so
+the value is not load-bearing for them; 5 % keeps unseen models conservative.
+Test pins it (`test_threshold_is_above_the_prediction_error`).
+
+**Interface audit** (the flag was silently ineffective on the worker path until
+`d3d3a59040`, so which interface produced which number matters):
+
+| where | interface | resolves? |
+|---|---|---|
+| `_bench_gfx906.py`, `ppl_probe.py` | config field, **in-process** | yes — one process, the platform hook runs |
+| `DEVLOG-nemotron-bolt.md` tables (`GFX906_FA_PACKED=0/1`) | env var | yes — backend reads it directly |
+| today's 8k/16k block-level + served arms | env var | yes (`KV cell` logged) |
+| `/local/tmp/run-bolt-*.sh` (`--gfx906-fa-packed on`, serves) | config field, pre-fix | **suspect — may have served the alias layout** |
+
+So: kernel-level and in-process harness numbers stand; the bolt serve scripts'
+packed arms need re-running to be cited. Nothing in the roadmap's packed numbers
+depends on those (the 35B +22.2 % and the Lightning data are env-var or
+block-probe based).

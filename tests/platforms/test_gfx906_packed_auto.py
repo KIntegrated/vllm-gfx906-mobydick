@@ -120,3 +120,10 @@ def test_worker_side_block_size_pass_republishes_the_config_field(monkeypatch):
 
     assert fa._PACKED_CONFIG_MODE == "on"
     fa.set_packed_config_mode("off")
+
+
+def test_threshold_is_above_the_prediction_error():
+    """Predictions over-state (16k: +14.8 % predicted, +7.1 % served), so the
+    threshold must not sit near the noise floor; 5 % keeps a predicted 3 %
+    (plausibly ~1 % real) off."""
+    assert RocmPlatform._GFX906_PACKED_MIN_GAIN == pytest.approx(0.05)

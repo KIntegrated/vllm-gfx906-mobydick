@@ -79,7 +79,7 @@ a smaller cell is usable at all. The rule is therefore
 gain = (page_off * blocks_per_req_off) / (page_on * blocks_per_req_on) - 1
 ```
 
-keep packed when `gain >= 3 %` (`_gfx906_packed_capacity_gain`,
+keep packed when `gain >= 5 %` (`_gfx906_packed_capacity_gain`,
 `RocmPlatform._GFX906_PACKED_MIN_GAIN`, unit test
 `tests/platforms/test_gfx906_packed_auto.py`).
 
@@ -191,7 +191,7 @@ healthy — the earlier "degraded boot" explanation was wrong. Re-run with the
 So the 16k prediction (+14.8 %) is an **upper bound**: the real gain is +7.1 %,
 consistent with the block-rounding theory in direction (8k +0.4 % → 16k +7.1 %)
 but over-stated in magnitude because usable tokens quantise into whole
-`max_model_len` requests per group. The 3 % threshold keeps both verdicts right
+`max_model_len` requests per group. The 5 % threshold keeps both verdicts right
 (8k off, 16k on).
 
 Open, in order: (1) fix the config-field propagation (the warning added today does

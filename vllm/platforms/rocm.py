@@ -1212,15 +1212,14 @@ class RocmPlatform(Platform):
         # Default dispatch to rocm's sparse_attn_indexer implementation
         compilation_config.custom_ops.append("+sparse_attn_indexer")
 
-    # Packed KV pays off only when it buys KV capacity. The hybrid aligner
-    # re-derives the scheduler block size from the (smaller) packed attention
-    # page, so "the block size moved" is the mechanism, not a red flag: the
-    # mamba state is allocated per block, so a smaller attention cell packs more
-    # tokens into the same mamba state (Qwen3.5-35B-A3B: 1056 -> 1376 tokens per
-    # block, +22.2 % served KV tokens). Decide on the predicted capacity (tokens
-    # per page byte) instead, and require a gain big enough that block-size
-    # rounding noise cannot produce it.
-    _GFX906_PACKED_MIN_GAIN = 0.03
+    # Packed KV pays off only when it buys *usable* KV capacity (see
+    # _gfx906_packed_capacity_gain). The prediction is an upper bound - the same
+    # pool quantises into whole max_model_len requests per group, so a predicted
+    # +14.8 % served +7.1 % on the 16k arm - hence a threshold well above the
+    # rounding noise. Our two hybrid classes sit at +0.4 % and +14.8 %, so the
+    # exact value is not load-bearing for them; 5 % keeps unseen models
+    # conservative.
+    _GFX906_PACKED_MIN_GAIN = 0.05
 
     @classmethod
     def _gfx906_packed_auto_geometry(
