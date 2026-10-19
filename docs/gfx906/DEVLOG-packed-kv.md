@@ -123,3 +123,28 @@ already-raised `block_size` (1056), which is the same wart the LAB-9 notes
 describe ("reports different would-be values (2672 vs 4192, 1376 vs 2112)").
 The boot logs agree with the fresh values (1376 / 2672), so the roadmap record is
 corrected to match.
+
+## 2026-10-19 — 16k served check: off-arm measured, on-arm did not engage (open)
+
+Served `Nemotron-3.5-Lightning-30B-A3B`, `--mamba-cache-mode align`, max_model_len
+**16384**, util 0.85:
+
+- `--gfx906-fa-packed off`: block 2096, `Available KV cache memory: 6.68 GiB`,
+  **`GPU KV cache size: 570,368 tokens`** (34.81x concurrency).
+- `--gfx906-fa-packed on`: **did not engage** — block stayed 2096, `6.68 GiB`,
+  **570,368 tokens**, and there is **no** `packed KV layout enabled` /
+  `KV cell` line in the log. The API process logged
+  `Failed to get total memory via amdsmi, falling back to torch.cuda`, i.e. this
+  was an amdsmi-degraded boot.
+
+So the 16k served confirmation of the predicted +14.8 % is **not** obtained, and
+the attempt turned up a separate defect worth its own issue: an explicit
+`--gfx906-fa-packed on` can silently fall back to the alias layout (fail-open) on
+a boot where amdsmi misbehaves, with no warning at the packed layer. The 8k
+prediction was validated at block level (202 -> 203 blocks, page sums
+10,731,520 -> 10,688,000, usable +0.4 % matching the served datum), so the
+formula stands; only the 16k *served* datum is missing.
+
+Next: retry the 16k on-arm on a healthy boot (amdsmi normal), and treat the
+silent fallback as a bug (log a warning whenever the requested mode is not the
+resolved one).

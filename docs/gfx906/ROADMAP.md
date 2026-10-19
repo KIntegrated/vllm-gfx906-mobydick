@@ -169,6 +169,17 @@ moves") testable — the 35B suggests it is over-conservative where the block mo
 *is* the win. Geometry tool + numbers: `_hybrid_kv_ratio.py`,
 `DEVLOG-packed-kv.md`.
 
+**2026-10-19 step 2 + correction:** a block-level in-process probe (num_blocks +
+per-group pages) shows the ceiling is the cell saving **that survives the
+per-request block rounding**, not the cell saving and not the mamba share: at
+max_model_len 8192 Lightning's raw pool gains 28.1 % (423,392 → 542,416 tokens)
+while `ceil(8192/2672) = ceil(8192/2096) = 4` blocks per request caps the usable
+gain at +0.4 %. The `auto` gate now uses that formula (35B 8k +33.6 % → on,
+Lightning 8k +0.4 % → off, Lightning 16k +14.8 % → on). The served 16k check is
+still missing: the on-arm silently fell back to the alias layout on an
+amdsmi-degraded boot (block stayed 2096, no `packed KV layout enabled` line) —
+that fail-open is a separate bug to fix before closing this item.
+
 ## Next — 0.30-post and 0.31
 
 ### QSA-FN-10 — next tester measurement list · [#5](../../issues/5)
