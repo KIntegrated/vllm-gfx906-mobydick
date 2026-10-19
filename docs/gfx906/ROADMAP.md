@@ -113,28 +113,20 @@ align`) the scheduler block size moves **2096 → 2672** and KV tokens rise only
 only**; hybrid models stay opt-in. Non-hybrid block size is unchanged (35B:
 8192 in both arms).
 
-**Default flipped to `auto` (2026-10-18)**, gated on the hybrid aligner's block
-size rather than the model class: on a hybrid model the aligner is dry-run for
-both layouts (on a config **copy**, since restoring a snapshot is not faithful)
-and packed was kept only when the scheduler block size was unchanged. That rule
-was **replaced on 2026-10-19**: a moving block size is the *mechanism* by which
-packed buys capacity, not a red flag (LAB-10 — the mamba state is per block, so a
-smaller attention cell packs more tokens into the same state). `auto` now
-compares the predicted KV capacity of the two layouts
-(`block_size / unified_page`, the quantity the served pool tracks) and keeps
-packed when the gain is >= 3 %. Measured predictions: **Qwen3.5-35B-A3B +30.6 %**
-(1056 → 1376; +22.2 % actually served) and **Lightning-30B +28.0 %**
-(2096 → 2672) — both hybrid classes therefore default to packed now, the 35B on
-measured evidence and Lightning on geometry pending the uncapped served A/B
-(LAB-10's remaining step; its recorded +0.4 % came from a request-capacity-capped
-arm). Non-hybrid models get packed by default, with the auto-fallback covering
-unsupported shapes. Decisions live in `_gfx906_packed_auto_geometry` +
-`_gfx906_packed_capacity_gain` (unit test:
-`tests/platforms/test_gfx906_packed_auto.py`); the dry-run pair is now evaluated
-once, from pristine copies, so its arms cannot report entry-block-dependent
-values. The *served* block size can still differ from the predicted one (phase 1
-runs between: 2112 vs 1376 for the 35B) without changing the predicted gain,
-because block and page scale together.
+**Default flipped to `auto` (2026-10-18)**, gated on the hybrid aligner's dry
+run rather than the model class. The gate was corrected on 2026-10-19 (LAB-10):
+it compares **usable** KV capacity - `page_off * ceil(max_model_len/block_off)` vs
+`page_on * ceil(max_model_len/block_on)` - not raw pool tokens and not "did the
+block size move". A request holds `ceil(max_model_len / block_size)` blocks, so
+a smaller cell pays only when it also needs fewer blocks per request:
+**Qwen3.5-35B-A3B at 8k: +33.6 %** (1056 → 1376; served +22.2 %), **Lightning at
+8k: +0.4 %** (2096 → 2672 — `ceil(8192/2672) = 4 = ceil(8192/2096)`, so the +28 %
+of raw pool tokens the block-level probe measured is unusable), Lightning at 16k:
++14.8 %. Decisions live in `_gfx906_packed_auto_geometry` +
+`_gfx906_packed_capacity_gain` (unit test
+`tests/platforms/test_gfx906_packed_auto.py`); the dry-run pair is evaluated once
+from pristine copies. Non-hybrid models get packed by default, with the
+auto-fallback covering unsupported shapes.
 
 **Earlier note, now superseded:** Items 1–2 of the
 plan landed (`650b417651` auto/fallback, `f1e0328805` config field +

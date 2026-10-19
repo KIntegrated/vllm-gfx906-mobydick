@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
-"""The gfx906 packed-KV `auto` decision must key on predicted capacity.
+"""The gfx906 packed-KV `auto` decision must key on *usable* capacity.
 
 The hybrid aligner re-derives the scheduler block size from the (smaller) packed
-attention page, so "the block size moved" says nothing about whether the layout
-helps. Capacity is ``block_size / page_bytes``: the mamba state is allocated per
-block, so a smaller attention cell packs more tokens into the same mamba state.
+attention page. Raw pool capacity is ``block_size / page_bytes``, but a request
+holds ``ceil(max_model_len / block_size)`` blocks, so what a pool can actually
+serve is ``pool / page * max_model_len / blocks_per_req`` — the quantity the
+served "GPU KV cache size" reports, and the one that decides the default.
 
-Geometry below is measured (``docs/gfx906/_hybrid_kv_ratio.py``, which
-reproduces the boot logs of the LAB-9 A/B).
+Geometry below is measured: ``docs/gfx906/_hybrid_kv_ratio.py`` for the pages and
+blocks (it reproduces the boot logs), and a block-level in-process probe
+(`num_blocks` + per-group pages) for Lightning's pool.
 """
 
 import pytest
@@ -18,41 +20,42 @@ from vllm.platforms.rocm import RocmPlatform
 
 gain = RocmPlatform._gfx906_packed_capacity_gain
 
+# Measured geometries (block size, unified page bytes per block).
+QWEN35B = ((1056, 2_162_688), (1376, 2_157_568))
+LIGHTNING = ((2096, 2_146_304), (2672, 2_137_600))
 
-def test_capacity_gain_accepts_a_model_where_packing_moves_the_block_size():
-    """Qwen3.5-35B-A3B: 1056 -> 1376 tokens/block while the page is unchanged.
 
-    The served A/B measured +22.2 % KV tokens here, so this is the case that the
-    old "block size moved -> keep the alias layout" rule got wrong.
+def test_packed_wins_when_the_smaller_cell_also_needs_fewer_blocks_per_request():
+    """Qwen3.5-35B-A3B at 16k: 16 blocks/request -> 12, i.e. the real win.
+
+    Served A/B: 142,987 -> 174,762 KV tokens (+22.2 %).
     """
-    off = (1056, 2_162_688)
-    on = (1376, 2_157_568)
-    assert gain(off, on) == pytest.approx(0.306, abs=0.002)
-    assert gain(off, on) >= RocmPlatform._GFX906_PACKED_MIN_GAIN
+    assert gain(*QWEN35B, 16_384) == pytest.approx(0.336, abs=0.003)
+    assert gain(*QWEN35B, 16_384) >= RocmPlatform._GFX906_PACKED_MIN_GAIN
 
 
-def test_capacity_gain_of_the_capped_lightning_geometry():
-    """Nemotron-3.5-Lightning-30B-A3B: 2096 -> 2672 tokens/block.
+def test_packed_loses_its_win_when_both_layouts_round_to_the_same_block_count():
+    """Nemotron-3.5-Lightning-30B-A3B at 8k: ceil(8192/x) is 4 either way.
 
-    Prediction (~+28 %) and the recorded served datum (+0.4 %) disagree because
-    that arm was capped by request capacity, not by VRAM — the decision follows
-    the prediction and the escape hatch is an explicit ``off``.
+    The pool gains 28 % of raw tokens (423,392 -> 542,416 at the same 2.02 GiB)
+    but a request still holds 4 blocks, so the usable gain is +0.4 % — the
+    recorded served datum. Must stay on the alias layout.
     """
-    off = (2096, 2_146_304)
-    on = (2672, 2_137_600)
-    assert gain(off, on) == pytest.approx(0.280, abs=0.002)
+    assert gain(*LIGHTNING, 8_192) == pytest.approx(0.004, abs=0.001)
+    assert gain(*LIGHTNING, 8_192) < RocmPlatform._GFX906_PACKED_MIN_GAIN
 
 
-def test_capacity_gain_rejects_a_layout_that_wastes_the_page():
-    """A packed cell that also grows the block's page is a net loss."""
-    off = (16, 131_072)
-    on = (16, 147_456)  # same block count, 12.5 % bigger page
-    assert gain(off, on) < 0
-    assert gain(off, on) < RocmPlatform._GFX906_PACKED_MIN_GAIN
+def test_same_model_can_flip_verdict_with_max_model_len():
+    """At 16k the Lightning block rounding finally pays: 8 blocks -> 7."""
+    assert gain(*LIGHTNING, 16_384) == pytest.approx(0.1475, abs=0.001)
+    assert gain(*LIGHTNING, 16_384) >= RocmPlatform._GFX906_PACKED_MIN_GAIN
 
 
-def test_capacity_gain_is_zero_without_a_unified_page():
-    """No page (aligner returned early) must not enable the layout."""
-    assert gain((16, None), (16, None)) == 0.0
-    assert gain((16, 131_072), (16, None)) == 0.0
-    assert gain((16, None), (16, 131_072)) == 0.0
+def test_packed_loses_when_the_page_grows_into_the_same_block_count():
+    """A bigger page at an unchanged block count is a straight loss."""
+    assert gain((16, 131_072), (16, 147_456), 8_192) < 0
+
+
+def test_no_unified_page_predicts_nothing_and_stays_off():
+    assert gain((16, None), (16, None), 8_192) == 0.0
+    assert gain((16, 131_072), (16, None), 8_192) == 0.0

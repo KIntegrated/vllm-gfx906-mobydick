@@ -68,32 +68,52 @@ logging `num_gpu_blocks` and the per-group page sizes. Only then is the LAB-9
 auto rule ("packed off when the block size moves") testable: the 35B suggests it
 is over-conservative where the block move *is* the win.
 
-## Decision rule (2026-10-19)
+## Decision rule (2026-10-19, corrected same day by the block-level probe)
 
-The `auto` gate no longer asks "did the block size move?" (a moving block is the
-mechanism, not a red flag — see the ceiling section). It compares predicted
-capacity `block_size / unified_page` for both layouts and keeps packed when the
-gain is >= 3 % (`RocmPlatform._GFX906_PACKED_MIN_GAIN` +
-`_gfx906_packed_capacity_gain`, unit test
+`auto` must key on **usable** capacity, not raw pool tokens. A request holds
+`ceil(max_model_len / block_size)` blocks, so usable tokens are
+`pool / page * max_model_len / blocks_per_req`; the block rounding decides whether
+a smaller cell is usable at all. The rule is therefore
+
+```
+gain = (page_off * blocks_per_req_off) / (page_on * blocks_per_req_on) - 1
+```
+
+keep packed when `gain >= 3 %` (`_gfx906_packed_capacity_gain`,
+`RocmPlatform._GFX906_PACKED_MIN_GAIN`, unit test
 `tests/platforms/test_gfx906_packed_auto.py`).
 
-Live verification, one boot per class with `--gfx906-fa-packed auto`:
+### Step 2: the block-level probe (in-process, `num_blocks` + per-group pages)
+
+Nemotron-3.5-Lightning-30B-A3B, `--mamba-cache-mode align`, fp16, max_model_len
+8192, util 0.70, identical 2.02 GiB pool in both arms:
+
+| arm | block | page/block (5 groups) | num_blocks | pool tokens | **usable at 8k** |
+|---|---|---|---|---|---|
+| off | 2096 | 10,731,520 | 202 | 423,392 | 413,696 (+0.4 %) |
+| on | 2672 | 10,688,000 | 203 | **542,416 (+28.1 %)** | 415,744 |
+
+The raw pool really does gain the predicted +28 %, but `ceil(8192/2672) = 4 =
+ceil(8192/2096)`, so a request holds 4 blocks either way and the *usable* gain is
++0.4 % — exactly the served datum this issue started from. So that +0.4 % was
+**not** a capping artifact (my earlier reading); it is the correct usable
+capacity, and the raw-pool figure is what is misleading.
+
+Live verification of the corrected rule, one boot per class:
 
 ```
-gfx906 FA: packed KV layout enabled under gfx906_fa_packed=auto:
-  predicted KV capacity +30.6 % (block 1056 -> 1376).   # Qwen3.5-35B-A3B
-gfx906 FA: packed KV layout enabled under gfx906_fa_packed=auto:
-  predicted KV capacity +28.0 % (block 2096 -> 2672).   # Lightning-30B-A3B
+Lightning-30B-A3B, max_model_len 8192:
+  packed KV layout left off under gfx906_fa_packed=auto:
+  predicted KV capacity +0.4 % (block 2096 -> 2672).
+Qwen3.5-35B-A3B, max_model_len 8192:
+  packed KV layout enabled under gfx906_fa_packed=auto:
+  predicted KV capacity +33.6 % (block 1056 -> 1376).
 ```
 
-The 35B — the roadmap's reference workload — is now packed by default on measured
-evidence (+22.2 % served KV tokens), where the previous rule kept it off. Lightning
-is enabled on geometry alone until the uncapped served A/B lands, with
-`--gfx906-fa-packed off` as the escape.
-
-The predicted gain is robust to the served block size differing from the predicted
-one (35B: served 2112 vs predicted 1376) because block and page scale together, so
-`block_size / page` is unchanged.
+The verdict is per (model, max_model_len), not per model class: Lightning at
+16384 predicts +14.8 % (8 blocks/request -> 7) and would be enabled, while the
+35B wins at both lengths. The 35B's served A/B (+22.2 %) is the measured
+counterpart of its prediction.
 
 ## Note on the recorded block sizes
 

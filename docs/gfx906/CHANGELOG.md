@@ -92,10 +92,20 @@ Effect, verified on one boot per class:
   capacity, so the uncapped A/B is still open (LAB-10). `--gfx906-fa-packed off`
   is the escape.
 
-The dry-run pair is now evaluated once from pristine copies, so its arms cannot
-report entry-block-dependent values (LAB-9's "2672 vs 4192, 1376 vs 2112" wart).
-The *served* block size may still differ from the predicted one (35B: 2112 vs
-1376) without changing the gain, because block and page scale together.
+**Corrected the same day by LAB-10 step 2** (block-level in-process probe, which
+prints `KVCacheConfig.num_blocks` + per-group page sizes): the first version of
+this rule predicted from raw pool tokens (`block/page`), which is wrong — a
+request holds `ceil(max_model_len / block_size)` blocks, so a smaller cell only
+pays when it also needs fewer blocks per request. Lightning at 8k proves it: the
+pool gains 28 % of raw tokens (423,392 -> 542,416 at the same 2.02 GiB pool) but
+`ceil(8192/2672) = 4 = ceil(8192/2096)`, so usable capacity gains +0.4 % — the
+served datum. The rule now uses `page_off * ceil(max_len/block_off)` vs
+`page_on * ceil(max_len/block_on)`: 35B at 8k **+33.6 %** (enabled, served
++22.2 %), Lightning at 8k **+0.4 %** (left off), Lightning at 16k +14.8 %
+(enabled). Verified live per class. The dry-run pair is evaluated once from
+pristine copies, so its arms cannot report entry-block-dependent values (LAB-9's
+"2672 vs 4192, 1376 vs 2112" wart). The *served* block size may still differ
+from the predicted one without changing the verdict in practice.
 Pre-existing, unrelated: `tests/platforms/test_cpu.py` fails 15 tests on this host
 in both the patched and reverted tree.
 

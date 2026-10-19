@@ -1256,19 +1256,30 @@ class RocmPlatform(Platform):
 
     @staticmethod
     def _gfx906_packed_capacity_gain(
-        off: tuple[int, int | None], on: tuple[int, int | None]
+        off: tuple[int, int | None],
+        on: tuple[int, int | None],
+        max_model_len: int,
     ) -> float:
-        """Predicted relative KV capacity of packed vs alias, from geometry.
+        """Predicted relative *usable* KV capacity of packed vs alias.
 
-        Capacity is `block_size / page_bytes` (tokens per byte of KV pool), the
-        quantity the served "GPU KV cache size" tracks. Returns 0.0 when either
-        arm has no unified page, i.e. when nothing can be predicted.
+        A request holds ``ceil(max_model_len / block_size)`` blocks, so the pool's
+        usable tokens are ``pool_bytes / page * max_model_len / blocks_per_req``:
+        the per-request block rounding decides whether a smaller cell is usable
+        at all. Nemotron-3.5-Lightning-30B-A3B is the worked example - packed
+        gains 28 % of raw pool tokens (423,392 -> 542,416 at the same 2.02 GiB)
+        but 8192/2672 and 8192/2096 both round to 4 blocks a request, so the
+        usable gain is +0.4 %, which is what the served metric reports.
+
+        Returns 0.0 when either arm has no unified page, i.e. when nothing can be
+        predicted.
         """
         off_bs, off_page = off
         on_bs, on_page = on
         if not off_page or not on_page:
             return 0.0
-        return (on_bs / on_page) / (off_bs / off_page) - 1.0
+        off_req = -(-max_model_len // off_bs)
+        on_req = -(-max_model_len // on_bs)
+        return (off_page * off_req) / (on_page * on_req) - 1.0
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
@@ -1324,7 +1335,11 @@ class RocmPlatform(Platform):
                         )
                         mode = "off"
                     else:
-                        gain = cls._gfx906_packed_capacity_gain(off_geom, on_geom)
+                        gain = cls._gfx906_packed_capacity_gain(
+                            off_geom,
+                            on_geom,
+                            model_config.max_model_len,
+                        )
                         if gain < cls._GFX906_PACKED_MIN_GAIN:
                             logger.info_once(
                                 "gfx906 FA: packed KV layout left off under "
