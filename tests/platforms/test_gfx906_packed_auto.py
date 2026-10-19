@@ -92,3 +92,31 @@ def test_explicit_packed_on_warns_when_gfx906_is_not_detected(
         "gfx906_fa_packed=on was requested but gfx906 was not detected" in r.message
         for r in caplog.records
     ), [r.message for r in caplog.records]
+
+
+def test_worker_side_block_size_pass_republishes_the_config_field(monkeypatch):
+    """`--gfx906-fa-packed on` must reach the process that resolves the layout.
+
+    Measured 2026-10-19: a serve with `--gfx906-fa-packed on` kept the alias
+    layout (block 2096) while `GFX906_FA_PACKED=1` on the same command line
+    engaged packed (2672) — the config field was never published where the
+    aligner runs, so the backend saw its "off" default.
+    """
+    from unittest.mock import MagicMock
+
+    from vllm.gfx906_fa import gfx906_fa_backend as fa
+    from vllm.platforms import rocm as rocm_mod
+
+    monkeypatch.setattr(rocm_mod, "on_gfx906", lambda: True)
+    monkeypatch.delenv("GFX906_FA_PACKED", raising=False)
+    fa.set_packed_config_mode("off")
+
+    vllm_config = MagicMock()
+    vllm_config.cache_config.gfx906_fa_packed = "on"
+    # The base method returns early on a missing model_config; the republish runs first.
+    vllm_config.model_config = None
+
+    RocmPlatform.update_block_size_for_backend(vllm_config)
+
+    assert fa._PACKED_CONFIG_MODE == "on"
+    fa.set_packed_config_mode("off")

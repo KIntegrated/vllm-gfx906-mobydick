@@ -1282,37 +1282,25 @@ class RocmPlatform(Platform):
         return (off_page * off_req) / (on_page * on_req) - 1.0
 
     @classmethod
-    def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        from vllm.config.compilation import CUDAGraphMode
+    def _gfx906_publish_packed_mode(cls, vllm_config: "VllmConfig") -> None:
+        """Publish CacheConfig.gfx906_fa_packed to the gfx906 FA backend.
 
-        compilation_config = vllm_config.compilation_config
-        parallel_config = vllm_config.parallel_config
-
-        if (
-            compilation_config.cudagraph_mode.has_full_cudagraphs()
-            and parallel_config.prefill_context_parallel_size > 1
-        ):
-            # prefill context parallel do not support full cudagraphs
-            logger.warning_once(
-                "Prefill context parallel (PCP) is enabled, which is "
-                "incompatible with full CUDA graphs. "
-                "Overriding cudagraph_mode to PIECEWISE."
-            )
-            compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-
-        if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
-
-        model_config = vllm_config.model_config
-        scheduler_config = vllm_config.scheduler_config
-
+        The backend has no vllm_config access at spec time, so the mode is
+        process-global. Call this from *every* entry point that runs in the
+        process resolving the KV layout: the API process builds the config
+        (`__post_init__` -> check_and_update_config), but the worker resolves
+        the layout later in update_block_size_for_backend(), and a config it
+        receives without re-running the platform hook leaves the backend at its
+        "off" default - which is how `--gfx906-fa-packed on` served the alias
+        layout with no message (measured 2026-10-19).
+        """
         # gfx906 custom FA: publish the KV cell layout choice for the backend,
-        # which has no vllm_config access when it customizes the KV spec. Hybrid
-        # (mamba+attention) models stay on the alias layout under "auto": there
-        # the packed cell buys ~0.4 % capacity while moving the scheduler block
-        # size (2096 -> 2672 measured), so it must not change silently. See
-        # LAB-9/#58 in the fork's roadmap.
+        # which has no vllm_config access when it customizes the KV spec. Under
+        # "auto" a hybrid model is decided on predicted usable capacity (LAB-9/#58
+        # in the fork's roadmap: a moving block size is the mechanism, not a red
+        # flag); an explicit "on"/"off" is passed through untouched.
         cache_config = vllm_config.cache_config
+        model_config = vllm_config.model_config
         # An explicit request must never be dropped silently: gfx906 detection
         # needs a device-name/props query, and a degraded boot (e.g. a broken
         # amdsmi) can fail it in the process that builds the config. Measured
@@ -1377,6 +1365,45 @@ class RocmPlatform(Platform):
                                 on_geom[0],
                             )
                 set_packed_config_mode(mode)
+
+    @classmethod
+    def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
+        """Republish the packed-KV mode in the process that resolves the layout.
+
+        `check_and_update_config` runs where the config is built; the worker
+        resolves the layout in this call. A worker whose config arrives without
+        that hook leaves the backend at its "off" default, which is how an
+        explicit `--gfx906-fa-packed on` served the alias layout with no message.
+        """
+        cls._gfx906_publish_packed_mode(vllm_config)
+        super().update_block_size_for_backend(vllm_config)
+
+    @classmethod
+    def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        from vllm.config.compilation import CUDAGraphMode
+
+        compilation_config = vllm_config.compilation_config
+        parallel_config = vllm_config.parallel_config
+
+        if (
+            compilation_config.cudagraph_mode.has_full_cudagraphs()
+            and parallel_config.prefill_context_parallel_size > 1
+        ):
+            # prefill context parallel do not support full cudagraphs
+            logger.warning_once(
+                "Prefill context parallel (PCP) is enabled, which is "
+                "incompatible with full CUDA graphs. "
+                "Overriding cudagraph_mode to PIECEWISE."
+            )
+            compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
+        if parallel_config.worker_cls == "auto":
+            parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+
+        model_config = vllm_config.model_config
+        scheduler_config = vllm_config.scheduler_config
+
+        cls._gfx906_publish_packed_mode(vllm_config)
         # Note: model_config may be None during testing
         if (
             model_config is not None

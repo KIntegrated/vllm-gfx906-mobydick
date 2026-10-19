@@ -197,3 +197,24 @@ but over-stated in magnitude because usable tokens quantise into whole
 Open, in order: (1) fix the config-field propagation (the warning added today does
 not cover it — it fires only when detection fails); (2) LAB-10 can close once (1)
 lands, using the env-var datum above as the served confirmation.
+
+## 2026-10-19 — propagation fixed: `--gfx906-fa-packed on` now reaches the aligner
+
+Root cause (not a degraded boot): `CacheConfig.gfx906_fa_packed` is published to the
+backend only from `check_and_update_config`, i.e. where the config is *built*. The
+process that resolves the KV layout does so in `update_block_size_for_backend()`,
+and a worker whose config arrives without re-running that hook leaves the backend's
+`_PACKED_CONFIG_MODE` at its `"off"` default — so an explicit `on` was silently
+served as the alias layout, while `GFX906_FA_PACKED=1` (read from the environment
+inside the backend) worked.
+
+Fix: the publish was factored into `RocmPlatform._gfx906_publish_packed_mode()` and
+`RocmPlatform` now overrides `update_block_size_for_backend()` to call it before the
+base phase 1/2/3 pass. Verified live: `--gfx906-fa-packed on` at
+`max_model_len 16384` now keeps `KV cell 400 B` and picks block **2672** (was
+2096). Tests: `test_worker_side_block_size_pass_republishes_the_config_field`
+plus the existing decision tests (17 passed across the two platform files).
+
+With this, LAB-10 can close on the served 16k datum already measured
+(610,577 vs 570,368 usable tokens, +7.05 %), noting that predictions are upper
+bounds.
