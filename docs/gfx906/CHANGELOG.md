@@ -71,6 +71,34 @@ layout the default therefore requires parameterizing those tests over the layout
 (or deleting the alias path), plus decode-t/s and feature-matrix work — tracked
 in LAB-9.
 
+## 2026-10-19 (packed KV: the `auto` gate keys on predicted capacity)
+
+The hybrid `auto` rule asked "did the aligner's block size move?", which LAB-10
+showed is backwards: a moving block size is *how* packed buys capacity (the mamba
+state is per block, so a smaller attention cell packs more tokens into the same
+state). It now compares predicted capacity `block_size / unified_page` for both
+layouts and keeps packed at a >= 3 % gain
+(`RocmPlatform._GFX906_PACKED_MIN_GAIN`, `_gfx906_packed_auto_geometry` +
+`_gfx906_packed_capacity_gain`, unit test
+`tests/platforms/test_gfx906_packed_auto.py`, 4 passed).
+
+Effect, verified on one boot per class:
+
+- **Qwen3.5-35B-A3B** — the reference workload — now defaults to packed:
+  `predicted KV capacity +30.6 % (block 1056 -> 1376)`, on measured evidence
+  (+22.2 % served KV tokens, 142,987 -> 174,762). It was kept **off** before.
+- **Nemotron-3.5-Lightning-30B-A3B** — `+28.0 % (block 2096 -> 2672)`, enabled on
+  geometry alone; its recorded +0.4 % came from an arm capped by request
+  capacity, so the uncapped A/B is still open (LAB-10). `--gfx906-fa-packed off`
+  is the escape.
+
+The dry-run pair is now evaluated once from pristine copies, so its arms cannot
+report entry-block-dependent values (LAB-9's "2672 vs 4192, 1376 vs 2112" wart).
+The *served* block size may still differ from the predicted one (35B: 2112 vs
+1376) without changing the gain, because block and page scale together.
+Pre-existing, unrelated: `tests/platforms/test_cpu.py` fails 15 tests on this host
+in both the patched and reverted tree.
+
 ## 2026-10-19 (PR #41 carry-over retargeted to 0.31)
 
 PR #41's remaining hunks (the sampler hunk landed 2026-10-18 as `afc9565da5`)

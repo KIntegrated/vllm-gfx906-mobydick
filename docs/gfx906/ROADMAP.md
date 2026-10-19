@@ -116,15 +116,25 @@ only**; hybrid models stay opt-in. Non-hybrid block size is unchanged (35B:
 **Default flipped to `auto` (2026-10-18)**, gated on the hybrid aligner's block
 size rather than the model class: on a hybrid model the aligner is dry-run for
 both layouts (on a config **copy**, since restoring a snapshot is not faithful)
-and packed is kept only when the scheduler block size is unchanged. Both of our
-hybrid models are excluded by that rule — Lightning 2096 → 2672, 35B **1056 →
-1376** — with pools of 526,336 / 142,987 tokens, so
-their capacity wins stay opt-in. Non-hybrid models get packed by default, with
-the auto-fallback covering unsupported shapes. Known wart: the dry run runs in
-both config paths and reports different would-be values (2672 vs 4192, 1376 vs
-2112) while agreeing on the decision; compute it once. The 35B's fresh value is
-**1376** (the boot logs agree); 2112 is only the second-pass value once
-`block_size` has already been raised to 1056 — see `DEVLOG-packed-kv.md`.
+and packed was kept only when the scheduler block size was unchanged. That rule
+was **replaced on 2026-10-19**: a moving block size is the *mechanism* by which
+packed buys capacity, not a red flag (LAB-10 — the mamba state is per block, so a
+smaller attention cell packs more tokens into the same state). `auto` now
+compares the predicted KV capacity of the two layouts
+(`block_size / unified_page`, the quantity the served pool tracks) and keeps
+packed when the gain is >= 3 %. Measured predictions: **Qwen3.5-35B-A3B +30.6 %**
+(1056 → 1376; +22.2 % actually served) and **Lightning-30B +28.0 %**
+(2096 → 2672) — both hybrid classes therefore default to packed now, the 35B on
+measured evidence and Lightning on geometry pending the uncapped served A/B
+(LAB-10's remaining step; its recorded +0.4 % came from a request-capacity-capped
+arm). Non-hybrid models get packed by default, with the auto-fallback covering
+unsupported shapes. Decisions live in `_gfx906_packed_auto_geometry` +
+`_gfx906_packed_capacity_gain` (unit test:
+`tests/platforms/test_gfx906_packed_auto.py`); the dry-run pair is now evaluated
+once, from pristine copies, so its arms cannot report entry-block-dependent
+values. The *served* block size can still differ from the predicted one (phase 1
+runs between: 2112 vs 1376 for the 35B) without changing the predicted gain,
+because block and page scale together.
 
 **Earlier note, now superseded:** Items 1–2 of the
 plan landed (`650b417651` auto/fallback, `f1e0328805` config field +

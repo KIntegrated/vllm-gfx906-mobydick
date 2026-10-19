@@ -68,6 +68,33 @@ logging `num_gpu_blocks` and the per-group page sizes. Only then is the LAB-9
 auto rule ("packed off when the block size moves") testable: the 35B suggests it
 is over-conservative where the block move *is* the win.
 
+## Decision rule (2026-10-19)
+
+The `auto` gate no longer asks "did the block size move?" (a moving block is the
+mechanism, not a red flag — see the ceiling section). It compares predicted
+capacity `block_size / unified_page` for both layouts and keeps packed when the
+gain is >= 3 % (`RocmPlatform._GFX906_PACKED_MIN_GAIN` +
+`_gfx906_packed_capacity_gain`, unit test
+`tests/platforms/test_gfx906_packed_auto.py`).
+
+Live verification, one boot per class with `--gfx906-fa-packed auto`:
+
+```
+gfx906 FA: packed KV layout enabled under gfx906_fa_packed=auto:
+  predicted KV capacity +30.6 % (block 1056 -> 1376).   # Qwen3.5-35B-A3B
+gfx906 FA: packed KV layout enabled under gfx906_fa_packed=auto:
+  predicted KV capacity +28.0 % (block 2096 -> 2672).   # Lightning-30B-A3B
+```
+
+The 35B — the roadmap's reference workload — is now packed by default on measured
+evidence (+22.2 % served KV tokens), where the previous rule kept it off. Lightning
+is enabled on geometry alone until the uncapped served A/B lands, with
+`--gfx906-fa-packed off` as the escape.
+
+The predicted gain is robust to the served block size differing from the predicted
+one (35B: served 2112 vs predicted 1376) because block and page scale together, so
+`block_size / page` is unchanged.
+
 ## Note on the recorded block sizes
 
 `ROADMAP.md` recorded "35B 1056 → **2112**". A *fresh* dry run gives **1376**;

@@ -1212,11 +1212,21 @@ class RocmPlatform(Platform):
         # Default dispatch to rocm's sparse_attn_indexer implementation
         compilation_config.custom_ops.append("+sparse_attn_indexer")
 
+    # Packed KV pays off only when it buys KV capacity. The hybrid aligner
+    # re-derives the scheduler block size from the (smaller) packed attention
+    # page, so "the block size moved" is the mechanism, not a red flag: the
+    # mamba state is allocated per block, so a smaller attention cell packs more
+    # tokens into the same mamba state (Qwen3.5-35B-A3B: 1056 -> 1376 tokens per
+    # block, +22.2 % served KV tokens). Decide on the predicted capacity (tokens
+    # per page byte) instead, and require a gain big enough that block-size
+    # rounding noise cannot produce it.
+    _GFX906_PACKED_MIN_GAIN = 0.03
+
     @classmethod
-    def _gfx906_packed_auto_block_size(
+    def _gfx906_packed_auto_geometry(
         cls, vllm_config: "VllmConfig", packed_mode: str
-    ) -> int:
-        """Scheduler block size the hybrid aligner derives for one KV layout.
+    ) -> tuple[int, int | None]:
+        """(scheduler block size, unified page bytes) for one KV layout.
 
         Dry run: the aligner writes ``block_size``/``mamba_block_size`` (and the
         page-padded hints), so those are snapshotted and restored, and the
@@ -1236,10 +1246,29 @@ class RocmPlatform(Platform):
         fa.set_packed_dry_run(True)
         try:
             cls._align_hybrid_block_size(dry, fa.Gfx906FABackend)
-            return dry.cache_config.block_size
+            return (
+                dry.cache_config.block_size,
+                dry.cache_config.mamba_page_size_padded,
+            )
         finally:
             fa.set_packed_dry_run(False)
             fa.reset_packed_mode()
+
+    @staticmethod
+    def _gfx906_packed_capacity_gain(
+        off: tuple[int, int | None], on: tuple[int, int | None]
+    ) -> float:
+        """Predicted relative KV capacity of packed vs alias, from geometry.
+
+        Capacity is `block_size / page_bytes` (tokens per byte of KV pool), the
+        quantity the served "GPU KV cache size" tracks. Returns 0.0 when either
+        arm has no unified page, i.e. when nothing can be predicted.
+        """
+        off_bs, off_page = off
+        on_bs, on_page = on
+        if not off_page or not on_page:
+            return 0.0
+        return (on_bs / on_page) / (off_bs / off_page) - 1.0
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
@@ -1281,20 +1310,11 @@ class RocmPlatform(Platform):
             else:
                 mode = getattr(cache_config, "gfx906_fa_packed", "off")
                 if mode == "auto" and model_config.is_hybrid:
-                    # The packed cell shrinks the attention page, which can move
-                    # the block size the hybrid aligner derives -- a
-                    # config-visible number (Lightning-30B: 2096 -> 2672 for
-                    # +0.4 % capacity), while other hybrid-flagged models keep
-                    # their block size and do win (Qwen3.5-35B-A3B: 8192 either
-                    # way, +22 %). So compare the aligner's outcome for both
-                    # layouts instead of keying on the model class.
                     try:
-                        on_bs = cls._gfx906_packed_auto_block_size(
-                            vllm_config, "on"
-                        )
-                        off_bs = cls._gfx906_packed_auto_block_size(
+                        off_geom = cls._gfx906_packed_auto_geometry(
                             vllm_config, "off"
                         )
+                        on_geom = cls._gfx906_packed_auto_geometry(vllm_config, "on")
                     except Exception as exc:  # noqa: BLE001 - never break a boot
                         logger.warning_once(
                             "gfx906 FA: could not dry-run the hybrid block-size "
@@ -1304,21 +1324,26 @@ class RocmPlatform(Platform):
                         )
                         mode = "off"
                     else:
-                        if on_bs != off_bs:
+                        gain = cls._gfx906_packed_capacity_gain(off_geom, on_geom)
+                        if gain < cls._GFX906_PACKED_MIN_GAIN:
                             logger.info_once(
                                 "gfx906 FA: packed KV layout left off under "
-                                "gfx906_fa_packed=auto: it would move the "
-                                "scheduler block size %d -> %d. Pass "
+                                "gfx906_fa_packed=auto: predicted KV capacity "
+                                "%+.1f %% (block %d -> %d). Pass "
                                 "gfx906_fa_packed=on to force it.",
-                                off_bs,
-                                on_bs,
+                                100 * gain,
+                                off_geom[0],
+                                on_geom[0],
                             )
                             mode = "off"
                         else:
                             logger.info_once(
                                 "gfx906 FA: packed KV layout enabled under "
-                                "gfx906_fa_packed=auto (block size stays %d).",
-                                on_bs,
+                                "gfx906_fa_packed=auto: predicted KV capacity "
+                                "%+.1f %% (block %d -> %d).",
+                                100 * gain,
+                                off_geom[0],
+                                on_geom[0],
                             )
                 set_packed_config_mode(mode)
         # Note: model_config may be None during testing
