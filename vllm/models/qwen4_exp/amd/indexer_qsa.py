@@ -18,6 +18,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
+from vllm.models.qwen4_exp.family import validate_selection_width
 
 from ..common.qsa_cache import (
     QSA_ACTIVATION_DTYPES,
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
     from .qsa import Qwen4ExpQSAAttention
 
 logger = init_logger(__name__)
+
 
 
 def addressable_token_topk(
@@ -148,6 +150,11 @@ class QSAIndexer(nn.Module):
             self.compress_ratio,
             int(vllm_config.model_config.max_model_len),
         )
+        # Fail at construction, not on the first decode step: upstream removed
+        # the config-time {512, 2048} check in v0.32.0, so an over-wide budget is
+        # now a legal configuration that would otherwise abort mid-serving.
+        if torch.cuda.is_available():
+            validate_selection_width(self.token_topk)
         self.rotary_emb = rotary_emb
         self.use_fused_pre_indexer = supports_fused_pre_indexer(
             rotary_emb,

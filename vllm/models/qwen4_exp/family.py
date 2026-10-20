@@ -103,3 +103,51 @@ def model_type_of(config: Any) -> str | None:
     """Convenience accessor used by callers that only need the string."""
     value = getattr(config, "model_type", None)
     return value if isinstance(value, str) else None
+
+def _torch_device_props():
+    import torch
+
+    return torch.cuda.get_device_properties(torch.cuda.current_device())
+
+
+def device_lds_bytes() -> int:
+    """Per-block LDS budget of the current device, in bytes.
+
+    The decode selection kernel (`_C.top_k_per_row_decode`) stages
+    ``2 * topK * int32`` of dynamic shared memory without opting in to a larger
+    dynamic allocation, so the request is capped by the device's per-block LDS.
+    PyTorch exposes the opt-in field on some builds only, hence the fallback: on
+    gfx906 both read 64 KiB, which is also the hardware's per-CU limit.
+    """
+    props = _torch_device_props()
+    return int(
+        getattr(props, "shared_memory_per_block_optin", None)
+        or props.shared_memory_per_multiprocessor
+    )
+
+
+def max_decode_topk(lds_bytes: int | None = None) -> int:
+    """Largest selection width the decode kernel can serve on this device.
+
+    Mirrors the guard added to the op itself (UPR-3/#37). Kept here as well so a
+    configuration that cannot run is rejected at construction with a message that
+    names the budget, instead of aborting a serving step later.
+    """
+    if lds_bytes is None:
+        lds_bytes = device_lds_bytes()
+    return max(1, int(lds_bytes) // (2 * 4))
+
+
+def validate_selection_width(width: int, lds_bytes: int | None = None) -> None:
+    """Raise if a QSA selection width cannot be served by the decode kernel."""
+    limit = max_decode_topk(lds_bytes)
+    if width > limit:
+        lds = lds_bytes if lds_bytes is not None else device_lds_bytes()
+        raise ValueError(
+            f"QSA selection width {width} exceeds this device's decode top-k "
+            f"budget (topK <= {limit} for {lds} B of per-block LDS): the kernel "
+            "stages 2*topK*int32 of dynamic shared memory and cannot serve a "
+            "wider row. Lower indexer_budget (or raise indexer_compress_ratio) "
+            "so that indexer_budget // indexer_compress_ratio <= "
+            f"{limit}."
+        )
