@@ -22,7 +22,7 @@ from pydantic import ConfigDict, Field, model_validator
 
 import vllm.envs as envs
 from vllm.logger import enable_trace_function_call, init_logger
-from vllm.models.qwen4_exp.config import needs_ple_ngram_split
+from vllm.models.qwen4_exp.family import needs_ple_ngram_split
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid

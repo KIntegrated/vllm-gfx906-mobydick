@@ -15,7 +15,7 @@ from vllm.config.model import HfOverrides, ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.utils import config, replace
 from vllm.logger import init_logger
-from vllm.models.qwen4_exp.config import is_qwen4_exp_model_type
+from vllm.models.qwen4_exp.family import is_qwen4_exp_model_type
 from vllm.transformers_utils.config import get_hf_text_config
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference

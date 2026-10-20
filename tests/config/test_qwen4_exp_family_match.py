@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm.models.qwen4_exp.config import (
+from vllm.models.qwen4_exp.family import (
     QWEN4_EXP_CONFIG_CLASSES,
     QWEN4_EXP_MODEL_TYPES,
     is_qwen4_exp_config,
