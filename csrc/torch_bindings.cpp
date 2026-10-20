@@ -8,6 +8,15 @@
 // Note: We register under namespace "_C" so ops are accessible as
 // torch.ops._C.<op_name> for compatibility with existing code.
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+  ops.def(
+      "indexer_k_cache_fp16(Tensor k, Tensor! kv_cache, Tensor slot_mapping) "
+      "-> ()");
+  ops.def(
+      "cp_gather_indexer_k_cache_fp16(Tensor kv_cache, Tensor! dst_k, Tensor "
+      "block_table, Tensor cu_seq_lens) -> ()");
+  ops.impl("indexer_k_cache_fp16", TORCH_BOX(&indexer_k_cache_fp16));
+  ops.impl("cp_gather_indexer_k_cache_fp16",
+           TORCH_BOX(&cp_gather_indexer_k_cache_fp16));
   // Compute per-token-group FP8 quantized tensor and scaling factor.
   // The dummy arguments are here so we can correctly fuse with RMSNorm.
   ops.def(
@@ -1166,17 +1175,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
            TORCH_BOX(&cp_gather_and_upconvert_nvfp4_kv_cache));
   ops.impl("indexer_k_quant_and_cache", TORCH_BOX(&indexer_k_quant_and_cache));
   ops.impl("concat_mla_q", TORCH_BOX(&concat_mla_q));
-  ops.def(
-      "indexer_k_cache_fp16(Tensor k, Tensor! kv_cache, Tensor slot_mapping) "
-      "-> ()");
-  ops.def(
-      "cp_gather_indexer_k_cache_fp16(Tensor kv_cache, Tensor! dst_k, Tensor "
-      "block_table, Tensor cu_seq_lens) -> ()");
   ops.impl("cp_gather_indexer_k_quant_cache",
            TORCH_BOX(&cp_gather_indexer_k_quant_cache));
-  ops.impl("indexer_k_cache_fp16", TORCH_BOX(&indexer_k_cache_fp16));
-  ops.impl("cp_gather_indexer_k_cache_fp16",
-           TORCH_BOX(&cp_gather_indexer_k_cache_fp16));
 }
 
 REGISTER_EXTENSION(_C_stable_libtorch)

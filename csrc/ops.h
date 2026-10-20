@@ -799,8 +799,8 @@ void concat_mla_q(
 
 // Extract function to gather quantized K cache
 void indexer_k_cache_fp16(
-    torch::stable::Tensor& k, torch::stable::Tensor& kv_cache,
-    torch::stable::Tensor& slot_mapping);
+    const torch::stable::Tensor& k, torch::stable::Tensor& kv_cache,
+    const torch::stable::Tensor& slot_mapping);
 
 void cp_gather_indexer_k_cache_fp16(
     const torch::stable::Tensor& kv_cache, torch::stable::Tensor& dst_k,

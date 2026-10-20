@@ -1,5 +1,6 @@
 #include "torch_utils.h"
 #include "dispatch_utils.h"
+#include "cuda_utils.h"
 
 #include "core/utils.hpp"
 #include "core/cuda_compat.h"
@@ -2085,8 +2086,8 @@ __global__ void cp_gather_indexer_k_cache_fp16_kernel(
   }
 }
 void indexer_k_cache_fp16(
-    torch::stable::Tensor& k, torch::stable::Tensor& kv_cache,
-    torch::stable::Tensor& slot_mapping) {
+    const torch::stable::Tensor& k, torch::stable::Tensor& kv_cache,
+    const torch::stable::Tensor& slot_mapping) {
   const int num_tokens = k.size(0);
   const int head_dim = k.size(1);
   const int cache_block_size = kv_cache.size(1);
