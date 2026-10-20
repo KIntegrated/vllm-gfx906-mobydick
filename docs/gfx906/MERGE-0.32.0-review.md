@@ -173,6 +173,48 @@ QSA / Qwen3.8-Flash-Next paths (no servable checkpoint), DeepSeek-V4/V4.1 and
 Kimi-K3 AMD paths, AITER MegaMoE, RDNA (`on_gfx1x`) items, PP/PCP/DCP and KV-connector
 changes, SM90/SM100-only kernels, Intel XPU/CPU backends, and the Rust frontend.
 
+## 6b. Validation log (what the ladder actually found)
+
+**Build** (`aacf920d39`) — three breakages, all in the `csrc` flattening's blast
+radius, none of them with a conflict marker:
+
+1. `csrc/cache_kernels.cu` lost its `cuda_utils` include (the flattening turned
+   `../cuda_utils.h` into a nonexistent path) → `use of undeclared identifier
+   cuda_utils` on our split-KV insert path.
+2. Upstream's rewritten `csrc/cuda_utils.h` **silently dropped** the fork's
+   `cuda_utils::ceil_div` *and* the `HOST_DEVICE_INLINE` macro. Restored with a
+   conditional device qualifier (the header is also included from host-only TUs).
+3. The ported op registrations aborted the whole extension at load:
+   `aoti_torch_library_def API call failed`. **Diagnosis method worth reusing:**
+   tag every `ops.def`/`ops.impl` with `std::fprintf(stderr, "REG line %d", __LINE__)`,
+   rebuild, load — the last printed line names the failing statement. It localised
+   to a def placed in the file's later fragment region; moving our two indexer
+   defs/impls to the top of the `_C` fragment loads cleanly.
+
+**Fast smoke test learned:** `torch.ops.load_library('vllm/_C_stable_libtorch*.so')`
+catches registration breakage in ~2 s, long before any model load. Run it
+immediately after every rebuild that touches bindings.
+
+**Import smoke** — one more semantic conflict (no marker): upstream deleted
+`vllm/models/qwen4_exp/config.py`, but `vllm/config/speculative.py` and
+`vllm/config/vllm.py` still imported the fork's family helpers from it, so the
+tree only failed at import (`ModuleNotFoundError`). Fixed in `bf58123bb6` by moving
+the helpers to `vllm/models/qwen4_exp/family.py`, deliberately **not** deriving the
+family set from `transformers` classes: the release pins `transformers >= 5.16.1`
+and the venv still has an older one, so the set is a static tuple and
+`QWEN4_EXP_CONFIG_CLASSES` degrades to `()`.
+
+**Tests:** `tests/config/test_qwen4_exp_family_match.py` **43 passed**;
+`tests/platforms/` 33 passed with the same 15 `test_cpu.py` failures that fail on a
+reverted tree on this host (pre-existing, host-specific).
+
+**Dependency divergence to watch:** upstream now pins torch `2.15.0.dev` on CUDA
+(`requirements/rubin-prerelease.txt`) and `transformers >= 5.16.1`; our ROCm venv
+is torch `2.13.0+gfx906` and an older transformers. Two of upstream's 0.32 perf
+items ("fusion passes restored under PyTorch 2.15", "static FP8 quant fusion on
+recent torch") therefore do not reach this build, and the Qwen4Exp/PLE paths stay
+unservable locally.
+
 ## 7. Next steps (in order)
 
 1. Resolve the remaining 38 conflicts (fork-critical Python first: `int_wna16.py`,
