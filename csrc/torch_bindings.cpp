@@ -702,6 +702,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 
   // Post processing for GPTQ.
   ops.def("gptq_shuffle(Tensor! q_weight, int bit) -> ()");
+  ops.def("gptq_shuffle_awq_qweight(Tensor! q_weight, int bit) -> ()");
 
   // Mamba selective scan kernel
   ops.def(
@@ -896,6 +897,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   // GPTQ kernels
   ops.impl("gptq_gemm", TORCH_BOX(&gptq_gemm));
   ops.impl("gptq_shuffle", TORCH_BOX(&gptq_shuffle));
+  ops.impl("gptq_shuffle_awq_qweight", TORCH_BOX(&gptq_shuffle_awq_qweight));
 
   // Mamba kernels
   ops.impl("selective_scan_fwd", TORCH_BOX(&selective_scan_fwd));
@@ -1164,8 +1166,17 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
            TORCH_BOX(&cp_gather_and_upconvert_nvfp4_kv_cache));
   ops.impl("indexer_k_quant_and_cache", TORCH_BOX(&indexer_k_quant_and_cache));
   ops.impl("concat_mla_q", TORCH_BOX(&concat_mla_q));
+  ops.def(
+      "indexer_k_cache_fp16(Tensor k, Tensor! kv_cache, Tensor slot_mapping) "
+      "-> ()");
+  ops.def(
+      "cp_gather_indexer_k_cache_fp16(Tensor kv_cache, Tensor! dst_k, Tensor "
+      "block_table, Tensor cu_seq_lens) -> ()");
   ops.impl("cp_gather_indexer_k_quant_cache",
            TORCH_BOX(&cp_gather_indexer_k_quant_cache));
+  ops.impl("indexer_k_cache_fp16", TORCH_BOX(&indexer_k_cache_fp16));
+  ops.impl("cp_gather_indexer_k_cache_fp16",
+           TORCH_BOX(&cp_gather_indexer_k_cache_fp16));
 }
 
 REGISTER_EXTENSION(_C_stable_libtorch)

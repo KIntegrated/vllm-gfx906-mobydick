@@ -370,7 +370,7 @@ def _gqa_sparse_decode_kernel(
         mask=hd_mask,
         other=0.0,
     )
-    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    # gfx906 (fork): fp32 operands must be cast to fp16 -- MI50 has no fp32 MMA.
     if q.dtype == tl.float32:
         q = q.to(tl.float16)
 

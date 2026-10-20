@@ -248,12 +248,16 @@ def _index_block_score_kernel(
     if BLOCK_SIZE_Q * pid_q >= q_len:
         return
 
-    q_desc = tl.make_tensor_descriptor(
+    # gfx906 (fork): keep the block-pointer load. Upstream moved this to a
+    # tensor descriptor; descriptors are not a validated path on MI50 with
+    # Triton 3.8.0, so the fork keeps tl.make_block_ptr here.
+    q_ptrs = tl.make_block_ptr(
         base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
-        shape=[q_len, head_dim],
-        strides=[stride_q_n, stride_q_d],
-        block_shape=[BLOCK_SIZE_Q, head_dim],
-        padding_option="zero",
+        shape=(q_len, head_dim),
+        strides=(stride_q_n, stride_q_d),
+        offsets=(pid_q * BLOCK_SIZE_Q, 0),
+        block_shape=(BLOCK_SIZE_Q, head_dim),
+        order=(1, 0),
     )
     q = tl.load(q_ptrs, boundary_check=(0,), padding_option="zero")
     if q.dtype == tl.float32:

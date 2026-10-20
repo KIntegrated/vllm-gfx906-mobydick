@@ -633,6 +633,9 @@ torch::stable::Tensor gptq_gemm(torch::stable::Tensor a,
 
 void gptq_shuffle(torch::stable::Tensor q_weight, int64_t bit);
 
+// gfx906 AWQ path (fork): repack AWQ qweight into GPTQ layout for gptq_gemm.
+void gptq_shuffle_awq_qweight(torch::stable::Tensor q_weight, int64_t bit);
+
 // Cache ops (shared CUDA/ROCm)
 void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,
                  int64_t block_size_in_bytes,
@@ -795,6 +798,15 @@ void concat_mla_q(
                                      // rope_dim]
 
 // Extract function to gather quantized K cache
+void indexer_k_cache_fp16(
+    torch::stable::Tensor& k, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& slot_mapping);
+
+void cp_gather_indexer_k_cache_fp16(
+    const torch::stable::Tensor& kv_cache, torch::stable::Tensor& dst_k,
+    const torch::stable::Tensor& block_table,
+    const torch::stable::Tensor& cu_seq_lens);
+
 void cp_gather_indexer_k_quant_cache(
     const torch::stable::Tensor& kv_cache,      // [num_blocks, block_size,
                                                 // cache_stride]

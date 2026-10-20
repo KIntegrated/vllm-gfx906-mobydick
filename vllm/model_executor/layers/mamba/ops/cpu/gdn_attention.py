@@ -14,6 +14,7 @@ from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
 )
 from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
     causal_conv1d_update_cpu,
+    causal_conv1d_update_torch,
 )
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.torch_utils import (
