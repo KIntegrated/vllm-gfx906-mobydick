@@ -2202,3 +2202,36 @@ executed - this box has two GPUs. See `DEVLOG-packed-kv.md`.
   in-process `LLM` run (`VLLM_USE_AOT_COMPILE=0`, cold inductor cache, variable
   unset, three prompt sizes, graphs) — passed. Removed from the README recipe and
   scoped to the fork in the mem-attribution skill.
+
+## 2026-10-20 — upstream v0.32.0 merged (`gfx906/v0.32.0`)
+
+**VERDICT: merged and validated (build + PPL); branch not yet promoted to `main`.**
+59 conflicts resolved by hand; review sheet with per-file rationale, opportunities
+and open risks in `MERGE-0.32.0-review.md` and issues #60–#66.
+
+Gates: static sweep clean (no markers / F821 / F811 / duplicate defs) · build
+rc=0, `_C_stable_libtorch` loads with all four fork ops registered · fork family
+tests 43 passed · **PPL MoE 35B 15.9555** (band 15.94–16.02) and **dense 27B
+14.3750** (its recorded baseline, exact), 0 top-20 misses both.
+
+Five post-merge breakages, none with a conflict marker: (1) `cache_kernels.cu`
+lost the `cuda_utils` include in the `csrc` flattening; (2) upstream's rewritten
+`cuda_utils.h` silently dropped our `cuda_utils::ceil_div` **and** the
+`HOST_DEVICE_INLINE` macro; (3) the ported op registrations aborted the whole
+extension at load (`aoti_torch_library_def`) until they were moved to the top of
+the `_C` fragment — diagnosed by tagging every def/impl with `__LINE__`;
+(4) `speculative.py` / `config/vllm.py` still imported the fork's Qwen4Exp family
+helpers from the module upstream deleted, so the tree failed at *import*
+(fixed: dependency-free `vllm/models/qwen4_exp/family.py`); (5) the QSA indexer
+module is unimportable on this venv because `transformers` predates the Qwen4Exp
+config classes (tracked in #66).
+
+**P32-7 (#65) resolved in the same session:** 0.32.0 does **not** remove Model
+Runner V1 — `VLLM_USE_V2_MODEL_RUNNER` is still honoured (HiSparse raises,
+watermarking overrides) — but it removed the model-specific MRV1 exceptions, so
+V2 is the default for every architecture. Verified on the merged base with the
+env var **unset**: Muse-Glimmer + the DFlash assistant boots under
+`Using V2 Model Runner`, captures its drafter graphs 1/1 and serves coherently
+at 38.6–40.5 t/s decode (B=1 effective). The 0.30-era claim that "Gemma-4 and
+Muse-Glimmer stay pinned to V1" is stale — both pins were lifted on evidence on
+2026-09-15/16 — and the preset comment carrying it is corrected.

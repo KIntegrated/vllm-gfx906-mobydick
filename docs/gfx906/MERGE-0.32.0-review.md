@@ -229,14 +229,21 @@ items ("fusion passes restored under PyTorch 2.15", "static FP8 quant fusion on
 recent torch") therefore do not reach this build, and the Qwen4Exp/PLE paths stay
 unservable locally.
 
+**P32-7 (#65) closed 2026-10-20.** v0.32.0 keeps V1 (`VLLM_USE_V2_MODEL_RUNNER`
+honoured; only HiSparse raises and watermarking overrides) but removes the
+model-specific MRV1 exceptions, so V2 is the default for every architecture.
+Verified on the merged base with the env var unset: Muse-Glimmer + DFlash assistant
+→ `Using V2 Model Runner`, drafter graphs 1/1, coherent output, 38.6–40.5 t/s
+decode. Gemma-4 is not downloaded on this box, so its arm is covered by the
+2026-09-15 templated V1-vs-V2 evidence rather than re-measured here.
+
 ## 7. Next steps (in order)
 
 1. Resolve the remaining 38 conflicts (fork-critical Python first: `int_wna16.py`,
    `compressed_tensors_moe_wna16.py`, `moe_wna16.cu`, `hisparse_kernels.cu`,
    `config/vllm.py`).
 2. `scripts/post-merge-sweep.sh` (F821/F811, duplicate `def`, import smoke).
-3. Rebuild `_C_stable_libtorch` / `_rocm_C` / `_moe_C_stable_libtorch`; verify the
-   ported op schemas (`gptq_shuffle_awq_qweight`, `indexer_k_cache_fp16`).
-4. PPL gate on dense (27B) **and** MoE (35B / Lightning), inside the recorded bands.
-5. TP=2 serving smoke; then the mamba-prefill-checkpoint and packed-layout
-   re-checks from §4.
+3. ~~Rebuild + op schemas~~ **done** (`aacf920d39`).
+4. ~~PPL gate dense + MoE~~ **done** (15.9555 / 14.3750).
+5. TP=2 serving smoke beyond the V2 Muse arm; then the mamba-prefill-checkpoint
+   (#62) and packed-layout (#60) re-checks from §4.
