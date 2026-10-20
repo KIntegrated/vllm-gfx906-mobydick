@@ -204,6 +204,20 @@ family set from `transformers` classes: the release pins `transformers >= 5.16.1
 and the venv still has an older one, so the set is a static tuple and
 `QWEN4_EXP_CONFIG_CLASSES` degrades to `()`.
 
+**PPL gates (in-process probe, 359 tokens):**
+
+| arm | PPL | band | verdict |
+|---|---|---|---|
+| MoE `Qwen3.5-35B-A3B-AWQ` | **15.9555** | 15.94–16.02 | pass, 0 top-20 misses |
+| dense `Qwen3.5-27B-AWQ` | **14.3750** | its own recorded baseline 14.3750 | pass, exact match, 0 misses |
+
+The dense arm deliberately used `Qwen3.5-27B-AWQ`: the skill names
+`Qwen3.8-27B-AWQ-INT4` (band 10.5472–10.5516) but that checkpoint is not on this
+box, and `ROADMAP.md` already warns *"do not use Qwen3.5-27B, which reads
+14.3750"* for that band. Against its own recorded baseline the arm is exact to
+the last digit, which is the stronger signal (it exercises `gptq_shuffle` +
+`ExllamaLinearKernel`).
+
 **Tests:** `tests/config/test_qwen4_exp_family_match.py` **43 passed**;
 `tests/platforms/` 33 passed with the same 15 `test_cpu.py` failures that fail on a
 reverted tree on this host (pre-existing, host-specific).
