@@ -1,8 +1,11 @@
 # MERGE-0.32.0 — review sheet (IN PROGRESS)
 
-**Status:** merge in progress on `gfx906/v0.32.0`; **not** build-validated, **not**
-gate-validated. Do not promote or release from this branch until the
-definition-of-done in `.agents/skills/upstream-merge/SKILL.md` is met.
+**Status:** **all 51 conflicts resolved** (`1e514c6fd0`) + post-merge fixes
+(`46aa74c262`); **static sweep PASSES** (no markers, no F821/F811 across
+`vllm/`, `tests/`, `csrc/`, syntax compiles, no duplicate defs). **Not**
+build-validated and **not** gate-validated — do not promote or release from this
+branch until the definition-of-done in `.agents/skills/upstream-merge/SKILL.md`
+is met.
 
 **Source:** upstream tag `v0.32.0` (`5df63a7203`), merged into `main`'s tip.
 **Merge base:** `3d5f4d4cd5`. **Sizes:** 822 fork commits / 840 upstream commits,
@@ -93,6 +96,40 @@ Tests: `tests/quantization/test_moe_wna16.py`, `tests/models/qwen4_exp/test_conf
 7. **Triton kernels off `tl.make_block_ptr` (#60502)** — our fork's Triton kernels
    still emit that deprecation warning on every run; the upstream rewrite is the
    template for ours.
+8. **`ROCM_SEGMENTED_ATTN` (#59132, MERGED) — mine it for our custom FA.**
+   An opt-in Triton backend spanning gfx11/gfx12 (RDNA3/3.5/4) that covers paged
+   decode, prefill **and multi-token verification**, head sizes 64/128/256, GQA
+   1-16, causal **and non-causal**, sliding windows and **attention sinks**, with
+   FP8 KV gated to gfx12 (so its FP16 path is what concerns us — MI50 has no
+   FP8). 4.4 k lines, no new compiler dependency. Three things are worth taking
+   even though the backend itself is RDNA-only:
+   - **Startup autotune + persisted launch-choice cache, shared between target and
+     draft.** Our FA picks its tiles from fixed heuristics (`nc2`, the gfx906
+     gather clip, per-file max-ilp). A one-time tuning pass persisted per
+     `(D, GQA, window, batch-shape class)` is the cheapest structural win
+     available to us and would also make our A/Bs reproducible across boots.
+   - **Its segmented-decode algorithm** is a second opinion on the split-K /
+     direct-paged route our M5 bake rejected at B=4 (`GFX906_FA_DIRECT_PAGED_Q8`);
+     the "segment + in-kernel merge" structure is what our gather clip does
+     implicitly. Worth reading before we revisit that route.
+   - **Non-causal + sinks coverage** — FA-NONCAUSAL Stage 2 (symmetric ±window)
+     is parked in our fork, and this PR is a working reference for the
+     non-causal verify tile the DFlash assistant uses.
+9. **`ultraquant_4bit` KV (#57057, MERGED) — portable shape, but INT4 not FP4.**
+   Stores KV at 4 bits (FP4 E2M1 codes + UE8M0 power-of-two per-group-32 scales
+   + **Hadamard-rotated keys**), ~2× density over fp8; decode runs a FlyDSL
+   `D=256` kernel for GQA {6,8,16} on gfx950 with a Triton unified-attention
+   fallback. **MI50 has no FP4 support**, so a gfx906 port must be **INT4**
+   (symmetric int4 codes, per-group-32 scale — the same shape our Q8_0 path
+   already uses) and the Triton fallback, not FlyDSL, is the carrier. The
+   rotation is the interesting part and is cheap on this hardware (one
+   `hipBLAS`-free elementwise pass per store, HBM-bound); it is what keeps
+   outliers inside int4 range. Natural landing site: our **packed KV cell**
+   (`K q8 | V fp16`, 784 B at D=256) becoming `K q8 | V int4` (~272 B), which
+   would roughly double the capacity win LAB-9 measured (+22 % → ~+2×) and is a
+   much bigger lever than LAB-5's int8 per-token-head plan (#49). Effort: real
+   kernel work (store + dequant-into-fp16-tile + dot), so it belongs behind a
+   capacity gate, not in this merge train.
 
 ## 5. Challenges / breaking changes that bite the fork
 
