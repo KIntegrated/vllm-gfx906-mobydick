@@ -120,6 +120,7 @@ def _index_block_score_kernel(
     stride_bt_b,
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
+    USE_SPLIT_K: tl.constexpr,
 ):
     pid_q = tl.program_id(0)
     pid_bh = tl.program_id(1)
@@ -133,17 +134,26 @@ def _index_block_score_kernel(
     if BLOCK_SIZE_Q * pid_q >= q_len:
         return
 
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
-        shape=(q_len, head_dim),
-        strides=(stride_q_n, stride_q_d),
-        offsets=(pid_q * BLOCK_SIZE_Q, 0),
-        block_shape=(BLOCK_SIZE_Q, head_dim),
-        order=(1, 0),
+    o_q = pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    o_d = tl.arange(0, head_dim)
+    m_q = o_q < q_len
+    q_ptrs = (
+        q_ptr
+        + seq_start.to(tl.int64) * stride_q_n
+        + pid_h.to(tl.int64) * stride_q_h
+        + o_q[:, None].to(tl.int64) * stride_q_n
+        + o_d[None, :].to(tl.int64) * stride_q_d
     )
-    q = tl.load(q_ptrs, boundary_check=(0,), padding_option="zero")
+    q = tl.load(q_ptrs, mask=m_q[:, None], other=0.0)
+    # gfx906 (fork): fp32 operands are cast down to fp16 -- MI50 has no fp32 or
+    # bf16 MMA, so leaving them in their stored dtype makes tl.dot fall back.
     if q.dtype == tl.float32:
         q = q.to(tl.float16)
+    # A matched fp8 pair (e.g. e4m3 x e4m3) lowers to a native FP8 MMA, so
+    # upcast only when the operands differ: there is no mixed-dtype fp8 MMA,
+    # including across fp8 flavours (fp8e4nv vs fp8e4b8).
+    elif q.dtype.is_fp8() and q.dtype != ik_cache_ptr.dtype.element_ty:
+        q = q.to(tl.bfloat16)
     q_start = prefix_len + pid_q * BLOCK_SIZE_Q
 
     off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
@@ -153,8 +163,19 @@ def _index_block_score_kernel(
     bt_row = block_table_ptr + pid_b * stride_bt_b
     # Causal window: only blocks up to the last query token's position.
     hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
-    for i in tl.range(0, hi, BLOCK_SIZE_K):
-        blk = i // BLOCK_SIZE_K
+    num_blocks = tl.cdiv(hi, BLOCK_SIZE_K)
+    if USE_SPLIT_K:
+        pid_k = tl.program_id(2)
+        blocks_per_split = tl.cdiv(num_blocks, tl.num_programs(2))
+        block_start = pid_k * blocks_per_split
+        block_end = tl.minimum(block_start + blocks_per_split, num_blocks)
+        if block_start >= block_end:
+            return
+    else:
+        block_start = 0
+        block_end = num_blocks
+    for blk in tl.range(block_start, block_end):
+        i = blk * BLOCK_SIZE_K
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = i + off_k
         # index-K for this page: [BLOCK_SIZE_D, BLOCK_SIZE_K] (transposed)
@@ -169,7 +190,9 @@ def _index_block_score_kernel(
         )
         if k.dtype == tl.float32:
             k = k.to(tl.float16)
-        qk = tl.dot(q, k)
+        elif k.dtype.is_fp8() and k.dtype != q.dtype:
+            k = k.to(tl.bfloat16)
+        qk = tl.dot(q, k, out_dtype=tl.float32)
         # apply causal mask as needed
         if q_start < i + BLOCK_SIZE_K:
             qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
@@ -387,6 +410,8 @@ def _decode_index_score_kernel(
     # so cast q here instead of inside the loop.
     if BLOCK_SIZE_HQ != 1 and q.dtype == tl.float32:
         q = q.to(tl.float16)
+    if q.dtype.is_fp8() and q.dtype != ik_cache_ptr.dtype.element_ty:
+        q = q.to(tl.bfloat16)
     for blk in tl.range(chunk_start_block, chunk_end_block):
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = blk * BLOCK_SIZE_K + off_k
@@ -407,6 +432,10 @@ def _decode_index_score_kernel(
         # q was cast before the loop, so only k needs it here.
         if k.dtype == tl.float32:
             k = k.to(tl.float16)
+        # Matched fp8 operands keep the native FP8 MMA; any mismatch upcasts,
+        # since no mixed-dtype fp8 MMA exists.
+        if k.dtype.is_fp8() and k.dtype != q.dtype:
+            k = k.to(tl.bfloat16)
         kq = tl.dot(k, q, out_dtype=tl.float32)  # [N,HQ]
         kq = tl.where(pos_mask & q_mask[None, :], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [HQ]
@@ -707,7 +736,17 @@ def minimax_m3_index_score(
         device=idx_q.device,
     )
     BLOCK_SIZE_Q = 64
-    grid_score = (triton.cdiv(max_query_len, BLOCK_SIZE_Q), batch * num_idx_heads)
+    n_q_tiles = triton.cdiv(max_query_len, BLOCK_SIZE_Q)
+    SCORE_TARGET_GRID = 48
+    split_k = max(
+        1,
+        min(max_block, SCORE_TARGET_GRID // max(1, n_q_tiles * batch * num_idx_heads)),
+    )
+    if not (
+        current_platform.is_cuda() and current_platform.is_device_capability((12, 0))
+    ):
+        split_k = 1
+    grid_score = (n_q_tiles, batch * num_idx_heads, split_k)
     _index_block_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
@@ -732,6 +771,7 @@ def minimax_m3_index_score(
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         # gfx906 index-score dot kernels need these launch params.
         **_index_score_launch_kwargs(),
+        USE_SPLIT_K=split_k > 1,
     )
     return score
 
@@ -845,7 +885,7 @@ def minimax_m3_index_decode_score(
         )
     # split-K over seq blocks; chunk count depends only on shape constants so
     # the grid is fixed within a cuda graph.
-    TARGET_GRID = 512
+    TARGET_GRID = 4096
     MAX_NUM_KV_CHUNKS = 256
     # Use the configured max decode length to avoid Triton recompiles when
     # switching between qlen=1 and spec-decode verification batches.
@@ -947,7 +987,7 @@ def minimax_m3_index_decode(
         )
     # Chunk count is shape-constant (cudagraph-safe), capped so the merge sorts
     # pow2(num_topk_chunks * pow2(topk)) candidates.
-    TOPK_TARGET_GRID = 64
+    TOPK_TARGET_GRID = 512
     MAX_NUM_TOPK_CHUNKS = 16
     topk_target = max(
         1, min(MAX_NUM_TOPK_CHUNKS, TOPK_TARGET_GRID // max(1, batch * num_idx_heads))

@@ -33,6 +33,7 @@ from vllm.model_executor.layers.fused_moe.experts.trtllm_mxint4_moe import (
     TrtLlmMxint4ExpertsMonolithic,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.humming import prioritize_humming
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     check_moe_marlin_supports_config,
     marlin_act_int8_process_scales,
@@ -307,7 +308,7 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
     if current_platform.is_xpu():
         return [WNA16MoEBackend.XPU]
 
-    backends: list[WNA16MoEBackend] = []
+    gfx906_backends: list[WNA16MoEBackend] = []
     if current_platform.is_rocm():
         from vllm.platforms.rocm import on_gfx906
 
@@ -316,10 +317,9 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
             and hasattr(torch.ops, "_rocm_C")
             and hasattr(torch.ops._rocm_C, "moe_gptq_gemm_gfx906")
         ):
-            backends.append(WNA16MoEBackend.GFX906_HIP)
+            gfx906_backends.append(WNA16MoEBackend.GFX906_HIP)
 
-    return backends + [
-        # Native HIP kernel, gated on gfx1100 by _supports_current_device().
+    backends = [        # Native HIP kernel, gated on gfx1100 by _supports_current_device().
         WNA16MoEBackend.RDNA3,
         WNA16MoEBackend.FLASHINFER_TRTLLM,
         WNA16MoEBackend.MARLIN,
@@ -328,6 +328,7 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
         WNA16MoEBackend.HUMMING,
         WNA16MoEBackend.EMULATION,
     ]
+    return gfx906_backends + prioritize_humming(backends)
 
 
 def _backend_incompatibility_reason(
@@ -430,6 +431,25 @@ def _backend_incompatibility_reason(
             return "zero points are not supported"
         if isinstance(quant_config, MoeWNA16Config):
             return "the MoeWNA16 weight layout is not supported"
+        if isinstance(quant_config, AutoGPTQConfig) and quant_config.desc_act:
+            return "GPTQ activation ordering is not supported"
+        if (
+            isinstance(quant_config, QuantizationArgs)
+            and quant_config.actorder == "group"
+        ):
+            return "group activation ordering is not supported"
+        group_size = getattr(quant_config, "group_size", None)
+        if group_size is None or group_size <= 0:
+            return "DA8W4 requires group-quantized weights"
+        # AOCL sym_quant requires the group size to be a multiple of 4.
+        if group_size % 4 != 0:
+            return f"group size {group_size} is not a multiple of 4"
+
+    if backend == WNA16MoEBackend.TRITON:
+        if may_have_bias:
+            return "expert bias is not supported"
+        if isinstance(quant_config, AutoAWQConfig):
+            return "the AutoAWQ weight layout is not supported"
         if isinstance(quant_config, AutoGPTQConfig) and quant_config.desc_act:
             return "GPTQ activation ordering is not supported"
         if (
@@ -1187,14 +1207,17 @@ def _process_weights_rdna3(
 ]:
     """RDNA3 (gfx1100) W4A16 weight post-processing.
 
-    Interleaves the packed nibbles per expert (the exllama shuffle the dense
-    RDNA3 kernel also uses) and synthesizes the symmetric zero points that
-    ``moe_gptq_gemm_rdna3`` dequantizes with. The packed layout
-    ``[E, K // 8, N]`` and the ``[E, groups, N]`` scales are already what the
-    kernel wants, so neither is repacked.
+    Transposes the canonical N-first inputs to the K-first layout of
+    ``moe_gptq_gemm_rdna3`` (weights ``[E, K // 8, N]``, scales
+    ``[E, groups, N]``), interleaves the packed nibbles per expert (the exllama
+    shuffle the dense RDNA3 kernel also uses) and synthesizes the symmetric
+    zero points the kernel dequantizes with.
     """
     device = w13.device
     num_experts = w13.size(0)
+
+    w13 = w13.transpose(1, 2).contiguous()
+    w2 = w2.transpose(1, 2).contiguous()
 
     for e in range(num_experts):
         w13_e = w13[e].contiguous()
@@ -1211,8 +1234,8 @@ def _process_weights_rdna3(
     return (
         w13,
         w2,
-        w13_scale.contiguous(),
-        w2_scale.contiguous(),
+        w13_scale.transpose(1, 2).contiguous(),
+        w2_scale.transpose(1, 2).contiguous(),
         _qzeros(w13),
         _qzeros(w2),
         None,  # w13_input_global_scale
