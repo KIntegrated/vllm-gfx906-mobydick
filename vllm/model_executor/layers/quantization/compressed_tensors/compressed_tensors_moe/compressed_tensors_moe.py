@@ -33,6 +33,11 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         # RoutedExperts was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         quant_config._add_fused_moe_to_target_scheme_map()
+        # Models without a separate gate (NemotronH sets ckpt_gate_proj_name to
+        # its up_proj and passes ckpt_up_proj_name=None) declare fewer than three
+        # expert projections. Building "...0.None" for the missing one made its
+        # scheme lookup return None, which then read as "multiple schemes" and
+        # refused the whole model -- so skip the None entries instead.
         unfused_names = [
             f"{layer_name}.0.{proj_name}"
             for proj_name in (
@@ -40,7 +45,10 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 layer.ckpt_up_proj_name,
                 layer.ckpt_down_proj_name,
             )
+            if proj_name
         ]
+        if not unfused_names:
+            unfused_names = [layer_name]
         # TODO: refactor this to use expert_mapping and check all layer numbers
         all_scheme_dicts = [
             quant_config.get_scheme_dict(layer, name) for name in unfused_names
@@ -51,7 +59,13 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         if not all([cur_dict == scheme_dict for cur_dict in all_scheme_dicts]):
             raise ValueError(
                 "All MoE projections need to have same "
-                "quantization scheme but found multiple"
+                "quantization scheme but found multiple: "
+                + ", ".join(
+                    f"{name}={scheme!r}"
+                    for name, scheme in zip(
+                        unfused_names, [*all_scheme_dicts, scheme_dict]
+                    )
+                )
             )
 
         if scheme_dict is None:  # ignored layer
