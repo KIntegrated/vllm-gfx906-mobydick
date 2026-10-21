@@ -278,3 +278,62 @@ The TP=1 B=4 pair is the hot re-run of a first pair that read **idle mclk 350**
 harness JSON is the field that catches it (350 = idle, 1000 = loaded); a 350
 sample is discarded, not averaged. So packed is within noise of alias at B=4 and
 the win at TP=2 is capacity/robustness, not throughput.
+
+## 2026-10-21 — re-anchored on the 0.32 base, and the `auto` gate fixed for spec decode
+
+**VERDICT: packed still pays on 0.32 (+18.8 % served capacity at 32k) and every
+recorded verdict reproduces — but `auto` had been silently OFF under spec decode,
+because the aligner left the unified page unset when no padding was needed.**
+
+### The bug
+
+`Platform._align_hybrid_block_size` returned early when the attention page already
+equalled the mamba page, so `cache_config.mamba_page_size_padded` stayed `None`.
+The packed-KV `auto` gate dry-runs the aligner twice and treats a missing page as
+"no prediction", so with MTP k=3 on the 35B the two arms read
+`(1072, None)` vs `(1408, 1,103,872)` and the gain short-circuited to **+0.0 %**
+— `packed KV layout left off under gfx906_fa_packed=auto`. Since MTP k=3 is our
+default recipe, packed was effectively never on. Fixed by recording the unified
+page on every path (`7fcd4205b1`); the boot now logs `enabled … +28.4 %`.
+
+Found by adversarially reviewing the plan for this item: the first diagnosis
+("the page is None in both arms") was asserted from the formula's short-circuit
+and was wrong in an informative way — the asymmetry was the whole bug.
+
+### Re-anchored geometry (config-only dry run, `_hybrid_kv_ratio.py` rules)
+
+| model | max_model_len | spec | off block | on block | prediction | verdict |
+|---|---|---|---|---|---|---|
+| 35B | 8192 | – | 1056 | 1376 | **+33.6 %** | on (matches the recorded +33.6 %) |
+| 35B | 8192 | MTP k=3 | 1072 | 1408 | **+32.6 %** | on (new) |
+| 35B | 32768 | MTP k=3 | 1072 | 1408 | **+28.4 %** | on |
+| Lightning | 8192 | – | 2096 | 2672 | **+0.4 %** | off (matches +0.4 %) |
+| Lightning | 16384 | – | 2096 | 2672 | **+14.8 %** | on (matches +14.8 %) |
+
+The bootstrap difference is the **draft KV group entering the same alignment**:
+without a drafter the 35B aligns at 1056 → 1376, with MTP k=3 at 1072 → 1408
+(+16 tokens of block, and the padded mamba page moves 2,162,688 → 2,195,456).
+Both geometries must be quoted with a packed verdict — the 0.31 numbers are the
+non-spec ones.
+
+### Served capacity on 0.32 (decision gate)
+
+Same knobs (TP=2, MTP k=3, util 0.85, `max_model_len 32768`), forced on vs off:
+
+| arm | served KV pool | concurrency @32k |
+|---|---|---|
+| `--gfx906-fa-packed off` | 890,070 tokens | 27.16× |
+| `--gfx906-fa-packed on` | **1,057,678 tokens** | 32.2× |
+| | **+18.8 %** | |
+
+`+18.8 %` served against `+28.4 %` predicted — the same over-statement factor as
+the 0.31 pair (+22.2 % served / +33.6 % predicted), so the prediction-is-an-upper-
+bound caveat stands unchanged. **Keep the packed layout.**
+
+### Consequence for the remaining work
+
+The packed cell is a **cache format** (K q8 bytes | V fp16 in one cell), not a
+`KVCacheLayout` (which is tensor axis order, e.g. `LBNHC`). Its upstream analogue
+is `ultraquant_4bit` / `int4_per_token_head` — `CacheDType`s — so the "first-class
+format" design belongs with P32-2/P32-5 (#61/#64), and P32-1's remaining scope is
+the `auto` decision itself, which is now correct.
