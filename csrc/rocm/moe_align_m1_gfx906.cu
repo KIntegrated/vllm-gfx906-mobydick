@@ -34,7 +34,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 
-#include "../cuda_compat.h"
+#include "core/cuda_compat.h"
 
 namespace vllm {
 namespace moe_align_m1_gfx906 {
