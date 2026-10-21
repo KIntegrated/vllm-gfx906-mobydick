@@ -38,14 +38,16 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         # expert projections. Building "...0.None" for the missing one made its
         # scheme lookup return None, which then read as "multiple schemes" and
         # refused the whole model -- so skip the None entries instead.
+        # getattr defaults keep this working for a layer that does not declare the
+        # names at all (RoutedExperts defines all three, but this method is typed
+        # against nn.Module); None means "this model has no such projection".
+        declared = (
+            getattr(layer, "ckpt_gate_proj_name", "gate_proj"),
+            getattr(layer, "ckpt_up_proj_name", "up_proj"),
+            getattr(layer, "ckpt_down_proj_name", "down_proj"),
+        )
         unfused_names = [
-            f"{layer_name}.0.{proj_name}"
-            for proj_name in (
-                layer.ckpt_gate_proj_name,
-                layer.ckpt_up_proj_name,
-                layer.ckpt_down_proj_name,
-            )
-            if proj_name
+            f"{layer_name}.0.{proj_name}" for proj_name in declared if proj_name
         ]
         if not unfused_names:
             unfused_names = [layer_name]
