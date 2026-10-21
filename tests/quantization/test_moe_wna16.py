@@ -1136,3 +1136,76 @@ def test_moe_wna16_w13_qzeros_shard_split_int8_asym_gptq(monkeypatch):
     expected_w3 = raw_w3.view(torch.uint8).T + 1
     assert torch.equal(layer.w13_qzeros[0, :intermediate].cpu(), expected_w1)
     assert torch.equal(layer.w13_qzeros[0, intermediate:].cpu(), expected_w3)
+
+
+def _ep_qzeros_loader(
+    param: torch.Tensor,
+    local_of: dict[int, int],
+    tp_size: int = 1,
+    tp_rank: int = 0,
+):
+    """Build the w2_qzeros loader for a rank that owns a subset of experts.
+
+    `tp_size`/`tp_rank` are the *MoE parallel config* values: upstream reports
+    tp_size=1/tp_rank=0 when expert parallelism is on, because each rank owns
+    its experts whole. The global TP rank can still be 1 on that rank.
+    """
+    quant_config = SimpleNamespace(
+        has_zp=True,
+        linear_quant_method="awq",
+        weight_bits=4,
+        bit8_pack_factor=2,
+    )
+    layer = SimpleNamespace(
+        group_size_div_factor=1,
+        intermediate_size_per_partition=8,
+        quant_config=quant_config,
+        moe_config=SimpleNamespace(
+            tp_size=tp_size, tp_rank=tp_rank, ep_size=2, ep_rank=1
+        ),
+        _map_global_expert_id_to_local_expert_id=lambda expert_id: local_of.get(
+            expert_id, -1
+        ),
+    )
+
+    def upstream(*args, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("qzeros must be handled by the sharded path")
+
+    return MoeWNA16Method.get_weight_loader(layer, upstream)
+
+
+def test_w2_qzeros_loader_is_expert_parallel_aware(monkeypatch):
+    """Global expert ids and the global TP rank must not leak into the write.
+
+    Regression (P32-9/#69): with TP=2 + --enable-expert-parallel the 35B MoE
+    failed at load with `IndexError: index 1 is out of bounds for dimension 1
+    with size 1` -- the branch sliced with the global TP rank (1) into a view
+    whose second dim is `moe_config.tp_size` (1 under EP) -- and the expert id
+    was used global, which would have written one rank's expert into another
+    rank's slot once a rank owned several experts.
+    """
+    monkeypatch.setattr(
+        moe_wna16,
+        "get_tp_group",
+        lambda: SimpleNamespace(device=torch.device("cpu")),
+    )
+    monkeypatch.setattr(moe_wna16, "get_tensor_model_parallel_rank", lambda: 1)
+
+    param = torch.nn.Parameter(torch.zeros(2, 4, 2))
+    loader = _ep_qzeros_loader(param, local_of={8: 0, 9: 1})
+    # AWQ qzeros: int32 (groups, n // pack_factor_32) -> packed uint8.
+    loaded = torch.arange(2, dtype=torch.int32).reshape(2, 1)
+
+    # Global expert 9 is this rank's local expert 1.
+    assert loader(
+        param, loaded.clone(), "experts.w2_qzeros", "w2", 9, return_success=True
+    )
+    assert param.data[1].abs().sum() > 0, "local expert 1 must have been written"
+    assert param.data[0].abs().sum() == 0, "local expert 0 must be untouched"
+
+    # An expert owned by another rank is skipped, not written to a wrong slot.
+    untouched = param.data.clone()
+    assert not loader(
+        param, loaded.clone(), "experts.w2_qzeros", "w2", 3, return_success=True
+    )
+    assert torch.equal(param.data, untouched)

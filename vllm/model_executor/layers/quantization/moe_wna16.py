@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 
 from typing import Any
 
@@ -651,6 +652,25 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 loaded_weight = loaded_weight.repeat_interleave(
                     layer.group_size_div_factor, 1
                 )
+
+            if "w13_qzeros" in weight_name or "w2_qzeros" in weight_name:
+                # Under expert parallelism the checkpoint iterates *global*
+                # expert ids while param.data holds only this rank's experts; the
+                # generic loader below localises the id the same way. Without EP
+                # the ids already are local.
+                if layer.moe_config.ep_size > 1:
+                    local_expert_id = layer._map_global_expert_id_to_local_expert_id(
+                        expert_id
+                    )
+                    if local_expert_id == -1:
+                        return False if return_success else None
+                    expert_id = local_expert_id
+                # Under EP the MoE parallel config reports tp_size=1/tp_rank=0
+                # (each rank owns its experts whole), so index the packed
+                # tensors with those rather than the global TP rank: doing the
+                # latter raised IndexError on TP1+EP and would have written to
+                # another rank's expert once several experts share a rank.
+                tp_rank = layer.moe_config.tp_rank
 
             if "w13_qzeros" in weight_name:
                 tensor = loaded_weight.view(
