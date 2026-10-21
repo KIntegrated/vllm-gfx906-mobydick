@@ -7,6 +7,27 @@ smoke green. Promoted to `main` at `5f41d480b9`; release snapshot:
 `RELEASE-0.32.0-final.md`. Post-merge model fixes: `96db9355c3` (#68),
 `5f41d480b9` (#69), `7fcd4205b1` (packed `auto` under MTP).
 
+**Late finding (2026-10-21, image build): a sixth marker-less breakage.** The
+from-scratch container build failed in the wheel stage on
+
+```
+csrc/rocm/moe_align_m1_gfx906.cu:39:10: fatal error: '../cuda_compat.h' file not found
+```
+
+The `csrc/libtorch_stable/* -> csrc/*` flattening moved that header to
+`csrc/core/cuda_compat.h` (upstream includes it as `"core/cuda_compat.h"`); this
+fork-only file kept the pre-merge relative path. Fixed in `9b85b0e9f4`,
+verified by a local rebuild of that TU.
+
+**The lesson is the gate, not the fix:** a green *incremental* `build_ext` did
+not catch it, because the TU was already built and its object was reusable — the
+include path only breaks on a clean compile. From now on the merge train's
+definition of done includes **one from-scratch build of the serving image**, not
+just `setup.py build_ext --inplace`. (Also fixed in the same pass: the build
+wrapper piped `docker buildx` through `tee`, so `$?` reported `tee`'s status and
+logged `rc=0` for a failed build — `set -o pipefail`, same class as the
+capture-rc-before-substitution trap in AGENTS.md.)
+
 **Source:** upstream tag `v0.32.0` (`5df63a7203`), merged into `main`'s tip.
 **Merge base:** `3d5f4d4cd5`. **Sizes:** 822 fork commits / 840 upstream commits,
 **59 conflicts**.
