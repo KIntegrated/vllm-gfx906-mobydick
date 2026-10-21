@@ -237,6 +237,33 @@ Verified on the merged base with the env var unset: Muse-Glimmer + DFlash assist
 decode. Gemma-4 is not downloaded on this box, so its arm is covered by the
 2026-09-15 templated V1-vs-V2 evidence rather than re-measured here.
 
+
+### Gates + two new findings (2026-10-21)
+
+**PPL gates complete** (three model classes, in-process probe): MoE 35B **15.9555**
+(15.94-16.02), dense 27B **14.3750** (recorded baseline, exact), **Nemotron-3.5-
+Lightning mixed INT4/INT8 26.9922** (26.96-27.02) -- all 0 top-20 misses.
+`tests/quantization/test_moe_wna16.py`: 50 passed, 9 skipped (all CUDA/XPU-only
+backends, justified). The stashed BOLT-1b `ckpt_*_proj_name` fix is **subsumed**
+by upstream's own adoption plus our `None` filter; its one unique defensive bit
+(getattr defaults) is folded in (`6fd3fc966e`) and the stash is dropped.
+
+**Finding 1 -- Lightning at TP=2 needs `--enable-expert-parallel`** (as AGENTS.md
+already says): the CT INT4 group-64 experts have `moe_intermediate_size 1856`, so
+TP=2 shards to 928 and `928 % 64 != 0` fails in `create_weights`. With EP the
+class loads, selects `GFX906_HIP` WNA16, runs on V2, sizes 3,042,304 KV tokens and
+captures graphs -- so the earlier in-process `Could not find an active GPU backend`
+was the documented inductor fork-worker hazard, not a model defect.
+
+**Finding 2 -- the packed-KV auto gate now reads +0.0 % on the 35B.** The serving
+smoke logs `packed KV layout left off under gfx906_fa_packed=auto: predicted KV
+capacity +0.0 %` with block 1072 -> 1408 at `max_model_len 32768`, where 0.31 read
+**+33.6 % (on)** with block 1056 -> 1376 at 8k. Either the upstream layout/block
+changes moved the geometry or our gate's arithmetic no longer matches the merged
+KV accounting (which now takes `get_resolved_kv_cache_layout()`). This must be
+re-derived before trusting `auto` on the 0.32 line -- and it is exactly the
+overlap P32-1 (#60) exists to remove.
+
 ## 7. Next steps (in order)
 
 1. Resolve the remaining 38 conflicts (fork-critical Python first: `int_wna16.py`,
