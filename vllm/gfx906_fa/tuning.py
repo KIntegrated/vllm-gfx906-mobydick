@@ -49,19 +49,32 @@ def gqa_ratio(num_heads: int, num_kv_heads: int) -> int:
     return num_heads // num_kv_heads
 
 
-def static_config(seq_q: int, gqa: int) -> FAConfig:
+def static_config(
+    seq_q: int, gqa: int, *, batch: int = 1, direct: bool = False
+) -> FAConfig:
     """The rule the C++ defaults encode today.
 
-    Mirrors ``get_fa_nc2()`` (8, the GQA head-packing default), the
-    shape-aware KV split (32 for verify-sized query blocks, 16 for decode,
-    per the Sq=2/Sq=8 measurements in ``gfx906_fa.cpp``), and the gather clip
-    default. Any change here must be matched there, or the fallback silently
-    diverges from the kernels that actually run.
+    Mirrors ``get_fa_nc2()`` (8, the GQA head-packing default),
+    ``fa_kv_split_default`` (32 for verify-sized query blocks, 16 for decode),
+    the paged-direct path's batch-aware decode clamp (``fa_paged_kv_split_default``:
+    8/8/5/2/2 for B=1/2/3/4/8, measured on MI50 — that path's grid is
+    batch*heads_q blocks, so its decode optimum is not the gather path's 16),
+    and the gather clip default. Any change here must be matched there, or the
+    fallback silently diverges from the kernels that actually run;
+    ``tests/gfx906_fa/test_tuning.py`` pins the kv_split half against the C++
+    ``kv_split_default`` probe.
+
+    Not modelled: ``fa_apply_kv_split_budget`` (a byte-budget clamp on the
+    partial buffers that can force 1 for real prefill) and any explicit
+    ``GFX906_FA_KVSPLIT`` override — both are runtime decisions, not defaults.
     """
     # Head packing needs the GQA ratio to divide evenly; fall back to the
     # unpacked path otherwise (the backend logs this case at runtime).
     nc2 = 8 if gqa % 8 == 0 else 1
-    kvsplit = 32 if seq_q >= 4 else 16
+    if direct and seq_q < 4:
+        kvsplit = max(2, min(8, 16 // max(1, batch)))
+    else:
+        kvsplit = 32 if seq_q >= 4 else 16
     return FAConfig(nc2=nc2, kvsplit=kvsplit, clip=True)
 
 

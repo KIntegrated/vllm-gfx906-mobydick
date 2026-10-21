@@ -87,3 +87,27 @@ def test_save_is_atomic_under_a_lock(tmp_path):
 def test_workload_key_separates_the_launch_dims():
     assert workload_key(1, 65536, 1) != workload_key(1, 65536, 4)
     assert workload_key(2, 1024, 1) != workload_key(4, 1024, 1)
+
+
+def test_kv_split_mirror_agrees_with_the_cpp_probe(monkeypatch):
+    """The Python mirror must equal the rule the kernels actually apply.
+
+    `vllm._gfx906_fa_C.kv_split_default` is the C++ decision for an unset
+    `GFX906_FA_KVSPLIT` (a no-GPU-work probe). Comparing against it is what
+    keeps `static_config` from drifting; it already caught one: the
+    paged-direct decode rule is batch-aware (8/8/5/2/2 for B=1/2/3/4/8), not the
+    gather path's flat 16.
+    """
+    fa = pytest.importorskip(
+        "vllm._gfx906_fa_C", reason="custom FA extension not built"
+    )
+    monkeypatch.delenv("GFX906_FA_KVSPLIT", raising=False)
+    monkeypatch.delenv("GFX906_FA_KVSPLIT_SHAPEAWARE", raising=False)
+
+    for direct in (False, True):
+        for seq_q in (1, 2, 3, 4, 8, 1568):
+            for batch in (1, 2, 3, 4, 8):
+                mine = static_config(seq_q, 8, batch=batch, direct=direct)
+                assert mine.kvsplit == fa.kv_split_default(seq_q, batch, direct), (
+                    f"seq_q={seq_q} batch={batch} direct={direct}"
+                )
