@@ -808,3 +808,62 @@ ngram spec m=1/m=6 distribution, aot_compile_fullgraph no graph break,
 per-arm VLLM_CACHE_ROOT KeyError weight, vcs_versioning tag parse BUILD_RC=1,
 systemd user service MemoryMax=infinity, local NVMe nemotron35 weights, eager
 mode MLOG, PPL 24.9 noise, dense_gemv_i8_m4 M≤4 cap.*
+
+## 2026-10-21 — Mamba prefill checkpoints on Lightning: −21 % KV capacity for no TTFT gain
+
+**VERDICT: the automatic Mamba2 prefill checkpoint (upstream #57329/#59759/#60797,
+`num_prefill_checkpoint_blocks=1` in `mamba_mixer2.py`) costs Lightning ~21 % of
+its KV pool at 16k and buys no measurable prefix-reuse TTFT. Keep it off for this
+class; the mechanism, not the measured lever, is what the numbers point at.**
+
+### Setup
+
+Lightning (mixed INT4/INT8), TP=2 + EP, `--mamba-cache-mode align` (required: the
+checkpoint consumer no-ops otherwise), prefix caching ON, `max_model_len 16384`,
+`--max-num-seqs 4`, util 0.85, capture ladder `[1,2,3,4]`. A–B–A over a fork kill
+switch `VLLM_GFX906_MAMBA_PREFILL_CKPT=0`. Each arm: one cold request of ~2917
+tokens, then two follow-ups that share that prefix and append 9 tokens.
+
+### Result
+
+| arm | cold TTFT | follow-up TTFT | speedup | GPU KV cache size |
+|---|---|---|---|---|
+| checkpoints **off** | 1.187 s | **0.165 / 0.167 s** | 7.1× | **2,970,965 tokens** |
+| checkpoints **on** (upstream default) | 1.152 s | **0.169 / 0.170 s** | 6.8× | **2,345,498 tokens** |
+
+- **Capacity: −21.0 %.** That is far more than the naive "one extra state block
+  per resident row" estimate (4 rows of a ~1110-block pool = 0.4 %), so the cost
+  is not the checkpoint block itself. It is almost certainly the retention mode:
+  with checkpoints the manager takes the `retention_interval != 0` path
+  (`v1/core/kv_cache_coordinator.py`), and the aligner's page padding differs
+  between the two dry runs (28.21 % vs 0.17 % mamba-page padding in the boot log).
+  **Untangling that is the real follow-up**, not tuning the block count.
+- **TTFT: neutral.** 0.169 vs 0.165 s is 2-3 %, inside the run-to-run spread, and
+  the checkpoint is *supposed* to win here (it can resume at the prompt tail
+  instead of the last block boundary). It does not, which is consistent with the
+  reuse-threshold observation below.
+
+### Reuse only engages past a Mamba block boundary
+
+Probing three prefix lengths against the same machinery (Lightning at 16k aligns
+at a 2672-token Mamba block):
+
+| shared prefix | follow-up TTFT | reuse? |
+|---|---|---|
+| 2197 tokens | ~1.0 s (= cold) | no |
+| 2497 tokens | ~1.0 s (= cold) | no |
+| 2737 tokens | 0.117 s | **yes** |
+| 2917 tokens | 0.165 s | **yes** |
+
+So in `align` mode the reusable point is the block boundary, not the checkpoint
+position — the tail checkpoint does not lower the reuse threshold. Prompts
+shorter than one Mamba block reuse nothing, which is worth knowing before
+promising prefix-cache wins on short-context Lightning workloads.
+
+### Consequence
+
+`VLLM_GFX906_MAMBA_PREFILL_CKPT=0` is now a documented fork lever: it recovers
+21 % KV capacity at 16k for a class where the checkpoint shows no benefit. The
+default stays 1 (upstream behaviour) until the retention-mode question is
+answered and a second model class is measured — Lightning is one data point, and
+the feature targets EAGLE/MTP sibling resumption more than plain prefix reuse.

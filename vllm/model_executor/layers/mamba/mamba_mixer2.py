@@ -1124,6 +1124,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
         spec = super().get_kv_cache_spec(vllm_config)
         if not isinstance(spec, MambaSpec):
             return spec
+        if os.environ.get("VLLM_GFX906_MAMBA_PREFILL_CKPT", "1") == "0":
+            # Kill switch for the A/B (#62): without a checkpoint block the
+            # aligner can only reuse a block-aligned prefix, and no extra state
+            # block is reserved per row.
+            return spec
         # The block-boundary state can be exported from inside one forward
         # pass, so the scheduler need not split the prefill; every reader
         # acts on this only in align mode. The metadata builder puts a chunk
