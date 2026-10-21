@@ -1116,14 +1116,14 @@ class Platform:
         attn_page_size = cache_config.block_size * attn_page_size_1_token
         assert attn_page_size >= mamba_page_size
 
-        if attn_page_size == mamba_page_size:
-            return
-
-        if (
-            cache_config.mamba_page_size_padded is None
-            or cache_config.mamba_page_size_padded != attn_page_size
-        ):
-            cache_config.mamba_page_size_padded = attn_page_size
+        # Record the unified page even when no padding is needed: the field is the
+        # caller's only handle on "the page every hybrid group shares", and readers
+        # (the mamba spec builder, and gfx906's packed-KV auto gate, which compares
+        # two dry runs) treat None as "unknown". Returning early with it None made
+        # the padding case and the already-equal case disagree -- measured as
+        # gfx906 packed `auto` never engaging on a MTP-spec 35B, where the alias
+        # arm's pages already matched (None) and only the packed arm padded.
+        if cache_config.mamba_page_size_padded != attn_page_size:
             mamba_padding_pct = (
                 100 * (attn_page_size - mamba_page_size) / mamba_page_size
             )
@@ -1133,6 +1133,7 @@ class Platform:
                 "exactly equal.",
                 mamba_padding_pct,
             )
+        cache_config.mamba_page_size_padded = attn_page_size
 
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:

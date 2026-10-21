@@ -126,4 +126,31 @@ def test_threshold_is_above_the_prediction_error():
     """Predictions over-state (16k: +14.8 % predicted, +7.1 % served), so the
     threshold must not sit near the noise floor; 5 % keeps a predicted 3 %
     (plausibly ~1 % real) off."""
-    assert RocmPlatform._GFX906_PACKED_MIN_GAIN == pytest.approx(0.05)
+    assert pytest.approx(0.05) == RocmPlatform._GFX906_PACKED_MIN_GAIN
+
+
+def test_gain_needs_a_page_from_both_arms():
+    """Asymmetric "unknown" is not a prediction of "no gain".
+
+    `_align_hybrid_block_size` used to return early when the attention page
+    already matched the mamba page, leaving `mamba_page_size_padded` None, while
+    the *packed* arm of the same dry run needed padding and set it. On a MTP-spec
+    35B the alias arm is exactly that case, so the gain short-circuited to 0.0 and
+    `auto` never engaged (block 1072 -> 1408, "+0.0 %", measured 2026-10-21).
+    The aligner now always records the unified page (`vllm/platforms/interface.py`),
+    and this test pins the gate's half of the contract: with both pages present
+    the wider block must show a gain, while a genuinely missing page still reads
+    as "no prediction".
+    """
+    off = (1072, 1097728)  # alias: unified page recorded even without padding
+    on = (1408, 1103872)  # packed: padded to the same kind of page
+    gain = RocmPlatform._gfx906_packed_capacity_gain(off, on, 32768)
+    assert gain > RocmPlatform._GFX906_PACKED_MIN_GAIN, (
+        f"a wider block at a similar page must clear the threshold, got {gain!r}"
+    )
+
+
+def test_missing_page_still_reports_no_prediction():
+    gain = RocmPlatform._gfx906_packed_capacity_gain
+    assert gain((1072, None), (1408, 1103872), 32768) == 0.0
+    assert gain((1072, 1097728), (1408, None), 32768) == 0.0
