@@ -1,11 +1,11 @@
-# MERGE-0.32.0 — review sheet (IN PROGRESS)
+# MERGE-0.32.0 — review sheet (COMPLETE, released 2026-10-21)
 
-**Status:** **all 51 conflicts resolved** (`1e514c6fd0`) + post-merge fixes
-(`46aa74c262`); **static sweep PASSES** (no markers, no F821/F811 across
-`vllm/`, `tests/`, `csrc/`, syntax compiles, no duplicate defs). **Not**
-build-validated and **not** gate-validated — do not promote or release from this
-branch until the definition-of-done in `.agents/skills/upstream-merge/SKILL.md`
-is met.
+**Status:** **released.** All 59 conflicts resolved (`1e514c6fd0`), five
+marker-less breakages fixed (`46aa74c262`, `aacf920d39`, `bf58123bb6`),
+build + static sweep + PPL ×3 + suite gates green, Lightning and 35B serving
+smoke green. Promoted to `main` at `5f41d480b9`; release snapshot:
+`RELEASE-0.32.0-final.md`. Post-merge model fixes: `96db9355c3` (#68),
+`5f41d480b9` (#69), `7fcd4205b1` (packed `auto` under MTP).
 
 **Source:** upstream tag `v0.32.0` (`5df63a7203`), merged into `main`'s tip.
 **Merge base:** `3d5f4d4cd5`. **Sizes:** 822 fork commits / 840 upstream commits,

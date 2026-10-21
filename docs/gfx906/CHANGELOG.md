@@ -8,6 +8,37 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-21 (0.32.0 released — merge train closed, packed gate fixed, P32-1/P32-6/P32-7/P32-9)
+
+**RELEASE-0.32.0-final.md** is the snapshot; `MERGE-0.32.0-review.md` holds the
+per-file resolution record. `main` promoted at `5f41d480b9`.
+
+- **Upstream 0.32.0 merge** (`1e514c6fd0`): 59 conflicts, `csrc/libtorch_stable/*`
+  → `csrc/*` flattening (187 fork files, 4 op registrations re-ported), five
+  marker-less breakages (missing include, `ceil_div`/`HOST_DEVICE_INLINE` restored,
+  registration ordering, two deleted-module imports). Build + PPL ×3 + serving
+  gates all green.
+- **Packed KV `auto` was silently off under MTP spec decode** (`7fcd4205b1`):
+  `_align_hybrid_block_size` returned early when no padding was needed, leaving
+  `mamba_page_size_padded=None`, so the gate compared `(1072, None)` against
+  `(1408, 1,103,872)` and read **+0.0 %**. Now records the unified page on every
+  path; served gate at 32k/MTP **890,070 → 1,057,678 tokens (+18.8 %)** against
+  +28.4 % predicted. Verdicts re-anchored; the bootstrap has a spec-decode form
+  (1056/1376 without, 1072/1408 with MTP). **P32-1 (#60) closed**: the packed cell
+  is a cache *format* (`CacheDType`-shaped), not a `KVCacheLayout` member, so the
+  first-class-format design moves to #61/#64.
+- **moe_wna16 qzeros loader was not EP-aware** (`5f41d480b9`, #69): sliced with the
+  global TP rank into a `moe_config.tp_size == 1` dim (`IndexError`) and indexed
+  `param.data` with global expert ids. Fixed; 35B TP=2 + `--enable-expert-parallel`
+  now serves (2/2 requests 200).
+- **`ckpt_*_proj_name=None`** no longer breaks the expert-scheme check
+  (`96db9355c3`, #68) — the latent upstream bug 0.32 exposed.
+- **P32-6 (#67)** QSA selection-width config-time guard; **P32-7 (#65)** MRV2 is
+  the default for every arch with V1 still available.
+- **P32-4 (#63) slice 1** (`51ce08adbe`): `vllm/gfx906_fa/tuning.py` — shape-keyed
+  launch-config records (identity digest, atomic save, TP identity cross-check,
+  static-rule mirror pinned by tests). Nothing consumes it yet.
+
 ## 2026-10-18 (docs + gates — packed KV is the documented, gated default)
 
 README now explains the packed KV cell as a user-facing feature (what it is, why

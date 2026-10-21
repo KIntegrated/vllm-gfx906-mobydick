@@ -88,29 +88,6 @@ re-run (none; #47930/#61261/#60174/#57032/#51581 all different), issue body read
 Left: post it. The acceptance numbers are from the **pre-refactor** shape — say so
 in the report (the persistence is code inference, not a re-measurement).
 
-### LAB-9 — packed KV layout (E2) · [PR #43](../../pull/43) — **closed 2026-10-19**
-
-Default `auto` resolves **per (model, max_model_len)** on predicted *usable* KV
-capacity at a 5 % threshold, so the old "hybrid models stay opt-in" rule is
-retired: hybrid models go through the same rule (35B 8k +33.6 % -> on, Lightning
-8k +0.4 % -> off, Lightning 16k +14.8 % -> on). The four guard arms are tested
-(`test_gfx906_packed_guards.py`), B=4 exists, packed is throughput-neutral, and
-the two defects found on the way are fixed: `--gfx906-fa-packed on` now reaches
-the process that resolves the layout (`d3d3a59040`), and packed x TP>1 no longer
-crashes on the layout flag (`ad69623e9c`). Still open, separately:
-`GFX906_FA_LEGACY=1` (fp16 K) versus the Q8 side buffer. Numbers and history:
-`CHANGELOG.md`, `DEVLOG-packed-kv.md`.
-
-### LAB-10 — packed KV for hybrid models · [#58](../../issues/58) — **closed 2026-10-19**
-
-Premise overturned and acted on: the ceiling is the cell saving *that survives
-per-request block rounding*, not the mamba page share and not the raw cell
-saving, and the `auto` gate now uses exactly that. Served confirmation on
-Lightning at 16k: same 6.68 GiB pool, 570,368 -> **610,577 usable tokens
-(+7.05 %)** against a +14.8 % prediction - a prediction that over-states, because
-tokens quantise into whole `max_model_len` requests. Geometry tool
-`_hybrid_kv_ratio.py`; numbers in `CHANGELOG.md` and `DEVLOG-packed-kv.md`.
-
 ## Next — 0.30-post and 0.31
 
 ### QSA-FN-10 — next tester measurement list · [#5](../../issues/5)
@@ -225,6 +202,45 @@ Ref: `DEVLOG-fa-verify-sq8.md`, `DEVLOG-fa-kernel-batches.md`.
 
 Verify HIP cooperative-launch support and resident-grid capacity on Vega 20
 first; follows C1–C3.
+
+## Next — 0.32-post (ports mined from upstream v0.32.0)
+
+Release basis: `RELEASE-0.32.0-final.md`; resolution record:
+`MERGE-0.32.0-review.md` §4 (porting opportunities) and §5 (breaking changes).
+Closed from this train already: P32-1 (#60), P32-6 (#67), P32-7 (#65), and the
+two load failures P32-9 (#68, #69).
+
+### P32-2 — adopt upstream's int4/int8 per-token-head KV · [#61](../../issues/61)
+
+#56198 / #57057 rework KV dtype so per-token-head formats become cache
+*formats*. Supersedes LAB-5's plan, and is now also the home for the packed
+cell as a first-class format (see P32-1's close). Gate: PPL within the probe's
+spread + a served capacity/payload A/B.
+
+### P32-3 — Mamba prefill checkpoints on the Lightning class · [#62](../../issues/62)
+
+#57329/#59759/#60797; the feature is **automatic for Mamba2**
+(`num_prefill_checkpoint_blocks=1` in `mamba_mixer2.py`), so this is a
+measurement: unaligned prefix-cache hits vs the 1-block-per-row cost, plus the
+Lightning PPL band as the correctness gate. Unblocked (serving gate is green).
+
+### P32-4 — mine ROCM_SEGMENTED_ATTN (#59132) for our FA · [#63](../../issues/63)
+
+Slice 1 landed (`51ce08adbe`, `vllm/gfx906_fa/tuning.py`: identity digest,
+atomic records, TP identity cross-check, static-rule mirror under test; nothing
+consumes it yet). Slice 2 = thread `(nc2, kvsplit, clip)` through the pybind
+boundary with bit-identical defaults; slice 3 = cache-only warmup; slice 4
+(own session) = per-shape candidate measurement.
+
+### P32-5 — INT4 port of `ultraquant_4bit` (#57057) · [#64](../../issues/64)
+
+Second half of the cache-format work; depends on P32-2's surface.
+
+### P32-8 — pins and `max_tokens` upper bound · [#66](../../issues/66)
+
+`transformers >= 5.16.1, < 5.20.0` in the pinset, and re-read
+`_bench_gfx906.py` / `_bench_chat_serve.py` against #57035: `max_tokens` is an
+upper bound now, so t/s denominators are not comparable with 0.31 records.
 
 ## Next — 0.31-post (ports from `0c33/mi50-vllm-lab`)
 
