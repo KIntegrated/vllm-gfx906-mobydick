@@ -1124,10 +1124,17 @@ class MambaMixer2(MambaBase, PluggableLayer):
         spec = super().get_kv_cache_spec(vllm_config)
         if not isinstance(spec, MambaSpec):
             return spec
-        if os.environ.get("VLLM_GFX906_MAMBA_PREFILL_CKPT", "1") == "0":
-            # Kill switch for the A/B (#62): without a checkpoint block the
-            # aligner can only reuse a block-aligned prefix, and no extra state
-            # block is reserved per row.
+        if os.environ.get("VLLM_GFX906_MAMBA_PREFILL_CKPT", "0") != "1":
+            # Fork default OFF (upstream defaults ON). Measured on this box: the
+            # checkpoint costs one state block per Mamba *group* per request, and
+            # a hybrid model with four groups lost 21.0% of its KV pool
+            # (2,970,965 -> 2,345,498 tokens at 16k, four groups x 2 -> 3 blocks
+            # with the attention group unchanged at 7). The benefit it buys -- a
+            # prefix-cache hit can resume at the prompt tail instead of the last
+            # block boundary -- measured 0.4% of a follow-up TTFT on that model,
+            # with no MTP/EAGLE draft, which is the case the feature is for.
+            # Set VLLM_GFX906_MAMBA_PREFILL_CKPT=1 to restore upstream behaviour
+            # (see docs/gfx906/DEVLOG-nemotron-h.md, P32-3/#62).
             return spec
         # The block-boundary state can be exported from inside one forward
         # pass, so the scheduler need not split the prefill; every reader

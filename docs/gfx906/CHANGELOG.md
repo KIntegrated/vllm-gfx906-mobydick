@@ -8,6 +8,28 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-22 (P32-3/#62 closed — Mamba prefill checkpoints now default OFF)
+
+Upstream enables a Mamba2 prefill checkpoint unconditionally; on this box that
+cost **21.0 % of the KV pool** (2,970,965 -> 2,345,498 tokens at 16k) and bought
+**0.4 %** of a follow-up TTFT, measured *without* a drafter — while Lightning, the
+only Mamba2 model served here, has no MTP head and so cannot use the sibling
+resumption the feature exists for.
+
+- **Attributed exactly, by instrumentation rather than inference:** with
+  `VLLM_GFX906_KV_SIZING_DEBUG=1` the arms differ only in the per-request
+  divisor — Lightning's **four** Mamba groups go from 2 to 3 blocks each
+  (8 -> 12) while the attention group stays at 7, i.e. 15 -> 19 blocks per
+  request; `15/19 = 0.7895` predicts -21.1 % against the measured -21.0 %, with
+  an identical pool (`num_blocks` 2720). A single-group model would have lost
+  ~10 %; the four-group hybrid is what makes it 21 %.
+- **Fork default flipped to OFF** (`VLLM_GFX906_MAMBA_PREFILL_CKPT=0`;
+  `=1` restores upstream). Verified with no env var: 2,963,319 tokens.
+- An earlier note claimed the per-request reservation "explains only 1.7 %" —
+  wrong, because it assumed one Mamba group. Kept in the dev log as the
+  superseded reasoning.
+- Records/tooling: `docs/gfx906/_fa_tune.py`, `DEVLOG-nemotron-h.md`.
+
 ## 2026-10-22 (P32-4/#63 closed — FA launch-config records, probed and measured)
 
 The FA launch parameters now have one definition, a probe, a per-shape record

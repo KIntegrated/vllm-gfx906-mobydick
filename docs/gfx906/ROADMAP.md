@@ -207,8 +207,8 @@ first; follows C1–C3.
 
 Release basis: `RELEASE-0.32.0-final.md`; resolution record:
 `MERGE-0.32.0-review.md` §4 (porting opportunities) and §5 (breaking changes).
-Closed from this train already: P32-1 (#60), P32-4 (#63), P32-6 (#67),
-P32-7 (#65), and the two load failures P32-9 (#68, #69).
+Closed from this train already: P32-1 (#60), P32-3 (#62), P32-4 (#63),
+P32-6 (#67), P32-7 (#65), and the two load failures P32-9 (#68, #69).
 
 ### P32-2 — adopt upstream's int4/int8 per-token-head KV · [#61](../../issues/61)
 
@@ -216,23 +216,6 @@ P32-7 (#65), and the two load failures P32-9 (#68, #69).
 *formats*. Supersedes LAB-5's plan, and is now also the home for the packed
 cell as a first-class format (see P32-1's close). Gate: PPL within the probe's
 spread + a served capacity/payload A/B.
-
-### P32-3 — Mamba prefill checkpoints on the Lightning class · [#62](../../issues/62)
-
-#57329/#59759/#60797; the feature is **automatic for Mamba2**
-(`num_prefill_checkpoint_blocks=1` in `mamba_mixer2.py`), so this is a
-measurement: unaligned prefix-cache hits vs the 1-block-per-row cost, plus the
-Lightning PPL band as the correctness gate. Unblocked (serving gate is green).
-
-### P32-5 — INT4 port of `ultraquant_4bit` (#57057) · [#64](../../issues/64)
-
-Second half of the cache-format work; depends on P32-2's surface.
-
-### P32-8 — pins and `max_tokens` upper bound · [#66](../../issues/66)
-
-`transformers >= 5.16.1, < 5.20.0` in the pinset, and re-read
-`_bench_gfx906.py` / `_bench_chat_serve.py` against #57035: `max_tokens` is an
-upper bound now, so t/s denominators are not comparable with 0.31 records.
 
 ## Next — 0.31-post (ports from `0c33/mi50-vllm-lab`)
 
