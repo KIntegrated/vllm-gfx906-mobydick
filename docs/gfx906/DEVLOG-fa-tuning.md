@@ -147,3 +147,47 @@ re-anchor.
 Records stay **opt-in** (`VLLM_CACHE_ROOT` pointing at the tuner's cache): the
 45 % decode win is measured in a synthetic harness, and enabling it for serving
 should be its own decision with a serving A/B, not a side effect of a sweep.
+
+## Slice 5 — why the serving A/B kept coming back void
+
+The record lookup is reached (verified with `VLLM_GFX906_FA_TUNING_DEBUG=1`) but
+serving never asked for a shape the tuner had measured. The debug log says why,
+and it invalidates the grid the tuner had been given:
+
+| what serving asks for | why |
+|---|---|
+| `sq4-sk32768-b4/b3/b2` (decode) | Sq **and** batch are cudagraph-capture padded (ladder `[4,8,12,16]`), and Sk buckets to **32768** = `max_model_len`, not to the prompt length |
+| `sq4096-sk8192-b1`, `sq4096-sk4096-b1`, `sq3072-sk8192-b1` | chunked-prefill chunks (`--max-num-batched-tokens 4096`), a Sq range the sweep never covered |
+
+So a generic grid of round numbers (Sq 1/2/4/8 x Sk 4096/16384/65536 x B 1/2/4/8)
+**does not intersect production at all**. Measuring the cells the engine actually
+presents (`_fa_tune_serving_cells.py`) gives the answer to the question the A/B
+was meant to answer:
+
+| cell | y=8 | y=16 | y=32 | rule | best | gap |
+|---|---|---|---|---|---|---|
+| sq4-sk32768-b4 | 1.614 | 1.391 | 1.401 | y32 | y16 | 0.7 % |
+| sq4-sk32768-b3 | 1.111 | 1.136 | 0.996 | y32 | y32 | 0.0 % |
+| sq4-sk32768-b2 | 1.029 | 0.827 | 0.737 | y32 | y32 | 0.0 % |
+| sq4-sk32768-b1 | 0.580 | 0.551 | 0.454 | y32 | y32 | 0.0 % |
+| sq1-sk32768-b4 | 0.795 | 0.813 | 0.612 | y16 | y32 | **24.7 %** |
+| sq2-sk32768-b4 | 0.747 | 0.766 | 0.677 | y16 | y32 | **11.6 %** |
+
+**VERDICT: at this recipe there is no serving win to collect.** With capture
+ladder `[4,8,12,16]`, decode is padded to **Sq=4**, and at Sq=4 the rule is
+already optimal (0.0-0.7 %). The 24.7 % / 11.6 % cells are Sq=1/2 — shapes the
+ladder pads *away*. The 45 % figure from slice 4b lives at unpadded Sq=2 decode,
+which production does not present.
+
+That is the honest end of this thread: the tuning work is real and now
+mechanically sound (one definition per rule, probes, records, a lookup that
+works, a debug switch), but the payoff depends entirely on the capture ladder.
+With `[1,2,3,4]` -- the ladder the Lightning recipe uses -- decode presents
+sq1/sq2 and the 24.7 % kernel gap applies; that A/B is the one worth running
+next, and it needs no new tooling (`ab63c.sh` with the ladder swapped, guard
+`record hits > 0` already in place).
+
+Prefill cells were all discarded by the mclk gate (median 800 MHz, 3-50 % of
+samples >= 900): a 4096-token prefill chunk holds the memory clock down, exactly
+as `dvfs-mi50.md` records for sustained prefill. Tuning prefill needs the sampler
+gate relaxed with an explicit note, or a different measurement route.
