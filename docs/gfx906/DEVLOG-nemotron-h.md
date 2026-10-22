@@ -867,3 +867,35 @@ promising prefix-cache wins on short-context Lightning workloads.
 default stays 1 (upstream behaviour) until the retention-mode question is
 answered and a second model class is measured — Lightning is one data point, and
 the feature targets EAGLE/MTP sibling resumption more than plain prefix reuse.
+
+### Follow-up: where the 21 % goes (partially explained, not closed)
+
+The measured delta is exactly **234 blocks** (2,970,965 - 2,345,498 = 625,467
+tokens / 2672). The geometry is identical in both arms (block 2672, same mamba
+page padding), so the loss is in the pool, not the layout.
+
+One mechanism is documented in the tree: in `align` mode the per-request Mamba
+state reservation is
+
+```
+max_memory_usage_bytes = page_size_bytes * (2 + num_speculative_blocks
+                                            + num_prefill_checkpoint_blocks)
+```
+
+(`vllm/v1/kv_cache_interface.py`), i.e. enabling the prefill checkpoint raises
+the resident state per request from 2 blocks to 3 — a 50 % increase per request.
+
+**That cannot be the whole story:** at `--max-num-seqs 4` it accounts for 4 of
+the 234 missing blocks (1.7 %). So the remainder comes from the pool-sizing path
+(`kv_cache_utils.py`), which does not read `num_prefill_checkpoint_blocks` at
+all — meaning something *else* that the checkpoint enables is changing the
+computed block count. The strongest candidate is the scheduler-side switch the
+checkpoint flips (`mamba_partial_cache_hit` → partial hash hits →
+`enable_partial_hash_hits`), which changes hash granularity and therefore how
+the attention group's blocks are counted.
+
+Closing this needs the pool sizing instrumented (the `gfx906-mem-attribution`
+approach: print the per-group block counts and `page_size_bytes` at sizing time
+for both arms) rather than another inference. That is the remaining work on #62;
+the −21 % figure itself stands, and the kill switch
+(`VLLM_GFX906_MAMBA_PREFILL_CKPT=0`) recovers it today.
