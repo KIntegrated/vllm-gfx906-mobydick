@@ -34,6 +34,8 @@ import time as _time
 
 import torch
 
+from vllm.gfx906_fa.tuning import static_config
+
 try:
     from vllm import _gfx906_fa_C as gfx906_fa
 except ImportError:
@@ -243,6 +245,7 @@ def _gather_kv(
     This torch fancy-indexing implementation is the A/B reference; the
     default path is the fused HIP kernels (gather_paged_kv_fp16 /
     gather_paged_kv_q8).
+
     """
     num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
     num_seqs = block_table.shape[0]
@@ -960,6 +963,13 @@ def forward_paged(
                 f"K_q8={tuple(K_q8.shape)} V={tuple(V_bhsd.shape)} "
                 f"causal={'inline' if need_causal else 'none'} scale={scale}")
         torch.cuda.synchronize()
+    # Launch-config record (P32-4/#63): the values equal the kernel's own
+    # env/shape defaults, so passing them is behaviour-preserving; the point is
+    # that the choice now comes from one place (probe-verified against
+    # gfx906_fa_effective_nc2 / kv_split_default) instead of being implicit.
+    _cfg = static_config(
+        int(Sq_pad), Hq // max(1, V_bhsd.shape[1]), batch=num_seqs
+    )
     try:
         out_padded = gfx906_fa.forward(
             q_padded, K_q8, V_bhsd, float(scale),
@@ -968,6 +978,8 @@ def forward_paged(
             q_abs_offset=q_abs_offset_tensor,
             window=window,
             kv_start=kv_start_tensor,
+            nc2=_cfg.nc2,
+            tile_clip=1 if _cfg.clip else 0,
         )
         global _dump_n
         if _DUMP_DIR and _dump_n < 40:

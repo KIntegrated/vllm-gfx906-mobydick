@@ -398,7 +398,14 @@ torch::Tensor gfx906_fa_forward(
     // measured 34-42 ms at Sq=1536/1728 (y=32, inside the 512 MiB budget)
     // against 7 ms at Sq=2304 (y forced to 1 by that same budget). Callers with
     // prefill-shaped inputs pass 1; <= 0 keeps default resolution.
-    c10::optional<int64_t>   kv_split_override = c10::nullopt
+    c10::optional<int64_t>   kv_split_override = c10::nullopt,
+    // Per-call launch-config overrides (P32-4/#63): <=0 / nullopt keeps the
+    // env + shape-aware default, so an unmodified caller behaves exactly as
+    // before. `nc2` is the GQA head-packing factor, `tile_clip` the M2 mask
+    // clip. The Python side passes the values from its launch-config record;
+    // gfx906_fa_effective_nc2 still applies the GQA/prefill downgrades.
+    c10::optional<int64_t>   nc2_override = c10::nullopt,
+    c10::optional<int64_t>   tile_clip_override = c10::nullopt
 ) {
     TORCH_CHECK(window == 0 || q_abs_offset.has_value(),
         "window > 0 requires q_abs_offset (the window mask needs absolute "
@@ -452,7 +459,9 @@ torch::Tensor gfx906_fa_forward(
     // KV-split (GFX906_FA_KVSPLIT>1): kernel writes per-split partials
     // [B, Sq, Hq, y, D] + meta [B, Sq, Hq, y, 2] (unscaled, (m, l)); merged
     // into o_bshd by gfx906_fa_split_combine.
-    const int nc2 = get_fa_nc2();
+    const int nc2 = (nc2_override.has_value() && nc2_override.value() > 0)
+                        ? static_cast<int>(nc2_override.value())
+                        : get_fa_nc2();
     int kv_split = get_fa_kv_split();
     // VIT-1: a per-call override wins over the env/shape-aware default. y=1 is
     // always safe (no partials, no combine), so it bypasses the byte budget.
@@ -461,7 +470,9 @@ torch::Tensor gfx906_fa_forward(
     if (kv_split_override.has_value() && kv_split_override.value() > 0) {
         kv_split = static_cast<int>(kv_split_override.value());
     }
-    const int tile_clip = get_fa_tile_clip();
+    const int tile_clip = tile_clip_override.has_value()
+                              ? (tile_clip_override.value() != 0 ? 1 : 0)
+                              : get_fa_tile_clip();
     if (kv_split < 0) kv_split = fa_kv_split_default(seq_q);  // shape-aware (see fn)
     // MTP-1b-0: the old hard clamp `if (seq_q > 2) kv_split = 1` (a prefill
     // OOM guard) also fired for spec-decode verify (Sq = k+1 padded to {2,4,8}),
@@ -1240,7 +1251,10 @@ torch::Tensor gfx906_fa_forward_paged_direct(
     c10::optional<torch::Tensor> mask         = c10::nullopt,
     c10::optional<torch::Tensor> q_abs_offset = c10::nullopt,
     int64_t window = 0,
-    c10::optional<torch::Tensor> kv_start = c10::nullopt
+    c10::optional<torch::Tensor> kv_start = c10::nullopt,
+    // Per-call launch-config override (P32-4/#63); nullopt keeps the default.
+    // No nc2 here: this path has no GQA head packing.
+    c10::optional<int64_t> tile_clip_override = c10::nullopt
 ) {
     TORCH_CHECK(window == 0 || q_abs_offset.has_value(),
         "window > 0 requires q_abs_offset (the window mask needs absolute "
@@ -1337,7 +1351,9 @@ torch::Tensor gfx906_fa_forward_paged_direct(
     // traffic. GFX906_FA_KVSPLIT=1 is the kill switch (old grid.y=1
     // behavior).
     int kv_split = get_fa_kv_split();
-    const int tile_clip = get_fa_tile_clip();
+    const int tile_clip = tile_clip_override.has_value()
+                              ? (tile_clip_override.value() != 0 ? 1 : 0)
+                              : get_fa_tile_clip();
     if (kv_split < 0) kv_split = fa_paged_kv_split_default(seq_q, batch);
     // MTP-1b-0: same fix as the gather path — the old `if (seq_q > 2)
     // kv_split = 1` prefill OOM guard also fired for spec-decode verify
@@ -1465,7 +1481,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q_abs_offset")  = c10::nullopt,
           py::arg("window")        = 0,
           py::arg("kv_start")      = c10::nullopt,
-          py::arg("kv_split")      = c10::nullopt);
+          py::arg("kv_split")      = c10::nullopt,
+          py::arg("nc2")           = c10::nullopt,
+          py::arg("tile_clip")     = c10::nullopt);
     m.def("quantize_q8_0", &quantize_q8_0,
           "Quantize fp16 tensor (last dim D) → block_q8_0 uint8 (device-side)",
           py::arg("k_fp16"));
@@ -1546,5 +1564,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("mask")         = c10::nullopt,
           py::arg("q_abs_offset") = c10::nullopt,
           py::arg("window")       = 0,
-          py::arg("kv_start")     = c10::nullopt);
+          py::arg("kv_start")     = c10::nullopt,
+          py::arg("tile_clip")    = c10::nullopt);
 }
