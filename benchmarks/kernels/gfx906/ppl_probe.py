@@ -82,6 +82,20 @@ def main():
         # BENCH_TP=2, Bolt also needs trust_remote_code and mamba_cache_mode=align.
         tensor_parallel_size=int(os.environ.get("BENCH_TP", "1")),
         trust_remote_code=os.environ.get("BENCH_TRUST_REMOTE_CODE", "0") == "1",
+        # P32-2/#61: KV-cache format and attention backend A/Bs. The
+        # per-token-head int4/int8/fp8 formats are upstream CacheDTypes whose
+        # only implementations live in the triton_attn backend, so a gfx906
+        # feasibility answer needs both knobs at once.
+        **(
+            {"kv_cache_dtype": os.environ["BENCH_KV_DTYPE"]}
+            if os.environ.get("BENCH_KV_DTYPE")
+            else {}
+        ),
+        **(
+            {"attention_backend": os.environ["BENCH_ATTN_BACKEND"]}
+            if os.environ.get("BENCH_ATTN_BACKEND")
+            else {}
+        ),
         **(
             {"mamba_cache_mode": os.environ["BENCH_MAMBA_CACHE_MODE"]}
             if os.environ.get("BENCH_MAMBA_CACHE_MODE")
