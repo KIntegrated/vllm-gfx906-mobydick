@@ -885,7 +885,30 @@ max_memory_usage_bytes = page_size_bytes * (2 + num_speculative_blocks
 (`vllm/v1/kv_cache_interface.py`), i.e. enabling the prefill checkpoint raises
 the resident state per request from 2 blocks to 3 — a 50 % increase per request.
 
-**That cannot be the whole story:** at `--max-num-seqs 4` it accounts for 4 of
+**RESOLVED (2026-10-22, instrumented): it *is* the whole story — because
+Lightning has FOUR Mamba groups, not one.** `VLLM_GFX906_KV_SIZING_DEBUG=1` on
+both arms:
+
+| arm | Mamba groups | FullAttention | blocks/request | num_blocks | capacity |
+|---|---|---|---|---|---|
+| checkpoint **off** | 4 x 2 = 8 | 7 | **15** | 2720 | 2,970,965 |
+| checkpoint **on** | 4 x 3 = 12 | 7 | **19** | 2720 | 2,304,970 |
+
+`15 / 19 = 0.7895` -> **-21.1 %**, against the measured -21.0 %. The pool
+(`num_blocks`) is *identical*: nothing is lost from the pool, the divisor simply
+grows because each Mamba group contributes its own checkpoint block per request
+(2 -> 3, from `max_memory_usage_bytes = page * (2 + spec + checkpoint)`, with
+`page = 1,068,800 B` here). A single-group model would see only 1 extra block out
+of 10 (-10 %); Lightning's four groups turn the same feature into -21 %.
+
+**Consequence:** for this model the checkpoint's benefit (saving at most one
+Mamba block of tail recompute, ~0.4 % of a follow-up TTFT) is far below its
+capacity cost (-21 %), so Lightning-class serving should run with
+`VLLM_GFX906_MAMBA_PREFILL_CKPT=0`. The default stays at 1 (upstream behaviour)
+for the fork as a whole; a model with one Mamba group and EAGLE/MTP sibling
+resumption is a different trade and unmeasured here.
+
+**Superseded reasoning (kept for the record — it was wrong):** at `--max-num-seqs 4` it accounts for 4 of
 the 234 missing blocks (1.7 %). So the remainder comes from the pool-sizing path
 (`kv_cache_utils.py`), which does not read `num_prefill_checkpoint_blocks` at
 all — meaning something *else* that the checkpoint enables is changing the
