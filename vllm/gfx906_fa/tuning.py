@@ -54,7 +54,9 @@ def static_config(
 ) -> FAConfig:
     """The rule the C++ defaults encode today.
 
-    Mirrors ``get_fa_nc2()`` (8, the GQA head-packing default),
+    Mirrors ``gfx906_fa_effective_nc2`` for nc2 (the C++ default 8, the
+    ``8 -> 2 -> 1`` GQA downgrade, and the decode-only clamp: head packing is
+    only validated at the decode tile, so prefill keeps nc2=1),
     ``fa_kv_split_default`` (32 for verify-sized query blocks, 16 for decode),
     the paged-direct path's batch-aware decode clamp (``fa_paged_kv_split_default``:
     8/8/5/2/2 for B=1/2/3/4/8, measured on MI50 — that path's grid is
@@ -68,9 +70,17 @@ def static_config(
     partial buffers that can force 1 for real prefill) and any explicit
     ``GFX906_FA_KVSPLIT`` override — both are runtime decisions, not defaults.
     """
-    # Head packing needs the GQA ratio to divide evenly; fall back to the
-    # unpacked path otherwise (the backend logs this case at runtime).
-    nc2 = 8 if gqa % 8 == 0 else 1
+    # Head packing needs the GQA ratio to divide evenly: 8, else the packed-by-2
+    # fallback if the ratio is even, else unpacked. Only at the decode tile --
+    # prefill keeps the legacy unpacked path.
+    if gqa % 8 == 0:
+        nc2 = 8
+    elif gqa % 2 == 0:
+        nc2 = 2
+    else:
+        nc2 = 1
+    if seq_q > 2:
+        nc2 = 1
     if direct and seq_q < 4:
         kvsplit = max(2, min(8, 16 // max(1, batch)))
     else:

@@ -26,11 +26,16 @@ def test_static_rule_matches_the_kernel_defaults():
     decode = static_config(seq_q=1, gqa=8)
     assert (decode.nc2, decode.kvsplit, decode.clip) == (8, 16, True)
 
+    # Verify/prefill keeps the unpacked path (nc2 is a decode-tile optimisation)
+    # but takes the wider KV split.
     verify = static_config(seq_q=4, gqa=8)
-    assert (verify.nc2, verify.kvsplit) == (8, 32)
+    assert (verify.nc2, verify.kvsplit) == (1, 32)
 
-    # GQA ratio that cannot fill the packing factor falls back to unpacked.
-    assert static_config(seq_q=2, gqa=4).nc2 == 1
+    # GQA 4 cannot fill 8 but is even -> packed-by-2; GQA 3 is odd -> unpacked.
+    assert static_config(seq_q=2, gqa=4).nc2 == 2
+    assert static_config(seq_q=2, gqa=3).nc2 == 1
+    # Head packing is a decode-tile optimisation only: prefill keeps nc2=1.
+    assert static_config(seq_q=8, gqa=8).nc2 == 1
 
 
 def test_static_rule_rejects_non_integral_gqa():
@@ -111,3 +116,34 @@ def test_kv_split_mirror_agrees_with_the_cpp_probe(monkeypatch):
                 assert mine.kvsplit == fa.kv_split_default(seq_q, batch, direct), (
                     f"seq_q={seq_q} batch={batch} direct={direct}"
                 )
+
+
+def test_nc2_mirror_agrees_with_the_cpp_probe():
+    """The nc2 half of the mirror must equal the rule the launcher applies.
+
+    The C++ rule has two parts the Python mirror originally missed: the
+    ``8 -> 2 -> 1`` GQA downgrade and the decode-only clamp (``seq_q > 2``
+    keeps nc2=1). Both live in ``gfx906_fa_effective_nc2`` so this probe and the
+    launcher cannot disagree.
+    """
+    fa = pytest.importorskip(
+        "vllm._gfx906_fa_C", reason="custom FA extension not built"
+    )
+    for heads_q, heads_kv in ((16, 2), (24, 4), (12, 2), (6, 2), (9, 3), (32, 1)):
+        gqa = heads_q // heads_kv
+        for seq_q in (1, 2, 3, 4, 8, 1568):
+            for requested in (1, 2, 8):
+                mine = static_config(seq_q, gqa).nc2
+                theirs = fa.nc2_effective(requested, heads_q, heads_kv, seq_q)
+                if requested != 8:
+                    # An explicit non-default request is not the mirror's job;
+                    # only assert the default (8) path matches.
+                    continue
+                assert mine == theirs, (
+                    f"heads_q={heads_q} heads_kv={heads_kv} seq_q={seq_q}: "
+                    f"mirror {mine} != kernel {theirs}"
+                )
+    # Odd GQA cannot be packed at all: 8 -> 1 (heads_q=6, heads_kv=2 -> gqa 3).
+    assert fa.nc2_effective(8, 6, 2, 1) == 1
+    # And an explicit, unservable request is reported, not silently clamped.
+    assert fa.nc2_effective(8, 3, 2, 1) == -1

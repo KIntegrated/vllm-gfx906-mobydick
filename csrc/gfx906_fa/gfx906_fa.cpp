@@ -41,6 +41,12 @@ static inline int fa_pick_ncols1(int seq_q) {
     return 2;
 }
 
+// Shared nc2 rule (gfx906_fa_launcher.cu): the launcher applies it and the
+// nc2_effective probe reports it, so the GQA downgrade and the prefill clamp
+// have one definition rather than a copy that can drift.
+extern "C" int gfx906_fa_effective_nc2(int nc2, int heads_q, int heads_kv,
+                                       int seq_q, int *down);
+
 // Launcher объявлен в gfx906_fa_launcher.cu
 extern "C" hipError_t gfx906_fa_launch(
     const float *  Q_fp32,
@@ -1518,6 +1524,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "shape (direct = paged-direct path rule, gather = gather rule). "
           "Test probe — no GPU work.",
           py::arg("seq_q"), py::arg("batch"), py::arg("direct"));
+    m.def("nc2_effective",
+          [](int64_t nc2, int64_t heads_q, int64_t heads_kv, int64_t seq_q) {
+              int down = 0;
+              return gfx906_fa_effective_nc2(static_cast<int>(nc2),
+                                             static_cast<int>(heads_q),
+                                             static_cast<int>(heads_kv),
+                                             static_cast<int>(seq_q), &down);
+          },
+          "nc2 the kernel will use for this shape (-1 = the request is "
+          "invalid): applies the GQA downgrade (8 -> 2 -> 1) and the "
+          "decode-only clamp. Test probe — no GPU work.",
+          py::arg("nc2"), py::arg("heads_q"), py::arg("heads_kv"),
+          py::arg("seq_q"));
     m.def("forward_paged_direct", &gfx906_fa_forward_paged_direct,
           "Level 3c: Direct-paged FA (no gather). Reads K/V from paged cache "
           "via block_table indirection. q: fp32 [B, Hq, Sq_pad, D]; output: "

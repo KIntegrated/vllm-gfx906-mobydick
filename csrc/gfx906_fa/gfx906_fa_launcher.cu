@@ -62,6 +62,34 @@
 // ============================================================================
 // Entry point из C++/pybind11: C-linkage удобнее для диагностики
 // ============================================================================
+// Shared nc2 selection: the launcher applies it and the introspection probe
+// (gfx906_fa.cpp: nc2_effective) reports it, so the rule has one definition.
+// Returns the effective nc2, or -1 when the requested value cannot be served
+// (only reachable from an explicit GFX906_FA_NC2, since the default 8 always
+// downgrades). `*down`, when non-null, receives the value 8 was downgraded to
+// (0 = no downgrade) so the caller can log it once.
+extern "C" int gfx906_fa_effective_nc2(int nc2, int heads_q, int heads_kv,
+                                       int seq_q, int *down) {
+    if (down) *down = 0;
+    if (heads_kv <= 0 || heads_q % heads_kv != 0) return -1;
+    const int gqa_ratio = heads_q / heads_kv;
+    if (nc2 <= 1) {
+        nc2 = 1;
+    } else {
+        if (nc2 != 1 && nc2 != 2 && nc2 != 8) return -1;
+        if (gqa_ratio % nc2 != 0) {
+            if (nc2 != 8) return -1;
+            nc2 = (gqa_ratio % 2 == 0) ? 2 : 1;
+            if (down) *down = nc2;
+        }
+    }
+    // NC2>1 (GQA head-packing) is only validated at the decode tile
+    // (seq_q <= 2 -> ncols = 2*ncols2 <= 16); prefill keeps NC2=1 (the
+    // ncols=64 NC2=8 config faults on OOB).
+    if (nc2 > 1 && seq_q > 2) nc2 = 1;
+    return nc2;
+}
+
 // Templated FA launch. HD is the compile-time head dimension (64/96/128/256).
 template <int HD>
 static hipError_t gfx906_fa_launch_impl(
@@ -103,55 +131,35 @@ static hipError_t gfx906_fa_launch_impl(
     // (16 for Hq=16) = 64/960 wavefront slots; packing GQA heads and/or
     // splitting the KV range restores parallelism. y>1 partials are merged
     // by the caller via gfx906_fa_split_combine (O unscaled, meta=(m,l)).
-    if (nc2 <= 1) {
-        nc2 = 1;
-    } else {
-        // A packed tile shares ONE kv head (K/V base = head0 / gqa_ratio),
-        // so a tile must not straddle GQA groups: gqa_ratio % nc2 == 0.
-        // heads_q % heads_kv == 0 is guaranteed above, so gqa_ratio is
-        // integral and gqa_ratio % nc2 == 0 already implies heads_q % nc2
-        // == 0 -- the old bare `heads_q % nc2` guard was redundant and
-        // aborted *before* the default downgrade could run, crashing any
-        // per-shard head count not divisible by 8 (e.g. heads_q=6 for a
-        // 12-head model at TP=2, or Qwen3.5-27B's 24 heads at TP=4).
-        // Only NC2 in {1, 2, 8} are instantiated in
-        // the dispatch below; any other value is rejected loudly (clamping
-        // to a non-instantiated value would still run the NC2=8 kernel and
-        // silently mispack).
-        // The DEFAULT nc2=8 auto-downgrades 8 -> 2 -> 1 so GQA ratios like
-        // 6 (or 1, MHA) keep a valid path; an explicit env value that is
-        // GQA-invalid is an error.
-        const int gqa_ratio = heads_q / heads_kv;
-        if (nc2 != 1 && nc2 != 2 && nc2 != 8) {
-            fprintf(stderr, "[gfx906_fa] nc2=%d unsupported (instantiated: 1, 2, 8)\n", nc2);
-            return hipErrorInvalidValue;
-        }
-        if (gqa_ratio % nc2 != 0) {
-            if (nc2 == 8) {
-                static bool warned = false;
-                const int down = (gqa_ratio % 2 == 0) ? 2 : 1;
-                if (!warned) {
-                    fprintf(stderr, "[gfx906_fa] gqa_ratio=%d not divisible by "
-                            "nc2=8, using nc2=%d\n", gqa_ratio, down);
-                    warned = true;
-                }
-                nc2 = down;
+    // nc2 selection (GQA head packing) lives in gfx906_fa_effective_nc2 so the
+    // introspection probe reports exactly what runs; the prefill downgrade
+    // (NC2>1 only at the decode tile) is part of that rule.
+    {
+        int down = 0;
+        const int eff = gfx906_fa_effective_nc2(nc2, heads_q, heads_kv, seq_q, &down);
+        if (eff < 0) {
+            const int gqa_ratio = heads_kv > 0 ? heads_q / heads_kv : 0;
+            if (nc2 != 1 && nc2 != 2 && nc2 != 8) {
+                fprintf(stderr, "[gfx906_fa] nc2=%d unsupported (instantiated: 1, 2, 8)\n", nc2);
             } else {
                 fprintf(stderr, "[gfx906_fa] nc2=%d invalid for gqa_ratio=%d "
                         "(need ratio %% nc2 == 0; use GFX906_FA_NC2=1 or 2)\n",
                         nc2, gqa_ratio);
-                return hipErrorInvalidValue;
+            }
+            return hipErrorInvalidValue;
+        }
+        if (down) {
+            static bool warned = false;
+            if (!warned) {
+                fprintf(stderr, "[gfx906_fa] gqa_ratio=%d not divisible by "
+                        "nc2=8, using nc2=%d\n", heads_q / heads_kv, down);
+                warned = true;
             }
         }
+        nc2 = eff;
     }
     if (kv_split < 1) {
         kv_split = 1;
-    }
-    // NC2>1 (GQA head-packing) is only validated at the decode tile
-    // (seq_q <= 2 -> ncols = 2*ncols2 <= 16); prefill (larger Sq) keeps
-    // the legacy NC2=1 path (the ncols=64 NC2=8 config faults on OOB).
-    if (nc2 > 1 && seq_q > 2) {
-        nc2 = 1;
     }
 
     // nb* computed in BYTES (ggml convention)
