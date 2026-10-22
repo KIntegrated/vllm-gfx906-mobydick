@@ -221,10 +221,26 @@ def test_resolve_prefers_a_recorded_measurement(tmp_path, monkeypatch):
 
 
 def test_identity_dtype_spellings_agree():
-    """Tuner, warmup and call site spell the dtype differently; records must not split."""
+    """The three dtype spellings must key one identity, not three."""
     keys = {
         digest(identity("gfx906", spelling, 24, 4, 256, 0))
         for spelling in ("auto", "fp16", "float16", "torch.float16", "HALF")
     }
     assert len(keys) == 1, "dtype spellings must canonicalise to one identity"
     assert digest(identity("gfx906", "bfloat16", 24, 4, 256, 0)) not in keys
+
+
+def test_workload_key_buckets_the_padded_context_length():
+    """Serving's padded Sk must land on the tuner's round-number records."""
+    from vllm.gfx906_fa.tuning import seq_k_bucket
+
+    assert seq_k_bucket(16384) == 16384
+    assert seq_k_bucket(16385) == 16384
+    assert seq_k_bucket(32767) == 16384
+    assert seq_k_bucket(32768) == 32768
+    assert seq_k_bucket(1) == 1
+    assert seq_k_bucket(0) == 0
+    # A record measured at 16384 is visible to every request in that class,
+    # and not to a request in the next one up.
+    assert workload_key(2, 16384, 1) == workload_key(2, 20000, 1)
+    assert workload_key(2, 16384, 1) != workload_key(2, 65536, 1)

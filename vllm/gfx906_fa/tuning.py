@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -29,6 +30,8 @@ from pathlib import Path
 from typing import Any
 
 RECORDS_VERSION = 1
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -88,9 +91,24 @@ def static_config(
     return FAConfig(nc2=nc2, kvsplit=kvsplit, clip=True)
 
 
+def seq_k_bucket(seq_k: int) -> int:
+    """Largest power of two <= seq_k (0 for a non-positive length).
+
+    Serving presents a *padded* KV length that changes request to request, while
+    a tuner run measures round numbers. Keying records on the exact length would
+    therefore never match in production; the KV-split optimum moves with the
+    context *class* (DEVLOG-fa-tuning.md), not with the last tile, so a floor
+    power-of-two bucket is the right granularity. Floor rather than ceil so a
+    short request never inherits a long-context decision.
+    """
+    if seq_k <= 0:
+        return 0
+    return 1 << (seq_k.bit_length() - 1)
+
+
 def workload_key(seq_q: int, seq_k: int, batch: int) -> str:
     """Key a workload by the dimensions the launch choice depends on."""
-    return f"sq{seq_q}-sk{seq_k}-b{batch}"
+    return f"sq{seq_q}-sk{seq_k_bucket(seq_k)}-b{batch}"
 
 
 # The three producers of an identity (the tuner, the backend warmup, and the
@@ -235,13 +253,23 @@ def resolve(
     means "no measurement", so this never changes behaviour on a machine that
     has not run the tuner -- the fallback (the static rule) is returned instead.
     """
+    if os.environ.get("VLLM_GFX906_FA_TUNING_READ", "1") == "0":
+        return fallback, False
     ident = identity(device, dtype, num_heads, num_kv_heads, head_size, block_size)
     key = tuple(sorted(ident.items()))
     table = _table_cache.get(key)
     if table is None:
         table = TuningTable.load(cache_path(ident), ident)
         _table_cache[key] = table
-    return table.select(workload_key(seq_q, seq_k, batch), fallback)
+    key = workload_key(seq_q, seq_k, batch)
+    chosen, tuned = table.select(key, fallback)
+    if tuned:
+        logger.info_once(
+            "gfx906 FA: using a recorded launch config for %s "
+            "(nc2=%d kvsplit=%d clip=%s)", key, chosen.nc2, chosen.kvsplit,
+            chosen.clip,
+        )
+    return chosen, tuned
 
 
 def clear_cache_for_tests() -> None:

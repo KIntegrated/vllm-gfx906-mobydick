@@ -1209,11 +1209,26 @@ def get_max_concurrency_for_kv_cache_config(
     """
     num_blocks_per_request = 0
     host_blocks_per_request = 0
+    sizing_debug = os.environ.get("VLLM_GFX906_KV_SIZING_DEBUG", "0") == "1"
     for group in kv_cache_config.kv_cache_groups:
         required = cdiv(
             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
             group.kv_cache_spec.page_size_bytes,
         )
+        if sizing_debug:
+            spec = group.kv_cache_spec
+            logger.info(
+                "[kv-sizing] group=%s spec=%s required_blocks=%d page=%d "
+                "max_mem=%d blocks_per_req=%d num_blocks=%d ckpt_blocks=%s",
+                getattr(group, "name", "?"),
+                type(spec).__name__,
+                required,
+                spec.page_size_bytes,
+                spec.max_memory_usage_bytes(vllm_config),
+                num_blocks_per_request,
+                kv_cache_config.num_blocks,
+                getattr(spec, "num_prefill_checkpoint_blocks", "n/a"),
+            )
         if group.host_resident:
             host_blocks_per_request += required
         else:
