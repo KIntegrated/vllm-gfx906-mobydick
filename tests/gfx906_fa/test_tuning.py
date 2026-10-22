@@ -147,3 +147,46 @@ def test_nc2_mirror_agrees_with_the_cpp_probe():
     assert fa.nc2_effective(8, 6, 2, 1) == 1
     # And an explicit, unservable request is reported, not silently clamped.
     assert fa.nc2_effective(8, 3, 2, 1) == -1
+
+
+def test_warmup_records_once_and_reuses_on_the_second_boot(tmp_path, monkeypatch):
+    """A cold boot records the shape set; a warm boot must not rewrite it."""
+    from vllm.gfx906_fa import tuning_warmup
+
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    monkeypatch.delenv("VLLM_GFX906_FA_TUNING_RECORDS", raising=False)
+    tuning_warmup.reset_for_tests()
+
+    kwargs = dict(
+        device="gfx906", dtype="float16", num_heads=24, num_kv_heads=2, head_size=256
+    )
+    tuning_warmup.warmup_launch_config(**kwargs)
+    ident = identity("gfx906", "float16", 24, 2, 256, 0)
+    path = cache_path(ident)
+    assert path.exists()
+
+    cold = TuningTable.load(path, ident)
+    expected = len(tuning_warmup.SHAPES) * len(tuning_warmup.SEQ_K_BUCKETS)
+    assert len(cold.records) == expected
+    # gqa=12 -> packs by 2 at the decode tile, unpacked in prefill.
+    key_decode = workload_key(1, 65536, 1)
+    assert cold.records[key_decode] == static_config(1, 12)
+    assert cold.records[key_decode].nc2 == 2
+
+    mtime = path.stat().st_mtime_ns
+    tuning_warmup.reset_for_tests()
+    tuning_warmup.warmup_launch_config(**kwargs)  # warm boot
+    assert path.stat().st_mtime_ns == mtime, "a warm boot must not rewrite records"
+    assert len(TuningTable.load(path, ident).records) == expected
+
+
+def test_warmup_can_be_disabled(tmp_path, monkeypatch):
+    from vllm.gfx906_fa import tuning_warmup
+
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("VLLM_GFX906_FA_TUNING_RECORDS", "0")
+    tuning_warmup.reset_for_tests()
+    tuning_warmup.warmup_launch_config(
+        device="gfx906", dtype="float16", num_heads=24, num_kv_heads=2, head_size=256
+    )
+    assert not list(tmp_path.glob("gfx906_fa/*.json"))

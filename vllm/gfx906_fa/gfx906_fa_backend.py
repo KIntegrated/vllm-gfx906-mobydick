@@ -1013,6 +1013,21 @@ class Gfx906FAImpl(AttentionImpl):
         self.padded_head_size = _padded_head_size(head_size) or head_size
         self._head_pad = self.padded_head_size - head_size
         self._pad_zeroed_cache: tuple | None = None
+        # Launch-config records (P32-4/#63): states what the static rules choose
+        # for this geometry and skips the work on a warm cache. Log-only, once
+        # per process, and never fatal -- a boot must not depend on the cache.
+        try:
+            from vllm.gfx906_fa.tuning_warmup import warmup_launch_config
+
+            warmup_launch_config(
+                device=torch.cuda.get_device_name(torch.cuda.current_device()),
+                dtype=kv_cache_dtype,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+            )
+        except Exception as exc:  # pragma: no cover - defensive by design
+            logger.debug("gfx906 FA launch-config records skipped: %s", exc)
         # ------------------------------------------------------------------
         # PACKED (丙) layout state. The pool cell becomes v_off + 2*D
         # (784 B for D=256) instead of 4*D (1024 B): K owns a dedicated Q8_0
