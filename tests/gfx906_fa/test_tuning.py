@@ -190,3 +190,31 @@ def test_warmup_can_be_disabled(tmp_path, monkeypatch):
         device="gfx906", dtype="float16", num_heads=24, num_kv_heads=2, head_size=256
     )
     assert not list(tmp_path.glob("gfx906_fa/*.json"))
+
+
+def test_resolve_prefers_a_recorded_measurement(tmp_path, monkeypatch):
+    """A record drives the choice; without one, the static rule is returned."""
+    from vllm.gfx906_fa import tuning
+
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    tuning.clear_cache_for_tests()
+    kwargs = dict(
+        device="gfx906", dtype="float16", num_heads=24, num_kv_heads=4,
+        head_size=256, block_size=0, seq_q=16, seq_k=65536, batch=2,
+    )
+    fallback = static_config(16, 6, batch=2)
+    cfg, tuned = tuning.resolve(**{**kwargs, "fallback": fallback})
+    assert (cfg, tuned) == (fallback, False), "no record yet"
+
+    ident = identity("gfx906", "float16", 24, 4, 256, 0)
+    measured = FAConfig(nc2=1, kvsplit=16, clip=True)
+    table = TuningTable(ident=ident, records={})
+    table.records[workload_key(16, 65536, 2)] = measured
+    table.save(cache_path(ident))
+
+    tuning.clear_cache_for_tests()  # a fresh process picks the record up
+    cfg, tuned = tuning.resolve(**{**kwargs, "fallback": fallback})
+    assert (cfg, tuned) == (measured, True)
+    # A shape with no record still falls back to the rule.
+    cfg, tuned = tuning.resolve(**{**kwargs, "seq_q": 32, "fallback": fallback})
+    assert (cfg, tuned) == (fallback, False)

@@ -194,6 +194,41 @@ def _locked(path: Path) -> Iterator[None]:
                 pass
 
 
+_table_cache: dict[tuple, TuningTable] = {}
+
+
+def resolve(
+    *,
+    device: str,
+    dtype: str,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    block_size: int,
+    seq_q: int,
+    seq_k: int,
+    batch: int,
+    fallback: FAConfig,
+) -> tuple[FAConfig, bool]:
+    """Return the config for this shape, preferring a recorded measurement.
+
+    Records are loaded once per identity and cached; an absent table simply
+    means "no measurement", so this never changes behaviour on a machine that
+    has not run the tuner -- the fallback (the static rule) is returned instead.
+    """
+    ident = identity(device, dtype, num_heads, num_kv_heads, head_size, block_size)
+    key = tuple(sorted(ident.items()))
+    table = _table_cache.get(key)
+    if table is None:
+        table = TuningTable.load(cache_path(ident), ident)
+        _table_cache[key] = table
+    return table.select(workload_key(seq_q, seq_k, batch), fallback)
+
+
+def clear_cache_for_tests() -> None:
+    _table_cache.clear()
+
+
 def consistent_across_ranks(local: dict[str, Any], group: Any) -> bool:
     """Whether every rank in `group` derived the same identity.
 

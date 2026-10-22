@@ -73,3 +73,47 @@ strength of two points would repeat the mistake this dev log exists to avoid, so
 PPL is unchanged throughout the plumbing (dense-27B 14.3750 exact after each
 slice: mirror fix, overrides, warmup), which is what "behaviour-preserving" has
 to mean for a change that only moves who chooses a launch parameter.
+
+## Slice 4b — the (batch, seq_q) sweep, and why a formula is the wrong target
+
+`_fa_tune.py --sweep` over four geometries (27B/35B at TP=1 and per-rank TP=2;
+the GQA ratio is preserved under TP, the grid is not) × B ∈ {1,2,4,8} ×
+Sq ∈ {2,4,8}, Sk=65536. Each shape gets its own preload and its own mclk gate;
+**48/48 windows valid** (median 1000 MHz), candidates timed interleaved with a
+rotating order.
+
+The first sweep had **23 of 42 cold-clock windows** (350/800 MHz) and was thrown
+away — the tool now discards and retries rather than averaging, and prints the
+retry count per cell.
+
+Mean gap of a rule vs the measured best over the 48 cells:
+
+| rule | mean gap |
+|---|---|
+| `B*Sq <= 8 -> 32`, `<= 24 -> 16`, else `8` | **+1.98 %** |
+| **current `32 if Sq >= 4 else 16`** | **+5.63 %** |
+| always 8 | +23.30 % |
+
+So the current rule leaves ~5.6 % on the table and a `batch x seq_q` staircase
+recovers about two thirds of it. The trend is monotone and principled — the
+split trades parallelism for combine traffic, and past B*Sq ≈ 8 the scan is
+already wide enough — which is why a staircase fits at all.
+
+**But a staircase is not the right deliverable.** The per-cell data shows the
+optimum also depends on heads per rank at fixed B*Sq: at B=1/Sq=2, 27B TP1
+(Hq=24) reads 1.103/1.042/1.062 for y=8/16/32 — a flat 5 % spread — while 35B
+TP2 (Hq=8) reads 1.462/0.740/0.405, a 3.6x spread where the splitting decision
+dominates. No single-key formula covers both, which is exactly the case the
+per-shape record table exists for.
+
+Slice 4b therefore lands the *consumer* instead of another formula: `resolve()`
+returns a recorded config when the tuner has written one for that
+`(identity, shape)` and the static rule otherwise, and the gather call site uses
+it. Behaviour is unchanged on any machine that has not run the tuner (verified:
+dense-27B PPL 14.3750 with no records present).
+
+Remaining before a rule or record set ships: (a) `--write-records` so a sweep
+persists its winners; (b) the context-length axis — every cell here is Sk=65536,
+and the split balance moves with context; (c) a numerical check that a changed
+`kvsplit` does not shift PPL beyond the probe's spread, since the split changes
+the reduction order in `gfx906_fa_split_combine`.

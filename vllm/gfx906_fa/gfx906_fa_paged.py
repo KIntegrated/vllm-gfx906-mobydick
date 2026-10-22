@@ -34,7 +34,7 @@ import time as _time
 
 import torch
 
-from vllm.gfx906_fa.tuning import static_config
+from vllm.gfx906_fa.tuning import resolve, static_config
 
 try:
     from vllm import _gfx906_fa_C as gfx906_fa
@@ -967,8 +967,22 @@ def forward_paged(
     # env/shape defaults, so passing them is behaviour-preserving; the point is
     # that the choice now comes from one place (probe-verified against
     # gfx906_fa_effective_nc2 / kv_split_default) instead of being implicit.
-    _cfg = static_config(
-        int(Sq_pad), Hq // max(1, V_bhsd.shape[1]), batch=num_seqs
+    _gqa_hkv = max(1, V_bhsd.shape[1])
+    _fallback = static_config(int(Sq_pad), Hq // _gqa_hkv, batch=num_seqs)
+    # Prefer a config a tuner run recorded for this shape; on a machine that has
+    # never run it, resolve() returns the static rule, so this is behaviour-
+    # preserving (see DEVLOG-fa-tuning.md for the measurements behind it).
+    _cfg, _from_record = resolve(
+        device=torch.cuda.get_device_name(query.device),
+        dtype=str(q_padded.dtype),
+        num_heads=Hq,
+        num_kv_heads=_gqa_hkv,
+        head_size=D,
+        block_size=0,
+        seq_q=int(Sq_pad),
+        seq_k=int(Sk_pad),
+        batch=num_seqs,
+        fallback=_fallback,
     )
     try:
         out_padded = gfx906_fa.forward(
