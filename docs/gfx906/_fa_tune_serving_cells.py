@@ -8,9 +8,13 @@ from vllm.gfx906_fa.tuning import FAConfig, cache_path, identity, static_config
 HQ, HKV, D = 8, 1, 256          # 35B at TP=2 (per-rank)
 GQA = HQ // HKV
 # (Sq_pad, Sk_pad, batch) as observed in the serving debug log
+# Decode shapes for a [1,2,3,4] capture ladder: Sq pads to 1 or 2 and the batch
+# to the capture size, so every (Sq, batch) in the ladder is reachable.
 CELLS = [
-    (4, 32768, 4), (4, 32768, 3), (4, 32768, 2), (4, 32768, 1),
-    (1, 32768, 4), (2, 32768, 4),
+    (sq, 32768, b)
+    for sq in (1, 2)
+    for b in (1, 2, 3, 4)
+] + [
     (4096, 8192, 1), (4096, 4096, 1), (3072, 8192, 1),
 ]
 device = torch.cuda.get_device_name(torch.cuda.current_device())

@@ -191,3 +191,41 @@ Prefill cells were all discarded by the mclk gate (median 800 MHz, 3-50 % of
 samples >= 900): a 4096-token prefill chunk holds the memory clock down, exactly
 as `dvfs-mi50.md` records for sustained prefill. Tuning prefill needs the sampler
 gate relaxed with an explicit note, or a different measurement route.
+
+## Slice 6 — the A/B, with hits, at the shapes that matter: no end-to-end effect
+
+This is the run the whole thread was for: capture ladder `[1,2,3,4]` so decode
+presents `sq1`/`sq2`, records written for every (Sq, batch) the ladder can
+present, debug on, arms `tuned -> rule -> tuned`.
+
+At full clock the kernel-level win is large and reproducible:
+
+| cell | y=8 | y=16 (rule) | y=32 | best | gap |
+|---|---|---|---|---|---|
+| sq1-sk32768-b1 | 0.741 | 0.397 | **0.233** | y32 | **41.2 %** |
+| sq2-sk32768-b1 | 0.735 | 0.393 | **0.231** | y32 | **41.2 %** |
+| sq1-sk32768-b4 | 0.738 | 0.753 | **0.600** | y32 | **20.4 %** |
+| sq2-sk32768-b4 | 0.739 | 0.754 | **0.603** | y32 | **20.0 %** |
+
+And the serving A/B, with `record hits: 2` (the guard finally satisfied):
+
+| arm | reps (t/s) | mean |
+|---|---|---|
+| tuned (records, y=32) | 19.98, 19.98, 19.96 | **19.973** |
+| rule (`TUNING_READ=0`, y=16) | 19.95, 19.97, 19.98 | **19.967** |
+
+**VERDICT: no end-to-end effect (< 0.05 %, inside noise).** The arithmetic says
+why: Qwen3.5-35B-A3B is **10 full-attention layers out of 40** (the rest are
+linear attention), so at 16k the FA work is 10 x 0.397 ms = 4.0 ms of a ~50 ms
+decode step (8 %) -- a 41 % cut there is 1.6 ms, i.e. ~3 % predicted, and the
+measured step is dominated by MoE weight streaming plus the 30 linear-attention
+layers. Whatever the remaining ~3 % would be is not visible at this resolution
+(three reps per arm, ±0.1 %).
+
+So the honest close on the tuning track: per-shape KV-split tuning is real at the
+kernel level (up to 41 % here, 45 % in the earlier sweep) but **does not pay on
+this model at this context**, and should not be enabled for serving on the
+strength of kernel numbers alone. It would matter where attention dominates the
+step: an all-full-attention model, longer context, or high batch. The tooling to
+answer that is in place (`_fa_tune.py`, `_fa_tune_serving_cells.py`,
+`VLLM_GFX906_FA_TUNING_DEBUG=1`), and the records remain opt-in.
