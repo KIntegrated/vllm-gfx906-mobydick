@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -29,9 +28,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from vllm.logger import init_logger
+
 RECORDS_VERSION = 1
 
-logger = logging.getLogger(__name__)
+# vLLM's logger, not the stdlib one: the hit path uses info_once(), which
+# logging.Logger does not have -- with a plain logger the first successful
+# record match would raise AttributeError inside the forward.
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -263,6 +267,11 @@ def resolve(
         _table_cache[key] = table
     key = workload_key(seq_q, seq_k, batch)
     chosen, tuned = table.select(key, fallback)
+    if os.environ.get("VLLM_GFX906_FA_TUNING_DEBUG", "0") == "1":
+        logger.info(
+            "gfx906 FA record %s: key=%s identity=%s records=%d",
+            "HIT" if tuned else "miss", key, ident, len(table.records),
+        )
     if tuned:
         logger.info_once(
             "gfx906 FA: using a recorded launch config for %s "
