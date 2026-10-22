@@ -68,7 +68,7 @@ SWEEP_GEOMETRIES = (
     ("35B TP2", 8, 1, 256),
 )
 SWEEP_BATCHES = (1, 2, 4, 8)
-SWEEP_SQ = (2, 4, 8)
+SWEEP_SQ = (1, 2, 4, 8)
 
 
 class MclkSampler:
