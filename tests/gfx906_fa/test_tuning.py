@@ -218,3 +218,13 @@ def test_resolve_prefers_a_recorded_measurement(tmp_path, monkeypatch):
     # A shape with no record still falls back to the rule.
     cfg, tuned = tuning.resolve(**{**kwargs, "seq_q": 32, "fallback": fallback})
     assert (cfg, tuned) == (fallback, False)
+
+
+def test_identity_dtype_spellings_agree():
+    """Tuner, warmup and call site spell the dtype differently; records must not split."""
+    keys = {
+        digest(identity("gfx906", spelling, 24, 4, 256, 0))
+        for spelling in ("auto", "fp16", "float16", "torch.float16", "HALF")
+    }
+    assert len(keys) == 1, "dtype spellings must canonicalise to one identity"
+    assert digest(identity("gfx906", "bfloat16", 24, 4, 256, 0)) not in keys

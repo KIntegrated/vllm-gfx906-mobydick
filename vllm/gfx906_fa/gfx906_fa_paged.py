@@ -974,7 +974,7 @@ def forward_paged(
     # preserving (see DEVLOG-fa-tuning.md for the measurements behind it).
     _cfg, _from_record = resolve(
         device=torch.cuda.get_device_name(query.device),
-        dtype=str(q_padded.dtype),
+        dtype=str(V_bhsd.dtype),
         num_heads=Hq,
         num_kv_heads=_gqa_hkv,
         head_size=D,

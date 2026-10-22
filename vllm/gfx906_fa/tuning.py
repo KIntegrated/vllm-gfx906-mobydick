@@ -93,6 +93,25 @@ def workload_key(seq_q: int, seq_k: int, batch: int) -> str:
     return f"sq{seq_q}-sk{seq_k}-b{batch}"
 
 
+# The three producers of an identity (the tuner, the backend warmup, and the
+# call-site resolve()) each hold the dtype in a different spelling. Canonicalise
+# so a record written by one is visible to the others; "auto" is the cache-config
+# value and means the fp16 V path this backend always runs.
+_DTYPE_ALIASES = {
+    "auto": "float16",
+    "fp16": "float16",
+    "torch.float16": "float16",
+    "half": "float16",
+    "bf16": "bfloat16",
+    "torch.bfloat16": "bfloat16",
+}
+
+
+def canonical_dtype(dtype: str) -> str:
+    key = dtype.strip().lower()
+    return _DTYPE_ALIASES.get(key, key)
+
+
 def identity(
     device: str,
     dtype: str,
@@ -105,7 +124,7 @@ def identity(
     return {
         "version": RECORDS_VERSION,
         "device": device,
-        "dtype": dtype,
+        "dtype": canonical_dtype(dtype),
         "num_heads": num_heads,
         "num_kv_heads": num_kv_heads,
         "head_size": head_size,

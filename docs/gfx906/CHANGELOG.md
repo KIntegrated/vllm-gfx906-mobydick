@@ -8,6 +8,39 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-22 (P32-4/#63 closed — FA launch-config records, probed and measured)
+
+The FA launch parameters now have one definition, a probe, a per-shape record
+and a measurement, instead of process-wide env defaults and a Python copy of
+their rules. Record: `DEVLOG-fa-tuning.md`; tool: `docs/gfx906/_fa_tune.py`.
+
+- **The mirror was wrong twice, invisibly** (`22aa898cbb`, `3f1f4d0ee2`): the KV
+  split's paged-direct rule is batch-aware (`8/8/5/2/2`), and `nc2` both
+  downgrades `8 -> 2 -> 1` by GQA ratio *and* clamps to 1 above Sq=2. Rules were
+  extracted into `gfx906_fa_effective_nc2` / existing `kv_split_default`, exposed
+  as no-GPU-work probes, and pinned by tests over 96 shape combinations.
+- **Records are load-bearing** (`f39c6dd054`, `6e581df3e4`): boot warmup records
+  the rule per shape (cold: 12 recorded, warm: 0 recorded/12 reused, PPL
+  unchanged at 14.3750 both ways); `tuning.resolve()` prefers a measured record
+  and falls back to the rule, so an un-tuned machine behaves exactly as before.
+- **Measurement** (`_fa_tune.py`, mclk-gated): the static rules are exactly
+  optimal in 3 of 4 table shapes, and two rules that looked like safety
+  fallbacks are large wins — the GQA downgrade is worth 1.7-1.85x at decode.
+- **Sweep over 4 geometries x B x Sq x Sk**: the current split rule is +5.63 %
+  from the measured best on average, up to **45 %** on 35B TP2 decode
+  (B=1/Sq=2, y=16 vs the measured y=32); a `batch x seq_q` staircase reaches
+  +1.98 % but the optimum also moves with heads-per-rank and with context, so
+  the deliverable is the per-shape record, not a formula.
+- **Numerics**: a split change moves raw attention outputs (up to 9.3e-4 on the
+  worst-case uniform-attention input) but dense-27B PPL is identical
+  (14.3750) at `GFX906_FA_KVSPLIT=8` and `=32`.
+- **Process**: the first sweep was discarded — 23 of 42 windows were cold-clock
+  (350/800 MHz). The tool now preloads per shape, retries a cold window instead
+  of averaging it, and samples `pp_dpm_mclk` (not `rocm-smi --showclocks`, which
+  blocks under load and reports DPM levels).
+
+Records remain opt-in; enabling them for serving needs its own A/B.
+
 ## 2026-10-21 (0.32.0 released — merge train closed, packed gate fixed, P32-1/P32-6/P32-7/P32-9)
 
 **RELEASE-0.32.0-final.md** is the snapshot; `MERGE-0.32.0-review.md` holds the

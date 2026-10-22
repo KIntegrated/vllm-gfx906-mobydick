@@ -117,3 +117,33 @@ persists its winners; (b) the context-length axis — every cell here is Sk=6553
 and the split balance moves with context; (c) a numerical check that a changed
 `kvsplit` does not shift PPL beyond the probe's spread, since the split changes
 the reduction order in `gfx906_fa_split_combine`.
+
+## Slice 4c — context axis, and the numerical gate
+
+Same grid at Sk=16384 vs Sk=65536 (27B TP1, 35B TP2), 48/48 windows valid,
+`--write-records --min-gain 1.0` → **14 + 14 records written** into the opt-in
+cache.
+
+**The optimum moves with context too.** 27B TP1 B=8/Sq=2: the rule (16) is
+exactly optimal at Sk=16384 (1.912 ms, gap 0.0 %) and 2.5 % off at Sk=65536
+(y=8 7.743 vs 7.940). With four axes — heads-per-rank, batch, Sq, Sk — a single
+formula is the wrong vehicle; the record key already carries all four, which is
+what makes the per-shape table the right answer rather than a stopgap.
+
+**Largest gaps are 35B TP2 decode.** B=1/Sq=2: the rule's y=16 runs 0.741 ms
+against y=32's 0.405 ms — **45 % slower**, at both context lengths. That is the
+concrete cost of a batch-blind, head-blind split rule on a low-Hq MoE rank.
+
+**Numerical gate (the one I owed).** Changing `kvsplit` does move the raw
+attention output: on synthetic inputs (B=2, Sq=8, Sk=16384, all-zero K → uniform
+attention) the max |delta| vs y=32 is 9.3e-4 at y=1, 2.5e-4 at y=8, 1.7e-4 at
+y=16 — far above fp32 rounding, because that input makes the output a
+near-cancelling mean of 16k values, i.e. the worst case for a reordered sum.
+The gate that matters is the model: dense-27B PPL is **14.3750 at both
+`GFX906_FA_KVSPLIT=8` and `=32`** (identical to four decimals, 0 top-20
+misses). So a split change is quality-neutral and does not need a PPL band
+re-anchor.
+
+Records stay **opt-in** (`VLLM_CACHE_ROOT` pointing at the tuner's cache): the
+45 % decode win is measured in a synthetic harness, and enabling it for serving
+should be its own decision with a serving A/B, not a side effect of a sweep.

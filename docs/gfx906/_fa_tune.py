@@ -39,7 +39,14 @@ import time
 import torch
 
 from vllm import _gfx906_fa_C as fa
-from vllm.gfx906_fa.tuning import static_config
+from vllm.gfx906_fa.tuning import (
+    FAConfig,
+    TuningTable,
+    cache_path,
+    identity,
+    static_config,
+    workload_key,
+)
 
 SEQ_K = 65536
 NC2_CANDIDATES = (1, 2, 8)
@@ -151,13 +158,13 @@ def time_candidates(q, k_q8, v, scale, nc2, candidates, reps, kv_max):
     return {kv: statistics.median(ts) for kv, ts in timed.items()}
 
 
-def measure_gated(batch, hq, hkv, d, sq, nc2, candidates, reps, preload_s,
-                  attempts=3):
+def measure_gated(batch, hq, hkv, d, seq_k, sq, nc2, candidates, reps,
+                  preload_s, attempts=3):
     """Measure one shape, discarding and retrying any cold-clock window."""
     scale = d**-0.5
     for attempt in range(1, attempts + 1):
-        q, k_q8, v = make_inputs(batch, hq, hkv, d, sq, SEQ_K)
-        kv_max = torch.full((batch,), SEQ_K, dtype=torch.int32, device="cuda")
+        q, k_q8, v = make_inputs(batch, hq, hkv, d, sq, seq_k)
+        kv_max = torch.full((batch,), seq_k, dtype=torch.int32, device="cuda")
         ramp_mclk(preload_s)
         with MclkSampler() as sampler:
             times = time_candidates(q, k_q8, v, scale, nc2, candidates, reps,
@@ -177,7 +184,8 @@ def run_table(reps: int, preload_s: float) -> None:
         rows = []
         for nc2 in NC2_CANDIDATES:
             times, report, attempt = measure_gated(
-                batch, hq, hkv, d, sq, nc2, KVSPLIT_CANDIDATES, reps, preload_s
+                batch, hq, hkv, d, SEQ_K, sq, nc2, KVSPLIT_CANDIDATES, reps,
+                preload_s,
             )
             if times is None:
                 print(f"{label} nc2={nc2}: DISCARDED ({report})")
@@ -196,12 +204,27 @@ def run_table(reps: int, preload_s: float) -> None:
                       f"rule {rule:.3f} ms -> {100 * (rule - best_ms) / rule:+.1f}%\n")
 
 
-def run_sweep(reps: int, preload_s: float) -> None:
-    print(f"sweep mode, seq_k={SEQ_K}, reps={reps}, preload {preload_s:.0f}s "
-          "per shape; cold windows discarded and retried")
+def write_record(device: str, dtype: str, hq: int, hkv: int, d: int,
+                 seq_q: int, seq_k: int, batch: int, cfg: FAConfig) -> str:
+    """Persist one measured winner for this (identity, shape)."""
+    ident = identity(device, dtype, hq, hkv, d, 0)
+    path = cache_path(ident)
+    table = TuningTable.load(path, ident)
+    table.records[workload_key(seq_q, seq_k, batch)] = cfg
+    table.save(path)
+    return str(path)
+
+
+def run_sweep(reps: int, preload_s: float, seq_k: int, geometries, write: bool,
+              min_gain: float) -> None:
+    print(f"sweep mode, seq_k={seq_k}, reps={reps}, preload {preload_s:.0f}s "
+          "per shape; cold windows discarded and retried"
+          + (f"; recording winners above {min_gain:.1f}%" if write else ""))
+    device = torch.cuda.get_device_name(torch.cuda.current_device())
+    recorded = 0
     discarded = 0
     rows_out = []
-    for label, hq, hkv, d in SWEEP_GEOMETRIES:
+    for label, hq, hkv, d in geometries:
         gqa = hq // hkv
         print(f"\n{label}: Hq={hq} Hkv={hkv} D={d} gqa={gqa}")
         print("  B  Sq  B*Sq  rule    y=8     y=16    y=32   best  delta tries")
@@ -209,8 +232,8 @@ def run_sweep(reps: int, preload_s: float) -> None:
             for batch in SWEEP_BATCHES:
                 base = static_config(sq, gqa, batch=batch)
                 times, report, attempt = measure_gated(
-                    batch, hq, hkv, d, sq, base.nc2, KVSPLIT_CANDIDATES,
-                    reps, preload_s,
+                    batch, hq, hkv, d, seq_k, sq, base.nc2,
+                    KVSPLIT_CANDIDATES, reps, preload_s,
                 )
                 if times is None:
                     discarded += 1
@@ -223,10 +246,17 @@ def run_sweep(reps: int, preload_s: float) -> None:
                 flag = "" if best == base.kvsplit else " <-- rule off"
                 rows_out.append((label, batch, sq, batch * sq, base.kvsplit,
                                  best, delta))
+                if write and best != base.kvsplit and delta >= min_gain:
+                    write_record(device, "float16", hq, hkv, d, sq, seq_k,
+                                 batch, FAConfig(nc2=base.nc2, kvsplit=best,
+                                                 clip=base.clip))
+                    recorded += 1
                 print(f"  {batch:2d} {sq:3d} {batch * sq:5d} y{base.kvsplit:<3d} "
                       f"{times[8]:8.3f} {times[16]:8.3f} {times[32]:8.3f}  "
                       f"y{best:<3d} {delta:+5.1f}%{flag}  {attempt}")
     print(f"\ndiscarded windows: {discarded}")
+    if write:
+        print(f"records written: {recorded}")
     if rows_out:
         print("\nsummary by batch*Sq (mean delta of the rule vs the measured "
               "best, and how often the rule was already best):")
@@ -244,6 +274,13 @@ def main() -> None:
     ap.add_argument("--preload-seconds", type=float, default=30.0,
                     help="preload for the first window; per-shape preloads use "
                          "a tenth of this (minimum 3 s)")
+    ap.add_argument("--seq-k", type=int, default=SEQ_K)
+    ap.add_argument("--write-records", action="store_true",
+                    help="persist each measured winner that beats the static "
+                         "rule by --min-gain")
+    ap.add_argument("--min-gain", type=float, default=1.0)
+    ap.add_argument("--only", default="",
+                    help="comma-separated geometry labels, e.g. '27B TP1'")
     ap.add_argument("--sweep", action="store_true",
                     help="run the (batch, seq_q) x kvsplit sweep")
     args = ap.parse_args()
@@ -253,7 +290,11 @@ def main() -> None:
         ramp_mclk(args.preload_seconds)
     print(f"initial preload {args.preload_seconds:.0f}s -> {sampler.report()}\n")
     if args.sweep:
-        run_sweep(args.reps, per_shape_preload)
+        chosen = [g for g in SWEEP_GEOMETRIES
+                  if not args.only or g[0] in
+                  {x.strip() for x in args.only.split(",") if x.strip()}]
+        run_sweep(args.reps, per_shape_preload, args.seq_k, chosen,
+                  args.write_records, args.min_gain)
     else:
         run_table(args.reps, per_shape_preload)
 

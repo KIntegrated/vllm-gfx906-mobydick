@@ -207,8 +207,8 @@ first; follows C1–C3.
 
 Release basis: `RELEASE-0.32.0-final.md`; resolution record:
 `MERGE-0.32.0-review.md` §4 (porting opportunities) and §5 (breaking changes).
-Closed from this train already: P32-1 (#60), P32-6 (#67), P32-7 (#65), and the
-two load failures P32-9 (#68, #69).
+Closed from this train already: P32-1 (#60), P32-4 (#63), P32-6 (#67),
+P32-7 (#65), and the two load failures P32-9 (#68, #69).
 
 ### P32-2 — adopt upstream's int4/int8 per-token-head KV · [#61](../../issues/61)
 
@@ -223,14 +223,6 @@ spread + a served capacity/payload A/B.
 (`num_prefill_checkpoint_blocks=1` in `mamba_mixer2.py`), so this is a
 measurement: unaligned prefix-cache hits vs the 1-block-per-row cost, plus the
 Lightning PPL band as the correctness gate. Unblocked (serving gate is green).
-
-### P32-4 — mine ROCM_SEGMENTED_ATTN (#59132) for our FA · [#63](../../issues/63)
-
-Slice 1 landed (`51ce08adbe`, `vllm/gfx906_fa/tuning.py`: identity digest,
-atomic records, TP identity cross-check, static-rule mirror under test; nothing
-consumes it yet). Slice 2 = thread `(nc2, kvsplit, clip)` through the pybind
-boundary with bit-identical defaults; slice 3 = cache-only warmup; slice 4
-(own session) = per-shape candidate measurement.
 
 ### P32-5 — INT4 port of `ultraquant_4bit` (#57057) · [#64](../../issues/64)
 
