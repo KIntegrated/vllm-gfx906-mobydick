@@ -75,9 +75,24 @@ def main() -> None:
         **extra_kwargs(),
     )
     tok = llm.get_tokenizer()
-    para = "The quick brown fox jumps over the lazy dog while the engineer measures. "
-    text = para * (int(PP * 3.2) // len(para) + 1)
-    prompt = tok.encode(text)[:PP]
+    # BENCH_PROMPT_FILE pins the exact text, so an in-process arm and a serving
+    # arm can be measured on a byte-identical prompt. Without it the harness
+    # synthesises its own text, which silently differs in token count from the
+    # file a serving client sends -- that mistake made an earlier comparison
+    # look like a 2.7x path penalty when part of it was prompt size.
+    prompt_file = os.environ.get("BENCH_PROMPT_FILE")
+    if prompt_file:
+        with open(prompt_file) as handle:
+            text = handle.read()
+        prompt = tok.encode(text)
+        print(f"prompt_file={prompt_file} tokens={len(prompt)}", flush=True)
+    else:
+        para = (
+            "The quick brown fox jumps over the lazy dog while the engineer "
+            "measures. "
+        )
+        text = para * (int(PP * 3.2) // len(para) + 1)
+        prompt = tok.encode(text)[:PP]
     print(f"prompt_tokens={len(prompt)} tg={TG} samples={SAMPLES} tag={TAG}",
           flush=True)
 

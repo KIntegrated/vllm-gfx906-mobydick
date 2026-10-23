@@ -268,3 +268,40 @@ first chunk for TTFT), CUDA events for GPU work, or `/metrics` histograms.
 Consequence for this file's earlier entries: any figure quoted from an engine log
 here is engine-internal only. The client-side numbers in the tables above are the
 ones to use.
+
+## RETRACTION: the "serving path is ~2.7x slower at prefill" finding was a clock artifact
+
+Chased the divergence properly and it dissolved. Same build, same flags, same
+11,201-token prompt, **same process**, consecutive samples:
+
+| sample | TTFT | mclk during prefill | decode |
+|---|---|---|---|
+| 0 | **39.84 s** | **350 MHz** (idle state) | 0.00 t/s |
+| 1 | **4.36 s** | 800 MHz | 19.63 t/s |
+
+**A 9x TTFT swing from memory-clock state alone.** Everything I had attributed to
+the serving path, MTP, chunk size, `max_num_seqs`, `maxlen`, the capture ladder,
+the endpoint or multiprocessing was noise on top of that.
+
+How the error was made, so it is not repeated:
+
+1. My preload ran *before* the request, but a 11k-token prefill takes long enough
+   (20-40 s at a low clock) that the governor drops back mid-request;
+2. the mclk gate therefore has to cover the **prefill window**, and on the
+   serving runs I checked the clock *before* the request, which proves nothing;
+3. the in-process and serving arms also used different prompts (9.2k tokens
+   synthesised vs 11.2k from the file), adding a genuine ~20 % on top.
+
+Also retracted from earlier in this file: the client-observed prefill rate of
+"~415 tok/s" — at 800 MHz the same harness does **2,570 tok/s** (11,201 tokens in
+4.36 s). Every prefill throughput number in this log that was not accompanied by
+a prefill-window clock reading is unusable, including the
+`--max-num-batched-tokens` sweep (+5.8 % claim) — that sweep's arms ran at
+verified 1000 MHz *before* each request but not during the prefill, so it needs a
+re-run before the 16384 recommendation is believed.
+
+The rule now lives in `/local/git/AGENTS.md` alongside the engine-log warning.
+What survives from this whole detour: the **client-side** decode measurements
+(gated during the decode window, mclk 1000) and the backend comparisons that used
+them — short context (upstream +0.8-2.6 %), 16k decode (CUSTOM +15 %), and the
+decode-window numbers in the int8/int4 capacity table.
