@@ -75,3 +75,42 @@ this metric measure prefill (1.97 t/s, 65 s per sample), and a prefill-heavy
 window holds mclk at 800 MHz, so the decode-shaped workload is what makes the
 1000 MHz gate pass at all. `attention_backend` (kwarg) conflicts with the fork's
 `attention_config.backend`; `VLLM_ATTENTION_BACKEND` is the form that works.
+
+## The arms where CUSTOM was supposed to win — it does not
+
+Three workloads, `_bench_gfx906.py`, 256 in / 256 out, prefix caching off,
+`BENCH_PRELOAD=20`, 3 samples per arm, every sample at mclk 1000 MHz. Arms:
+CUSTOM (packed FP16 cell) vs upstream `TRITON_ATTN` + `int8_per_token_head`.
+B=4 and B=1-dense carried an order control (CUSTOM repeated last).
+
+| workload | CUSTOM | upstream triton+int8 | delta |
+|---|---|---|---|
+| dense 27B, B=1 | 29.10 (control 29.06) | **29.48** | +1.3 % upstream |
+| dense 27B, **B=4** | 61.77 (control 61.46) | **62.28** | +0.8-1.3 % upstream |
+| **35B MoE**, B=1 | 89.60 | **91.90** | **+2.6 % upstream** |
+
+The 35B MoE order control aborted (rc=134, the documented abort-after-work
+pattern) and is missing; the other two controls reproduce CUSTOM to 0.1-0.5 %.
+
+**VERDICT: on every workload measured so far, the fork's custom FA has no
+throughput advantage, and upstream's Triton path with int8 KV is 0.8-2.6 %
+faster while also carrying +70 % KV capacity at 32k (+0.05 % PPL).** The
+advantages the README attributes to CUSTOM -- GQA head-packing, KV split,
+fused gather-and-quantize -- are measured *against the 0.28-era fallback*, not
+against this backend; against `TRITON_ATTN` they do not show up at 256-token
+context, at B=4, or on the MoE geometry.
+
+**Not yet measured, and therefore not yet a retirement decision:**
+- **long context** (16k+), where the KV-split/packed trade and int8 density
+  could separate the two; this needs the prefill-vs-decode separation the
+  harness does not currently do (a 16k prefill window measures prefill and pins
+  mclk at 800 MHz, so it must be measured as TTFT + decode rate, not t/s);
+- **MTP/DFlash verify shapes**, where the fork's spec-decode path depends on the
+  custom FA's verify tile and int8 KV may change acceptance;
+- **Lightning (hybrid) and Muse-Glimmer**, which have their own recipes and
+  model-specific caveats.
+
+Until those three are known, the defensible action is to stop *adding* to the
+custom FA and treat it as the rollback path, not to delete it: the cost of
+keeping it is maintenance, the cost of removing it early is losing the one
+configuration that may still win at long context.

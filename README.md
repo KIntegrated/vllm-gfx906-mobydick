@@ -154,7 +154,10 @@ i.e. upstream's Triton path with an int8 KV cache is **1.3 % faster** here, and
 carries ~2× the KV capacity at long context (PPL +0.05 %). CUSTOM remains the
 default for the gfx906-specific paths it owns (packed KV cell, MTP verify
 shapes, the MoE geometry); it is not the fastest option at plain B=1 decode on a
-dense model. Details: `docs/gfx906/DEVLOG-kv-formats.md`.
+dense model. The same comparison at **B=4** (61.77 vs 62.28 t/s, control 61.46)
+and on the **35B MoE** (89.60 vs 91.90 t/s) also favours upstream, so CUSTOM is
+not faster in any workload measured so far. Long-context and MTP-verify arms are
+still open. Details: `docs/gfx906/DEVLOG-kv-formats.md`.
 See [`docs/gfx906/`](docs/gfx906/) for the full change inventory, numbers,
 and bench recipes.
 
