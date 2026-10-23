@@ -242,3 +242,29 @@ Conclusions, in the order they were earned:
    three effects added together — drift, flags, and path — and only the path
    term survives at ~2x. Long-context numbers on this box must be compared
    same-session, ideally interleaved, or they mislead by tens of percent.
+
+## **Engine-log throughput is not a measurement instrument** (permanent, 2026-10-23)
+
+While isolating the serving-path TTFT (P32-10/#70) the engine contradicted the
+client outright, and its own numbers were not self-consistent:
+
+* 16k prompt, serving path: engine logged **1121 tokens/s prompt throughput**
+  (⇒ 14.6 s) while the client measured **39.2 s** to first token, twice.
+* The *same configuration* re-run logged **2.7 / 21.1 / 287.9 / 574.4 tokens/s**
+  in successive lines — never 1121 — with client TTFT unchanged.
+* Client TTFT scaled linearly and sanely with prompt length, which is what a
+  prefill measurement should look like:
+  **256 tok → 1.14 s, 4k → 10.47 s, 8k → 19.03 s, 16k → 39.2 s** (≈ 415 tok/s,
+  plus ~1 s fixed). Chat vs raw `/v1/completions` differed by 0.01 s and
+  `max_tokens` 1 vs 256 by 0.04 s, so TTFT is prefill-bound and the endpoint is
+  not the variable.
+
+Rule, now also in `/local/git/AGENTS.md` so every future session sees it: **do
+not time anything with the engine's throughput log lines.** They exclude
+inter-step gaps, they are not comparable across runs, and they can be off by
+2.7x against wall time. Use an external clock around the request (streaming
+first chunk for TTFT), CUDA events for GPU work, or `/metrics` histograms.
+
+Consequence for this file's earlier entries: any figure quoted from an engine log
+here is engine-internal only. The client-side numbers in the tables above are the
+ones to use.
