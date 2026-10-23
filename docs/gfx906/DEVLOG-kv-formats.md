@@ -186,3 +186,26 @@ custom FA. What it does separate is *this recipe from a good one*:
    number here suggests it inverts badly at 16k.
 2. Repeat the MTP arm once that is fixed, so the arm measures the backend rather
    than the chunking.
+
+## Production-shaped batched-tokens sweep at 16k with MTP: small effect, and my hypothesis was wrong
+
+Same 16k prompt, MTP k=3, ladder `[4,8,12,16]`, mclk verified at 1000 MHz, three
+reps per arm:
+
+| `--max-num-batched-tokens` | agg t/s | TTFT |
+|---|---|---|
+| 4096 (current recipe) | 5.20 | 41.60 s |
+| 8192 | 5.27 | 41.15 s |
+| 16384 | **5.39** | **39.2 s** |
+
+So the production-shaped chunk size is **16384**, and it is worth **+5.8 % TTFT /
++3.6 % agg** over 4096 — real, but nowhere near the 2.9x I attributed to it. The
+earlier claim in this log that "`--max-num-batched-tokens 4096` costs ~2.9x TTFT
+at 16k" is **falsified**: 4096 vs 16384 is 41.60 vs 39.2 s, not 41.6 vs 14.5.
+
+The remaining gap to the in-process measurement (14.52 s TTFT, no spec decode,
+default batching) must therefore come from **MTP/spec decode at long context**,
+not from chunking. That is the next control: identical serving flags with
+`--speculative-config` removed. Until it runs, the honest statement is "enabling
+MTP k=3 costs ~2.7x TTFT at a 16k prompt on this stack, cause not yet isolated" —
+which is itself the more important finding, since MTP k=3 is our default recipe.
