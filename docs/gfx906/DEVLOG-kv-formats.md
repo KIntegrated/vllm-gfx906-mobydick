@@ -150,3 +150,39 @@ sweep looks decisive.
 
 Still unmeasured: MTP/DFlash verify shapes, and the Lightning (hybrid) /
 Muse-Glimmer recipes.
+
+## MTP k=3 + 16k prompt: a tie, and it indicts the serving recipe
+
+Serving both arms with the production-shaped flags (27B, `max_model_len 32768`,
+`--max-num-seqs 4`, `--max-num-batched-tokens 4096`, MTP k=3, capture ladder
+`[4,8,12,16]`, prefix caching off), 16k prompt, 256 output tokens, mclk verified
+at 1000 MHz before each measurement:
+
+| arm | agg t/s (3 reps) | TTFT |
+|---|---|---|
+| CUSTOM | 5.20 / 5.20 / 5.19 | 41.60 / 41.60 / 41.67 s |
+| upstream `TRITON_ATTN` + int8 KV | 5.20 / 5.20 / 5.19 | 41.57 / 41.54 / 41.63 s |
+
+**Identical to the noise floor.** The MTP/verify-shape arm is therefore a tie: it
+does not separate the backends, so it neither supports nor weakens keeping the
+custom FA. What it does separate is *this recipe from a good one*:
+
+- The same 16k prompt measured **14.52 s TTFT (1128 tok/s prefill)** in-process
+  with default batching, against **41.6 s (395 tok/s)** here. The only recipe
+  difference that matters is `--max-num-batched-tokens 4096`: a 16k prompt is
+  then prefilled in four 4096-token chunks, and 4096 matches no captured graph
+  size (`[4,8,12,16]`), so those chunks run eager. The flag was chosen for
+  **+12 % prefill at 1024-token contexts** (AGENTS.md); at 16k it costs ~2.9x
+  TTFT.
+- Because prefill dominates the aggregate t/s, both arms are prefill-bound and
+  the attention backend cannot show — which is exactly why a "tie" here must not
+  be read as "the backends are equal at long context". The clean long-context
+  comparison (previous section) used a recipe without the 4096 chunking and
+  found CUSTOM +15 %.
+
+**Two follow-ups this opens**, both independent of the backend question:
+1. Re-measure the serving recipe's `--max-num-batched-tokens` at long context
+   (4096 vs 8192/16384) — the AGENTS note's +12 % was measured at 1024, and the
+   number here suggests it inverts badly at 16k.
+2. Repeat the MTP arm once that is fixed, so the arm measures the backend rather
+   than the chunking.
