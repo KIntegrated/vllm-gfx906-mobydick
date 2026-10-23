@@ -209,3 +209,36 @@ not from chunking. That is the next control: identical serving flags with
 `--speculative-config` removed. Until it runs, the honest statement is "enabling
 MTP k=3 costs ~2.7x TTFT at a 16k prompt on this stack, cause not yet isolated" —
 which is itself the more important finding, since MTP k=3 is our default recipe.
+
+## TTFT: it is not MTP, not the chunk size, and not the serving flags
+
+Three-way isolation, 16k prompt, decode window mclk-gated at 1000 MHz:
+
+| path / config | TTFT | decode t/s |
+|---|---|---|
+| **serving**, maxlen 32k, max_seqs 4, bt 16384, MTP k=3 | 39.2 s | (agg 5.39) |
+| serving, same flags, **no MTP** | 39.3 s | (agg 4.51) |
+| **in-process**, same flags (`_bench_longctx`, maxlen 32k, max_seqs 4, ladder, bt 16384) | **19.61 s** | 9.88 |
+| in-process, plain flags (maxlen 17k, max_seqs 1) | 19.87 s | 14.04 |
+
+Conclusions, in the order they were earned:
+
+1. **MTP does not affect prefill** (39.2 vs 39.3 s) — as expected; it lifts aggregate
+   throughput by +19 % at 16k, which *is* its job. It appears to cost nothing at
+   prefill and to help decode in proportion to content, as it should.
+2. **The serving flags are not the cause of the TTFT gap**: identical flags
+   in-process give 19.61 s against the serving path's 39.2 s. (They do cost
+   **decode**: 14.04 -> 9.88 t/s, i.e. -30 %, from padding to
+   `max_num_seqs=4`/`maxlen 32k` with a single request — worth a separate look.)
+3. **The remaining ~2x lives in the serving path or in the client's TTFT
+   definition.** Prime suspects, in order of cheapness to test: the client's
+   first-SSE-chunk timer (queueing, chat-template application, and one decode
+   step are all inside it) versus a `max_tokens=1` `generate()`; then the
+   chat-template/tokenization of a 16k raw-text prompt; then engine-side
+   per-request setup.
+4. **Inter-run drift is real and large**: the *identical* plain in-process config
+   measured 14.52 s TTFT earlier in the day and 19.87 s now (+37 %), with decode
+   18.70 -> 14.04 t/s (-25 %). So the original "2.7x serving penalty" was
+   three effects added together — drift, flags, and path — and only the path
+   term survives at ~2x. Long-context numbers on this box must be compared
+   same-session, ideally interleaved, or they mislead by tens of percent.

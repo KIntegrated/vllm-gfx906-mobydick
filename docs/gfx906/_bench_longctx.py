@@ -38,12 +38,21 @@ TG = int(os.environ.get("BENCH_TG", "256"))
 SAMPLES = int(os.environ.get("BENCH_SAMPLES", "3"))
 UTIL = float(os.environ.get("BENCH_GPU_UTIL", "0.93"))
 MAXLEN = int(os.environ.get("BENCH_MAXLEN", str(PP + TG + 512)))
+MAXSEQS = int(os.environ.get("BENCH_MAX_SEQS", "1"))
+BATCHED = os.environ.get("BENCH_MAX_BATCHED_TOKENS")
+CGSIZES = os.environ.get("BENCH_CG_SIZES")
 MODEL = os.environ.get("BENCH_MODEL", "/data/models/qwen/Qwen3.5-27B-AWQ")
 TAG = os.environ.get("BENCH_TAG", "longctx")
 
 
 def extra_kwargs() -> dict:
     out = {}
+    if BATCHED:
+        out["max_num_batched_tokens"] = int(BATCHED)
+    if CGSIZES:
+        out["compilation_config"] = {
+            "cudagraph_capture_sizes": [int(x) for x in CGSIZES.split(",")]
+        }
     if os.environ.get("BENCH_ATTN_BACKEND"):
         out["attention_backend"] = os.environ["BENCH_ATTN_BACKEND"]
     elif os.environ.get("VLLM_ATTENTION_BACKEND"):
