@@ -305,3 +305,32 @@ What survives from this whole detour: the **client-side** decode measurements
 (gated during the decode window, mclk 1000) and the backend comparisons that used
 them — short context (upstream +0.8-2.6 %), 16k decode (CUSTOM +15 %), and the
 decode-window numbers in the int8/int4 capacity table.
+
+## The clock is not stuck — the 39.8 s was a one-time cold start
+
+Six consecutive identical 11,201-token prefills in one process (same flags):
+
+| sample | TTFT | prefill mclk | decode mclk |
+|---|---|---|---|
+| 0 (first request after engine load) | **39.83 s** | **350 MHz** | – |
+| 1 | **4.34 s** | 800 MHz | 1000 MHz |
+| 2-5 | 4.35 s | 800 MHz | 1000 MHz |
+
+So the governor is not stuck at 350 MHz; it ramps after the first request and
+then **holds 800 MHz through sustained prefill** (1000 during decode). The 39.8 s
+was the *cold-start* case only, and it is what every serving arm in this log
+measured: each serving run sent two short warm-up prompts (64 tokens), which are
+too brief to ramp mclk, so request #1 of the actual measurement ran cold. The
+in-process runs did a 20 s GEMM preload and therefore did not.
+
+That fully closes the retraction above: the "serving path 2.7x slower" finding was
+cold start, reproduced in-process (39.83 s) as soon as the preload was removed
+from the sampled window.
+
+**Two open questions once the perf level can be pinned** (`gfx906_perf.sh on`,
+needs root):
+1. does pinning remove the cold-start 39.8 s → 4.3 s transition entirely (i.e.
+   make request #1 as fast as request #2)? That is worth ~35 s of first-token
+   latency per engine start and per idle-to-active transition;
+2. does prefill run faster at a pinned 1000 MHz than at the self-selected 800
+   (a 25 % clock step; decode already reaches 1000 on its own)?
