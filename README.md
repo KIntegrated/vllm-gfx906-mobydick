@@ -155,9 +155,15 @@ carries ~2× the KV capacity at long context (PPL +0.05 %). CUSTOM remains the
 default for the gfx906-specific paths it owns (packed KV cell, MTP verify
 shapes, the MoE geometry); it is not the fastest option at plain B=1 decode on a
 dense model. The same comparison at **B=4** (61.77 vs 62.28 t/s, control 61.46)
-and on the **35B MoE** (89.60 vs 91.90 t/s) also favours upstream, so CUSTOM is
-not faster in any workload measured so far. Long-context and MTP-verify arms are
-still open. Details: `docs/gfx906/DEVLOG-kv-formats.md`.
+and on the **35B MoE** (89.60 vs 91.90 t/s) also favours upstream — at *short
+context*. **Long context is where CUSTOM wins, and by a lot**: same model,
+16384-token prompt, 256 output tokens, B=1, prefix caching off, decode window
+mclk-gated at 1000 MHz, three samples per arm with the first arm repeated last
+as an order control — **CUSTOM 18.70 t/s decode (control 18.72) and 14.52 s TTFT
+(control 14.50) vs upstream `TRITON_ATTN` + int8 KV 16.25 t/s and 19.91 s**:
+**+15 % decode and 37 % faster prefill**. The fork's KV-split, GQA head-packing
+and packed cell are long-context work, and they show up exactly there. Details:
+`docs/gfx906/DEVLOG-kv-formats.md`.
 See [`docs/gfx906/`](docs/gfx906/) for the full change inventory, numbers,
 and bench recipes.
 

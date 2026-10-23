@@ -114,3 +114,39 @@ Until those three are known, the defensible action is to stop *adding* to the
 custom FA and treat it as the rollback path, not to delete it: the cost of
 keeping it is maintenance, the cost of removing it early is losing the one
 configuration that may still win at long context.
+
+## Long context: CUSTOM wins, decisively
+
+Measured with the new `_bench_longctx.py` (TTFT from a 1-token request on the
+same prompt, decode rate from the TG-token request minus its TTFT, mclk sampled
+and reported for the *decode window* — a 16k prefill legitimately holds 800 MHz,
+so gating the whole window would have thrown away valid decode numbers).
+
+Dense 27B, 16384-token prompt, 256 output tokens, B=1, prefix caching off, 3
+samples, first arm repeated last:
+
+| arm | decode t/s | TTFT | prefill rate |
+|---|---|---|---|
+| **CUSTOM** (packed FP16 cell) | **18.70** (control **18.72**) | **14.52 s** (control 14.50) | ~1128 tok/s |
+| upstream `TRITON_ATTN` + int8 KV | 16.25 | 19.91 s | ~823 tok/s |
+
+**CUSTOM is +15.1 % on decode and 37 % faster on prefill at 16k**, and the order
+control reproduces it to 0.1 %. Combined with the short-context arms (upstream
++0.8-2.6 % at 256-token context), the picture is now coherent rather than
+contradictory:
+
+* **short context** — attention is a small share of the step and upstream's
+  Triton path is marginally ahead (0.8-2.6 %);
+* **long context** — attention dominates, and the fork's kernels (KV split, GQA
+  head-packing, packed cell) are 8.2 % faster per decode step and 37 % faster at
+  prefill.
+
+**So the custom FA is worth maintaining**, and the answer to "should it be the
+default" is context-dependent rather than global. The earlier "no uplift" verdict
+in this log was true and incomplete: it measured 256-token contexts only, which
+is where the fork's long-context machinery cannot pay. Retiring it on that basis
+would have been a mistake — worth remembering the next time a three-workload
+sweep looks decisive.
+
+Still unmeasured: MTP/DFlash verify shapes, and the Lightning (hybrid) /
+Muse-Glimmer recipes.
