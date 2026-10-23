@@ -144,6 +144,17 @@ MoE flagship at 66.1 t/s single-request (67.4 record) / 193 t/s concurrent
 reuse the prompt prefix); the harness default has been prefix caching OFF since
 2026-08-27 — same build, cold basis: MoE 58.4 / dense 16.3 t/s (2026-09-13,
 mclk-verified). See the note under the model table.
+
+**Not a speed claim against upstream's ROCm attention.** Measured 2026-10-23 on
+dense Qwen3.5-27B, decode-only workload (256 in / 256 out, B=1, eager off,
+prefix caching off, 27B at util 0.93), 5 samples per arm, mclk 1000 MHz on every
+sample, first arm repeated last as an order control: **CUSTOM 29.10 t/s** (order
+control 29.06) vs **upstream `TRITON_ATTN` + `int8_per_token_head` 29.48 t/s** —
+i.e. upstream's Triton path with an int8 KV cache is **1.3 % faster** here, and
+carries ~2× the KV capacity at long context (PPL +0.05 %). CUSTOM remains the
+default for the gfx906-specific paths it owns (packed KV cell, MTP verify
+shapes, the MoE geometry); it is not the fastest option at plain B=1 decode on a
+dense model. Details: `docs/gfx906/DEVLOG-kv-formats.md`.
 See [`docs/gfx906/`](docs/gfx906/) for the full change inventory, numbers,
 and bench recipes.
 
