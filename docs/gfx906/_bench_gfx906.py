@@ -184,7 +184,14 @@ def main():
         # Packed KV cell (K Q8_0 | V fp16): ~+22 % KV tokens at the same VRAM,
         # bit-identical output, 2.9-9.8 % faster decode kernel. On by default for
         # our runs; BENCH_FA_PACKED=auto/off reverts.
-        gfx906_fa_packed=os.environ.get("BENCH_FA_PACKED", "on"),
+        # attention_backend and attention_config.backend are mutually exclusive,
+        # and the fork's packed flag rides on attention_config -- so an explicit
+        # BENCH_ATTN_BACKEND (upstream-backend A/Bs) drops the fork flag.
+        **(
+            {}
+            if os.environ.get("BENCH_ATTN_BACKEND")
+            else {"gfx906_fa_packed": os.environ.get("BENCH_FA_PACKED", "on")}
+        ),
         # P32-2/#61: KV format / attention backend A/B (BENCH_KV_DTYPE,
         # BENCH_ATTN_BACKEND) -- the per-token-head formats only exist in
         # triton_attn, so the comparison must vary both.
@@ -284,6 +291,24 @@ def main():
     if WARMUP:
         llm.generate(prompts, gen_params(min(tg, 8)))
         print("BENCH warmup_pass done", flush=True)
+
+    # Clock ramp (dvfs-mi50.md): a decode window on this MI50 sits at 350 MHz
+    # unless the card is already loaded, and a cold-clock sample invalidates the
+    # number. BENCH_PRELOAD seconds of sustained fp16 GEMM lifts mclk before the
+    # timed loop; the per-sample warnings below then verify it stayed up.
+    preload = float(os.environ.get("BENCH_PRELOAD", "0"))
+    if preload > 0:
+        import torch as _t
+
+        _a = _t.randn(4096, 4096, dtype=_t.float16, device="cuda")
+        _deadline = time.time() + preload
+        while time.time() < _deadline:
+            _a = _a @ _a
+            _a = _a / _a.abs().max().clamp(min=1e-3)
+        _t.cuda.synchronize()
+        del _a
+        _t.cuda.empty_cache()
+        print(f"BENCH preload {preload:.0f}s done", flush=True)
 
     sampler = _MclkSampler().start()
     results = []

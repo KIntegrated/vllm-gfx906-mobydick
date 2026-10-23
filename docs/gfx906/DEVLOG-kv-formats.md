@@ -44,3 +44,34 @@ and context. Then:
 
 `ppl_probe.py` gained `BENCH_KV_DTYPE` and `BENCH_ATTN_BACKEND` to make these
 arms runnable; that is how the table above was produced.
+
+## Decode throughput: the missing arm, and it does not favour our FA
+
+Method: `_bench_gfx906.py` with a decode-shaped workload (256 in / 256 out, B=1,
+27B dense, `BENCH_PRELOAD=25` before the timed window), arms interleaved with the
+first arm repeated last, every sample mclk-gated.
+
+| arm | t/s (5 samples) | mean | mclk |
+|---|---|---|---|
+| our custom FA, packed fp16 cell | 29.079 / 29.101 / 29.122 / 29.110 / 29.093 | **29.10** | 1000 MHz, all |
+| `TRITON_ATTN` + `int8_per_token_head` | 29.473 / 29.496 / 29.491 / 29.471 / 29.465 | **29.48** | 1000 MHz, all |
+| our custom FA, repeated (order control) | 29.067 / 29.087 / 29.050 / 29.068 / 29.040 | **29.06** | 1000 MHz, all |
+
+**VERDICT: there is no decode-throughput uplift to claim.** Upstream's
+`TRITON_ATTN` with int8 KV is **+1.3 %** over our custom FA (29.48 vs 29.10), and
+the order control reproduces our arm to 0.1 % (29.10 vs 29.06), so the delta is
+outside the method's noise. Both formats were also quality-checked earlier in
+this log (int8: +0.05 % PPL, +70 % KV capacity at 32k).
+
+Two things this does *not* say. It is one workload — B=1 decode on a dense model
+with a 1k effective context. Our FA's documented advantages live elsewhere
+(packed-KV capacity at long context, MTP verify shapes, B>1, the 35B MoE
+geometry), and none of those were re-measured here. So the honest reading is
+"upstream's path is competitive enough that retiring ours needs a decision, not
+an assumption" — not "our FA is pointless".
+
+Method notes, since they cost two discarded runs: a 16k-prefill workload makes
+this metric measure prefill (1.97 t/s, 65 s per sample), and a prefill-heavy
+window holds mclk at 800 MHz, so the decode-shaped workload is what makes the
+1000 MHz gate pass at all. `attention_backend` (kwarg) conflicts with the fork's
+`attention_config.backend`; `VLLM_ATTENTION_BACKEND` is the form that works.
