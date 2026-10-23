@@ -334,3 +334,55 @@ needs root):
    latency per engine start and per idle-to-active transition;
 2. does prefill run faster at a pinned 1000 MHz than at the self-selected 800
    (a 25 % clock step; decode already reaches 1000 on its own)?
+
+## FINAL: the 39.9 s is a one-time first-call cost, not the clock (second retraction)
+
+Pinned the perf level (`gfx906_perf.sh on`, mclk verified **1000 MHz during the
+slow sample**, sclk 1800) and re-ran:
+
+| sample | TTFT | prefill mclk |
+|---|---|---|
+| 0 (first after load) | **39.90 s** | 1000 MHz |
+| 1-4 | 4.34-4.35 s | 1000 MHz |
+
+Pinning changed nothing. Then, with a **representative full-length warm-up**
+instead of a 64-token one:
+
+```
+warm-up (one 11k-token prefill): 39.86 s
+sample 0: 4.35 s  at mclk 350 MHz   <- idle clock, full speed anyway
+sample 1: 4.35 s  at mclk 800 MHz
+sample 2: 4.35 s  at mclk 800 MHz
+sample 3: 4.36 s  at mclk 800 MHz
+```
+
+So:
+
+* **prefill is insensitive to mclk at this shape** — 4.35 s at 350, 800 and 1000
+  MHz alike;
+* the 39.9 s is a **one-time first-call cost for that shape** (lazy JIT/compile
+  or first-touch allocation), which a full-length warm-up absorbs entirely;
+* my previous entry in this file ("9x TTFT swing from clock state alone") was a
+  **correlation, not a cause**: a cold process has both a low clock *and* the
+  first-call cost, and I changed the clock without controlling for the repeat.
+
+Corrections to the record, in order of the mistakes made:
+
+1. "serving path is 2.7x slower at prefill" — wrong (compared first-request
+   serving against warmed in-process, and different prompt sizes).
+2. "the difference is mclk state, 9x" — wrong (clock was a bystander).
+3. **correct**: first call for an 11k-token prefill costs ~35 s once per process;
+   every subsequent call is 4.35 s regardless of clock.
+
+Actionable outcomes, both real:
+
+* **measurement**: never compare a first request with later ones; warm up at the
+  length being measured (`_bench_longctx.py` now takes `BENCH_PROMPT_FILE` so
+  both paths run the byte-identical prompt);
+* **serving**: our current warm-up (two 64-token requests) leaves ~35 s on the
+  user's first long-context request. A single full-length warm-up at startup
+  would move that cost to boot, where it belongs. Worth doing in the recipes.
+
+`gfx906_perf.sh` stays as a tool (it works, sudoers-gated, and is the way to
+control the clock when a workload *is* bandwidth-bound) but it is not a fix for
+this.
