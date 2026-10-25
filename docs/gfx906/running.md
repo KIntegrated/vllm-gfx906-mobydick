@@ -186,6 +186,26 @@ aware if you see empty device/ROCm detection on 7.14.
 
 ---
 
+### Warm up at the served length (first long prefill is a first-call cost)
+
+The **first** prefill at a long length costs ~9x steady state, once per server
+process — measured 39.9 s then 4.35 s for an 11k-token prompt, unchanged at mclk
+350/800/1000 MHz, so it is a first-call cost and not a clock effect. A 64-token
+warm-up does not absorb it; a warm-up at the length you expect to serve does.
+
+After the server reports healthy, run:
+
+```bash
+.venv/bin/python docs/gfx906/_warmup_serve.py \
+    --model <served-name> --tokens 16384
+```
+
+It posts the prompt twice and prints both latencies; the first call pays the
+cost, the second shows what a real caller now sees. Exit status 1 means the
+second call was not materially faster (usually: the prompt did not reach the
+target length — the reported `prompt_tokens` is printed). Without it, the ~35 s
+lands on the first user request. See ROADMAP P32-10 / issue #70.
+
 ## 2. GPU memory pressure
 
 The MI60/MI50 has 32 GB. Current validated practice (2026-08):
