@@ -430,3 +430,40 @@ exist here (`card1`/`card2`, and the numbering moves between boots), so the gate
 was inert until changed to scan `card*/device/pp_dpm_mclk` and take the fastest of
 the two. The harness already records `mclk_prefill_mhz` / `mclk_decode_mhz` per
 sample, and that is what the table is gated on.
+
+### P32-10(b)(c) — batched tokens do not move sustained prefill; `max_model_len` costs ~linearly
+
+Interleaved sweep, dense 27B, PP 16,384 / TG 256, util 0.93, no spec decode,
+sustained samples only (sample 0 = the per-process first-call cost, reported
+separately), per-sample mclk from the harness.
+
+**(b) `--max-num-batched-tokens` is not a prefill lever here.** Sustained TTFT at
+a 16,384-token prompt is **3.78 s at 4096 and 3.78 s at 8192** (third arm
+pending). The earlier "+5.8 % from 4096 -> 16384" was **first-call variance, not
+a prefill-window effect**: the first-call column moves 35.41-36.42 s across all
+runs regardless of batched size, and the sustained column does not move at all.
+
+**(c) `max_model_len` costs decode roughly linearly**, at fixed real sequence
+length (16,384 prompt + 256 decode):
+
+| `max_model_len` | decode t/s | vs 17k |
+|---|---|---|
+| 17,408 | 28.03 / 28.11 / 28.02 | baseline |
+| 24,576 | 27.09 | -3.4 % |
+| 32,768 | 26.26 / 26.22 | -6.3 % |
+| 40,960 | 25.32 | -9.7 % |
+
+Succcessive deltas are -0.94, -0.83, -0.94 t/s for +7k/+8k/+8k tokens, i.e.
+~-0.118 t/s per 1024 of `max_model_len`, steady. A step would have implicated a
+geometry boundary (the packed-`auto` gate was excluded: packed was forced `on` in
+every cell); a clean ramp instead implicates a launch parameter derived from the
+*bound* rather than the actual length. Prime suspect: the paged launcher's
+`kv_split` / tile-clip choice, which is computed from `max_seq_kv`. Confirmation
+is one experiment: force a fixed `kv_split` at 40,960 and see whether the arm
+returns to 28 t/s. Until then this is a hypothesis, not a mechanism.
+
+Practical reading: the fork's serving default (`--max-model-len 256k` on the
+hybrid recipes) is not free — but note the ramp was measured in the *in-process*
+harness with packed KV forced on, and the earlier serving measurements at 32k
+did not show a comparable penalty, so it must be re-checked on the serving path
+before it constrains the documented recipes.
