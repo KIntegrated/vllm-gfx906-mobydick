@@ -386,3 +386,47 @@ Actionable outcomes, both real:
 `gfx906_perf.sh` stays as a tool (it works, sudoers-gated, and is the way to
 control the clock when a workload *is* bandwidth-bound) but it is not a fix for
 this.
+
+### P32-10(c) — the −30 % decode cost was cudagraph ladder padding, not `max_num_seqs`
+
+**VERDICT: `max_num_seqs` 1→4 costs nothing (28.03 → 28.01 t/s, −0.1 %). The
+−30 % pair above (14.04 → 9.88) is `max_model_len` 32k (−6.3 %) plus an explicit
+`[4,8,12,16]` ladder whose smallest captured graph is B=4 (−24.4 %), because a
+single request then decodes padded to four sequences. 6.3 + 24.4 ≈ 30 %.**
+
+Dense 27B, PP 16,384 / TG 256, util 0.93, no spec decode, 2 interleaved reps
+(A B C D E then E D C B A), each cell a fresh process, sample 0 discarded
+(first-call prefill), every measured sample at mclk 1000 (per-sample record, not
+a sysfs pre-read):
+
+| cell | max_model_len | max_num_seqs | resolved capture sizes | decode t/s (r1, r2) | median |
+|---|---|---|---|---|---|
+| A | 17,408 | 1 | [1, 2] | 28.06, 28.00 | **28.03** |
+| B | 32,768 | 1 | [1, 2] | 26.25, 26.26 | **26.26** |
+| C | 17,408 | 4 | [1, 2] | 28.03, 27.98 | **28.01** |
+| D | 32,768 | 4 | [1, 2] | 26.18, 26.25 | **26.22** |
+| E | 32,768 | 4 | [4, 8, 12, 16] | 19.79, 19.84 | **19.82** |
+
+TTFT was flat at 3.77–3.78 s in every cell; the one-time first-call prefill cost
+**36.0 s in all ten runs** (further support for P32-10: it is a per-process cost,
+not a function of these flags).
+
+Readings:
+
+- **max_num_seqs is free** (A vs C). The earlier "padding to max_num_seqs"
+  attribution is retracted.
+- **max_model_len 17k→32k costs 6.3 %** at fixed seqs (A vs B), independent of
+  the ladder: a block/layout effect at the longer bound, still open.
+- **The ladder is the mechanism** (D vs E, −24.4 %): [4,8,12,16] makes the
+  smallest replayable decode batch four sequences, so a single request pays for
+  three idle slots — larger than the effect it was meant to test.
+- **Production recipe is unaffected:** entries round up to multiples of k+1, so
+  under MTP k=3 the documented [4,8,12,16] means 1–4 *sequences* and pads
+  nothing. The 24 % is specific to a non-MTP harness whose ladder starts at 4,
+  which is exactly what the `_bench_longctx` arms do (speculative_config=None).
+
+Tooling note: the mclk gate written for this sweep read `card0`, which does not
+exist here (`card1`/`card2`, and the numbering moves between boots), so the gate
+was inert until changed to scan `card*/device/pp_dpm_mclk` and take the fastest of
+the two. The harness already records `mclk_prefill_mhz` / `mclk_decode_mhz` per
+sample, and that is what the table is gated on.
