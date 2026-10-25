@@ -8,6 +8,41 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-23 (0.32.1 released — Mamba checkpoint default OFF, +21 % KV capacity on hybrids)
+
+Snapshot: `RELEASE-0.32.1.md`. Patch release on the 0.32.0 base; the 0.32.0 image
+predates both the new default and its kill switch, so this capacity fix was
+unreachable there.
+
+- **Mamba prefill checkpoints default OFF** (`226eefdb9a`): Lightning-class
+  hybrids lose one state block per Mamba group per request to upstream's
+  unconditional checkpoint — four groups take the per-request divisor from 15 to
+  19 blocks (`-21.1 %` predicted, `-21.0 %` measured; 2,345,498 -> 2,970,965
+  tokens at 16k) while buying ~0.4 % of a follow-up TTFT on a model with no MTP
+  head. `VLLM_GFX906_MAMBA_PREFILL_CKPT=1` restores upstream.
+  Attributed by instrumentation, not inference (`VLLM_GFX906_KV_SIZING_DEBUG=1`),
+  after an earlier per-request estimate claimed only 1.7 % of the cost.
+- **FA launch-config records** (`22aa898cbb`, `3f1f4d0ee2`, `f39c6dd054`,
+  `6e581df3e4`, `d2881bc4a5`, `f10601687d`): one C++ definition per rule, pinned
+  by `nc2_effective` / `kv_split_default` probes over 96 shapes (two real mirror
+  bugs found: batch-aware paged-direct KV split, and the `8 -> 2 -> 1` nc2
+  downgrade plus the Sq>2 clamp), per-shape boot records, and explicit passing
+  from Python. Behaviour-neutral: dense-27B PPL 14.3750 (baseline, exact) after
+  every step, and the serving A/B eventually showed no end-to-end effect at
+  256-token contexts (tuned 19.973 vs rule 19.967 t/s) once records really hit.
+- **`VLLM_GFX906_KV_SIZING_DEBUG=1`** per-group KV-sizing log; `gfx906_perf.sh`
+  (sudoers-friendly DPM pin/release); `_bench_longctx.py`, `_probe_ttft.py`,
+  `_fa_tune*.py` harnesses.
+- **Measurement corrections** (documented, and in `/local/git/AGENTS.md`):
+  engine-log throughput is not a measurement instrument; a slow first prefill is
+  a one-time first-call cost (~39.9 s then 4.35 s at mclk 350/800/1000 alike) and
+  not a clock effect; serving warm-up must cover the served length.
+- **Backend comparison, measured** (P32-2/#61): upstream `TRITON_ATTN` with
+  `int8_per_token_head` is +0.8-2.6 % at short context, CUSTOM is +15 % decode /
+  +37 % prefill at 16k plain decode; int8 KV gives +70 % capacity at 32k for
+  +0.05 % PPL, int4 +182 % for +1.24 %. Recorded in `DEVLOG-kv-formats.md`; the
+  README now states the CUSTOM-vs-upstream basis instead of implying a speed win.
+
 ## 2026-10-22 (P32-3/#62 closed — Mamba prefill checkpoints now default OFF)
 
 Upstream enables a Mamba2 prefill checkpoint unconditionally; on this box that
