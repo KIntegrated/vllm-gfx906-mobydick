@@ -94,8 +94,24 @@ def main() -> None:
             "The quick brown fox jumps over the lazy dog while the engineer "
             "measures. "
         )
-        text = para * (int(PP * 3.2) // len(para) + 1)
-        prompt = tok.encode(text)[:PP]
+        # Fill until the TOKEN count reaches PP. The previous version sized the
+        # text in characters and truncated, which silently produced 10,067
+        # tokens for BENCH_PP=16384 and made every tok/s figure derived from PP
+        # wrong by 63% (it manufactured a "470 tok/s" prefill that did not exist).
+        text = para * (int(PP / 2) + 1)
+        prompt = tok.encode(text)
+        extra = para * 256
+        while len(prompt) < PP:
+            text += extra
+            prompt = tok.encode(text)
+        prompt = prompt[:PP]
+    if abs(len(prompt) - PP) > 0.02 * PP:
+        print(
+            f"WARNING: prompt is {len(prompt)} tokens, not BENCH_PP={PP}; "
+            "every rate in this run is per-token, so the reported throughput "
+            "matches this actual length",
+            flush=True,
+        )
     print(f"prompt_tokens={len(prompt)} tg={TG} samples={SAMPLES} tag={TAG}",
           flush=True)
 
@@ -139,6 +155,7 @@ def main() -> None:
         row = {
             "sample": s,
             "ttft_s": round(ttft, 3),
+            "prefill_tps": round(len(prompt) / max(1e-9, ttft), 1),
             "total_s": round(total, 3),
             "out_tokens": n_out,
             "decode_tps": round(rate, 3),
@@ -155,7 +172,8 @@ def main() -> None:
     ttfts = [r["ttft_s"] for r in rows]
     clocks = [r["mclk_decode_mhz"] for r in rows if r["mclk_decode_mhz"]]
     print(
-        f"BENCHLONG: {{\"tag\": \"{TAG}\", \"pp\": {PP}, \"tg\": {TG}, "
+        f"BENCHLONG: {{\"tag\": \"{TAG}\", \"pp\": {PP}, "
+        f"\"pp_actual\": {len(prompt)}, \"tg\": {TG}, "
         f"\"decode_tps_mean\": {statistics.mean(rates):.3f}, "
         f"\"ttft_s_mean\": {statistics.mean(ttfts):.3f}, "
         f"\"mclk_decode\": {clocks}, \"rows\": {json.dumps(rows)}}}",

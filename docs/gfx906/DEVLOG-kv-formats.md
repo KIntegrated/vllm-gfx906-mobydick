@@ -541,3 +541,55 @@ Tooling consequences: `_bench_longctx.py` now defaults `BENCH_PREFIX_CACHE=0`
 (opt in with `=1`), the AGENTS.md "first-call cost" rule is retracted in place,
 and the lesson generalises — **a repeat of the same prompt is a cache hit, never
 a steady-state measurement.**
+
+Confirmation of the cache-hit reading: the same harness with the same prompt and
+prefix caching back **on** gives `35.44 s, 3.78 s, 3.77 s` -- the exact 9x
+"first-call" pattern, now with the mechanism named. Nothing in the engine changes
+between samples 1 and 3; the second and third simply reuse the first's KV.
+
+### P32-10 — FINAL: ~278 tok/s prefill, everywhere; my harness was lying about length
+
+**VERDICT: there is no first-call cost, no serving overhead and no clock effect.
+Dense-27B AWQ prefill on one MI50 runs at ~278 tok/s in every path measured. The
+one real defect was in the measurement harness: it sized its synthetic prompt in
+characters and truncated, so `BENCH_PP=16384` produced a 10,067-token prompt, and
+dividing elapsed time by the *configured* 16384 invented a 470 tok/s regime.**
+
+| measurement | actual tokens | time | tok/s |
+|---|---|---|---|
+| in-process, synthetic prompt (`pc_off`) | **10,067** | 34.9 s | 288 |
+| in-process, `BENCH_PROMPT_FILE` | 16,852 | 61.4 s | 275 |
+| in-process, sclk pinned `high` (mclk 1000) | 16,852 | 61.2 s | 275 |
+| in-process, `auto` DVFS | 16,852 | 61.5 s | 274 |
+| serving HTTP, default | 13,386 | 53.5 s | 250 |
+| serving HTTP, batched tokens 16384 | 13,386 | 48.0 s | 279 |
+| serving HTTP, `VLLM_ENABLE_V1_MULTIPROCESSING=0` | 13,386 | 61.5 s* | 274 |
+| serving HTTP, `--gfx906-fa-packed on` | 16,852 | 61.5 s | 274 |
+| **after the fix**, in-process, `pp_actual` verified | **16,384** | 59.0 s | **277.7** |
+
+\* same window as the 61.4 s in-process run, i.e. the two paths agree exactly
+when measured side by side; the 48-53 s serving numbers came from an earlier
+window and differ by prompt length, not by path.
+
+Order of discovery matters, because each step looked conclusive:
+
+1. **"First prefill costs 39.9 s once per process"** — repeats were prefix-cache
+   hits. With `enable_prefix_caching=False`, three identical prefills took
+   34.94 / 34.84 / 34.86 s. (The harness now defaults `BENCH_PREFIX_CACHE=0`.)
+2. **"Serving is 10-17x slower than in-process"** — the in-process number was
+   470 tok/s, computed as `16384 / 34.9 s` from a prompt that was really 10,067
+   tokens. Real ratio: 1.0, not 17.
+3. **"It's DVFS"** — sclk does oscillate 925-1800 MHz, but pinning it
+   (`gfx906-perf on`, mclk 1000 verified) changed nothing: 61.25 s pinned vs
+   61.56 s auto. Prefill at this shape is not clock-limited either.
+
+The fix, in `_bench_longctx.py`: fill the synthetic prompt until the **token**
+count reaches `BENCH_PP` (encode-and-top-up loop instead of a character
+estimate), emit `pp_actual` in the result row, print a loud warning when a
+`BENCH_PROMPT_FILE` disagrees with `BENCH_PP` by >2 %, and add a per-sample
+`prefill_tps` computed from the actual length so no downstream reader has to
+divide by a configured number. Verified: `pp_actual: 16384`, `prefill_tps 277.7`.
+
+Consequence for every earlier number in this document that divides by a
+configured length: **none of the prefill tok/s figures survive**; the decode
+tok/s figures were always computed from emitted tokens and are unaffected.
