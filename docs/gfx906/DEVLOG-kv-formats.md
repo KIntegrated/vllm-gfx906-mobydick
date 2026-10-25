@@ -593,3 +593,40 @@ divide by a configured number. Verified: `pp_actual: 16384`, `prefill_tps 277.7`
 Consequence for every earlier number in this document that divides by a
 configured length: **none of the prefill tok/s figures survive**; the decode
 tok/s figures were always computed from emitted tokens and are unaffected.
+
+### P32-8/#66 — post-merge pins settled, `max_tokens` audit clean with guards added
+
+**VERDICT (pins): transformers 5.18.0 is the right pin and is now shipped in the
+0.32.1 image; torch 2.15 is simply not available for gfx906 and two upstream
+items are therefore out of reach on this build.**
+
+| component | upstream 0.32 requires | this box |
+|---|---|---|
+| transformers | `>= 5.16.1, < 5.20.0` | **5.18.0** (the 0.32.0 pin of 5.15.0 was *below the minimum* — every 0.32 gate had run unsupported) |
+| torch | `2.15.0.dev` (CUDA) | **2.13.0+gfx906.20260802001858** |
+
+Recording the consequences rather than working around them: upstream's "fusion
+passes restored under PyTorch 2.15" and "static FP8 quant fusion on recent torch"
+do not reach this build, and the Qwen4Exp config classes that 5.15.0 lacked
+(which broke the QSA import during the merge) are present now. PPL bands are
+unchanged after the bump on all three models, and `tests/quantization/
+test_moe_wna16.py` is 50 passed / 9 skipped.
+
+**VERDICT (`max_tokens`): no reservation assumptions anywhere; both harnesses
+already divide by emitted tokens.** #57035 makes `max_tokens` an upper bound, so
+a request can return fewer tokens and move the t/s denominator. Audit result:
+
+- `_bench_gfx906.py` sends `ignore_eos=True` on both `SamplingParams` paths, so
+  generation runs to exactly the bound, and the denominator is
+  `sum(len(o.outputs[0].token_ids))` — the real count.
+- `_bench_chat_serve.py` sends `"ignore_eos": True` and divides by
+  `usage.completion_tokens` (falling back to a chunk count).
+
+Two guards added so the invariant is enforced rather than incidental: both now
+emit `max_tokens_cfg` alongside the actual count, and the HTTP client warns when
+the server returns <95 % of the requested tokens (a compat layer that drops
+`ignore_eos`, or one that ignores it, would otherwise look like a throughput
+regression) and when no `usage` block arrives (chunk counting undercounts
+multi-token chunks). Verified with a smoke run at TG=64 on both paths:
+`out_tokens 64 / max_tokens_cfg 64` and `n_tokens 64 / max_tokens_cfg 64`, no
+warnings.

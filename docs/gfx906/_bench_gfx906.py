@@ -344,6 +344,7 @@ def main():
                 "sample": s,
                 "nreqs": nreqs,
                 "out_tokens": n_out,
+                "max_tokens_cfg": tg,
                 "elapsed_s": round(elapsed, 3),
                 "tokens_per_s": round(n_out / elapsed, 3) if elapsed else 0.0,
                 "mclk_median_mhz": mclk,

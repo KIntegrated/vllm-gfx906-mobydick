@@ -8,6 +8,23 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-25 (P32-8/#66 closed — pins settled, max_tokens audit clean)
+
+- **Pins recorded, not worked around**: transformers **5.18.0** (upstream 0.32
+  requires `>= 5.16.1, < 5.20.0`, so the original 5.15.0 pin was below the
+  minimum and every 0.32 gate had run unsupported); torch stays
+  **2.13.0+gfx906** because 2.15.dev is not available for this GPU, which puts
+  upstream's torch-2.15 fusion restorations and static FP8 fusion out of reach
+  here — stated, not faked. PPL bands unchanged; `test_moe_wna16.py` 50 passed /
+  9 skipped.
+- **`max_tokens`-as-upper-bound (#57035) audit**: neither harness had a
+  reservation assumption. `_bench_gfx906.py` sets `ignore_eos=True` and divides
+  by emitted token ids; `_bench_chat_serve.py` sets `ignore_eos` and divides by
+  `usage.completion_tokens`. Both now also emit `max_tokens_cfg`, and the HTTP
+  client warns on <95 % of the requested count or a missing `usage` block, so a
+  compat layer that drops `ignore_eos` cannot masquerade as a throughput
+  regression. Smoke-verified on both paths at TG=64.
+
 ## 2026-10-25 (P32-10/#70 closed — the "first-call prefill" was prefix caching)
 
 - **Retraction.** The 39.9 s -> 4.35 s pattern was the harness reading its own KV

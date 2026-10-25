@@ -88,6 +88,21 @@ def one_request(url: str, model: str, prompt: str, max_tokens: int,
         raise RuntimeError("no content received")
     out = "".join(text)
     ntok = (usage or {}).get("completion_tokens") or n_chunks
+    if not (usage or {}).get("completion_tokens"):
+        print(
+            "WARNING: server sent no usage block; token count is a chunk count, "
+            "which undercounts when chunks carry more than one token",
+            flush=True,
+        )
+    if ntok < 0.95 * max_tokens:
+        # max_tokens is an UPPER BOUND upstream since #57035: a server that
+        # ignores ignore_eos (or a non-vLLM compat layer that drops the field)
+        # returns fewer tokens, and the t/s denominator shrinks with it.
+        print(
+            f"WARNING: {ntok} tokens returned for max_tokens={max_tokens}; "
+            "rates below are per *emitted* token, not per requested",
+            flush=True,
+        )
     ttft = first - t0
     decode_s = max(t_last - first, 1e-6)
     return {
@@ -95,6 +110,7 @@ def one_request(url: str, model: str, prompt: str, max_tokens: int,
         "decode_tps": round(max(ntok - 1, 0) / decode_s, 2),
         "total_tps": round(ntok / (t_last - t0), 2),
         "n_tokens": ntok,
+        "max_tokens_cfg": max_tokens,
         "out_sha1": hashlib.sha1(out.encode()).hexdigest()[:12],
         "text_head": out[:70].replace("\n", " "),
     }
