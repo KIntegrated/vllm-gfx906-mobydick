@@ -16,7 +16,7 @@ per dvfs-mi50.md).
 
 Env: BENCH_ATTN_BACKEND / BENCH_KV_DTYPE (via VLLM_ATTENTION_BACKEND too),
 BENCH_PP, BENCH_TG, BENCH_SAMPLES, BENCH_GPU_UTIL, BENCH_MAXLEN, BENCH_MODEL,
-BENCH_FA_PACKED, BENCH_PRELOAD.
+BENCH_FA_PACKED, BENCH_PRELOAD, BENCH_PREFIX_CACHE.
 """
 
 from __future__ import annotations
@@ -72,6 +72,9 @@ def main() -> None:
         max_num_seqs=1,
         dtype=os.environ.get("BENCH_DTYPE", "float16"),
         enforce_eager=os.environ.get("BENCH_EAGER", "0") == "1",
+        # Prefix caching makes a repeat of the same prompt a cache hit, which
+        # reads as a ~10x faster "prefill". Off when measuring prefill itself.
+        enable_prefix_caching=os.environ.get("BENCH_PREFIX_CACHE", "0") == "1",
         **extra_kwargs(),
     )
     tok = llm.get_tokenizer()

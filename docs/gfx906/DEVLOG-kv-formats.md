@@ -499,3 +499,45 @@ Consequences:
 - The tool itself now reports the token count it actually reached (its first
   version under-built the prompt at 12,754 of 16,384 tokens; the guard caught it
   and exited 1 rather than reporting a fake result).
+
+### P32-10 — CLOSED: the "first-call prefill" was prefix caching; prefill is compute-bound
+
+**VERDICT: there is no first-call prefill premium and no 10-17x serving gap. The
+in-process harness ran with `enable_prefix_caching=True`, so every "repeat" of a
+prompt was a KV cache hit. With caching off, three identical 16,384-token
+prefills took 34.94 / 34.84 / 34.86 s — flat (470 tok/s), at mclk 350 and 800 MHz
+alike. Serving the same prompt length runs ~1.7x slower; that is the whole gap.**
+
+| measurement | time | tok/s |
+|---|---|---|
+| in-process, 16,384 tok, prefix cache **off** (x3) | 34.94 / 34.84 / 34.86 s | **470** |
+| in-process, same, prefix cache **on** | 36.0 s then 3.78 s | (hit) |
+| serving, 13,386 tok, `max-num-batched-tokens` default | 53.50 / 53.45 s | 250 |
+| serving, same, `--max-num-batched-tokens 16384` | **47.99 / 47.94 s** | **279** |
+| serving, same, `--max-num-batched-tokens 4096` | 48.84 / 48.83 s | 274 |
+
+Every serving arm shows the two identical requests within 0.1 s of each other:
+nothing is paid once, and `--no-enable-prefix-caching` was set on the server, so
+the comparison is honest on both sides.
+
+Readings:
+
+- **Prefill is at the hardware limit**, not mis-scheduled: 8.8e14 FLOPs for a
+  16,384-token prefill of a 27B model in 34.9 s is ~25 TFLOPS-equivalent, which
+  is the MI50 fp16 ceiling rather than a code smell. It is also **clock-
+  insensitive at 350 vs 800 MHz**, which is why pinning never helped.
+- **Serving overhead is ~1.7x**, not 10-17x: 279 vs 470 tok/s. Real, worth
+  chasing, but a different order of problem than the retracted claim.
+- **`--max-num-batched-tokens 16384` is 10 % faster on the serving path**
+  (48.0 vs 53.5 s at the default), so the documented value survives on a
+  measurement that is not cache-polluted — for the opposite reason to the one
+  originally recorded ("+12 % prefill" was noise).
+- The **(b) table earlier in this document has a void TTFT column**: its 3.78 s
+  entries were cache hits at every batched size, which is exactly why they looked
+  identical. Its decode column (28.11/28.02/27.89) stands, since decode is real
+  work either way.
+
+Tooling consequences: `_bench_longctx.py` now defaults `BENCH_PREFIX_CACHE=0`
+(opt in with `=1`), the AGENTS.md "first-call cost" rule is retracted in place,
+and the lesson generalises — **a repeat of the same prompt is a cache hit, never
+a steady-state measurement.**
