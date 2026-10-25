@@ -8,6 +8,27 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-25 (P32-10/#70 closed — the "first-call prefill" was prefix caching)
+
+- **Retraction.** The 39.9 s -> 4.35 s pattern was the harness reading its own KV
+  cache, not a one-time engine cost. With `enable_prefix_caching=False`, three
+  identical 16,384-token prefills took **34.94 / 34.84 / 34.86 s** (470 tok/s),
+  flat and clock-insensitive at mclk 350 vs 800 MHz. `_bench_longctx.py` now
+  defaults `BENCH_PREFIX_CACHE=0`; the AGENTS.md "first-call cost" rule is
+  replaced by "a repeat of the same prompt is a cache hit".
+- **The serving gap is 1.7x, not 10-17x**: 279 tok/s at
+  `--max-num-batched-tokens 16384` (48.0 s for 13,386 tokens) vs 470 in-process,
+  with two identical requests 0.05 s apart on every arm. The 16384 default
+  survives on this measurement (10 % faster than default, 4096 is 48.8 s), for
+  the opposite reason to the "+12 % prefill" it was adopted on.
+- **Also closed in this issue's train**: `max_num_seqs` 1->4 costs nothing;
+  `max_model_len` costs ~linearly (~-0.118 t/s per 1024, 17k 28.03 -> 41k 25.32)
+  with a `kv_split`-from-`max_seq_kv` hypothesis named; the batched-tokens
+  "no effect" table's TTFT column was void (cache hits) while its decode column
+  stands.
+- Tooling: `_warmup_serve.py` (serving-regime diagnostic, reports the length it
+  actually reached), `docs/gfx906/gfx906_perf.sh` (DPM pin/release).
+
 ## 2026-10-23 (0.32.1 released — Mamba checkpoint default OFF, +21 % KV capacity on hybrids)
 
 Snapshot: `RELEASE-0.32.1.md`. Patch release on the 0.32.0 base; the 0.32.0 image
