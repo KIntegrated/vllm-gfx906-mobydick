@@ -25,6 +25,7 @@ import argparse
 import json
 import time
 import urllib.request
+from pathlib import Path
 
 WORDS = (
     "the quick brown fox jumps over a lazy dog while seventeen engineers argue "
@@ -55,12 +56,17 @@ def main() -> int:
     ap.add_argument("--model", required=True, help="served model name")
     ap.add_argument("--tokens", type=int, default=16384, help="prompt length")
     ap.add_argument("--timeout", type=float, default=600.0)
+    ap.add_argument("--prompt-file", help="use this exact prompt text")
     args = ap.parse_args()
 
     url = args.base_url.rstrip("/") + "/v1/completions"
     payload = {
         "model": args.model,
-        "prompt": build_prompt(args.tokens),
+        "prompt": (
+            Path(args.prompt_file).read_text()
+            if args.prompt_file
+            else build_prompt(args.tokens)
+        ),
         "max_tokens": 1,
         "temperature": 0.0,
     }
