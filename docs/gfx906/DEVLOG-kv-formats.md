@@ -630,3 +630,25 @@ regression) and when no `usage` block arrives (chunk counting undercounts
 multi-token chunks). Verified with a smoke run at TG=64 on both paths:
 `out_tokens 64 / max_tokens_cfg 64` and `n_tokens 64 / max_tokens_cfg 64`, no
 warnings.
+
+### P32-5/#64 — DECISION: no INT4 port; the cheap lever is V-side int8 in the packed cell
+
+| configuration | PPL | capacity | vs custom packed |
+|---|---|---|---|
+| CUSTOM FA, packed fp16 | 14.3750 | 132,796 | - |
+| TRITON fp16 | 14.3930 | 105,130 | -21 % |
+| TRITON + int8 per-token-head | 14.4008 (+0.05 %) | 179,053 | +35 % |
+| TRITON + int4 per-token-head | 14.5714 (+1.24 %) | 296,839 | +124 % |
+
+int8 buys +35 % over the packed cell for +0.05 % PPL; int4 buys +124 % for
++1.24 % — 25x the quality cost for 3.5x the capacity, on a model whose PPL band
+is 0.001 wide. int4 also *already ships* here via `TRITON_ATTN`, so nobody is
+blocked on it; what a port would add is int4 capacity *and* the custom FA's
+long-context advantage, at the price of a new 4-bit dequant path in the
+hand-written kernel.
+
+The packed cell is already 784 B = **K q8 row 272 B + V fp16 512 B**, so the
+capacity still on the table is the V side: int8 there takes the cell to ~528 B
+(**+48 %**) and needs no new kernel architecture. That is the follow-up; INT4 is
+parked. Reopen only for a >300k-token single-card workload where int8-V is not
+enough.
