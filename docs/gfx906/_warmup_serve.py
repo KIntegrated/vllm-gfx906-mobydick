@@ -8,8 +8,11 @@ per server process (~39.9 s vs 4.35 s for an 11k-token prompt, measured at mclk
 350, 800 and 1000 MHz alike, so it is a first-call cost and not a clock effect).
 A 64-token warm-up does not absorb it; a warm-up at the served length does.
 
-This posts one prompt at the length you expect to serve, twice: the first call
-pays the cost, the second shows what a caller will now see.
+This is a DIAGNOSTIC as much as a warm-up. On the serving path measured
+2026-10-25 it buys nothing: two identical 12.7k-token requests took 51.06 s and
+50.95 s -- there is no first-call premium over HTTP at all, so the ~36 s -> 4 s
+first-call effect is an in-process phenomenon. Run it to find out which regime
+your build is in; do not expect it to move latency on its own.
 
     python docs/gfx906/_warmup_serve.py --model Qwen3.8-27B --tokens 16384
 
@@ -30,8 +33,8 @@ WORDS = (
 
 
 def build_prompt(target_tokens: int) -> str:
-    """Word salad long enough for the target; ~1.35 tokens per word on Qwen."""
-    words = int(target_tokens / 1.35) + 64
+    """Word salad long enough for the target; measured ~1.05 tokens/word."""
+    words = int(target_tokens * 0.98) + 64
     return " ".join(WORDS[i % len(WORDS)] for i in range(words))
 
 

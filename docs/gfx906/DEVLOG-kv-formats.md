@@ -467,3 +467,35 @@ hybrid recipes) is not free — but note the ramp was measured in the *in-proces
 harness with packed KV forced on, and the earlier serving measurements at 32k
 did not show a comparable penalty, so it must be re-checked on the serving path
 before it constrains the documented recipes.
+
+### P32-10(a) — RETRACTED: the serving path has no first-call premium
+
+**VERDICT: the warm-up remedy does not apply to serving. Two identical
+12,754-token requests over HTTP took 51.06 s and 50.95 s — no first-call effect
+at all — so the 39.9 s -> 4.35 s pattern is an in-process phenomenon.**
+
+Server: dense 27B AWQ, `--max-num-seqs 1 --max-model-len 17408
+--gpu-memory-utilization 0.93 --no-enable-prefix-caching`, no spec decode, single
+tenant. Client: `_warmup_serve.py`, wall clock around the request, the reported
+`prompt_tokens` confirming both calls carried the same 12,754-token prompt.
+
+The finding this leaves behind is larger than the one it removes: serving prefill
+runs at **~250 tok/s** for that prompt while the **same length takes 3.78 s
+(4,330 tok/s) in-process** (P32-10(c) table). The serving path is 10-17x slower
+than the engine on identical work, and it is the number a user feels. Earlier
+notes already show the same regime (client TTFT scaling at ~415 tok/s against a
+4k/8k/16k sweep), so this is not a one-off configuration.
+
+Consequences:
+
+- The `_warmup_serve.py` recipe is demoted to a **diagnostic** that distinguishes
+  the two regimes in one run (second call much faster = first-call regime;
+  equal = uniformly slow serving path).
+- The open question for #70 is now sharply defined: **why is HTTP-served prefill
+  10-17x slower than in-process prefill for the same length, with one request,
+  one tenant, no prefix cache?** Candidates: chunked-prefill scheduling with
+  `max_num_seqs=1`, per-chunk graph replay/dispatch overhead, or the engine
+  waiting on something between chunks.
+- The tool itself now reports the token count it actually reached (its first
+  version under-built the prompt at 12,754 of 16,384 tokens; the guard caught it
+  and exited 1 rather than reporting a fake result).
