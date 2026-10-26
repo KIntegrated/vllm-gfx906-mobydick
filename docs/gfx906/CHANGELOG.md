@@ -24,6 +24,14 @@ index, and closing an item means recording it here and deleting its roadmap line
 - **Blocker**: the checkpoint is not local (refs stub only).
   `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE` is **120.1 GiB** public (the issue
   assumed ~66 GiB); 374 GiB free on `/data`.
+- **Mechanism checked, and it is not CPU compute**: the UVA arm runs GPU kernels
+  reading expert weights out of pinned host memory (the copy wrapper is only
+  installed in the non-UVA branch), and the prefetch arm streams on a copy stream
+  with per-layer events but falls back to `wait_stream` (drain-all) in eager mode.
+  Fraction scaling: 6.25 % offloaded -> 3.60 t/s, 25 % -> 0.74 t/s, i.e.
+  volume-proportional with a large per-layer synchronisation term. vLLM has *no*
+  CPU expert path — that is what the port would add, and it is exactly what these
+  two failure modes argue for.
 - Recon + numbers: new `docs/gfx906/DEVLOG-qwen4exp-offload.md`.
 
 ## 2026-10-26 (DFlash2 x INT8 = 3.14x interleaved; IFT reference gate closes #24)
