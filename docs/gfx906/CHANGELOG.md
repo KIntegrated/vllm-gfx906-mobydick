@@ -8,6 +8,24 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-26 (FA-COVER-2/#16 closed — head-size class already closed by padding)
+
+- **Re-ran `tools/fa_coverage.py` on the 0.32.1 tree**: **0 of 138** real checkpoint
+  configs fall back (was 13 at enumeration). The `head_size not supported` class is
+  down to **288 and 512 only** — dims above the largest instantiated kernel dim,
+  which padding cannot reach (`_pad_head_dim` rounds up, 256 is the ceiling; D=512
+  kernels do not fit the 64 KiB LDS budget at D=256 occupancy). No code change was
+  needed: the entry's own item 2 had landed as the Phi-3 floor gate
+  (`_padded_head_size`, default ON) plus FA-D96, so every dim ≤ 256 pads onto an
+  instantiated kernel.
+- **Sinks** (96 rows) parked in `REFRIGERATOR.md` with the denominator-term design
+  and a model trigger; **encoder** (48) and **bf16 / 288 ViT** are out of the
+  serving envelope.
+- **New issue #71**: `get_vit_attn_backend` takes no sliding/causality argument, so
+  a windowed ViT (Qwen2.5-VL) selects CUSTOM with no way to express its window —
+  a possible correctness gap, needing a model-level check rather than a selector
+  change.
+
 ## 2026-10-26 (PR #41 closed; LLMM1 truncation guard landed; U30-2 parked)
 
 - **PR #41 closed** after the full triage: four hunks landed (capture guard,
