@@ -186,6 +186,20 @@ aware if you see empty device/ROCm detection on 7.14.
 
 ---
 
+### Vision tower and text attention are chosen independently
+
+`--mm-encoder-attn-backend` affects only the vision tower; `--attention-backend` /
+`VLLM_ATTENTION_BACKEND` affects only the decoder. To take fp16-exact ViT attention
+while keeping the fork's custom FA (and its packed KV) for the LLM:
+
+```bash
+vllm serve <vlm> --mm-encoder-attn-backend FLASH_ATTN
+```
+
+The custom ViT path quantises K to q8_0 (~0.9-2.6e-2 absolute error vs an fp32
+reference, 20-25x the fp16 backends), which is the trade being opted out of here;
+see FA-VIT-ACC (#72) and `DEVLOG-vit-window.md`.
+
 ### Warm-up: it is a diagnostic, and it did NOT fix serving prefill
 
 The in-process harness shows a first-call premium — 39.9 s the first time, 4.35 s

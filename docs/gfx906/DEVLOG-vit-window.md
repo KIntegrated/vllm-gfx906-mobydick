@@ -102,3 +102,24 @@ platform-aware. `tests/kernels/attention/test_mha_attn.py` went from **20 errors
 Not established: whether ~2.6e-2 absolute ViT error is acceptable for towers we
 have not served. The bound is measured and the opt-out is named; a per-model gate
 would need that model in the zoo.
+
+## Can a user mix them? Yes — verified
+
+`--mm-encoder-attn-backend` and `--attention-backend` are read by different
+selectors (`get_vit_attn_backend` vs the decoder selector), so the split is legal:
+
+```
+mm_override=None           -> mm_encoder_attn_backend=None                  ViT=CUSTOM      text_backend=None (default)
+mm_override='FLASH_ATTN'   -> mm_encoder_attn_backend=FLASH_ATTN            ViT=FLASH_ATTN  text_backend=None (default)
+```
+
+and a real boot of Qwen3.5-4B with `--mm-encoder-attn-backend FLASH_ATTN`
+(`--enforce-eager`, 2026-10-26) logged
+`GFX906_FA_PACKED=1: packed KV layout (K q8 | V fp16)` — that line comes from the
+text FA backend, so the decoder stayed on CUSTOM with the packed cell while the
+tower was on fp16 flash-attn.
+
+Documented in the README decision table (with the copy-paste command) and in
+`running.md`. The reverse direction is likewise supported: pinning the decoder to
+`TRITON_ATTN` + an int8 KV format leaves the ViT on CUSTOM unless the mm flag says
+otherwise.

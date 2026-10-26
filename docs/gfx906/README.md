@@ -21,6 +21,24 @@ chooses the other's cost.
 | **Very short contexts only** (≤512 tok), throughput over latency budget | `TRITON_ATTN` | fp16 | upstream is **0.8–2.6 %** faster there; the custom FA's advantage is long-context, not short |
 | **Vision towers** (`--mm-encoder-attn-backend`) | `CUSTOM` (default) | n/a | the ViT path **quantises K to q8_0**, so kernel error is ~0.9–2.6e-2 absolute against an fp32 reference — **20–25x** the fp16 backends (0.0004–0.0011). Fast and validated end-to-end on the served VLMs; choose `FLASH_ATTN` when a tower needs fp16-exact attention |
 
+**The ViT backend and the text backend are independent knobs.** `--attention-backend`
+(and `VLLM_ATTENTION_BACKEND`) choose the *decoder* attention; `--mm-encoder-attn-backend`
+chooses the *vision tower*. So the mixed configuration is supported and verified:
+
+```bash
+# fp16-exact vision tower + the fork's custom FA for the LLM itself
+vllm serve <vlm> --mm-encoder-attn-backend FLASH_ATTN
+```
+
+Verified 2026-10-26 on Qwen3.5-4B: the engine config carries
+`multimodal_config.mm_encoder_attn_backend=FLASH_ATTN` while
+`attention_config.backend` stays unset, `MMEncoderAttention` resolves to
+`FLASH_ATTN`, and a real boot with that flag still logs
+`GFX906_FA_PACKED=1: packed KV layout (K q8 | V fp16)` — i.e. the text attention is
+CUSTOM with the packed cell, exactly as without the flag. The reverse also works:
+`--attention-backend TRITON_ATTN --kv-cache-dtype int8_per_token_head` leaves the
+ViT on CUSTOM unless the mm flag says otherwise.
+
 Switch with:
 
 ```bash

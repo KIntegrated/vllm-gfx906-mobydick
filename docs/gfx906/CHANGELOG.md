@@ -8,6 +8,19 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-26 (ViT and text attention backends are independent — verified and documented)
+
+- **Mixed configuration is supported**: `--mm-encoder-attn-backend FLASH_ATTN`
+  changes only the vision tower, while the decoder keeps CUSTOM + packed KV.
+  Verified two ways: the engine config carries
+  `mm_encoder_attn_backend=FLASH_ATTN` with `attention_config.backend` unset and
+  `MMEncoderAttention` resolving to FLASH_ATTN; and a real Qwen3.5-4B boot with
+  that flag still logs `GFX906_FA_PACKED=1: packed KV layout (K q8 | V fp16)`,
+  which is the text FA backend talking.
+- Documented in `README.md` (decision table + command), `running.md` (operating
+  note) and `DEVLOG-vit-window.md` (evidence). The reverse also works: pinning the
+  decoder to `TRITON_ATTN` + int8 KV leaves the ViT on CUSTOM.
+
 ## 2026-10-26 (FA-VIT-ACC/#72 closed — ViT accuracy is q8-K by design, now documented and tested)
 
 - **Like-for-like fp16 A/B, fresh process per backend** (the selector caches per
