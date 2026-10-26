@@ -20,6 +20,19 @@ Usage:
     BENCH_MODEL=<ckpt> HIP_VISIBLE_DEVICES=0 .venv/bin/python \
         benchmarks/kernels/gfx906/ift_chat_gate.py
 
+Reference mode (GEMMA4-1 follow-up, #24): with BENCH_SAVE_REF=<path> the run
+writes a reference file; with BENCH_REF=<path> it *asserts* against one instead of
+merely reporting. Assertions, in order of strength:
+
+* the **top-1 token id** must match per prompt (hard failure, exit 1);
+* its logprob must be within BENCH_REF_TOL nats (default 0.5 -- the measured
+  INT8-W8A16 vs bf16 spread on this box is <=0.4);
+* the continuation prefix is reported but only asserted with
+  BENCH_REF_STRICT=1, because quantization legitimately changes surface text.
+
+That is what makes this a gate rather than a probe: a build that silently changes
+the model's first-token distribution now fails a command instead of looking fine.
+
 Env: BENCH_MODEL (required), BENCH_TOP_K (default 5), BENCH_MAX_TOKENS (default 16),
 BENCH_GPU_UTIL (default 0.90 — W8A16 27B checkpoints need ~0.95), BENCH_EAGER=1,
 BENCH_TP (default 1 — bf16 27B needs 2).
@@ -30,6 +43,7 @@ VLLM_* / VLLM_USE_V2_MODEL_RUNNER knobs. Prompts can be overridden with BENCH_PR
 
 from __future__ import annotations
 
+import json
 import os
 
 from vllm import LLM, SamplingParams
@@ -75,6 +89,7 @@ def main() -> None:
     print(f"GATE runner={os.environ.get('VLLM_USE_V2_MODEL_RUNNER', 'default')} "
           f"n_prompts={len(prompts)} top_k={top_k}", flush=True)
 
+    results = []
     for p, rendered in zip(PROMPTS + EXTRA, prompts):
         o = llm.generate([rendered], SamplingParams(temperature=0.0, max_tokens=max_tokens,
                                                    ignore_eos=True, logprobs=top_k),
@@ -87,6 +102,60 @@ def main() -> None:
         print(f"  PROMPT {p[:60]!r}")
         print(f"      text : {out.text[:120]!r}")
         print(f"      top{top_k} : " + ", ".join(f"{t!r}={v:.2f}" for t, v in top), flush=True)
+        results.append({
+            "prompt": p,
+            "top1": int(top[0][0]) if top else None,
+            "top1_logprob": round(float(top[0][1]), 4) if top else None,
+            "topk": [[int(t), round(float(v), 4)] for t, v in top],
+            "text_head": out.text[:40],
+        })
+
+    ref_out = os.environ.get("BENCH_SAVE_REF")
+    if ref_out:
+        with open(ref_out, "w") as fh:
+            json.dump({"model": os.path.basename(os.path.normpath(model)),
+                       "top_k": top_k, "n": len(results),
+                       "prompts": results}, fh, indent=1)
+        print(f"wrote reference {ref_out}", flush=True)
+
+    ref_in = os.environ.get("BENCH_REF")
+    if not ref_in:
+        return
+    with open(ref_in) as fh:
+        ref = json.load(fh)
+    tol = float(os.environ.get("BENCH_REF_TOL", "0.5"))
+    strict = os.environ.get("BENCH_REF_STRICT", "0") == "1"
+    if ref.get("n") != len(results):
+        raise SystemExit(
+            f"reference has {ref.get('n')} prompts, this run has {len(results)} "
+            "-- regenerate it or fix BENCH_PROMPTS")
+    bad = []
+    for got, want in zip(results, ref["prompts"]):
+        if got["prompt"] != want["prompt"]:
+            bad.append(f"prompt mismatch: {got['prompt'][:40]!r} vs {want['prompt'][:40]!r}")
+            continue
+        if got["top1"] != want["top1"]:
+            bad.append(f"{got['prompt'][:40]!r}: top-1 {got['top1']} != reference "
+                       f"{want['top1']}")
+            continue
+        dlp = abs((got["top1_logprob"] or 0.0) - (want["top1_logprob"] or 0.0))
+        if dlp > tol:
+            bad.append(f"{got['prompt'][:40]!r}: top-1 logprob moved {dlp:.2f} nats "
+                       f"(tol {tol})")
+        if got["text_head"] != want["text_head"]:
+            msg = (f"{got['prompt'][:40]!r}: continuation differs "
+                   f"({got['text_head'][:24]!r} vs {want['text_head'][:24]!r})")
+            if strict:
+                bad.append(msg)
+            else:
+                print(f"  note: {msg}", flush=True)
+    if bad:
+        print(f"GATE FAIL ({len(bad)} item(s)):", flush=True)
+        for b in bad:
+            print(f"  - {b}", flush=True)
+        raise SystemExit(1)
+    print(f"GATE PASS: {len(results)} prompts match {ref_in} "
+          f"(top-1 exact, <= {tol} nats)", flush=True)
 
 
 if __name__ == "__main__":

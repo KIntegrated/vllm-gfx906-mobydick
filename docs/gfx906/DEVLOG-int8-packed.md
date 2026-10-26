@@ -202,3 +202,19 @@ the usual order caveat applies — 2.83x is far outside this box's 2-4 % order
 variance, but an interleaved re-run is what would make it a record number.
 Acceptance was not measured (no per-request spec counters in the in-process
 harness); the ratio is end-to-end, so it includes acceptance.
+
+### Interleaved re-run: 3.14x (the sequential 2.83x understated it)
+
+Arms in the order **spec, none, none, spec** (fresh process each), pp1024/tg128,
+TP=2, util 0.92, mclk 1000:
+
+| rep | spec decode (k=7) | no spec |
+|---|---|---|
+| 1 | **27.871** | 8.981 |
+| 2 | **27.985** | 8.831 |
+| mean | 27.93 | 8.91 |
+
+**3.14x**, with within-arm spread 0.4 % (spec) and 1.7 % (control). The earlier
+sequential pair gave 2.83x -- the spec arm ran *first* there, on a colder GPU, so
+the order effect understated the win by 11 %. Exactly the case the fork's
+"interleave arms" rule exists for.

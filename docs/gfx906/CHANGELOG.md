@@ -8,6 +8,22 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-26 (DFlash2 x INT8 = 3.14x interleaved; IFT reference gate closes #24)
+
+- **Interleaved A/B (spec, none, none, spec)** at pp1024/tg128, TP=2, util 0.92:
+  spec k=7 **27.871 / 27.985 t/s** vs no-spec **8.981 / 8.831** → **3.14x**, with
+  0.4 % / 1.7 % within-arm spread. The earlier sequential pair said 2.83x because
+  the spec arm ran first on a colder GPU — an 11 % order effect, which is the case
+  the interleave rule exists for.
+- **`ift_chat_gate.py` is now a reference gate** (#24): `BENCH_SAVE_REF` records
+  per-prompt top-k logprobs + continuation; `BENCH_REF` asserts top-1 id (hard),
+  logprob within `BENCH_REF_TOL` (default 0.5 nats), and reports continuation
+  drift (asserted only with `BENCH_REF_STRICT=1`). Exit 1 on failure. Verified:
+  identical re-run PASSes, a one-id perturbation FAILs naming the prompt.
+- Workflow documented in `running.md`: record on the known-good build, assert on
+  the candidate build — the guard for merges and for IFT checkpoints that a raw
+  PPL probe cannot gate.
+
 ## 2026-10-26 (DFlash2 x INT8 W8A16: 2.83x; bf16 reference gate passes)
 
 - **The issue's "no drafter" conclusion was wrong**: DFlash2 pairs a *separate*

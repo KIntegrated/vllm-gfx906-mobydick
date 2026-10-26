@@ -186,6 +186,31 @@ aware if you see empty device/ROCm detection on 7.14.
 
 ---
 
+### Numerics gate for instruction-tuned checkpoints (and merges)
+
+`benchmarks/kernels/gfx906/ift_chat_gate.py` renders prompts through the model's
+own chat template and reports per-prompt first-token top-k logprobs. A raw-text
+PPL probe cannot gate these checkpoints at all (Gemma-4-*-it scores PPL 84261 on
+raw text while answering correctly through its template), so this is the gate.
+
+It also works as a **reference gate**, which is what makes it useful across builds:
+
+```bash
+# on the known-good build: record
+BENCH_MODEL=<ckpt> BENCH_SAVE_REF=/local/tmp/ref_<model>.json \
+    .venv/bin/python benchmarks/kernels/gfx906/ift_chat_gate.py
+# on the candidate build: assert
+BENCH_MODEL=<ckpt> BENCH_REF=/local/tmp/ref_<model>.json \
+    .venv/bin/python benchmarks/kernels/gfx906/ift_chat_gate.py
+```
+
+Assertions: top-1 token id must match (hard), its logprob must stay within
+`BENCH_REF_TOL` nats (default 0.5 — the measured INT8-W8A16 vs bf16 spread on this
+box is <=0.4), and a continuation change is reported always but only asserted with
+`BENCH_REF_STRICT=1` (quantization legitimately changes surface text). Exit 1 on
+failure. Verified both ways: identical re-run → PASS, a one-id perturbation of the
+reference → FAIL naming the prompt and both ids.
+
 ### Vision tower and text attention are chosen independently
 
 `--mm-encoder-attn-backend` affects only the vision tower; `--attention-backend` /
