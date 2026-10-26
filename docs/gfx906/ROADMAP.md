@@ -234,7 +234,14 @@ optimizations" section, and the commit message.
 one long sequence, prefix caching on. The `triton_attn` half is in; decide
 whether int8 KV is worth it on 32 GB cards.
 
-### LAB-6 — per-region step timer · [#50](../../issues/50)
+### ~~LAB-6 — per-region step timer~~ · [#50](../../issues/50) · DONE
+
+Adopted 2026-10-26: `vllm/gfx906_step_timer.py` (opt-in, graph-safe, ~0.3 us/step).
+First reading is negative and useful — host prep (`prep_inputs` + `attn_metadata`)
+is **~1 % of an MTP k=3 step** (0.9 ms of 95 ms), so the step is GPU-bound.
+Hooked on both runners after the gate caught V1-only hooks reporting zero.
+`gen_draft` (V2: `speculator.propose`) and the forward call stay unaccounted on
+V2. Ref: `DEVLOG-step-timer.md`.
 
 `prep_inputs` / `attn_metadata` / `ctx_kv` / `gen_draft` ms/step regions — the
 resolution our spec A/Bs keep missing. Only if graph-safe and <1 % overhead.

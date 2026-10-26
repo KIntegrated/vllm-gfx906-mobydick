@@ -193,6 +193,7 @@ from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
+from vllm import gfx906_step_timer
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.worker.cp_utils import (
@@ -4018,9 +4019,10 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            logits_indices, spec_decode_metadata, max_num_sampled_tokens = (
-                self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
-            )
+            with gfx906_step_timer.region("prep_inputs"):
+                logits_indices, spec_decode_metadata, max_num_sampled_tokens = (
+                    self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
+                )
 
             (
                 cudagraph_mode,
@@ -4138,8 +4140,9 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
-            attn_metadata, spec_decode_common_attn_metadata = (
-                self._build_attention_metadata(
+            with gfx906_step_timer.region("attn_metadata"):
+                attn_metadata, spec_decode_common_attn_metadata = (
+                    self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded if pad_attn else None,
                     num_reqs=num_reqs,
@@ -4361,7 +4364,8 @@ class GPUModelRunner(
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
-            with record_function_or_nullcontext("gpu_model_runner: draft"):
+            with record_function_or_nullcontext("gpu_model_runner: draft"), \
+                    gfx906_step_timer.region("gen_draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,

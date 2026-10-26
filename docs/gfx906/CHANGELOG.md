@@ -8,6 +8,24 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-26 (LAB-6/#50 closed — per-region step timer adopted)
+
+- **`vllm/gfx906_step_timer.py`** (`VLLM_GFX906_STEP_TIMER=1`,
+  `..._TIMER_EVERY`): per-region ms/step with an explicit `unaccounted`
+  remainder. Graph-safe by construction (CPU `perf_counter` only, no CUDA calls,
+  no syncs), ~0.3 us/step against a ~95 ms step.
+- **First measurement (dense 27B, MTP k=3, ladder `[4,8,12,16]`)**: wall 94.5-98.3
+  ms/step, of which `prep_inputs` 0.14-0.23 ms and `attn_metadata` 0.68-0.75 ms —
+  **host prep is ~1 % of the step**, so the step is GPU-bound and no ms/step A/B
+  should be explained by Python.
+- **The gate caught its own bug**: the first run reported a 90.24 ms/step wall
+  with every region at zero, because the hooks were written against the V1 runner
+  while this build defaults to V2. Both runners are hooked now; `gen_draft`
+  (V2: `speculator.propose`) and the forward call remain unaccounted on V2, and
+  that is stated rather than papered over.
+- New: `tests/gfx906_fa/test_step_timer.py` (6 tests) and
+  `docs/gfx906/DEVLOG-step-timer.md`.
+
 ## 2026-10-26 (FA-COVER-2/#16 closed — head-size class already closed by padding)
 
 - **Re-ran `tools/fa_coverage.py` on the 0.32.1 tree**: **0 of 138** real checkpoint

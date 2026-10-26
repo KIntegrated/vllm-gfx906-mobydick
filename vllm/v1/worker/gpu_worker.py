@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm import gfx906_step_timer
 from vllm.config import (
     CUDAGraphMode,
     VllmConfig,
@@ -1326,9 +1327,10 @@ class Worker(WorkerBase):
             )
 
         with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
+            with gfx906_step_timer.step():
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model

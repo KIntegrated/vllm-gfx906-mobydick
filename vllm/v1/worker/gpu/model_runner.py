@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm import gfx906_step_timer
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.compilation.wrapper import compile_model_with_stock_torch
@@ -1882,12 +1883,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             # Update the request states.
-            self.update_pp_decode_requests()
-            self.finish_requests(scheduler_output)
-            self.free_states(scheduler_output)
-            self.add_requests(scheduler_output)
-            self.update_requests(scheduler_output)
-            self.block_tables.apply_staged_writes()
+            with gfx906_step_timer.region("prep_inputs"):
+                self.update_pp_decode_requests()
+                self.finish_requests(scheduler_output)
+                self.free_states(scheduler_output)
+                self.add_requests(scheduler_output)
+                self.update_requests(scheduler_output)
+                self.block_tables.apply_staged_writes()
             if self.aux_output_connector is not None:
                 # Register this step before the GPU forward.
                 self.aux_output_connector.begin_step(
@@ -2065,18 +2067,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                     for groups in attn_groups
                 ]
-            attn_metadata = self.model_state.prepare_attn(
-                input_batch,
-                batch_desc.cg_mode,
-                block_tables,
-                slot_mappings,
-                attn_groups,
-                self.kv_cache_config,
-                # FULL replay reads capture-time metadata buffers. Re-stage them
-                # from the zeroed dummy block tables instead of retaining state
-                # indices from the previous real batch.
-                for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
-            )
+            with gfx906_step_timer.region("attn_metadata"):
+                attn_metadata = self.model_state.prepare_attn(
+                    input_batch,
+                    batch_desc.cg_mode,
+                    block_tables,
+                    slot_mappings,
+                    attn_groups,
+                    self.kv_cache_config,
+                    # FULL replay reads capture-time metadata buffers. Re-stage them
+                    # from the zeroed dummy block tables instead of retaining state
+                    # indices from the previous real batch.
+                    for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+                )
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
