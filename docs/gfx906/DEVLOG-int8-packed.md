@@ -95,3 +95,56 @@ Re-gated on main: `Application startup complete` after 300 s, `GPU KV cache size
 no skipped/unexpected-key lines, and the same two coherent templated answers as on the branch
 ("...The capital of France is Paris."; a fenced python block). The DFlash2 records stay on
 `gfx906/dflash2`; only the quantisation work is promoted.
+
+## 2026-10-26 — INT8-PACKED-1 closed
+
+**VERDICT: the checkpoint is served and gated; the MTP wiring gap is fixed but
+latent because this checkpoint ships *no* MTP weights; and the DFlash2-INT8
+pairing arm is therefore not runnable as the issue imagined.**
+**GATE:** templated chat gate (per-prompt first-token logprobs) + a decode number.
+
+### The MTP wiring gap, fixed
+
+`qwen3_5_mtp.py` built its `embed_tokens` as
+`VocabParallelEmbedding(vocab_size, hidden_size)` — no `quant_config`, no
+`prefix` — while the main model passes both (`qwen3_5.py:251`). On a
+compressed-tensors pack-quantized checkpoint the embedding carries
+`weight_packed` / `weight_scale` / `weight_shape`, so without the wiring those
+parameters never register in the MTP module and every MTP embedding weight is
+skipped silently. Fixed by mirroring the main model.
+
+**Safe for the AWQ line**, verified two ways rather than assumed: the main path
+already passes `quant_config` for an embedding that is *plain*
+(`model.language_model.embed_tokens.weight`) and *not* in the ignore list, and
+compressed-tensors resolves an unquantized method for it; a full AWQ + MTP k=3
+run after the patch loaded and served (pp512/tg64, 17.06 t/s, no errors).
+
+### Why it is latent here
+
+`lued/Qwen3.8-27B-INT8-W8A16-DFlash2` has **1986 weight keys and zero containing
+`mtp` or `draft`**. So MTP drafting cannot be enabled with this checkpoint at
+all, and the DFlash2-INT8 pairing arm needs a checkpoint that actually ships a
+drafter head. The fix is for the next one that does.
+
+### Gate and numbers
+
+- **Templated chat gate** (`ift_chat_gate.py`): both prompts answer coherently
+  with confident first tokens — `760=-0.72, 1421=-0.97, 1596=-2.22` for the
+  capital question, `1596=-0.05` for the code request. (The checkpoint is a
+  thinking-style model: within 24 tokens it plans rather than answering, which is
+  why the gate reports logprobs, not the text.)
+- **Decode: 13.43 t/s** at pp2048/tg256, single request, `--gpu-memory-utilization
+  0.95`, mclk 1000. Against the AWQ-INT4 baseline on the same path (~25.6 t/s)
+  that is the expected ~2x from doubling the weight bytes — W8A16 is a *quality*
+  trade, not a speed one.
+- The gate needed two knobs to run at all: `BENCH_GPU_UTIL` (default 0.90 OOMs on
+  a ~27 GB W8A16 27B — "No available memory for the cache blocks") and
+  `BENCH_EAGER`. Both added.
+
+### Wart found and fixed on the way
+
+Eager mode on TP=1 emitted the packed-KV layout warning **16 times** (once per
+attention layer) because the "already warned" flag was per impl instance; the
+non-eager path emits none. The flag is process-level now and the message says
+what it actually means (impls built before the layout is resolved: TP workers
+*and* eager mode). Re-measured: 1 warning, was 16.

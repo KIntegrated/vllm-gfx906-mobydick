@@ -64,6 +64,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
+_PACKED_LAYOUT_WARNED = False
+
 
 # -----------------------------------------------------------------------------
 # PACKED (丙) KV layout -- K stored as Q8_0 bytes, V as fp16, one cell both.
@@ -1763,13 +1765,18 @@ class Gfx906FAImpl(AttentionImpl):
         checks (head padding, head_size % 32) only.
         """
         packed = _pool_cell_is_packed(kv_cache, self.head_size)
-        if packed != self._packed and not self._packed_layout_warned:
-            self._packed_layout_warned = True
+        # Once per process, not once per impl: there is one impl per attention
+        # layer (16 on dense 27B), and each one hits this on the first forward.
+        global _PACKED_LAYOUT_WARNED
+        if packed != self._packed and not _PACKED_LAYOUT_WARNED:
+            _PACKED_LAYOUT_WARNED = True
             logger.warning(
                 "GFX906_FA_PACKED: pool cell %d B decides the layout, but the "
                 "mode captured at construction was %s - using the pool "
-                "geometry (packed=%s). This is expected in a TP worker, whose "
-                "impls are built before the KV layout is resolved.",
+                "geometry (packed=%s). Expected when impls are built before the "
+                "KV layout is resolved: TP workers, and eager mode (measured "
+                "2026-10-26: enforce_eager=True on TP=1 warns once per layer "
+                "while the non-eager path never warns).",
                 _pool_cell_bytes(kv_cache), self._packed, packed)
         assert packed or _pool_cell_is_fused_alias(kv_cache, self.padded_head_size), (
             "gfx906_fa: unrecognised KV pool cell "

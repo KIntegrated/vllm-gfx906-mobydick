@@ -8,6 +8,27 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-26 (INT8-PACKED-1/#23 closed — INT8 W8A16 gated and measured)
+
+- **MTP `embed_tokens` wiring fixed** (`qwen3_5_mtp.py`): it was built without
+  `quant_config`/`prefix`, so a pack-quantized checkpoint's
+  `weight_packed/_scale/_shape` embedding never registered in the MTP module and
+  every MTP embedding weight was skipped silently. Mirrors `qwen3_5.py:251`.
+  Safe on the AWQ line (verified: the main path already passes `quant_config` for
+  a plain, non-ignored embedding, and an AWQ + MTP k=3 run still loads and serves).
+- **Latent here, not fixed by anything else**: `lued/Qwen3.8-27B-INT8-W8A16-DFlash2`
+  has **zero `mtp`/`draft` keys** among 1986, so MTP/DFlash2 drafting cannot be
+  enabled with it — the DFlash2-INT8 pairing arm needs a checkpoint that ships a
+  drafter head.
+- **Gated and measured**: templated chat gate passes with confident first tokens
+  (`1596=-0.05`, `760=-0.72`); decode **13.43 t/s** at pp2048/tg256 util 0.95 vs
+  the AWQ-INT4 baseline ~25.6 — the expected ~2x from doubled weight bytes.
+- **Harness**: `ift_chat_gate.py` gained `BENCH_GPU_UTIL` (0.90 OOMs on a ~27 GB
+  W8A16 27B) and `BENCH_EAGER`.
+- **Fix**: the packed-KV layout warning fired once per impl (16x on dense 27B in
+  eager mode); the flag is process-level now and the text names eager mode as a
+  legitimate cause. Measured 1 warning after, 16 before.
+
 ## 2026-10-26 (ViT and text attention backends are independent — verified and documented)
 
 - **Mixed configuration is supported**: `--mm-encoder-attn-backend FLASH_ATTN`

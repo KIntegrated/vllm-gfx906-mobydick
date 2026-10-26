@@ -177,13 +177,13 @@ critical-path discount). Bit-correctness + serving A/B. Ref:
 Store directly into `[B,Hq,D]` for batched single-token decode; B=1 is already
 copy-free. Ref: `DEVLOG-fa-attention.md`.
 
-### INT8-PACKED-1 — finish pack-quantized int8/W8A16 support · [#23](../../issues/23)
+### ~~INT8-PACKED-1~~ · [#23](../../issues/23) · CLOSED 2026-10-26
 
-The checkpoint loads and generates (2-line `embed_tokens` wiring fix). Remaining:
-templated numerics gate vs bf16, a serving/perf measurement, the same wiring gap
-in `qwen3_5_mtp.py`, then the DFlash2 INT8 pairing arm. Ref:
-`DEVLOG-int8-packed.md`.
-
+INT8 W8A16 27B serves and gates (chat gate confident, 13.43 t/s at pp2048/tg256 —
+the expected ~2x weight-byte cost vs AWQ-INT4's ~25.6). The MTP `embed_tokens`
+wiring gap is fixed but latent: this checkpoint has zero `mtp`/`draft` keys, so
+the DFlash2-INT8 pairing arm needs a checkpoint that ships a drafter.
+Ref: `DEVLOG-int8-packed.md`.
 ### MUSE-2 — Muse-Glimmer + official DFlash assistant · [#25](../../issues/25) — **closed 2026-10-19**
 
 B=4 measured (acceptance **2.95**, same distribution as B=1; aggregate decode

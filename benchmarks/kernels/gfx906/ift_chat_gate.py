@@ -21,6 +21,7 @@ Usage:
         benchmarks/kernels/gfx906/ift_chat_gate.py
 
 Env: BENCH_MODEL (required), BENCH_TOP_K (default 5), BENCH_MAX_TOKENS (default 16),
+BENCH_GPU_UTIL (default 0.90 — W8A16 27B checkpoints need ~0.95), BENCH_EAGER=1,
 ATTN_BACKEND (optional, forwarded to LLM(attention_backend=...)), and the usual
 VLLM_* / VLLM_USE_V2_MODEL_RUNNER knobs. Prompts can be overridden with BENCH_PROMPTS
 (one per line, newline-escaped with \\n as literal).
@@ -50,10 +51,11 @@ def main() -> None:
         model=model,
         max_model_len=2048,
         max_num_seqs=2,
-        gpu_memory_utilization=0.90,
+        gpu_memory_utilization=float(os.environ.get("BENCH_GPU_UTIL", "0.90")),
         dtype=os.environ.get("BENCH_DTYPE", "float16"),
         seed=0,
         attention_backend=ab,
+        enforce_eager=os.environ.get("BENCH_EAGER", "0") == "1",
     )
     tok = llm.get_tokenizer()
     if not getattr(tok, "chat_template", None):

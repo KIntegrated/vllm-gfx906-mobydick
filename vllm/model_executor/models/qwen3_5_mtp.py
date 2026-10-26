@@ -138,9 +138,19 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
 
+        # INT8-PACKED-1: mirror the main model's wiring (qwen3_5.py:251). Without
+        # quant_config/prefix the packed embedding of a compressed-tensors
+        # pack-quantized checkpoint never registers its weight_packed/_scale/
+        # _shape parameters here, and every MTP embedding weight is silently
+        # ignored. The main path proves this is safe for AWQ too: there
+        # embed_tokens.weight is plain and still not in the ignore list, because
+        # compressed-tensors resolves an unquantized method when the checkpoint
+        # carries no quantized embedding scheme.
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         # CAT-1 (ported from syv-ai/qwen38-27b-rtx3090, patches/
