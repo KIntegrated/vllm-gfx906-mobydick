@@ -208,8 +208,8 @@ first; follows C1–C3.
 Release basis: `RELEASE-0.32.0-final.md`; resolution record:
 `MERGE-0.32.0-review.md` §4 (porting opportunities) and §5 (breaking changes).
 Closed from this train already: P32-1 (#60), P32-3 (#62), P32-4 (#63),
-P32-6 (#67), P32-7 (#65), P32-8 (#66), P32-10 (#70), and the two load
-failures P32-9 (#68, #69).
+P32-6 (#67), P32-7 (#65), P32-8 (#66), P32-2 (#61), P32-10 (#70), and the
+two load failures P32-9 (#68, #69).
 
 ### P32-2 — adopt upstream's int4/int8 per-token-head KV · [#61](../../issues/61)
 

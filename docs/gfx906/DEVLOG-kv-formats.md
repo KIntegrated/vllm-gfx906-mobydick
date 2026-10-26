@@ -652,3 +652,36 @@ capacity still on the table is the V side: int8 there takes the cell to ~528 B
 (**+48 %**) and needs no new kernel architecture. That is the follow-up; INT4 is
 parked. Reopen only for a >300k-token single-card workload where int8-V is not
 enough.
+
+### P32-2/#61 — DECISION: keep CUSTOM; upstream per-token-head KV is an option, not a replacement
+
+Lightning (Nemotron-3.5-Lightning-30B-A3B, hybrid Mamba2 with four groups), TP=1,
+16,384-token prompt, no spec decode (the model has no MTP head), prefix caching
+off, 2 samples per arm, custom arm measured twice to bound drift:
+
+| arm | decode t/s | prefill tok/s | TTFT | GPU KV capacity |
+|---|---|---|---|---|
+| CUSTOM FA, packed fp16 (run 1) | **103.53 / 103.15** | 1497 | 10.9 s | 1,128,354 tok |
+| TRITON_ATTN + `int8_per_token_head` | 85.02 / 84.87 | 897 | 18.3 s | **1,382,968 tok** |
+| CUSTOM FA, packed fp16 (run 2) | 103.xx | 1497 | 10.9 s | 1,128,354 tok |
+
+- **Upstream int8 KV works on the hybrid model at numerical parity**: PPL
+  **27.0102**, inside the Lightning band (26.96-27.02) with 0 top-20 misses. The
+  hybrid path is not a blocker for these formats.
+- **It costs 21.7 % decode and 40 % prefill** (103.3 -> 84.9 t/s, 1497 -> 897
+  tok/s) because the per-token-head formats are implemented only in
+  `triton_attn`, which loses to the custom FA on this GPU at every length
+  measured.
+- **The capacity it buys is 22.6 %** (1,128,354 -> 1,382,968 tokens).
+
+Decision: **do not adopt upstream's formats as a replacement for the packed cell,
+and do not build our own.** The trade is explicit and belongs to the operator:
+int8 KV is the right answer when the workload is capacity-bound (dense-27B 32k:
++35 % capacity, +0.05 % PPL, -1.3 % decode; Lightning 16k: +22.6 % capacity,
+-21.7 % decode), and the packed cell is right when decode latency matters.
+
+Internal consistency check that the numbers are now trustworthy: the MoE 30B-A3B
+prefills at 1497 tok/s against the dense 27B's 278 tok/s, i.e. 5.4x for ~9x fewer
+active parameters -- the expected direction and magnitude for an active-parameter
+ratio once KV traffic is included. Both figures come from `pp_actual`-verified
+runs.

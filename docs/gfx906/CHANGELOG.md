@@ -8,6 +8,24 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-26 (P32-2/#61 + LAB-5/#49 closed — upstream per-token-head KV is an option, not a replacement)
+
+- **Lightning (hybrid Mamba2, four groups) arm measured**: `int8_per_token_head`
+  under `TRITON_ATTN` is numerically at parity (PPL **27.0102**, band 26.96-27.02,
+  0 top-20 misses) and buys **+22.6 % KV capacity** (1,128,354 -> 1,382,968
+  tokens at 16k), but costs **21.7 % decode** (103.3 -> 84.9 t/s) and **40 %
+  prefill** (1497 -> 897 tok/s) because those formats exist only in `triton_attn`
+  and our FA wins at every length measured.
+- **Decision**: keep the packed cell as the default; upstream's int4/int8
+  per-token-head formats stay available as the capacity-bound choice (dense-27B
+  32k: +35 % capacity, +0.05 % PPL, -1.3 % decode; int4: +124 % capacity,
+  +1.24 % PPL). Neither side is built: both already exist.
+- **LAB-5 (#49) closes on the same evidence** — its planned bespoke int8 KV is
+  what `int8_per_token_head` already does here, and it is not a throughput win.
+- Sanity check on the corrected harness: MoE 30B-A3B prefills at 1497 tok/s vs
+  dense 27B at 278 tok/s (5.4x for ~9x fewer active parameters), the direction and
+  magnitude expected once KV traffic is included.
+
 ## 2026-10-25 (P32-8/#66 closed — pins settled, max_tokens audit clean)
 
 - **Pins recorded, not worked around**: transformers **5.18.0** (upstream 0.32
