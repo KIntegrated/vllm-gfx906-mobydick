@@ -8,6 +8,27 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-26 (PR #41 closed; LLMM1 truncation guard landed; U30-2 parked)
+
+- **PR #41 closed** after the full triage: four hunks landed (capture guard,
+  `[load-weights-mem]` logging, `*.bak`, half-atomic epilogue reworked behind a
+  version gate), five declined with reasons, one carried forward to MTP-1c (#19)
+  with its ordering constraint and CPU-test requirement recorded.
+- **LLMM1 silent-truncation guard** (`cad3bd1ea9`): `NUM_BLOCKS = M /
+  rows_per_block` truncates, so `M % rows_per_block` trailing rows of `out_c`
+  were left uninitialized with nothing reported; the `else` arm also coerced an
+  unknown `rows_per_block` to 4. Both are `TORCH_CHECK`s now. The only call sites
+  pass 4 with M padded, so the checks are inert on valid input;
+  `test_rocm_unquantized_gemm.py` 34 passed / 2 skipped.
+- **Rebuild prerequisite documented**: on ROCm 7.14 an in-tree `build_ext` fails
+  in `LoadHIP.cmake` (`Findrocm_smi.cmake`) without
+  `CMAKE_PREFIX_PATH=/opt/rocm/core-7.14:/opt/rocm`, and verifying a `csrc`
+  change means grepping the loaded `.so` (`skinny_gemms.cu` lands in `_rocm_C`)
+  because `rc=0` alone does not prove it compiled in.
+- **U30-2 (#13) closed and parked**: gfx906's 64 KiB LDS is below both large-LDS
+  gates, so the chunked `persistent_topk_kernel` is the only path (8/6/5 CTA
+  groups per 64k row); device-inherent, reopen only with a servable QSA model.
+
 ## 2026-10-26 (P32-2/#61 + LAB-5/#49 closed — upstream per-token-head KV is an option, not a replacement)
 
 - **Lightning (hybrid Mamba2, four groups) arm measured**: `int8_per_token_head`
