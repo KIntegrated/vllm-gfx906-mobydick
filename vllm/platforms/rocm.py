@@ -1426,7 +1426,11 @@ class RocmPlatform(Platform):
                 pass
             else:
                 mode = getattr(cache_config, "gfx906_fa_packed", "off")
-                if mode == "auto" and model_config.is_hybrid:
+                if (
+                    mode == "auto"
+                    and model_config is not None
+                    and model_config.is_hybrid
+                ):
                     try:
                         off_geom = cls._gfx906_packed_auto_geometry(
                             vllm_config, "off"

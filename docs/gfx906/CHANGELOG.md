@@ -8,6 +8,26 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-26 (FA-COVER-3/#71 closed — the ViT window is honoured; plus two findings)
+
+- **The premise was wrong**: vLLM has no window argument in the ViT attention
+  layer at all (any backend). Windowing is expressed by repacking the image into
+  window-sized sequences and passing different `cu_seqlens` per block
+  (`qwen2_5_vl.py:1108-1131`). CUSTOM honours the segment boundaries —
+  window-sized `[112,112,112]` gives 0.0114 max abs error against 0.0116 for an
+  arbitrary `[128,96]` split, so there is no cross-segment leakage. No fix needed.
+- **Fixed**: `RocmPlatform`'s packed-KV `auto` path called
+  `model_config.is_hybrid` unguarded and crashed with `AttributeError` whenever
+  the config had no model config — which made 20 tests in
+  `tests/kernels/attention/test_mha_attn.py` error out. Guarded; the varlen
+  subset now reports real results (12 passed / 4 failed / 16 skipped).
+- **Open (new issue)**: CUSTOM ViT fp16 varlen accuracy is ~1.1-1.9e-2 absolute
+  against an fp32 reference at GQA 16 (0.0255 on `[2,3,4]`), which exceeds the
+  upstream test's 1e-2 tolerance. Not attributable yet — the like-for-like
+  non-CUSTOM fp16 arm could not be forced through `MultiModalConfig` after the
+  selector cached, and the bf16 FLASH_ATTN arm (0.0025-0.0038) is not comparable.
+- New: `docs/gfx906/DEVLOG-vit-window.md`.
+
 ## 2026-10-26 (LAB-6/#50 closed — per-region step timer adopted)
 
 - **`vllm/gfx906_step_timer.py`** (`VLLM_GFX906_STEP_TIMER=1`,
