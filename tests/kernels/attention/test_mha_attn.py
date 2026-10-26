@@ -19,7 +19,7 @@ from vllm.platforms import current_platform
 from vllm.platforms.cpu import CpuPlatform
 from vllm.platforms.cuda import CudaPlatform
 from vllm.platforms.interface import DeviceCapability
-from vllm.platforms.rocm import RocmPlatform, on_mi3xx
+from vllm.platforms.rocm import RocmPlatform, on_gfx906, on_mi3xx
 from vllm.utils.torch_utils import set_default_torch_dtype, set_random_seed
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import _cached_get_attn_backend
@@ -62,7 +62,14 @@ def test_mha_attn_platform(default_vllm_config, device: str):
             patch("vllm.model_executor.models.vision.current_platform", RocmPlatform()),
         ):
             attn = MMEncoderAttention(16, 64, scale=1)
-            assert attn.attn_backend == AttentionBackendEnum.FLASH_ATTN
+            # This fork's gfx906 ViT path is its own backend (VIT-1), so CUSTOM is
+            # the correct answer on MI50; upstream's expectation is FLASH_ATTN.
+            expected = (
+                AttentionBackendEnum.CUSTOM
+                if on_gfx906()
+                else AttentionBackendEnum.FLASH_ATTN
+            )
+            assert attn.attn_backend == expected
     else:
         # Test CUDA with head_size=64 (divisible by 32)
         # - should use vLLM's FlashAttention
@@ -184,11 +191,20 @@ def test_mha_attn_forward(
         v,
         scale=scale,
     ).reshape(batch_size, seq_len, num_heads * head_size)
-    tol_kwargs = (
-        dict(rtol=1e-3, atol=1e-3)
-        if attn.attn_backend == AttentionBackendEnum.TRITON_ATTN
-        else {}
-    )
+    # Per-backend numerics, measured rather than assumed (gfx906, 2026-10-26):
+    # the CUSTOM gfx906 FA path quantises K to q8_0 blocks
+    # (vllm/gfx906_fa/gfx906_fa_mm_encoder.py), so its fp16 varlen error is
+    # ~0.9-2.6e-2 absolute against an fp32 reference, while TRITON/FLASH stay at
+    # ~4-11e-4. Measured per backend in fresh processes on window-sized segments
+    # ([112,112,112]): CUSTOM 0.0114, FLASH_ATTN 0.00045, TORCH_SDPA 0.00045.
+    # The Q8 K is the reason VIT-1 is fast on MI50; the parity gate for it is
+    # end-to-end VLM output on real models, not this kernel-level tolerance.
+    if attn.attn_backend == AttentionBackendEnum.CUSTOM:
+        tol_kwargs = dict(rtol=3e-2, atol=3e-2)
+    elif attn.attn_backend == AttentionBackendEnum.TRITON_ATTN:
+        tol_kwargs = dict(rtol=1e-3, atol=1e-3)
+    else:
+        tol_kwargs = {}
     torch.testing.assert_close(output, ref_output, **tol_kwargs)
 
 
@@ -245,7 +261,16 @@ def test_mha_attn_varlen_forward(
         )
         ref_output.append(output_i)
     ref_output = torch.cat(ref_output, dim=1)
-    torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2)
+    # CUSTOM quantises K to q8_0 blocks (gfx906_fa_mm_encoder.py), so its varlen
+    # error is ~0.9-2.6e-2 against an fp32 reference -- 20-25x the fp16 backends.
+    # Measured per backend in fresh processes, [112,112,112]: CUSTOM 0.0114,
+    # FLASH_ATTN 0.00045, TORCH_SDPA 0.00045. VIT-1's gate is end-to-end VLM
+    # parity, so the kernel-level bound is stated per backend rather than global.
+    if attn.attn_backend == AttentionBackendEnum.CUSTOM:
+        tol_kwargs = dict(atol=3e-2, rtol=3e-2)
+    else:
+        tol_kwargs = dict(atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(output, ref_output, **tol_kwargs)
 
 
 @pytest.mark.parametrize("var_seq_len", VAR_SEQ_LENS)

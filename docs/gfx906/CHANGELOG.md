@@ -8,6 +8,26 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-26 (FA-VIT-ACC/#72 closed — ViT accuracy is q8-K by design, now documented and tested)
+
+- **Like-for-like fp16 A/B, fresh process per backend** (the selector caches per
+  (head, dtype, device), so in-process overrides silently do nothing):
+  CUSTOM ViT error is **0.0092–0.0255** absolute against an fp32 reference, vs
+  **0.0004–0.0011** for `FLASH_ATTN` and `TORCH_SDPA` — 20–25x, uniform across
+  shapes and independent of segment split. Cause is by design:
+  `gfx906_fa_mm_encoder.py:269` quantises K to **q8_0**, which is what makes
+  VIT-1 fast on MI50.
+- **Tests now say so per backend** instead of asserting an fp16-exactness bound on
+  all three: `atol/rtol=3e-2` for CUSTOM with the measured numbers in a comment,
+  `1e-2` otherwise. Also fixed `test_mha_attn_platform[hip]`, which asserted
+  `FLASH_ATTN` on ROCm — gfx906 legitimately selects CUSTOM.
+  `test_mha_attn.py`: **36 passed / 16 skipped** (was 20 errors + 5 failures).
+- **Escape hatch documented** in the README decision table: the ViT row now carries
+  the accuracy/latency trade and names `--mm-encoder-attn-backend FLASH_ATTN` for
+  towers that need fp16-exact attention.
+- Not established: acceptability for towers not in the zoo (bound measured, opt-out
+  named, per-model gate would need the model).
+
 ## 2026-10-26 (FA-COVER-3/#71 closed — the ViT window is honoured; plus two findings)
 
 - **The premise was wrong**: vLLM has no window argument in the ViT attention

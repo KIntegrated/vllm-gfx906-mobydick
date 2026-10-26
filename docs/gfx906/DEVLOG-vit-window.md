@@ -60,3 +60,45 @@ attributable to our kernel**: the only non-CUSTOM fixture I could measure was
 did not take effect through `MultiModalConfig` once the selector had cached. Until
 that A/B exists the honest statement is "CUSTOM fp16 varlen error is ~1e-2 at GQA
 16; the comparison that would call it a defect is missing". Filed separately.
+
+## Follow-up: the accuracy question, answered (FA-VIT-ACC / #72)
+
+**VERDICT:** not a defect — the CUSTOM ViT path **quantises K to q8_0**
+(`gfx906_fa_mm_encoder.py:269`), so ~1e-2 absolute error is the design cost of
+VIT-1's speedup, and it is 20-25x the fp16 backends' error. Recorded per backend
+in the test that was silently comparing all three to a 1e-2 bound.
+
+Fresh-process A/B, fp16, fp32 reference (the selector caches per
+(head, dtype, device), which is why patching `MultiModalConfig` in-process had no
+effect and why each arm needs its own process):
+
+| shape (lens, Hkv, D) | CUSTOM | FLASH_ATTN | TORCH_SDPA |
+|---|---|---|---|
+| [112,112,112], 16, 64 | **0.0185** | 0.00048 | 0.00048 |
+| [112,112,112], 1, 64 | **0.0114** | 0.00045 | 0.00045 |
+| [112,112,112], 1, 256 | **0.0128** | 0.00048 | 0.00048 |
+| [128,96], 1, 96 | **0.0092** | 0.00040 | 0.00040 |
+| [2,3,4], 1, 64 | **0.0255** | 0.0011 | 0.0010 |
+
+So: 20-25x, uniform across shapes, and **independent of segment split** — the
+error is the K quantisation, not the varlen/window handling (which #71 cleared).
+
+Two decisions fell out:
+
+1. **Per-backend tolerance in the test**, with the numbers in a comment
+   (`atol/rtol=3e-2` for CUSTOM, `1e-2` otherwise). A single global bound was
+   asserting an fp16-exactness property that a q8-K kernel cannot have — the
+   right gate for VIT-1 is end-to-end VLM output parity on real models, which is
+   what it shipped on.
+2. **The escape hatch is already there**: `--mm-encoder-attn-backend FLASH_ATTN`
+   selects an fp16 ViT backend for accuracy-sensitive towers. Documented in the
+   README decision table.
+
+Also fixed while here: `test_mha_attn_platform[hip]` asserted FLASH_ATTN on ROCm,
+which gfx906 legitimately violates (it selects CUSTOM); the expectation is now
+platform-aware. `tests/kernels/attention/test_mha_attn.py` went from **20 errors
++ 5 failures** to **36 passed / 16 skipped**.
+
+Not established: whether ~2.6e-2 absolute ViT error is acceptable for towers we
+have not served. The bound is measured and the opt-out is named; a per-model gate
+would need that model in the zoo.

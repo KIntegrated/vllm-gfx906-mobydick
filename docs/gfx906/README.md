@@ -19,6 +19,7 @@ chooses the other's cost.
 | You need **more KV** than packed gives | `TRITON_ATTN` | `int8_per_token_head` | **+35 %** capacity (dense 27B, 32k) or **+22.6 %** (Lightning 16k) for **+0.05 %** PPL — but **−1.3 %** decode on dense and **−21.7 %** decode / −40 % prefill on the hybrid |
 | You need **much more KV** and accept quality loss | `TRITON_ATTN` | `int4_per_token_head` | **+124 %** capacity (dense 27B, 32k) for **+1.24 %** PPL |
 | **Very short contexts only** (≤512 tok), throughput over latency budget | `TRITON_ATTN` | fp16 | upstream is **0.8–2.6 %** faster there; the custom FA's advantage is long-context, not short |
+| **Vision towers** (`--mm-encoder-attn-backend`) | `CUSTOM` (default) | n/a | the ViT path **quantises K to q8_0**, so kernel error is ~0.9–2.6e-2 absolute against an fp32 reference — **20–25x** the fp16 backends (0.0004–0.0011). Fast and validated end-to-end on the served VLMs; choose `FLASH_ATTN` when a tower needs fp16-exact attention |
 
 Switch with:
 
