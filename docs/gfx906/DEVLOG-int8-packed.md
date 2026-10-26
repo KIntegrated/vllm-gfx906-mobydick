@@ -148,3 +148,57 @@ attention layer) because the "already warned" flag was per impl instance; the
 non-eager path emits none. The flag is process-level now and the message says
 what it actually means (impls built before the layout is resolved: TP workers
 *and* eager mode). Re-measured: 1 warning, was 16.
+
+## 2026-10-26 (addendum) — the drafter exists; DFlash2 x INT8 is 2.83x, and the bf16 gate passes
+
+**VERDICT: two of this issue's "remaining" items were wrong for the same reason —
+I looked for MTP weights when the DFlash2 family pairs a *separate* drafter model.
+With that drafter (local, 2.1 GB) the INT8 pairing arm runs and delivers **2.83x**,
+and the bf16 reference gate passes at <=0.4 nats.**
+
+### Checkpoint census (local, `mtp`/`draft` keys counted from each index)
+
+| checkpoint | keys | mtp | note |
+|---|---|---|---|
+| `Qwen/Qwen3.8-27B` (bf16) | 1199 | **15** | the issue's reference; 52 GB, needs TP=2 |
+| `cyankiwi/Qwen3.8-27B-AWQ-INT4` | 2396 | **15** | the AWQ line (regression arm) |
+| `lued/Qwen3.8-27B-INT8-W8A16-DFlash2` | 1986 | **0** | the INT8 target |
+| `lued/Qwen3.8-27B-DFlash2-W8` | — | — | **`DFlash2DraftModel`**, bf16, 2.1 GB — the drafter |
+
+So the INT8 target has no MTP head *by design*: DFlash2 does not use one. Both
+facts recorded earlier ("MTP drafting cannot be enabled with this checkpoint",
+"the pairing arm needs a checkpoint that ships a drafter head") were wrong in
+their conclusion — the drafter is a separate model and it is here.
+
+### The bf16 numerical gate (the issue's own wording: "vs bf16 Qwen/Qwen3.8-27B")
+
+`ift_chat_gate.py`, templated, 24 tokens; bf16 on **TP=2** (52 GB of weights),
+INT8 W8A16 on TP=1 util 0.95:
+
+| prompt | bf16 top-5 | INT8 W8A16 top-5 |
+|---|---|---|
+| capital of France | 1421=-0.66, 760=-0.94, 1596=-2.59, 90700=-3.98, 81266=-7.07 | 760=-0.72, 1421=-0.97, 1596=-2.22, 90700=-3.95, 81266=-6.75 |
+| add two numbers | 1596=-0.06, 1421=-3.08, 760=-4.62, 22916=-6.03, 90700=-7.98 | 1596=-0.05, 1421=-3.45, 760=-4.55, 22916=-6.11, 90700=-8.37 |
+
+Same token sets, same ordering apart from a near-tie at the top of the first
+prompt (bf16 -0.66/-0.94 vs INT8 -0.72/-0.97), largest logprob delta **0.4 nats**,
+and near-identical continuations. The pack-quantized embedding plus W8A16 GEMMs
+are numerically sound against the bf16 reference.
+
+### The pairing arm (the issue's original purpose)
+
+Target INT8 W8A16 + `lued/Qwen3.8-27B-DFlash2-W8`, `{"method":"dflash",
+"num_speculative_tokens":7}`, pp1024/tg128, TP=2, util 0.92, mclk 1000:
+
+| arm | t/s |
+|---|---|
+| no spec decode (control, 2 samples) | **8.97 / 8.97** |
+| DFlash2 k=7 | **25.41** |
+
+**2.83x.** Two constraints worth recording: **TP=1 OOMs** (28 GB target + 2.1 GB
+drafter on a 32 GB card), so the pairing is a two-card configuration; and the
+control is sequential rather than interleaved (single sample on the spec arm), so
+the usual order caveat applies — 2.83x is far outside this box's 2-4 % order
+variance, but an interleaved re-run is what would make it a record number.
+Acceptance was not measured (no per-request spec counters in the in-process
+harness); the ratio is end-to-end, so it includes acceptance.

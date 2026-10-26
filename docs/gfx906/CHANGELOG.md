@@ -8,6 +8,21 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-26 (DFlash2 x INT8 W8A16: 2.83x; bf16 reference gate passes)
+
+- **The issue's "no drafter" conclusion was wrong**: DFlash2 pairs a *separate*
+  draft model, and `lued/Qwen3.8-27B-DFlash2-W8` (`DFlash2DraftModel`, bf16,
+  2.1 GB) is local. So the INT8 target's missing `mtp` keys are by design.
+- **Pairing arm runs**: INT8 W8A16 target + DFlash2 k=7 at pp1024/tg128, TP=2,
+  util 0.92 → **25.41 t/s** against a matched no-spec control at **8.97 t/s**
+  (**2.83x**). TP=1 OOMs (28 GB target + drafter), so this is a two-card config.
+  Sequential arms + single spec sample: outside the box's order variance, but an
+  interleaved re-run is needed before it becomes a record.
+- **bf16 reference gate passes**: INT8 W8A16 vs bf16 `Qwen/Qwen3.8-27B` (TP=2, 52 GB)
+  through the chat template — same top-5 token sets, ≤0.4 nats apart, near-identical
+  continuations.
+- Harness: `ift_chat_gate.py` gained `BENCH_TP` and `BENCH_MAX_SEQS`.
+
 ## 2026-10-26 (INT8-PACKED-1/#23 closed — INT8 W8A16 gated and measured)
 
 - **MTP `embed_tokens` wiring fixed** (`qwen3_5_mtp.py`): it was built without
