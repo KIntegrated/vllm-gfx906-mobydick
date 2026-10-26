@@ -8,6 +8,24 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-26 (#44 recon: stock expert offload is unusable; hot-set is the only viable axis)
+
+- **Both GPUs are PCIe 4.0 x16** (16 GT/s, measured from sysfs), not x8 as #44
+  assumed — 4x the streaming bandwidth the design was budgeted on.
+- **vLLM 0.32 already has the port's core**: `offloader/{uva,prefetch}.py`,
+  `--cpu-offload-gb`, `--offload-backend prefetch` with
+  `--offload-group-size/--offload-num-in-group/--offload-prefetch-step`, and
+  expert targeting via `--cpu-offload-params experts`. What is *missing* is the
+  hot-set and any CPU-side expert compute (CUDA-only upstream of us).
+- **Measured (35B-A3B, pp256/tg128, B=1, 3 samples)**: base **81.0 t/s**;
+  `--cpu-offload-gb 6 --cpu-offload-params experts` **12.3 t/s (−85 %)**;
+  prefetch backend (group 8 / 2) **0.74 t/s (−99 %)**. Wholesale expert offload is
+  dead here; only a hot-set can be viable.
+- **Blocker**: the checkpoint is not local (refs stub only).
+  `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE` is **120.1 GiB** public (the issue
+  assumed ~66 GiB); 374 GiB free on `/data`.
+- Recon + numbers: new `docs/gfx906/DEVLOG-qwen4exp-offload.md`.
+
 ## 2026-10-26 (DFlash2 x INT8 = 3.14x interleaved; IFT reference gate closes #24)
 
 - **Interleaved A/B (spec, none, none, spec)** at pp1024/tg128, TP=2, util 0.92:
