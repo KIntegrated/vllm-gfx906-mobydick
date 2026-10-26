@@ -292,6 +292,21 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
               ? K * 2 / 16
               : K * 2 / 16 + (WARP_SIZE - K * 2 / 16 % WARP_SIZE));
 
+  // Silent-truncation guards (adopted from PR #41's LLMM1 hunk).
+  //   NUM_BLOCKS = M / rows_per_block truncates, so when M is not a multiple of
+  //   rows_per_block the trailing M % rows_per_block rows of out_c are never
+  //   written -- they stay uninitialized and nothing reports it. The else arm
+  //   below additionally coerces an unknown rows_per_block to 4, which would
+  //   turn a caller's mistake into a wrong-shaped launch. Both are explicit now.
+  TORCH_CHECK(rows_per_block == 2 || rows_per_block == 4 ||
+                  rows_per_block == 8 || rows_per_block == 16,
+              "LLMM1: rows_per_block must be 2, 4, 8 or 16, got ",
+              rows_per_block);
+  TORCH_CHECK(M % rows_per_block == 0,
+              "LLMM1: M (", M, ") must be a multiple of rows_per_block (",
+              rows_per_block, "); the last ", M % rows_per_block,
+              " row(s) would be silently dropped.");
+
   int NUM_BLOCKS = M / rows_per_block;
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(in_b));

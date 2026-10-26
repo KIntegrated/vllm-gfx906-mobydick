@@ -292,6 +292,22 @@ docker run ... \
 - The built `_gfx906_fa_C.cpython-312-*.so` lands in-tree and is gitignored; a
   build rebuilds it under `vllm/`.
 
+### In-tree rebuild on ROCm 7.14 needs `CMAKE_PREFIX_PATH`
+
+`setup.py build_ext --inplace` re-runs CMake configure, which fails in
+`LoadHIP.cmake` with `Findrocm_smi.cmake not found` unless the ROCm cmake package
+dir is on the path — ROCm 7.14 keeps it under the versioned root:
+
+```bash
+export CMAKE_PREFIX_PATH=/opt/rocm/core-7.14:/opt/rocm
+```
+
+With that set, an incremental rebuild of a single `csrc` change is ~5 minutes
+(60 targets, `MAX_JOBS=10`). Verify the change reached a loaded extension rather
+than trusting `rc=0`: the string you added should be in the `.so` —
+`strings vllm/_rocm_C.abi3.so | grep <marker>` (note `skinny_gemms.cu` and the
+other `csrc/rocm/*` kernels land in `_rocm_C`, not `_C_stable_libtorch`).
+
 ### Rebuilding the C/C++ extension in the 7.14 image
 
 ```bash
