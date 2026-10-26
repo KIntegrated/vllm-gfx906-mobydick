@@ -5,6 +5,49 @@ This fork optimizes vLLM for AMD **gfx906 (Vega 20)** — MI50/MI60, 60 CUs,
 measured on a single MI50 with ROCm 7.14, torch 2.13, single request,
 `pp=2048`/`tg=256`, `cudagraph_mode=FULL_DECODE_ONLY`.
 
+## Which attention backend and KV format to use — decision table
+
+**Read this first.** Two things are independently choosable: the attention
+**backend** (our custom Q8 FlashAttention vs upstream `TRITON_ATTN`) and the KV
+**format** (our packed cell vs upstream's per-token-head quantized formats). The
+upstream quantized formats exist **only** in `triton_attn`, so choosing one also
+chooses the other's cost.
+
+| your situation | backend | KV format | measured trade-off |
+|---|---|---|---|
+| **Default** — single MI50, decode latency matters | **CUSTOM FA** (fork default) | **packed fp16** (`auto`) | fastest measured decode at every length tested: **103.3 vs 84.9 t/s** (Lightning 16k, hybrid) and **+0.8–2.6 %** vs upstream at 256 tok (dense 27B, MoE 35B) |
+| You need **more KV** than packed gives | `TRITON_ATTN` | `int8_per_token_head` | **+35 %** capacity (dense 27B, 32k) or **+22.6 %** (Lightning 16k) for **+0.05 %** PPL — but **−1.3 %** decode on dense and **−21.7 %** decode / −40 % prefill on the hybrid |
+| You need **much more KV** and accept quality loss | `TRITON_ATTN` | `int4_per_token_head` | **+124 %** capacity (dense 27B, 32k) for **+1.24 %** PPL |
+| **Very short contexts only** (≤512 tok), throughput over latency budget | `TRITON_ATTN` | fp16 | upstream is **0.8–2.6 %** faster there; the custom FA's advantage is long-context, not short |
+
+Switch with:
+
+```bash
+# capacity-bound arm (KV format only implemented in triton_attn)
+VLLM_ATTENTION_BACKEND=TRITON_ATTN vllm serve <model> --kv-cache-dtype int8_per_token_head
+# default arm: nothing to set (packed KV is chosen automatically when it pays)
+vllm serve <model>
+```
+
+Practical rules:
+
+- **Do not run the packed cell and a per-token-head format together.** The packed
+  cell is a fork-specific cache *format*; the per-token-head formats are upstream
+  `CacheDType`s served by `triton_attn`. Mixing them is not a configuration, it is
+  a bug report.
+- **int4 is not built here, on purpose** — it costs 25x the quality of int8 for
+  3.5x the capacity, and it already ships via `TRITON_ATTN` (P32-5/#64).
+- The **capacity-left-on-the-table** in the packed cell is its V side: the cell is
+  784 B = K q8 272 B + **V fp16 512 B**, so a measured int8-V would add ≈48 % with
+  no new kernel architecture. Not implemented yet.
+- **Prefill has no first-call cost and no backend-independent overhead**: this box
+  does ~278 tok/s for the dense 27B and ~1497 tok/s for the 30B-A3B MoE
+  regardless of path (P32-10/#70). Numbers claiming otherwise were harness bugs.
+
+All figures single MI50, ROCm 7.14, `pp_actual`-verified prompts (the prefill
+harness used to mis-size its own prompt; see `DEVLOG-kv-formats.md`). Full
+evidence: P32-2/#61, P32-5/#64, P32-10/#70.
+
 ## Release snapshots
 
 - **[`0.30.0-final`](RELEASE-0.30.0-final.md)** (2026-09-26) — the first release on
@@ -150,7 +193,7 @@ survived.
 
 | file | what it is |
 |---|---|
-| `README.md` | this hub: changes, numbers, recipes, knobs |
+| `README.md` | this hub: **backend/KV decision table**, changes, numbers, recipes, knobs |
 | `CHANGELOG.md` | chronological record of completed roadmap work and release merges |
 | `DEAD-ENDS.md` | one-pass index: hypothesis → gate → verdict → commit for what was tried (grep-able) |
 | `_devlog-template.md` | the `VERDICT:`/`HYPOTHESIS:`/`GATE:` devlog convention + worked example |
