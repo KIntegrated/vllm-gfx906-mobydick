@@ -310,3 +310,46 @@ when a dim cannot be padded at all (> 256, e.g. Gemma-4's 512).
 
 Kept for the next such bug: `GFX906_FA_DEBUG_SHAPES=1` prints the spec in/out and the first few
 kernel-boundary shapes (this bug was invisible without it).
+
+## 2026-10-26 — FA-COVER-2 (#16) closed: the head-size class was already closed by padding
+
+**VERDICT: re-ran `tools/fa_coverage.py` on the 0.32.1 tree. The `head_size not
+supported` class no longer exists for any dim the kernel can reach, and **0 of 138
+real checkpoint configs** fall back (the 2026-09-16 census found 13). No code
+change was needed; the entry's own ranked item 2 had already landed as the Phi-3
+gate (`_padded_head_size`, default ON) plus FA-D96.**
+
+Synthetic text matrix, non-CUSTOM rows by reason (192 configs):
+
+| reason | rows now | rows then (2026-09-16) |
+|---|---|---|
+| attention sinks | 96 | 72 |
+| attention type encoder | 48 | 36 |
+| **head_size not supported** | **48, all of them head 288 / 512** | 61 (e.g. 96/112) |
+
+The survivors are exactly the dims **above** the largest instantiated kernel dim:
+`head=288` and `head=512` (Gemma-4's heterogeneous 256/512 layers). Padding cannot
+reach those — `_pad_head_dim` rounds *up* to an instantiated dim, and 256 is the
+largest. Serving them would mean instantiating D=512 kernels, which the 64 KiB LDS
+budget cannot hold at D=256's occupancy (D=256 already spends most of it), so they
+stay a documented fallback rather than a work item.
+
+Everything else (40, 72, 80, 96, 112, and every other dim ≤ 256) pads onto an
+instantiated dim and is served by the custom FA — which is why the real-checkpoint
+count is now zero: the head_dim 32/40 BERT/BGE-shaped reads that used to fall back
+are served too.
+
+Remaining FA-COVER-2 classes, unchanged and deliberately not worked:
+
+- **sinks** (96 rows): needs a kernel feature (a per-head logit added to the
+  softmax denominator, contributing nothing to the numerator) and has no model in
+  the zoo. Parked in `REFRIGERATOR.md` with that design and a reopen trigger.
+- **encoder / enc-dec** (48 rows): out of the serving envelope (decoder-only here).
+- **ViT `bfloat16` and head_dim 288** (12 of 30 ViT combos): the Q8 ViT kernel is
+  fp16/fp32-only and 288 exceeds D=256, same as text.
+
+**New risk surfaced by the re-run, recorded rather than fixed:** 
+`get_vit_attn_backend(head_size, dtype)` takes **no sliding/causality argument**, so
+a windowed ViT (e.g. Qwen2.5-VL) selects CUSTOM with no way to express its window.
+That is a potential *correctness* gap, not a performance one, and it needs a
+model-level check rather than a selector change. Filed as its own issue.

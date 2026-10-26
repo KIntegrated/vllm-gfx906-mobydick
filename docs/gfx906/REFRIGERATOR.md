@@ -25,6 +25,26 @@ onboard the Q8_0 file, gate coherence against the bf16 serving path, and measure
 quantized file does to the host-resident-PLE footprint — that comparison, not the throughput,
 is why the item existed.
 
+## FA-COVER-2 sinks — per-head attention logits in the custom FA
+
+Parked 2026-10-26 (#16 closed). The only remaining FA coverage class that is
+reachable by a real model family. A sink is a per-head learned logit added to the
+softmax **denominator** with no numerator contribution:
+
+```
+m = max(rowmax(q·k), sink[h])
+l = Σ_j exp(s_j − m) + exp(sink[h] − m)
+```
+
+The tile kernel already keeps `m` and `l` per row, so the implementation is that
+term at init and at each max update, plus plumbing through both launchers
+(gather + paged) and the backend — tens of lines, no new kernel architecture.
+Numbers today: 96 synthetic census rows, GPT-OSS-style models, **none in the zoo**.
+
+Unblock: a servable sink model (GPT-OSS-class). Gate per FA-COVER-2: a per-model
+backend log line showing CUSTOM selection, a torch-SDPA numerics screen with
+synthetic sink values, and a serving A/B.
+
 ## U30-2 — gfx906 indexer top-k: chunked fallback always taken
 
 Parked 2026-10-26 (#13 closed). gfx906's 64 KiB LDS is below both large-LDS
