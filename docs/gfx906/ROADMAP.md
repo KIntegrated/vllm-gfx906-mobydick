@@ -107,15 +107,17 @@ Re-run the Nemotron TP=2 decode A/B on the 0.30 base; confirm the lm_head loads
 and whether #52301's ~13 % skip fires under EP. **Gate:** decode t/s + PPL
 26.96–27.02.
 
-### U30-2 — persistent top-k on low-shared-memory GPUs · [#13](../../issues/13)
+### ~~U30-2 — persistent top-k on low-shared-memory GPUs~~ · [#13](../../issues/13) · PARKED
 
-**Census done** (2026-10-19): the op is the DeepSeek-V3 indexer top-k, and the
-fallback fires on **every** gfx906 call — `sampled_topk` needs ≥144 KiB optin and
-`FilteredTopK` ≥128 KiB, while gfx906 offers 64 KiB, so the chunked cooperative
-`persistent_topk_kernel` always runs (8/6/5 CTA groups per 64k-column row for
-rows ≤4/≤8/>8). **Blocked on measurement:** the affected op is the QSA indexer and
-no QSA checkpoint is servable here; reopen by attributing the indexer's share of a
-64k decode step. Ref: `DEVLOG-u30-2-persistent-topk.md`.
+Closed 2026-10-26: the census answered the question and the remainder is
+unreachable here. gfx906's 64 KiB LDS cannot take `sampled_topk` (needs ≥144 KiB
+optin) or `FilteredTopK` (≥128 KiB), so the chunked cooperative
+`persistent_topk_kernel` runs on **every** call (8/6/5 CTA groups per 64k-column
+row for rows ≤4/≤8/>8) rather than the single-pass large-LDS paths. That is
+device-inherent, not a bug. Reopen **only** when a QSA checkpoint is servable
+locally — then attribute the indexer's share of a 64k decode step (ms/step,
+mclk 1000) and decide whether a 48 KiB single-pass variant pays. Ref:
+`DEVLOG-u30-2-persistent-topk.md`.
 
 ### U30-3 — W4A16 packed zero-points for Gemma-4 AWQ · [#14](../../issues/14)
 

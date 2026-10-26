@@ -25,6 +25,16 @@ onboard the Q8_0 file, gate coherence against the bf16 serving path, and measure
 quantized file does to the host-resident-PLE footprint — that comparison, not the throughput,
 is why the item existed.
 
+## U30-2 — gfx906 indexer top-k: chunked fallback always taken
+
+Parked 2026-10-26 (#13 closed). gfx906's 64 KiB LDS is below both large-LDS
+gates (`sampled_topk` ≥144 KiB optin, `FilteredTopK` ≥128 KiB), so the chunked
+cooperative `persistent_topk_kernel` is *the* path here: 8 / 6 / 5 CTA groups per
+65,536-column row for rows ≤4 / ≤8 / >8. Structural, not a defect. Unblock when a
+QSA (Qwen3.8-Flash-Next) checkpoint is locally servable: attribute the indexer's
+share of a 64k decode step, then consider a 48 KiB single-pass variant on the
+existing `kSmemMedium` layout. Evidence: `DEVLOG-u30-2-persistent-topk.md`.
+
 ## DeepSeek-V4-Flash
 
 **Parked: hardware-blocked, not an active target (user decision
